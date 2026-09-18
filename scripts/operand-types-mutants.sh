@@ -203,15 +203,21 @@ mutant M13 "$IDX" \
   a_refinement_through_an_alias_stands_its_class_down \
   'alias resolution: `I = Integer; refine I` prints "aliased s" under MRI'
 
-# The anchor carries `note_refinement`'s line as well, because the bare
-# recursion line stopped being unique on 2026-09-17: `dynamic_defs_in_body`
-# (singleton-track step N+1) has its own nested `Visit` impl that recurses
-# the same way, and `mutant`'s substring match found both — reported as
-# INVALIDO, exactly as designed, rather than mutating a coin flip.
+# The anchor carries the statement IMMEDIATELY above the recursion, because
+# the bare recursion line stopped being unique on 2026-09-17: the
+# singleton track added two nested `Visit` impls to this file whose own
+# recursion lines contain this one as a substring (they sit one block
+# deeper, so the 8-space needle matches inside their 12-space lines) —
+# three matches, reported as INVALIDO rather than mutating a coin flip.
+# `self.note_refinement(node);` was the first attempt and is NOT adjacent
+# to the recursion: `note_opaque_eval` and `note_injection` sit between
+# them, so that anchor matched zero times and the mutant was never
+# injected (measured 2026-09-18, sha 63749fc: `FAIL M14 INVALIDO`). Only
+# `note_injection`'s line touches the recursion, and it occurs once.
 mutant M14 "$IDX" \
-  '        self.note_refinement(node);
+  '        self.note_injection(node);
         ruby_prism::visit_call_node(self, node);' \
-  '        self.note_refinement(node);
+  '        self.note_injection(node);
         let _ = &node;' \
   a_refinement_inside_a_module_new_block_is_silent \
   'recursion into call blocks: a refine inside `Module.new do ... end` is still a refine'

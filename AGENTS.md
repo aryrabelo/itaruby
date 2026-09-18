@@ -320,6 +320,19 @@ found, and the launch bar is winning on both.
   reportable when the same window also measures the parent revision, and
   the two are compared to each other before either is compared to the
   ceiling.
+- A disambiguated anchor is a NEW anchor and needs its own match count
+  (learned 2026-09-18, binding, measured): the singleton track added two
+  nested `Visit` impls to `index.rs` whose own
+  `ruby_prism::visit_call_node(self, node);` lines contain M14's 8-space
+  needle as a substring, so the bare anchor went from one match to three.
+  The replacement shipped with the track named `self.note_refinement(node);`
+  as the line above the recursion — but `note_opaque_eval` and
+  `note_injection` sit between them, so the new needle matched ZERO times
+  and the mutant was never injected. `INVALIDO` caught it, forty minutes
+  into gate c1, on the integration run. Counting a candidate needle with
+  the harness's own semantics (`src.count(needle)`) costs three seconds:
+  every anchor edit does it, and no anchor edit is believed until its leg
+  has been re-run once.
 
 ## Engineering History
 

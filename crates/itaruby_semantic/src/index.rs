@@ -1428,6 +1428,21 @@ impl DefWalker<'_> {
         }
     }
 
+    /// The method list a definition inside fragment `i` belongs to.
+    /// `in_singleton` is true inside a `class << self` body, where every
+    /// method-defining form — `def`, `attr_*`, `define_method`,
+    /// `alias_method`, `alias` — lands on the CLASS OBJECT and on
+    /// nothing else (singleton-track family (a); MRI agrees, see
+    /// `sclass_define_method_is_not_an_instance_method.rb`).
+    fn track(&mut self, i: usize, in_singleton: bool) -> &mut Vec<MethodDef> {
+        let f = &mut self.fragments[i];
+        if in_singleton {
+            &mut f.singleton_methods
+        } else {
+            &mut f.methods
+        }
+    }
+
     /// Defect A (bead ita-exc): literal constant writes directly inside a
     /// class-body call's block — `enums do; Alpha = new(...); end`, or
     /// the fixture's invented `constvis_enums do; ... end` (any method
@@ -2026,7 +2041,11 @@ impl DefWalker<'_> {
                             Some(m) => {
                                 let mut md = MethodDef::synthetic(m, 0, span_of(node));
                                 md.arity_unknown = true;
-                                self.fragments[i].methods.push(md);
+                                // `define_method(:x) { ... }` — the
+                                // BLOCK spelling, and the common one.
+                                // Same track routing as the argument
+                                // form below.
+                                self.track(i, in_singleton).push(md);
                             }
                             None => self.open_class(i, OpenReason::DynamicDefineMethod),
                         }
@@ -2646,6 +2665,12 @@ impl DefWalker<'_> {
                             self.open_class(i, OpenReason::DynamicAttrArg);
                         }
                     }
+                    // Routed by `in_singleton` exactly like `attr_*`
+                    // above (commit eeb4e6a): in a `class << self` body
+                    // these define CLASS-OBJECT methods, and filing them
+                    // on the instance track put them where no singleton
+                    // lookup ever looks while inventing an instance
+                    // method MRI does not have.
                     "define_method" => {
                         let sym = call
                             .arguments()
@@ -2655,7 +2680,7 @@ impl DefWalker<'_> {
                             Some(m) => {
                                 let mut md = MethodDef::synthetic(m, 0, span);
                                 md.arity_unknown = true;
-                                self.fragments[i].methods.push(md);
+                                self.track(i, in_singleton).push(md);
                             }
                             None => self.open_class(i, OpenReason::DynamicDefineMethod),
                         }
@@ -2674,7 +2699,7 @@ impl DefWalker<'_> {
                             Some(m) => {
                                 let mut md = MethodDef::synthetic(m, 0, span);
                                 md.arity_unknown = true;
-                                self.fragments[i].methods.push(md);
+                                self.track(i, in_singleton).push(md);
                             }
                             None => self.open_class(i, OpenReason::DynamicAliasMethod),
                         }
@@ -2772,7 +2797,8 @@ impl DefWalker<'_> {
                     }
                 }
             }
-            // `alias foo bar` keyword form.
+            // `alias foo bar` keyword form — same track routing as
+            // `alias_method` above.
             Node::AliasMethodNode { .. } => {
                 let al = node.as_alias_method_node().unwrap();
                 if let Some(i) = frag_idx {
@@ -2783,7 +2809,7 @@ impl DefWalker<'_> {
                             span_of(node),
                         );
                         md.arity_unknown = true;
-                        self.fragments[i].methods.push(md);
+                        self.track(i, in_singleton).push(md);
                     }
                 }
             }

@@ -37,6 +37,17 @@
 #          -> every_dynamic_def_shape_opens_its_class must fail
 #   MUT-G  the concern-edge gate on the `class_methods do` harvest is cut
 #          -> a_non_concern_class_methods_block_invents_nothing must fail
+#   MUT-H  the BLOCK spelling of `define_method` inside `class << self`
+#          goes back to the instance track
+#          -> sclass_define_method_called_on_an_instance_accuses must
+#             fail: the name back on the instance track silences the
+#             instance-side NoMethodError
+#   MUT-I  the ARGUMENT spelling of `define_method`, same revert
+#          -> sclass_define_method_and_aliases_are_indexed_on_the_singleton_track
+#   MUT-J  `alias_method` inside `class << self`, same revert
+#          -> sclass_define_method_and_aliases_are_indexed_on_the_singleton_track
+#   MUT-K  the `alias foo bar` KEYWORD form, same revert
+#          -> sclass_define_method_and_aliases_are_indexed_on_the_singleton_track
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -224,6 +235,58 @@ mutant MUT-G "$IDX" \
                     {' \
   a_non_concern_class_methods_block_invents_nothing \
   'the concern-edge gate on the class_methods harvest: a non-concern module must not get an invented ClassMethods surface'
+
+mutant MUT-H "$IDX" \
+  '                                // `define_method(:x) { ... }` — the
+                                // BLOCK spelling, and the common one.
+                                // Same track routing as the argument
+                                // form below.
+                                self.track(i, in_singleton).push(md);' \
+  '                                self.fragments[i].methods.push(md);' \
+  sclass_define_method_called_on_an_instance_accuses \
+  'the BLOCK spelling of define_method goes back to the instance track: the instance-side NoMethodError goes silent again'
+
+mutant MUT-I "$IDX" \
+  '                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.track(i, in_singleton).push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicDefineMethod),' \
+  '                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.fragments[i].methods.push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicDefineMethod),' \
+  sclass_define_method_and_aliases_are_indexed_on_the_singleton_track \
+  'the ARGUMENT spelling of define_method goes back to the instance track'
+
+mutant MUT-J "$IDX" \
+  '                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.track(i, in_singleton).push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicAliasMethod),' \
+  '                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.fragments[i].methods.push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicAliasMethod),' \
+  sclass_define_method_and_aliases_are_indexed_on_the_singleton_track \
+  'alias_method inside class << self goes back to the instance track'
+
+mutant MUT-K "$IDX" \
+  '                        md.arity_unknown = true;
+                        self.track(i, in_singleton).push(md);
+                    }
+                }
+            }' \
+  '                        md.arity_unknown = true;
+                        self.fragments[i].methods.push(md);
+                    }
+                }
+            }' \
+  sclass_define_method_and_aliases_are_indexed_on_the_singleton_track \
+  'the `alias foo bar` KEYWORD form goes back to the instance track'
 
 echo '--- restore and prove the shipped source is byte-identical'
 restore

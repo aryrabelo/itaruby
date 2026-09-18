@@ -125,6 +125,49 @@ fn sclass_attr_called_on_an_instance_accuses() {
     );
 }
 
+/// `attr_*` was only the first spelling. `define_method`,
+/// `alias_method` and the `alias` KEYWORD inside `class << self` define
+/// class-object methods too, and the index filed all three on the
+/// instance track — the same defect as family (a), one review later.
+/// MRI runs `sclass_define_method_resolves_silently.rb` to completion.
+#[test]
+fn sclass_define_method_and_aliases_are_indexed_on_the_singleton_track() {
+    let (instance, singleton, open) =
+        facts("sclass_define_method_resolves_silently.rb", "Config");
+    assert_eq!(
+        singleton,
+        vec!["other", "stats", "stats2", "stats3", "stats4"],
+        "class-object track"
+    );
+    assert!(instance.is_empty(), "instance track must stay empty, got {instance:?}");
+    assert!(!open, "a literal definer names what it defines: Config stays closed");
+}
+
+/// The silence side: every call in the fixture is real.
+#[test]
+fn sclass_define_method_calls_resolve_silently() {
+    assert!(
+        diags("sclass_define_method_resolves_silently.rb").is_empty(),
+        "expected silence, got {:?}",
+        diags("sclass_define_method_resolves_silently.rb")
+    );
+}
+
+/// The observable side, through the instance track: a name
+/// `define_method` installs inside `class << self` is NOT an instance
+/// method, so this call is a certain `NoMethodError` (MRI raises on
+/// line 15) and E0101 must report it. While the name sat on the
+/// instance track the call was SILENT — the routing fix is what makes
+/// this line accusable, and the mutant that reverts it makes this test
+/// fail.
+#[test]
+fn sclass_define_method_called_on_an_instance_accuses() {
+    assert_eq!(
+        diags("sclass_define_method_is_not_an_instance_method.rb"),
+        vec!["15:12:E0101"]
+    );
+}
+
 // ---------------------------------------------------------------------
 // family (b): `extend` copies a module's instance methods onto the
 // extender's singleton — including `extend self` and `module_function`
@@ -601,4 +644,126 @@ fn thread_mattr_accessor_is_indexed_on_both_tracks() {
     assert!(open, "the catch-all's openness must be preserved");
     let d = diags("thread_mattr_accessor_resolves_silently.rb");
     assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+// ---------------------------------------------------------------------
+// MRI ground truth, EXECUTED. Until 2026-09-18 every "MRI raises on
+// this line" / "MRI runs the file to completion" claim in this file
+// lived in a doc comment — narrated, never run, which is exactly the
+// shape AGENTS.md refuses ("the probes proving each side live next to
+// the instrument, never only narrated"). The table below runs each
+// fixture and pins the SAME line numbers the diagnostic assertions
+// above pin, which is what makes this a check on the diagnostic rather
+// than on Ruby, and its closure check forces a new fixture to declare
+// what MRI does with it instead of arriving unmeasured.
+// ---------------------------------------------------------------------
+
+enum Mri {
+    /// Runs to completion, exit 0.
+    Clean,
+    /// Raises `kind` on this 1-based line.
+    Raises(&'static str, u32),
+}
+
+fn fixture_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../testdata/singleton_track"
+    ))
+}
+
+fn ruby_available() -> bool {
+    std::process::Command::new("ruby")
+        .arg("-e")
+        .arg("exit 0")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// (exit code, stdout+stderr) of `ruby <path> [args...]`.
+fn run_ruby(path: &std::path::Path, args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new("ruby")
+        .arg(path)
+        .args(args)
+        .output()
+        .expect("ruby must be spawnable");
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
+    (out.status.code().unwrap_or(-1), text)
+}
+
+fn assert_mri(name: &str, expected: &Mri) {
+    let (code, text) = run_ruby(&fixture_dir().join(name), &[]);
+    match expected {
+        Mri::Clean => assert_eq!(code, 0, "{name} must run clean: {text}"),
+        Mri::Raises(kind, line) => {
+            assert_eq!(code, 1, "{name} must fail: {text}");
+            assert!(text.contains(kind), "{name} must raise {kind}: {text}");
+            let blamed = format!("{name}:{line}:in ");
+            assert!(text.contains(&blamed), "{name} must raise on line {line}: {text}");
+        }
+    }
+}
+
+#[test]
+fn mri_ground_truth_is_executed() {
+    if !ruby_available() {
+        eprintln!("skipping: no `ruby` on PATH — the MRI leg is machine-dependent");
+        return;
+    }
+    let table = [
+        ("class_attribute_dynamic_option_defines_everything.rb", Mri::Clean),
+        ("class_attribute_instance_predicate_false_raises.rb", Mri::Raises("NoMethodError", 28)),
+        ("class_attribute_instance_reader_false_raises.rb", Mri::Raises("NoMethodError", 28)),
+        ("class_attribute_resolves_silently.rb", Mri::Clean),
+        ("class_methods_block_resolves_silently.rb", Mri::Clean),
+        ("concern_class_methods_arity_accuses.rb", Mri::Raises("ArgumentError", 16)),
+        ("concern_class_methods_resolves_silently.rb", Mri::Clean),
+        ("dynamic_def_in_body_only_opens_its_own_class.rb", Mri::Raises("ArgumentError", 11)),
+        ("dynamic_def_shapes_all_open.rb", Mri::Clean),
+        ("dynamic_singleton_def_in_body_opens.rb", Mri::Clean),
+        ("extend_non_constant_opens.rb", Mri::Clean),
+        ("extend_self_arity_accuses.rb", Mri::Raises("ArgumentError", 6)),
+        ("extend_self_resolves_silently.rb", Mri::Clean),
+        ("module_function_arity_accuses.rb", Mri::Raises("ArgumentError", 6)),
+        ("module_function_resolves_silently.rb", Mri::Clean),
+        ("non_concern_class_methods_invents_nothing.rb", Mri::Clean),
+        ("sclass_attr_arity_accuses.rb", Mri::Raises("ArgumentError", 9)),
+        ("sclass_attr_is_not_an_instance_method.rb", Mri::Raises("NoMethodError", 9)),
+        ("sclass_attr_resolves_silently.rb", Mri::Clean),
+        ("sclass_call_attr_arity_accuses.rb", Mri::Raises("ArgumentError", 7)),
+        ("sclass_call_attr_resolves_silently.rb", Mri::Clean),
+        ("sclass_call_attr_typo_would_be_not_found.rb", Mri::Raises("NoMethodError", 5)),
+        ("sclass_define_method_is_not_an_instance_method.rb", Mri::Raises("NoMethodError", 15)),
+        ("sclass_define_method_resolves_silently.rb", Mri::Clean),
+        ("sclass_of_const_arity_accuses.rb", Mri::Raises("ArgumentError", 6)),
+        ("sclass_of_const_resolves_silently.rb", Mri::Clean),
+        ("singleton_class_prepend_arity_accuses.rb", Mri::Raises("ArgumentError", 11)),
+        ("singleton_class_prepend_resolves_silently.rb", Mri::Clean),
+        ("singleton_method_missing_opens.rb", Mri::Clean),
+        ("singleton_patch_on_undeclared_class_invents_nothing.rb", Mri::Clean),
+        ("stdlib_singleton_surface_silent.rb", Mri::Clean),
+        ("thread_mattr_accessor_resolves_silently.rb", Mri::Clean),
+    ];
+    for (name, expected) in &table {
+        assert_mri(name, expected);
+    }
+    // The dynamic-option fixture's whole point is that the runtime flag
+    // decides, so BOTH argument vectors must run clean.
+    let (code, text) = run_ruby(
+        &fixture_dir().join("class_attribute_dynamic_option_defines_everything.rb"),
+        &["off"],
+    );
+    assert_eq!(code, 0, "the dynamic-option fixture must run clean with `off` too: {text}");
+    // Every fixture on disk is in the table.
+    let mut on_disk: Vec<String> = std::fs::read_dir(fixture_dir())
+        .expect("fixture dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.extension().is_some_and(|e| e == "rb"))
+        .map(|p| p.file_name().expect("file name").to_string_lossy().into_owned())
+        .collect();
+    on_disk.sort();
+    let mut declared: Vec<String> = table.iter().map(|(n, _)| (*n).to_string()).collect();
+    declared.sort();
+    assert_eq!(on_disk, declared, "every fixture must declare its MRI outcome");
 }

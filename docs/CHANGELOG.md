@@ -244,6 +244,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now zero, which is exactly what the fix predicted: `rspec` is among the
   305 namespaces discovery parses from that lock, and
   `apply_gem_reopenings` opens 2862 classes with `RSpec` in the set.
+  corpus-c does not move for a narrower reason, also instrumented: its
+  `Gemfile.lock` exists (one directory above the checked root, found by
+  the upward walk) and maps 291 namespaces opening 3117 classes, but it
+  declares no `rspec`-prefixed gem, so `RSpec` stays closed there — and
+  its residue contains zero `RSpec` receivers anyway: 92 distinct
+  receivers, 2 explicit-receiver sites out of 1701, essentially all
+  receiverless self-sends inside open-shaped classes.
 
 - Fixed: `scripts/public-gate.sh` reported "public errors match baseline
   exactly" for all three repos, in ~0.01s each, while measuring nothing.

@@ -48,6 +48,24 @@ module ByModuleEval
   end
 end
 
+class ByInstanceExec
+  def self.install(blk)
+    instance_exec(&blk)
+  end
+end
+
+class ByClassExec
+  def self.install(blk)
+    class_exec(&blk)
+  end
+end
+
+module ByModuleExec
+  def self.install(blk)
+    module_exec(&blk)
+  end
+end
+
 ByDefineMethod.install(:a)
 ByDefineSingletonMethod.install(:b)
 ByAliasMethod.install(:base, :also_base)
@@ -55,6 +73,18 @@ ByAttr.install(:c)
 ByClassEval.install(:d)
 ByInstanceEval.install(:e)
 ByModuleEval.install(:f)
+ByInstanceExec.install(proc do
+  raise "instance_exec must rebind self to the class" unless self == ByInstanceExec
+  @via_instance_exec = 7
+end)
+ByClassExec.install(proc do
+  raise "class_exec must rebind self to the class" unless self == ByClassExec
+  @via_class_exec = 8
+end)
+ByModuleExec.install(proc do
+  raise "module_exec must rebind self to the module" unless self == ByModuleExec
+  @via_module_exec = 9
+end)
 
 raise "define_method" unless ByDefineMethod.new.a == 1
 raise "define_singleton_method" unless ByDefineSingletonMethod.b == 2
@@ -63,3 +93,6 @@ raise "attr" unless ByAttr.new.respond_to?(:c)
 raise "class_eval" unless ByClassEval.new.d == 4
 raise "instance_eval" unless ByInstanceEval.new.e == 5
 raise "module_eval" unless Class.new { include ByModuleEval }.new.f == 6
+raise "instance_exec" unless ByInstanceExec.instance_variable_get(:@via_instance_exec) == 7
+raise "class_exec" unless ByClassExec.instance_variable_get(:@via_class_exec) == 8
+raise "module_exec" unless ByModuleExec.instance_variable_get(:@via_module_exec) == 9

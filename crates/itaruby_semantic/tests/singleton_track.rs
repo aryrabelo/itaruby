@@ -481,6 +481,39 @@ fn sclass_call_attr_typo_stays_characterized_silent() {
     assert!(d.is_empty(), "expected characterized silence, got {d:?}");
 }
 
+/// The concern edge is the gate: a module that calls `class_methods do`
+/// WITHOUT extending ActiveSupport::Concern must not have a
+/// `ClassMethods` module invented for it — no fragment in `by_path`, no
+/// extends edge, no filed methods. An invented CLOSED surface is
+/// exactly what the flip could never be allowed to accuse against; the
+/// module itself still opens (the `_` catch-all, unchanged silence).
+/// MRI ground truth for the idiom lives in the sibling concern fixture:
+/// there the gem really defines `ClassMethods` from the block.
+#[test]
+fn a_non_concern_class_methods_block_invents_nothing() {
+    let name = "non_concern_class_methods_invents_nothing.rb";
+    let (db, _file, _text) = fixture(name);
+    let index = project_index(&db);
+    assert!(
+        !index.by_path.contains_key("Plain::ClassMethods"),
+        "the harvest must not invent ClassMethods without the concern edge"
+    );
+    let id = *index.by_path.get("Plain").expect("the module itself is indexed");
+    let class = index.class(id);
+    assert!(
+        !class.extends.iter().any(|e| e.ends_with("ClassMethods")),
+        "no extends edge may be invented either"
+    );
+    assert_eq!(
+        class.singleton_methods.keys().cloned().collect::<Vec<_>>(),
+        vec!["class_methods"],
+        "the fixture's own def self.class_methods is filed; nothing else may be"
+    );
+    assert!(class.open, "the catch-all's openness must be preserved");
+    let d = diags(name);
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
 // ---------------------------------------------------------------------
 // `class_attribute :a` (ActiveSupport). Read out of the gem's own
 // source: singleton reader/writer always, `a?` predicate unless

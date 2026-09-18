@@ -174,6 +174,48 @@ mutant MUT-E "$IDX" \
   any_instance_softens_when_a_mock_gem_is_locked \
   'the any_instance softening branch is cut: the locked project keeps conclusive NotFound'
 
+mutant MUT-F "$IDX" \
+  'const BODY_DEF_NAMES: [&str; 12] = [
+    "define_method",
+    "define_singleton_method",
+    "alias_method",
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    "class_eval",
+    "module_eval",
+    "instance_eval",
+    "instance_exec",
+    "class_exec",
+    "module_exec",
+];' \
+  'const BODY_DEF_NAMES: [&str; 9] = [
+    "define_method",
+    "define_singleton_method",
+    "alias_method",
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    "class_eval",
+    "module_eval",
+    "instance_eval",
+];' \
+  every_dynamic_def_shape_opens_its_class \
+  'the prefilter drops the _exec family: their def bodies are never walked and the classes stay closed'
+
+mutant MUT-G "$IDX" \
+  '                    } else if call.name().as_slice() == b"class_methods"
+                        && call.receiver().is_none()
+                        && !scope.is_empty()
+                        && is_concern_edge(&self.fragments[i].extends)
+                    {' \
+  '                    } else if call.name().as_slice() == b"class_methods"
+                        && call.receiver().is_none()
+                        && !scope.is_empty()
+                    {' \
+  a_non_concern_class_methods_block_invents_nothing \
+  'the concern-edge gate on the class_methods harvest: a non-concern module must not get an invented ClassMethods surface'
+
 echo '--- restore and prove the shipped source is byte-identical'
 restore
 cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" \

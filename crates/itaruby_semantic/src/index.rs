@@ -2051,6 +2051,7 @@ impl DefWalker<'_> {
                     } else if call.name().as_slice() == b"class_methods"
                         && call.receiver().is_none()
                         && !scope.is_empty()
+                        && is_concern_edge(&self.fragments[i].extends)
                     {
                         // `class_methods do ... end` (singleton-track
                         // family (c)): ActiveSupport::Concern's block
@@ -2061,6 +2062,26 @@ impl DefWalker<'_> {
                         // `apply_concern_class_methods` adds for the
                         // written-out form, so both spellings resolve
                         // through one mechanism.
+                        //
+                        // GATED ON THE CONCERN EDGE
+                        // (`is_concern_edge_before`): a receiverless
+                        // `class_methods` call is only this DSL when the
+                        // module extends ActiveSupport::Concern — without
+                        // the edge the harvest would INVENT
+                        // `M::ClassMethods` (fragment + edge + methods)
+                        // for a module whose block may never execute as
+                        // this DSL at all, and an invented CLOSED surface
+                        // is exactly what the flip cannot be allowed to
+                        // accuse on. Measured 2026-09-18 across the
+                        // public corpora: 123 of 125 `class_methods do`
+                        // sites have `extend ActiveSupport::Concern`
+                        // lexically BEFORE the block in the same file
+                        // (rails 19/21, discourse 83/83, mastodon
+                        // 21/21); the misses fall through to the `_`
+                        // catch-all below — the module opens exactly as
+                        // it did, and the harvest loss is a documented
+                        // false negative, never a diagnostic (invariant
+                        // #1).
                         //
                         // OPENNESS IS PRESERVED: the block still opens
                         // the concern, exactly as before. Closing it
@@ -2945,7 +2966,7 @@ fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
 /// here is a missed finding" failure the sentence above describes.
 /// `dynamic_def_prefilter_covers_every_reacting_name` now pins the list
 /// against `body_def_reason`.
-const BODY_DEF_NAMES: [&str; 9] = [
+const BODY_DEF_NAMES: [&str; 12] = [
     "define_method",
     "define_singleton_method",
     "alias_method",
@@ -2955,6 +2976,9 @@ const BODY_DEF_NAMES: [&str; 9] = [
     "class_eval",
     "module_eval",
     "instance_eval",
+    "instance_exec",
+    "class_exec",
+    "module_exec",
 ];
 
 /// Does this `def`'s BODY define methods in a way the index cannot
@@ -3081,8 +3105,23 @@ fn is_own_singleton_class(node: &Node<'_>) -> bool {
     })
 }
 
+/// The `_eval`/`_exec` rebind family: inside any of these blocks the
+/// block's `self` is the receiver, so a definition there lands on an
+/// object no index position can name. One predicate because
+/// `body_def_reason` treats them identically (`EvalOrSend`) and
+/// `BODY_DEF_NAMES` must list all six or the prefilter drops the body
+/// before `body_def_reason` is ever consulted
+/// (`dynamic_def_prefilter_covers_every_reacting_name` pins the pair).
 fn is_eval_name(name: &[u8]) -> bool {
-    matches!(name, b"class_eval" | b"module_eval" | b"instance_eval")
+    matches!(
+        name,
+        b"class_eval"
+            | b"module_eval"
+            | b"instance_eval"
+            | b"instance_exec"
+            | b"class_exec"
+            | b"module_exec"
+    )
 }
 
 /// The reason a method-defining call in a `def` body makes its target's
@@ -3962,6 +4001,16 @@ fn apply_undeclared_namespace_reopenings(index: &mut ProjectIndex) {
     }
 }
 
+/// Is this an `extend ActiveSupport::Concern` edge, spelled with or
+/// without the leading cbase? The one predicate both readers of the
+/// concern idiom share: `DefWalker`'s `class_methods do` harvest gate
+/// (harvest-time, same-file edge) and `apply_concern_class_methods`
+/// (post-merge, any-file edge). Both must ask the SAME question or the
+/// two spellings of the idiom drift apart.
+fn is_concern_edge(extends: &[String]) -> bool {
+    extends.iter().any(|e| e.trim_start_matches("::") == "ActiveSupport::Concern")
+}
+
 /// Singleton-track family (c): `ActiveSupport::Concern`'s `ClassMethods`
 /// convention. A module that `extend ActiveSupport::Concern` and defines
 /// a nested `ClassMethods` module has that module extended onto EVERY
@@ -3994,12 +4043,7 @@ fn apply_concern_class_methods(index: &mut ProjectIndex) {
         .classes
         .iter()
         .enumerate()
-        .filter(|(_, class)| {
-            class
-                .extends
-                .iter()
-                .any(|e| e.trim_start_matches("::") == "ActiveSupport::Concern")
-        })
+        .filter(|(_, class)| is_concern_edge(&class.extends))
         .filter_map(|(i, class)| {
             let nested = format!("{}::ClassMethods", class.path);
             let id = ClassId(u32::try_from(i).ok()?);
@@ -6884,5 +6928,85 @@ fn outcomes_agree(
         (Some(Ok((pm, _))), Ok((m, _))) => (pm.file, pm.name_span) == (m.file, m.name_span),
         (Some(Err(())), Err(())) => true,
         _ => false,
+    }
+}
+
+
+#[cfg(test)]
+mod dynamic_def_tests {
+    use super::*;
+
+    /// Visits every call node of the probed def body and records whether
+    /// the TARGET name produced a reason.
+    struct ReasonScan {
+        name: &'static str,
+        seen_reason: bool,
+    }
+
+    impl<'pr> ruby_prism::Visit<'pr> for ReasonScan {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if node.name().as_slice() == self.name.as_bytes() {
+                assert!(
+                    body_def_reason(node).is_some(),
+                    "`{}` was expected to react in `body_def_reason` but \
+                     returned None — the table in \
+                     dynamic_def_prefilter_covers_every_reacting_name is \
+                     stale",
+                    self.name
+                );
+                self.seen_reason = true;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+
+    /// The prefilter and the reason must agree, name by name: a call
+    /// name `body_def_reason` reacts to but that is missing from
+    /// `BODY_DEF_NAMES` means the substring scan drops the whole body
+    /// before the AST walk can see the call — the class stays CLOSED
+    /// with its surface provably dynamic, the exact missed finding the
+    /// prefilter exists to prevent (measured twice: the first version
+    /// omitted `instance_eval` and 10 discourse sites came back
+    /// unopened; the 2026-09-18 review added the `_exec` family). The
+    /// table below is the spec of every name `body_def_reason` reacts
+    /// to, spelled in the shape that makes it react. A new match arm
+    /// without a prefilter entry fails the COVERED half here, and a
+    /// stale table entry fails the REACTING half.
+    #[test]
+    fn dynamic_def_prefilter_covers_every_reacting_name() {
+        // (name, the call source that makes `body_def_reason` react)
+        let reacting: &[(&str, &str)] = &[
+            ("class_eval", "class_eval(:X)"),
+            ("module_eval", "module_eval(:X)"),
+            ("instance_eval", "instance_eval(:X)"),
+            ("instance_exec", "instance_exec(:X)"),
+            ("class_exec", "class_exec(:X)"),
+            ("module_exec", "module_exec(:X)"),
+            ("define_method", "define_method(name)"),
+            ("define_singleton_method", "define_singleton_method(name)"),
+            ("alias_method", "alias_method(name, :other)"),
+            ("attr_reader", "attr_reader(name)"),
+            ("attr_writer", "attr_writer(name)"),
+            ("attr_accessor", "attr_accessor(name)"),
+        ];
+        for (name, call_src) in reacting {
+            // COVERED: the substring prefilter must let the body through.
+            assert!(
+                BODY_DEF_NAMES.contains(name),
+                "`{name}` reacts in `body_def_reason` but is missing from \
+                 BODY_DEF_NAMES — a def body containing only it is never \
+                 walked and its openness is missed"
+            );
+            // REACTING: the parsed call really produces a reason, so the
+            // table above stays honest about what "reacts" means.
+            let src = format!("def __probe\n  {call_src}\nend");
+            let parse = ruby_prism::parse(src.as_bytes());
+            let mut scan = ReasonScan { name, seen_reason: false };
+            ruby_prism::Visit::visit(&mut scan, &parse.node());
+            assert!(
+                scan.seen_reason,
+                "`{call_src}` did not parse into a reachable call node"
+            );
+        }
     }
 }

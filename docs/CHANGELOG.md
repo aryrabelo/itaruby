@@ -296,6 +296,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `DiscourseEvent.raise` — a `raise` inside `def self.trigger`'s rescue,
   i.e. Kernel, not a class method.
 
+- Singleton-track step N+1, shapes (2)-(4): a class whose singleton
+  surface cannot be proven closed now says so.
+  Shape (2) is the one that mattered and the one that was a latent
+  invariant #1 bug: `def` bodies are never walked, so a class that
+  installs its class methods with `define_singleton_method(key)` inside
+  `def self.*` looked CLOSED with none of those names in it — discourse's
+  `GlobalSetting` (`app/models/global_setting.rb:5`, `:69`, `:262`), 275
+  residue sites, silent today only because the `Ty::Class` `NotFound`
+  arm is characterized silent. Bodies are now scanned for definition
+  shapes (`define_method`/`define_singleton_method` with a non-literal
+  name, `alias_method`, `attr_*` with a non-symbol, `class_eval`/
+  `module_eval`/`instance_eval`), attributed BY RECEIVER: implicit/`self`
+  (or `singleton_class`) opens the enclosing class, a literal constant
+  opens that constant by name, a dynamic receiver opens nothing.
+  Attribution is not cosmetic — attributing a nested implicit-receiver
+  call inside `MountedHelpers.class_eval do ... end` to the enclosing
+  class opened `ActionDispatch::Routing::RouteSet` and swallowed a
+  baseline rails E0101.
+  Shapes (3) `extend <non-constant>` and (4) singleton
+  `method_missing`/`respond_to_missing?` were already handled; they now
+  have MRI-executed fixtures and tests so a later narrowing cannot
+  silently close those classes.
+  Perf: walking every body unconditionally measured `check/project_index`
+  at 10.71 ms against a 7.04 ms ceiling, so a substring prefilter over
+  the def's own span runs first (the technique the `NotImplementedError`
+  scan already used). 6.20 ms after, against 6.13 ms for the parent
+  revision measured in the same window — the ceiling is NOT tightened:
+  this change spends slack, it does not create it. The prefilter's first
+  version omitted `instance_eval` and the probe caught it as 10 MISSING
+  discourse findings; the list is now pinned by a behavioral test over
+  one fixture class per shape.
+  Residue (probe rebuilt from this exact source): rails 299 -> 279 (130
+  -> 121 explicit), mastodon 22 (0) unchanged, discourse 1312 -> 1023
+  (639 -> 430 explicit), corpus-c 1701 (2) unchanged.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

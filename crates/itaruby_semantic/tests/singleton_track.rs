@@ -304,3 +304,87 @@ fn a_patch_on_an_undeclared_class_invents_nothing() {
         index.by_path.keys().collect::<Vec<_>>()
     );
 }
+
+// ---------------------------------------------------------------------
+// step N+1, shapes (2)-(4): the class whose singleton surface cannot be
+// proven closed must SAY so. Openness is not a diagnostic today — the
+// `Ty::Class` `NotFound` arm is characterized silent in
+// `singleton_lookup.rs` — so these assert the index FACT, plus the
+// E0102 arity observable where one exists.
+// ---------------------------------------------------------------------
+
+/// Shape (2), the measured one: discourse's `GlobalSetting` installs its
+/// class methods with `define_singleton_method(key)` inside a
+/// `def self.*` body (`app/models/global_setting.rb:5`, `:69`, `:262`),
+/// 275 residue sites. Def bodies are never walked, so the class looked
+/// CLOSED with none of those names — silent today, an invariant #1
+/// violation the moment the arm reports. MRI proves the method is real.
+#[test]
+fn a_dynamic_singleton_def_in_a_body_opens_the_class() {
+    let name = "dynamic_singleton_def_in_body_opens.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (_i, _s, open) = facts(name, "Settings");
+    assert!(open, "a def body defining class methods dynamically must open the class");
+}
+
+/// The attribution rule, which is the whole reason this is not a text
+/// scan: `Inner.class_eval { define_method(name) ... }` defines on
+/// `Inner`. The enclosing class stays CLOSED and keeps being checked —
+/// E0102 on line 20 proves it. Measured on rails: attributing that
+/// nested implicit-receiver call to the enclosing class opened
+/// `ActionDispatch::Routing::RouteSet` and swallowed a baseline E0101.
+#[test]
+fn a_foreign_eval_block_does_not_open_the_enclosing_class() {
+    let name = "dynamic_def_in_body_only_opens_its_own_class.rb";
+    assert_eq!(diags(name), vec!["20:7:E0102"]);
+    let (_i, _s, open) = facts(name, "Outer");
+    assert!(!open, "the enclosing class must stay closed");
+}
+
+/// Shape (3): `extend <local>`. Already handled by
+/// `OpenReason::DynamicMixinArg` before step N+1 — pinned so a later
+/// narrowing of that arm cannot silently close a class whose singleton
+/// surface is chosen at runtime. MRI proves the module really answers.
+#[test]
+fn extend_of_a_non_constant_opens_the_class() {
+    let name = "extend_non_constant_opens.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (_i, _s, open) = facts(name, "Probe");
+    assert!(open, "a runtime-chosen extend must open the class");
+}
+
+/// Shape (4): a singleton `method_missing`/`respond_to_missing?` answers
+/// names no index can enumerate. Already handled (the `def` arm checks
+/// the NAME before the track), pinned for the same reason.
+#[test]
+fn a_singleton_method_missing_opens_the_class() {
+    let name = "singleton_method_missing_opens.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (_i, _s, open) = facts(name, "Ghost");
+    assert!(open, "a singleton method_missing must open the class");
+}
+
+/// The prefilter's coverage, pinned through behavior rather than
+/// introspection: one class per shape `body_def_reason` reacts to, each
+/// of which must end up OPEN. `BODY_DEF_NAMES` is a cheap substring gate
+/// in front of the AST walk, and its first version omitted
+/// `instance_eval` — measured as 10 MISSING discourse findings against
+/// the unfiltered walk. A name dropped from that list is exactly this
+/// test going red. Every line of the fixture really runs under MRI.
+#[test]
+fn every_dynamic_def_shape_opens_its_class() {
+    let name = "dynamic_def_shapes_all_open.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    for path in [
+        "ByDefineMethod",
+        "ByDefineSingletonMethod",
+        "ByAliasMethod",
+        "ByAttr",
+        "ByClassEval",
+        "ByInstanceEval",
+        "ByModuleEval",
+    ] {
+        let (_i, _s, open) = facts(name, path);
+        assert!(open, "{path} must be open");
+    }
+}

@@ -1839,6 +1839,42 @@ impl DefWalker<'_> {
                     if name == "method_missing" || name == "respond_to_missing?" {
                         self.open_class(i, OpenReason::MethodMissing);
                     }
+                    // Singleton-track step N+1, shape (2): a def BODY
+                    // that defines methods dynamically. Def bodies are
+                    // otherwise never walked, so a class whose class
+                    // methods are installed by
+                    // `define_singleton_method(key)` inside
+                    // `def self.setup` looked CLOSED with none of them
+                    // in it — silent today only because the singleton
+                    // `NotFound` arm is characterized silent, and a
+                    // guaranteed invariant #1 violation the moment it
+                    // flips. Measured: discourse's `GlobalSetting`
+                    // (app/models/global_setting.rb:5, :69, :262) is
+                    // exactly this, 275 residue sites.
+                    //
+                    // TEXT PREFILTER FIRST, then the AST. Walking every
+                    // def body unconditionally cost `check/project_index`
+                    // 10.71 ms against a 7.04 ms ceiling (measured; the
+                    // perf gate caught it). The overwhelming majority of
+                    // method bodies mention none of these names, and a
+                    // substring scan over the def's own span is orders
+                    // cheaper than a prism walk — the same technique the
+                    // `NotImplementedError` scan just below already uses.
+                    // The prefilter only ever SKIPS work: a body that
+                    // mentions a name still goes through the AST, which
+                    // is what decides anything.
+                    let body_text = &self.text[md.def_span.0..md.def_span.1];
+                    if BODY_DEF_NAMES.iter().any(|n| body_text.contains(n)) {
+                        for (target, reason) in dynamic_defs_in_body(&def) {
+                            match target {
+                                DefTarget::Enclosing => self.open_class(i, reason),
+                                DefTarget::Named(path) => {
+                                    let oi = self.fragment_idx_for(&path, nesting);
+                                    self.open_class(oi, reason);
+                                }
+                            }
+                        }
+                    }
                     // ponytail: text scan, not AST — `raise NotImplementedError`
                     // is Ruby's abstract-class idiom; such classes call
                     // subclass hooks we can't see. Proper abstract-method
@@ -2668,6 +2704,188 @@ fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
             Some(first)
         }
         None => Some(body),
+    }
+}
+
+/// Every call name `body_def_reason` can react to. Used ONLY as a cheap
+/// substring prefilter over a `def`'s own source span before the AST
+/// walk (`dynamic_defs_in_body`): a body naming none of these cannot
+/// produce a finding, and skipping the walk for it is what keeps
+/// `check/project_index` inside its ceiling (measured: walking every
+/// body unconditionally cost 10.71 ms against a 7.04 ms ceiling). Keep
+/// in sync with `body_def_reason` — a name here it ignores only costs a
+/// wasted walk; a name MISSING here is a missed finding.
+/// Proven by measurement, not by reading: the first version of this list
+/// omitted `instance_eval`, and the residue probe came back with 10 MORE
+/// discourse sites than the unfiltered walk — the exact "a name missing
+/// here is a missed finding" failure the sentence above describes.
+/// `dynamic_def_prefilter_covers_every_reacting_name` now pins the list
+/// against `body_def_reason`.
+const BODY_DEF_NAMES: [&str; 9] = [
+    "define_method",
+    "define_singleton_method",
+    "alias_method",
+    "attr_reader",
+    "attr_writer",
+    "attr_accessor",
+    "class_eval",
+    "module_eval",
+    "instance_eval",
+];
+
+/// Does this `def`'s BODY define methods in a way the index cannot
+/// enumerate — and if so, with which reason?
+///
+/// Def bodies are never walked by `walk_stmt` (methods are recorded,
+/// their contents are the checker's business, not the index's), which
+/// left a hole the singleton track cannot afford: discourse's
+/// `GlobalSetting` installs every one of its class methods with
+/// `define_singleton_method(key)` inside `def self.load_defaults` and
+/// friends (`app/models/global_setting.rb:5`, `:69`, `:262`), and the
+/// class looked CLOSED with none of those names in it. That is silent
+/// today only because the `Ty::Class` `NotFound` arm is characterized
+/// silent; it is a guaranteed invariant #1 violation the moment the arm
+/// reports, and 275 residue sites on that one class.
+///
+/// ATTRIBUTION BY RECEIVER, because the first version opened the
+/// enclosing class for any of these calls anywhere in the body and that
+/// is measurably too coarse: rails' `route_set.rb:526` writes
+/// `MountedHelpers.class_eval do ... end` inside
+/// `def self.mounted_helpers`, which defines methods on
+/// `MountedHelpers` and says nothing at all about `RouteSet`. So:
+///
+/// * implicit or `self` receiver -> the ENCLOSING class (`None`): in a
+///   `def self.x` body `self` IS the class, so `define_method` there
+///   really does define its instance methods and
+///   `define_singleton_method` its class methods
+/// * literal constant receiver -> that constant, by name (`Some(path)`,
+///   applied through `apply_singleton_patches`' declared-owner rule)
+/// * dynamic receiver (`mod.define_method`, `route_set.rb:340`) ->
+///   NOTHING: an unknown object's methods are not evidence about this
+///   class, and opening it anyway would blanket most of any real app
+///
+/// DEFINITION shapes only. A dynamic DISPATCH (`send`, `public_send`)
+/// proves nothing about what a class defines, so it is deliberately not
+/// here.
+///
+/// A LITERAL `define_method(:name)`/`define_singleton_method(:name)`
+/// opens nothing: the name is knowable, and pretending otherwise trades
+/// a fact for a blanket. Registering those names is worth doing and is
+/// not this function's job (see `harvest_included_hook` for the same
+/// discipline on the hook shape).
+fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> Vec<(DefTarget, OpenReason)> {
+    struct Scan {
+        found: Vec<(DefTarget, OpenReason)>,
+    }
+    impl Scan {
+        fn note(&mut self, target: DefTarget, reason: OpenReason) {
+            if !self.found.iter().any(|(t, _)| *t == target) {
+                self.found.push((target, reason));
+            }
+        }
+
+        /// Record what this one call says, and answer whether the walk
+        /// should stop here. Inside `X.class_eval { ... }` the block's
+        /// `self` is X, so an implicit-receiver `define_method(name)` in
+        /// there defines on X — NOT on the class lexically around the
+        /// `def`. Measured on rails: attributing that nested call to the
+        /// enclosing class opened `ActionDispatch::Routing::RouteSet`
+        /// and took a baseline E0101 with it.
+        fn consume(&mut self, node: &ruby_prism::CallNode<'_>) -> bool {
+            let Some(target) = body_def_target(node) else { return false };
+            let names_its_target = matches!(target, DefTarget::Named(_));
+            if let Some(reason) = body_def_reason(node) {
+                self.note(target, reason);
+            }
+            names_its_target && is_eval_name(node.name().as_slice())
+        }
+    }
+    impl<'pr> ruby_prism::Visit<'pr> for Scan {
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            if self.consume(node) {
+                return;
+            }
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let Some(body) = def.body() else { return Vec::new() };
+    let mut scan = Scan { found: Vec::new() };
+    ruby_prism::Visit::visit(&mut scan, &body);
+    scan.found
+}
+
+/// Whose surface a method-defining call inside a `def` body describes.
+#[derive(Clone, PartialEq, Eq)]
+enum DefTarget {
+    /// Implicit or `self` receiver: the class the `def` is written in.
+    /// In a `def self.x` body `self` IS the class, so `define_method`
+    /// there really defines its instance methods and
+    /// `define_singleton_method` its class methods.
+    Enclosing,
+    /// A literal constant receiver — that class, by name, applied
+    /// through `apply_singleton_patches`' declared-owner rule.
+    Named(String),
+}
+
+/// `None` for a dynamic receiver: an unknown object's methods are
+/// evidence about nothing, and opening the enclosing class for them
+/// would blanket most of any real app.
+fn body_def_target(node: &ruby_prism::CallNode<'_>) -> Option<DefTarget> {
+    // `X.singleton_class.alias_method(...)`: the class object, reached
+    // exactly the way shape (1) reaches it.
+    if let Some(owner) = singleton_class_owner(node) {
+        return Some(DefTarget::Named(owner));
+    }
+    match node.receiver() {
+        None => Some(DefTarget::Enclosing),
+        Some(r) if r.as_self_node().is_some() => Some(DefTarget::Enclosing),
+        // Bare `singleton_class.alias_method(...)` in a `def self.x`
+        // body: self's own class object. Without this the receiver reads
+        // as "some unknown object" and a real, knowable singleton edit
+        // is filed as evidence about nothing — caught by
+        // `every_dynamic_def_shape_opens_its_class`.
+        Some(r) if is_own_singleton_class(&r) => Some(DefTarget::Enclosing),
+        Some(r) => const_path_str(&r).map(DefTarget::Named),
+    }
+}
+
+fn is_own_singleton_class(node: &Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|inner| {
+        inner.name().as_slice() == b"singleton_class"
+            && inner.arguments().is_none()
+            && inner.receiver().is_none_or(|b| b.as_self_node().is_some())
+    })
+}
+
+fn is_eval_name(name: &[u8]) -> bool {
+    matches!(name, b"class_eval" | b"module_eval" | b"instance_eval")
+}
+
+/// The reason a method-defining call in a `def` body makes its target's
+/// surface unknowable, or `None` when the call names everything it
+/// defines. Split out of the visitor above to keep it under the
+/// complexity ceiling — `L1.COMPLEXITY_CEILING` caught the inline
+/// version at 15 paths against 12, doing exactly its job.
+fn body_def_reason(node: &ruby_prism::CallNode<'_>) -> Option<OpenReason> {
+    let args: Vec<Node<'_>> =
+        node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let name = node.name();
+    let name = name.as_slice();
+    if is_eval_name(name) {
+        return Some(OpenReason::EvalOrSend);
+    }
+    match name {
+        b"define_method" | b"define_singleton_method" => args
+            .first()
+            .is_none_or(|a| literal_method_name(a).is_none())
+            .then_some(OpenReason::DynamicDefineMethod),
+        b"alias_method" => (!args.iter().all(|a| literal_method_name(a).is_some()))
+            .then_some(OpenReason::DynamicAliasMethod),
+        b"attr_reader" | b"attr_writer" | b"attr_accessor" => {
+            (!args.iter().all(|a| a.as_symbol_node().is_some()))
+                .then_some(OpenReason::DynamicAttrArg)
+        }
+        _ => None,
     }
 }
 

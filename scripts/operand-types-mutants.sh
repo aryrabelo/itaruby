@@ -203,9 +203,16 @@ mutant M13 "$IDX" \
   a_refinement_through_an_alias_stands_its_class_down \
   'alias resolution: `I = Integer; refine I` prints "aliased s" under MRI'
 
+# The anchor carries `note_refinement`'s line as well, because the bare
+# recursion line stopped being unique on 2026-09-17: `dynamic_defs_in_body`
+# (singleton-track step N+1) has its own nested `Visit` impl that recurses
+# the same way, and `mutant`'s substring match found both — reported as
+# INVALIDO, exactly as designed, rather than mutating a coin flip.
 mutant M14 "$IDX" \
-  '        ruby_prism::visit_call_node(self, node);' \
-  '        let _ = &node;' \
+  '        self.note_refinement(node);
+        ruby_prism::visit_call_node(self, node);' \
+  '        self.note_refinement(node);
+        let _ = &node;' \
   a_refinement_inside_a_module_new_block_is_silent \
   'recursion into call blocks: a refine inside `Module.new do ... end` is still a refine'
 

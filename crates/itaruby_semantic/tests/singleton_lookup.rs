@@ -31,6 +31,37 @@
 //! (3) stdlib module-function inventories. Then the residue can be
 //! re-measured against all three private corpora plus the public ones.
 //!
+//! RESIDUE, AND WHAT THE NUMBER MEANS (re-measured 2026-09-17 after
+//! singleton-track steps 1-3b and the `gem_namespace_key` fix). The
+//! metric is the only one that can ever become a diagnostic: a lookup
+//! that reaches this arm has already passed `lookup_singleton` (which
+//! returns `Inconclusive` the moment ANY ancestor is open) and
+//! `soften_not_found` (kernel/object singleton surface, dynamic mixins,
+//! gem reopenings), so "residue" == `NotFound` AND the singleton surface
+//! provably closed AND unsoftened. Verified per site, not assumed: every
+//! one of the 1534 discourse sites reports `open=false` and
+//! `inconclusive_reason = None`.
+//!
+//!   corpus    | sites | explicit receiver
+//!   rails     |   299 | 130
+//!   mastodon  |    22 |   0
+//!   discourse |  1534 | 861
+//!   corpus-c  |  1701 |   2
+//!
+//! A number measured on a probe built from UNCOMMITTED-then-reverted
+//! source is not a measurement (learned the hard way the same day: the
+//! pre-fix 650/44/4572/1701 was reported as "unchanged by the fix" when
+//! it was simply the old build twice). Rebuild the probe from the exact
+//! revision under test.
+//!
+//! Where the remaining residue lives, by receiver (explicit only):
+//! discourse `DiscourseEvent.track_events` 205, `FileUtils.*` 270,
+//! `GlobalSetting.*` 36; rails `ActiveSupport::Dependencies.*` 23,
+//! `ActionDispatch::ExceptionWrapper.*` 12. `FileUtils` is family (e)
+//! (stdlib singleton inventory); `DiscourseEvent`/`GlobalSetting` are
+//! `define_singleton_method`/`method_missing`-shaped openness the index
+//! does not yet prove, i.e. step N+1's OPEN reasons, not family (e).
+//!
 //! When someone closes it, these tests fail — that is the point. Flip them
 //! to assert the diagnostic, and re-run `scripts/public-gate.sh` and the
 //! corpus gates before believing it.

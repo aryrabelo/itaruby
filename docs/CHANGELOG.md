@@ -229,9 +229,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Api` (145 reopening sites in mastodon, via `elasticsearch-api`),
   `Auth` (16 in discourse, via `auth-sanitizer`), plus `Scheduler`,
   `Form`, `Event` and `Web` — all of them the project's own namespaces.
-  All four corpora unchanged in both directions: errors byte-identical,
-  warnings 923/986/1890 and corpus-c 179 unmoved, singleton residue
-  identical at 650/44/4572/1701.
+  All four corpora unchanged in the diagnostic direction: errors
+  byte-identical, warnings 923/986/1890 and corpus-c 179 unmoved.
+  CORRECTION (measured 2026-09-17, after the commit above): the same
+  entry first claimed the singleton `NotFound` residue was "identical at
+  650/44/4572/1701". That number came from a probe build made BEFORE the
+  fix was committed — `git checkout feat/singleton-track -- crates/` in
+  the probe worktree while the fix was still uncommitted, so the probe
+  measured the unfixed comparison and the reported "identical" was the
+  same number twice. Re-measured on a probe built from the fixed source,
+  the residue DROPS: rails 650 -> 299, mastodon 44 -> 22, discourse
+  4572 -> 1534, corpus-c 1701 -> 1701 (explicit receivers
+  478/22/3894/2 -> 130/0/861/2). Discourse's 2861 `RSpec.*` sites are
+  now zero, which is exactly what the fix predicted: `rspec` is among the
+  305 namespaces discovery parses from that lock, and
+  `apply_gem_reopenings` opens 2862 classes with `RSpec` in the set.
 
 - Fixed: `scripts/public-gate.sh` reported "public errors match baseline
   exactly" for all three repos, in ~0.01s each, while measuring nothing.

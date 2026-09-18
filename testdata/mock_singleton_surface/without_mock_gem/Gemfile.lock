@@ -1,0 +1,13 @@
+GEM
+  remote: https://rubygems.org/
+  specs:
+    rack (3.1.0)
+
+PLATFORMS
+  arm64-darwin-24
+
+DEPENDENCIES
+  rack
+
+BUNDLED WITH
+   2.5.3

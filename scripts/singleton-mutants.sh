@@ -28,6 +28,10 @@
 #             must fail: `Rspec` from the lock never equals `RSpec` in
 #             the code, the reopening looks like a complete project
 #             definition, and the fixture's typo becomes accusable
+#   MUT-E  the any_instance softening branch in soften_not_found is cut
+#          -> any_instance_softens_when_a_mock_gem_is_locked must fail:
+#             with rspec-mocks in the lock the lookup must soften to
+#             Inconclusive; a cut returns it to conclusive NotFound
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -61,7 +65,8 @@ failing=
 # "did not compile" would read as "green".
 run_suite() {
   CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby_semantic \
-    --test singleton_track --test gem_reopen_lockfile >"$LOG" 2>&1
+    --test singleton_track --test gem_reopen_lockfile \
+    --test mock_singleton_surface >"$LOG" 2>&1
   if grep -q 'could not compile' "$LOG"; then compiles=0; else compiles=1; fi
   failing=$(grep -oE '^test [a-z0-9_]+ \.\.\. FAILED' "$LOG" | awk '{print $2}' | sort -u)
 }
@@ -160,6 +165,14 @@ mutant MUT-D "$DIS" \
 }' \
   rspec_reopen_matching_lockfile_gem_case_insensitively_stays_silent \
   'the camelize key degrades to exact equality: lock `rspec` never equals code `RSpec`'
+
+mutant MUT-E "$IDX" \
+  '        if singleton && self.mock_singleton_methods.iter().any(|m| m == name) {
+            return MethodLookup::Inconclusive;
+        }' \
+  '' \
+  any_instance_softens_when_a_mock_gem_is_locked \
+  'the any_instance softening branch is cut: the locked project keeps conclusive NotFound'
 
 echo '--- restore and prove the shipped source is byte-identical'
 restore

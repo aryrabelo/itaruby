@@ -3484,6 +3484,19 @@ pub struct ProjectIndex {
     /// rejected `Global`/`BuilderName` candidates.
     pub dynamic_mixin_instance_targets: Vec<ClassId>,
     pub dynamic_mixin_singleton_targets: Vec<ClassId>,
+    /// Singleton-track, the mocking gems' class-object population:
+    /// method names every class object's singleton answers to while a
+    /// declared mocking gem is loaded — populated once at index build
+    /// from the same `Gemfile.lock` namespaces `apply_gem_reopenings`
+    /// consumes, and consulted ONLY by `soften_not_found`, itself
+    /// reached only after the lookup already committed to `NotFound`.
+    /// NAME-KEYED and POPULATION-GATED, never blanket: the mechanism
+    /// cannot see the receiver's runtime surface, so only the name
+    /// carries the proof (the same rule that replaced bead ita-a8z's
+    /// receiver-blind `method_missing` clause, measured twice), and a
+    /// project whose lock names neither gem keeps conclusive
+    /// `NotFound` on every one of these names.
+    pub mock_singleton_methods: Vec<String>,
 }
 
 /// Merge all files' `file_defs` into the global class table.
@@ -3513,6 +3526,12 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // `apply_gem_reopenings`'s doc comment for the fail-closed contract.
     if let Some(gem_ns) = crate::discovery::GemfileLockNamespaces::try_get(db) {
         apply_gem_reopenings(&mut index, gem_ns.namespaces(db));
+        // Singleton-track: the mocking gems' class-object surface
+        // (`X.any_instance`) rides the same lock namespaces — see
+        // `apply_mock_singleton_surface`'s doc comment for why the gem
+        // must be in THIS project's lock and why the softening keys on
+        // the method name alone.
+        apply_mock_singleton_surface(&mut index, gem_ns.namespaces(db));
     }
     // Bead ita-c8h: generalizes past `apply_gem_reopenings` itself — a
     // reopening under a namespace no project file ever wrapped bare stays
@@ -3609,6 +3628,48 @@ fn build_subclass_map(index: &mut ProjectIndex) {
         .collect();
     for (parent, child) in edges {
         index.subclasses.entry(parent).or_default().push(child);
+    }
+}
+
+/// Singleton-track: the mocking gems' class-object surface, collected
+/// from the same `Gemfile.lock` namespaces `apply_gem_reopenings`
+/// consumes. Measured 2026-09-18 at de28b40: ALL 160 of discourse's
+/// explicit-receiver residue sites are `SomeClass.any_instance` —
+/// rspec-mocks (3.13.8 in discourse's lock) includes
+/// `RSpec::Mocks::AnyInstance::ClassMethods` into every class and mocha
+/// (3.1.0 in the same lock) monkey-patches `Object`, so while either
+/// gem is loaded every class object really answers `any_instance`
+/// (MRI ground truth on this machine: with `rspec/mocks` required, the
+/// call returns `RSpec::Mocks::AnyInstance::Proxy`; without the gem,
+/// `NoMethodError`). None of the curated declarations
+/// (`declarations/gems.rbi`, the rbs collection pack) declare
+/// `any_instance`/`stubs`/`expects` for rspec-mocks or mocha — the
+/// declared-gem-reopening mechanism is therefore unavailable, and
+/// declaring `Module#any_instance` there would force-open `Module`
+/// project-wide, softening EVERY singleton lookup for EVERY project
+/// (the exact blanket the task forbids). So the population is
+/// lock-gated (this project's lock, keyed case-insensitively through
+/// `gem_namespace_key` — `rspec-mocks` locks as `rspecmocks`) and the
+/// softening is name-keyed (`soften_not_found`): a project whose lock
+/// names neither gem keeps a conclusive `NotFound` on `any_instance`.
+/// The measured inventory is exactly `any_instance`: zero `stubs`/
+/// `expects` sites exist in any corpus residue, and rspec-mocks alone
+/// does not install those names on class objects, so listing them
+/// would silence real typos on rspec-only projects for no measured
+/// gain.
+fn apply_mock_singleton_surface(
+    index: &mut ProjectIndex,
+    namespaces: &std::collections::HashSet<String>,
+) {
+    const MOCK_GEMS: &[(&str, &[&str])] = &[("rspecmocks", &["any_instance"]), ("mocha", &["any_instance"])];
+    for (key, names) in MOCK_GEMS {
+        if namespaces.contains(*key) {
+            for name in *names {
+                if !index.mock_singleton_methods.iter().any(|m| m == name) {
+                    index.mock_singleton_methods.push((*name).to_string());
+                }
+            }
+        }
     }
 }
 
@@ -5944,6 +6005,16 @@ impl ProjectIndex {
         // single largest family left. Mechanically harvested, never
         // hand-listed (`declarations/stdlib_singletons.txt`).
         if singleton && stdlib_singleton_method(&self.class(id).path, name) {
+            return MethodLookup::Inconclusive;
+        }
+        // The mocking gems' class-object surface (`X.any_instance`):
+        // name-keyed, lock-gated — see `apply_mock_singleton_surface`'s
+        // doc comment for the measurement and the mechanism choice.
+        // Receiver-blind by construction (every class object gets the
+        // name from the gem), so ONLY the name may carry the proof, and
+        // only while this project's own lock declares a gem that really
+        // installs it.
+        if singleton && self.mock_singleton_methods.iter().any(|m| m == name) {
             return MethodLookup::Inconclusive;
         }
         let targets = if singleton {

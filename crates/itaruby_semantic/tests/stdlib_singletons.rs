@@ -65,9 +65,28 @@ fn the_inventory_covers_the_measured_residue_receivers() {
 /// every namespace in the file grows ~100 entries of class-object
 /// surface — which `core.rs::kernel_object_singleton_method` already
 /// covers, and which would make "what does this file add?" unanswerable.
+///
+/// This used to assert a TEN-NAME SAMPLE, which is an instrument that
+/// passes while most of the subtraction is gone: a regeneration that
+/// lost every name but those ten would have been reported clean. The
+/// banned set is now the WHOLE surface, computed from the same
+/// expression the generator subtracts
+/// (`scripts/gen-stdlib-singleton-inventory.rb`'s
+/// `CLASS_OBJECT_SURFACE`) plus the module objects whose surface rides
+/// along on it — around 130 names instead of 10, `new` and `allocate`
+/// among them.
+///
+/// Two-sided in the same test, because a computed banned set can fail
+/// open in three ways and each one is checked: the list must be
+/// substantial, it must still contain the ten names this assertion
+/// shipped with, and the same predicate must FLAG a synthetic leaked
+/// pair. Without `ruby` on PATH the ten-name floor is used instead —
+/// weaker, never vacuous.
 #[test]
 fn the_class_object_surface_is_excluded() {
-    for banned in [
+    // The names this test asserted before the surface was computed.
+    // They are the floor: whatever else changes, these stay banned.
+    const SAMPLE: [&str; 10] = [
         "name",
         "ancestors",
         "instance_methods",
@@ -78,18 +97,70 @@ fn the_class_object_surface_is_excluded() {
         "superclass",
         "allocate",
         "instance_variable_get",
-    ] {
-        let leaked: Vec<&str> = pairs()
-            .iter()
-            .filter(|(_, m)| *m == banned)
-            .map(|(ns, _)| *ns)
-            .take(3)
-            .collect();
+    ];
+    let banned = class_object_surface().unwrap_or_else(|| {
+        eprintln!("no usable `ruby` on PATH — falling back to the ten-name floor");
+        SAMPLE.iter().map(|s| (*s).to_string()).collect()
+    });
+    for floor in SAMPLE {
         assert!(
-            leaked.is_empty(),
-            "`{banned}` is Module/Class surface and must not be in the inventory (e.g. {leaked:?})"
+            banned.iter().any(|b| b == floor),
+            "`{floor}` vanished from the computed class-object surface — the \
+             expression that produces it no longer describes what it used to"
         );
     }
+    let leaked = leaked_pairs(&banned, &pairs());
+    assert!(
+        leaked.is_empty(),
+        "Module/Class surface must not be in the inventory: {:?} (+{} more)",
+        leaked.iter().take(5).collect::<Vec<_>>(),
+        leaked.len().saturating_sub(5)
+    );
+    // POSITIVE CONTROL: the predicate that just answered "clean" must
+    // answer "leaked" on a planted pair, or its silence proves nothing.
+    let mut planted = pairs();
+    planted.push(("PlantedNamespace", "name"));
+    assert_eq!(
+        leaked_pairs(&banned, &planted),
+        vec!["PlantedNamespace.name".to_string()],
+        "the leak check is blind: it did not flag a planted class-object name"
+    );
+}
+
+/// Every `<namespace>.<method>` pair whose method is in `banned`.
+fn leaked_pairs(banned: &[String], pairs: &[(&str, &str)]) -> Vec<String> {
+    pairs
+        .iter()
+        .filter(|(_, m)| banned.iter().any(|b| b == m))
+        .map(|(ns, m)| format!("{ns}.{m}"))
+        .collect()
+}
+
+/// Everything a class object answers to, from MRI itself: the
+/// generator's own `Module.methods | Class.methods`, plus
+/// `BasicObject`/`Comparable`/`Enumerable` — the three whose own class
+/// objects the inventory walks — so the banned set is the surface as a
+/// whole and not a reading of it. `None` when `ruby` cannot be run or
+/// answers with something implausible.
+fn class_object_surface() -> Option<Vec<String>> {
+    let out = std::process::Command::new("ruby")
+        .arg("-e")
+        .arg(
+            "puts (Module.methods | Class.methods | BasicObject.methods | \
+             Comparable.methods | Enumerable.methods).map(&:to_s).uniq.sort",
+        )
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    // A truncated or empty answer must not read as "nothing is banned".
+    (names.len() >= 50).then_some(names)
 }
 
 /// EXCLUSION 2: the ten core classes `declarations/core_inventory.txt`

@@ -1,0 +1,65 @@
+[workspace]
+resolver = "2"
+members = ["crates/itaruby_syntax", "crates/itaruby_semantic", "crates/itaruby_server", "crates/itaruby"]
+
+# Shared package metadata: the LICENSE file is MIT, and the crates inherit
+# it so "compiles here" and "what crates.io would publish" say the same
+# thing. Homepage is the project's public findings/benchmark page.
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/aryrabelo/itaruby"
+homepage = "https://aryrabelo.com/en/itaruby/"
+
+[workspace.dependencies]
+ruby-prism = "1.9"
+salsa = { version = "0.28", features = ["macros"] }
+lsp-server = "0.10"
+lsp-types = "0.97"
+ignore = "0.4"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crossbeam-channel = "0.5"
+
+# One lint policy for the whole workspace; every crate opts in with
+# `[lints] workspace = true`. Declared here rather than as CI flags so a
+# local `cargo clippy` and the `hazards` job cannot disagree — the shape
+# that let 58 clippy warnings live unnoticed while CI could not run
+# (measured 2026-08-24, see AGENTS.md).
+[workspace.lints.rust]
+# This is a typechecker: every hazard it reasons about is someone else's
+# memory model, never its own. Zero `unsafe` today, and `forbid` means a
+# future one cannot be waved through with a local `allow`.
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+
+# Each allow below names a code and a reason, as L1.NO_BLANKET_SUPPRESSION
+# requires of any suppression in this repository.
+# reason: this repo's doc comments are long-form reasoning on purpose — the
+# measured history behind a decision is the artifact, and a first paragraph
+# clipped to one line would delete it.
+too_long_first_doc_paragraph = "allow"
+# reason: nearly every helper here is a pure query, so the attribute would
+# land on ~58 internal functions and say nothing a reader did not know.
+must_use_candidate = "allow"
+# reason: several match arms are deliberately kept apart with a per-arm
+# comment so that a change to the invariant fails a test instead of
+# silently folding into a neighbour (see check.rs's `Blocker` arms).
+match_same_arms = "allow"
+# reason: the LSP loop state stays flat so each arm shows exactly which
+# fields it touches; the same reasoning already documented at its
+# `too_many_arguments` allow.
+struct_excessive_bools = "allow"
+# reason: this repository already measures function size, cyclomatic, through
+# `L1.COMPLEXITY_CEILING` in `.software-factory/policy.yaml`, with a dated
+# ratchet naming each function that exceeds it. A second ceiling counting
+# raw lines would freeze the same functions under a different number and
+# make neither the real bar.
+too_many_lines = "allow"
+
+[profile.release]
+# Kept on: every corpus measurement in this repository is a profile away
+# from being explainable, and the binary is not distributed.
+debug = true

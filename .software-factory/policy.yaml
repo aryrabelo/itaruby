@@ -1,0 +1,116 @@
+# Which rules this repository enforces, and how its paths map onto the
+# catalog's neutral vocabulary. `sf explain <RULE>` prints the reasoning
+# behind any rule below.
+version: 1
+project:
+  name: itaruby
+  languages: [rust]
+  exclude: []
+
+docs:
+  scan:
+    - "docs/**/*.md"
+    - "*.md"
+
+# A gate activates from the paths a change touches, never from a label
+# or a sentence in a pull request. See L3.GATE_HAS_FRESH_EVIDENCE.
+gates: {}
+
+rules:
+  # L1 — No function exceeds the cyclomatic ceiling
+  L1.COMPLEXITY_CEILING:
+    enabled: true
+  # L1 — Every suppression names a code and a reason
+  L1.NO_BLANKET_SUPPRESSION:
+    enabled: true
+  # L1 — The untyped escape hatch is banned, and the message names the alternative
+  L1.NO_UNTYPED_ESCAPE_HATCH:
+    enabled: true
+  # L1 — A skipped or expected-to-fail test says why
+  L1.SKIPPED_TESTS_STATE_A_REASON:
+    enabled: false  # inert for Rust (no query for this language); re-enable if a language with skip-markers is added
+  # L2 — The guardrail may be strengthened, never quietly weakened
+  L2.POLICY_ONLY_TIGHTENS:
+    enabled: true
+  # L2 — The guardrail's own configuration is hash-locked
+  L2.FACTORY_CONFIG_IS_LOCKED:
+    enabled: true
+  # L2 — Dependency manifests move only with an explicit lock update
+  L2.DEPENDENCIES_CHANGE_DELIBERATELY:
+    enabled: true
+    options:
+      scope:
+        - "Cargo.toml"
+        - "crates/*/Cargo.toml"
+        - "scripts/ruby-lsp-itaruby/ruby-lsp-itaruby.gemspec"
+        - "scripts/vscode/package.json"
+  # L2 — Generated artifacts are hash-locked and not hand-edited
+  L2.GENERATED_FILES_ARE_LOCKED:
+    enabled: true
+    options:
+      # Every file here carries a "GENERATED FILE — do not hand-edit" header
+      # and, until now, nothing enforced it. `declarations/gems.rbi` is
+      # deliberately absent: that one is hand-curated by an entry rule
+      # written in its own header, so it is source, not derivative.
+      scope:
+        - "crates/itaruby_semantic/declarations/activerecord_api.txt"
+        - "crates/itaruby_semantic/declarations/core_inventory.txt"
+        - "crates/itaruby_semantic/declarations/rbs_collection.rbi"
+        - "crates/itaruby_semantic/declarations/stdlib_constants.txt"
+        - "scripts/vscode/package-lock.json"
+  # L2 — Every frozen exception carries a future review date
+  L2.NO_PERMANENT_EXCEPTION:
+    enabled: true
+  # L2 — Regenerating the derived artifacts changes nothing
+  L2.DERIVED_ARTIFACTS_MATCH_THEIR_SOURCE:
+    enabled: false  # every generator here reads state this repo does not own — a
+    # pinned Ruby version (core/stdlib inventories), an external
+    # `gem_rbs_collection` checkout, or a private corpus's Tapioca tree
+    # (activerecord_api). Running them in CI would compare against a
+    # different machine's world and fail for the wrong reason.
+    # `L2.GENERATED_FILES_ARE_LOCKED` is what actually guards these files.
+  # L4 — Repo-relative documentation links resolve
+  L4.DOC_LINKS_RESOLVE:
+    enabled: true
+  # L4 — Every enabled rule is cited in prose, and every citation resolves
+  L4.EVERY_RULE_HAS_A_WHY:
+    enabled: true
+  # L4 — Every acceptance criterion names the check that proves it
+  L4.PLAN_CRITERION_NAMES_ITS_CHECK:
+    enabled: true
+  # L4 — Every plan declares its exit condition and sits in the execution order
+  L4.PLAN_DECLARES_EXIT_CONDITION:
+    enabled: true
+  # L4 — New top-level files are declared before they appear
+  L4.ROOT_FILES_ARE_DECLARED:
+    enabled: true
+  # L5 — Every enabled rule has a mutation that proves it fires
+  L5.EVERY_CHECK_HAS_A_MUTATION_TEST:
+    enabled: true
+  # L5 — An enabled rule must be capable of producing a finding
+  L5.NO_INERT_RULE:
+    enabled: true
+  # L6 — Concurrent code is exercised under a race detector
+  L6.DATA_RACES_ARE_DETECTED:
+    enabled: true
+  # L6 — Something detects code nothing reaches
+  L6.DEAD_CODE_IS_DETECTED:
+    enabled: true
+  # L6 — Something audits dependencies for known vulnerabilities
+  L6.DEPENDENCY_VULNERABILITIES_ARE_SCANNED:
+    enabled: true
+  # L6 — Something scans the code for known-insecure patterns
+  L6.INSECURE_PATTERNS_ARE_SCANNED:
+    enabled: true
+  # L6 — Nothing blocks while a lock is held
+  L6.NO_BLOCKING_CALL_WHILE_HOLDING_A_LOCK:
+    enabled: true
+  # L6 — A function does not acquire a second lock while holding the first
+  L6.ONE_LOCK_AT_A_TIME:
+    enabled: true
+  # L6 — Something would notice the code getting slower
+  L6.PERFORMANCE_REGRESSION_IS_GUARDED:
+    enabled: true
+  # L6 — Something scans for committed secrets
+  L6.SECRETS_ARE_SCANNED:
+    enabled: true

@@ -1,0 +1,28 @@
+# Generated mutation fixture for L5.NO_INERT_RULE. It is supposed to fail.
+version: 1
+project:
+  name: mutation-L5.NO_INERT_RULE
+  languages: [python, typescript, go, rust, ruby]
+docs:
+  scan: ["docs/**/*.md"]
+gates: {}
+rules:
+  L2.GENERATED_FILES_ARE_LOCKED:
+    enabled: true
+    options:
+      scope: []
+  L1.NO_BLANKET_SUPPRESSION@inert:
+    enabled: true
+    options:
+      scope: ["nonexistent/**"]
+  L1.COMPLEXITY_CEILING@inert:
+    enabled: true
+    options:
+      scope: ["nonexistent/**"]
+  L6.DATA_RACES_ARE_DETECTED@toolchain_gap:
+    enabled: true
+    options:
+      tools:
+        java: ["error-prone", "jcstress"]
+  L5.NO_INERT_RULE:
+    enabled: true

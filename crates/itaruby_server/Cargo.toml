@@ -1,0 +1,22 @@
+[package]
+name = "itaruby_server"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+itaruby_syntax = { path = "../itaruby_syntax" }
+itaruby_semantic = { path = "../itaruby_semantic" }
+salsa = { workspace = true }
+lsp-server = { workspace = true }
+lsp-types = { workspace = true }
+ignore = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+crossbeam-channel = { workspace = true }
+
+[lints]
+workspace = true

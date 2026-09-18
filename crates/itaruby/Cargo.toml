@@ -1,0 +1,27 @@
+[package]
+name = "itaruby"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[[bin]]
+name = "ita"
+path = "src/main.rs"
+
+[dependencies]
+itaruby_syntax = { path = "../itaruby_syntax" }
+itaruby_semantic = { path = "../itaruby_semantic" }
+itaruby_server = { path = "../itaruby_server" }
+salsa = { workspace = true }
+ignore = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+mimalloc = "0.1"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

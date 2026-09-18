@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "files": {
+    "Cargo.toml": "a9e171ba3398a7acc67a8227ed3e9c93bc1b7a0ef01cc7b4c9eb6312eb9319d5",
+    "crates/itaruby/Cargo.toml": "52bf3839fe665f97f49a2ad05474e73759bd3cb385b063db47615a2c64a236ae",
+    "crates/itaruby_semantic/Cargo.toml": "c8c080cc93e68f0420e9d58c5a987e2c3cfbf30b58230529c12a1cf87e97afe3",
+    "crates/itaruby_server/Cargo.toml": "4e0c9f4f9823c89bc77cd63f290b8880c086dac72fe6f5f8a016f58c30f32bac",
+    "crates/itaruby_syntax/Cargo.toml": "c6f47cd3a7aba1b314218fd01d326dd1001a764b36d9a157056ff1be08bc83b5",
+    "scripts/ruby-lsp-itaruby/ruby-lsp-itaruby.gemspec": "2ef8948c729fb06f4e0656c0ae96ba20e509d9d36defe9b4abeac45d118e0a6d",
+    "scripts/vscode/package.json": "96afd0639a2a060f247959e5b98d0a5a6cb435ff85873455168d7312612da04f"
+  }
+}

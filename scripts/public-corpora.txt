@@ -1,0 +1,47 @@
+# Public-corpus declaration — the launch bar, as a versioned file.
+#
+# The project is benchmarked against Sorbet on four PUBLIC Rails apps
+# (rails/rails, mastodon/mastodon, discourse/discourse, gitlab-org/gitlab-foss)
+# on both speed and true errors found, and the launch bar is winning on both.
+# This file makes that measurement an exit code: scripts/public-gate.sh reads
+# one repo per line, clones it when the operator allows, runs
+# `ita check <clone> --format=json`, and compares the SORTED diagnostic set
+# against the in-clear baseline in scripts/public-baseline/<id>.jsonl
+# (normalized: `$clone/` stripped from each path, replaced with `<id>/`, so
+# the baseline is machine-independent — these are PUBLIC repos, so the
+# no-secrecy-wall exception in AGENTS.md applies and the diffs are written
+# in the clear).
+#
+# Format: one repo per line, whitespace-separated:
+#   <id> <git-url> <pinned-sha> <time_ceiling_s>
+# `<pinned-sha>` is the exact default-branch HEAD these numbers were measured
+# against, pinned so a repo rename/rebase cannot silently move the corpus
+# under a baseline. Clone the repo into $PUBLIC_CORPORA_ROOT/<id>; a missing
+# clone is a SKIP unless PUBLIC_GATE_CLONE=1 clones it (gitlab-foss is
+# multi-GB, so the human decides).
+#
+# `time_ceiling_s` is a real measured number on the measuring machine, set
+# to the anchored wall time x1.5 (rounded up) when the baseline was
+# generated — slack is debt (AGENTS.md, binding), so a comfortably-under
+# reading is tightened in the same commit.
+#
+# All shas pinned 2026-09-02 from `git ls-remote <url> HEAD`.
+#
+# Baselines generated and time ceilings measured 2026-09-02 on machine: m5
+# (Apple M5), release binary at commit ed3a06d (cargo build --release, exit 0).
+# Each time_ceiling_s = that run's ita wall time x1.5, rounded up:
+#   rails     1.83s -> 3s
+#   mastodon  0.79s -> 2s
+#   discourse 10.3s (steady-state median) -> 16s
+#   (7.67s was a lucky-fast first run; repeat runs measure 10-12s, so the
+#   first-set 12s ceiling failed on ordinary variance and was corrected.)
+# gitlab-foss has no measured ceiling: its clone is multi-GB and this
+# machine only had ~12GiB free, so it stays cloned==absent -> SKIP. Generate
+# its baseline + ceiling on a disk-capable machine (see scripts/public-gate.sh).
+#
+# Slack is debt (AGENTS.md, binding): a comfortably-under reading means
+# tighten the ceiling in the same commit.
+rails https://github.com/rails/rails 3df2cbea2027026a29edb92cbb7e336a63e35444 3
+mastodon https://github.com/mastodon/mastodon 171438e185139efd68df7245f39f57c880dceff6 2
+discourse https://github.com/discourse/discourse dd4cc4f4cc5aa73d8eb8efc3c154f4e139ff6052 16
+gitlab-foss https://gitlab.com/gitlab-org/gitlab-foss.git 4a42053c3a8274a18d5d71fff2f88ba23e5a69e9 600

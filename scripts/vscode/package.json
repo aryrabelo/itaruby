@@ -1,0 +1,39 @@
+{
+  "name": "itaruby-vscode",
+  "displayName": "itaruby",
+  "description": "Thin LSP client for the itaruby (ita) Ruby type checker",
+  "version": "0.1.0",
+  "license": "MIT",
+  "private": true,
+  "publisher": "itaruby-local",
+  "engines": {
+    "vscode": "^1.91.0"
+  },
+  "categories": ["Programming Languages", "Linters"],
+  "activationEvents": ["onLanguage:ruby"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "itaruby",
+      "properties": {
+        "itaruby.serverPath": {
+          "type": "string",
+          "default": "ita",
+          "description": "Path to the ita binary. Accepts a bare command resolved from PATH (default 'ita') or an absolute path to the binary."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^10.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.91.0",
+    "typescript": "^5.7.0"
+  }
+}

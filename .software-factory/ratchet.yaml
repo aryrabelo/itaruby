@@ -1,0 +1,102 @@
+# Frozen violations, one key per line, per rule.
+# These are debt with a due date, not permission. Adding a key by hand
+# to silence a new violation is the one move this file exists to make
+# visible in review.
+version: 1
+rules:
+  L1.COMPLEXITY_CEILING:
+    review_by: 2027-02-20
+    note: null
+    allow:
+    - crates/itaruby_semantic/src/check.rs:add_block_params
+    - crates/itaruby_semantic/src/check.rs:check_call
+    - crates/itaruby_semantic/src/check.rs:check_method_body
+    - crates/itaruby_semantic/src/check.rs:core_ret_to_ty
+    - crates/itaruby_semantic/src/check.rs:find_def_at
+    - crates/itaruby_semantic/src/check.rs:infer_expr_inner
+    - crates/itaruby_semantic/src/check.rs:rbs_to_ty
+    - crates/itaruby_semantic/src/check.rs:scope_stmt
+    - crates/itaruby_semantic/src/check.rs:ty_name
+    - crates/itaruby_semantic/src/core.rs:array_method
+    - crates/itaruby_semantic/src/core.rs:hash_method
+    - crates/itaruby_semantic/src/core.rs:integer_method
+    - crates/itaruby_semantic/src/core.rs:object_method
+    - crates/itaruby_semantic/src/core.rs:str_method
+    - crates/itaruby_semantic/src/index.rs:const_exists
+    - crates/itaruby_semantic/src/index.rs:method_def
+    - crates/itaruby_semantic/src/index.rs:walk_stmt
+    - crates/itaruby_server/src/main_loop.rs:handle_notification
+  L1.NO_BLANKET_SUPPRESSION:
+    review_by: 2027-02-20
+    note: null
+    allow:
+    - crates/itaruby_server/src/main_loop.rs:0403ab370064
+  L1.NO_UNTYPED_ESCAPE_HATCH:
+    review_by: 2027-02-20
+    note: null
+    allow:
+    - crates/itaruby_semantic/src/check.rs:0bdba1b1ec2d
+    - crates/itaruby_semantic/src/check.rs:0c667edbfd67
+    - crates/itaruby_semantic/src/check.rs:0fc5a51208f1
+    - crates/itaruby_semantic/src/check.rs:125d75981763
+    - crates/itaruby_semantic/src/check.rs:16208b56a187
+    - crates/itaruby_semantic/src/check.rs:177258aa723e
+    - crates/itaruby_semantic/src/check.rs:178cd7535a65
+    - crates/itaruby_semantic/src/check.rs:1cf38ee48c6d
+    - crates/itaruby_semantic/src/check.rs:1d63ba65d840
+    - crates/itaruby_semantic/src/check.rs:226b2a284502
+    - crates/itaruby_semantic/src/check.rs:234a223e0b70
+    - crates/itaruby_semantic/src/check.rs:23d66a957734
+    - crates/itaruby_semantic/src/check.rs:28795c4d5b8b
+    - crates/itaruby_semantic/src/check.rs:2aa39975fb2f
+    - crates/itaruby_semantic/src/check.rs:2d3dee6ad1a5
+    - crates/itaruby_semantic/src/check.rs:3151796f1503
+    - crates/itaruby_semantic/src/check.rs:37f17ec6429a
+    - crates/itaruby_semantic/src/check.rs:442d6f64c17c
+    - crates/itaruby_semantic/src/check.rs:4532365c2385
+    - crates/itaruby_semantic/src/check.rs:45476b116f6f
+    - crates/itaruby_semantic/src/check.rs:4773353a85e4
+    - crates/itaruby_semantic/src/check.rs:4a2c00eca51b
+    - crates/itaruby_semantic/src/check.rs:5a829f751b43
+    - crates/itaruby_semantic/src/check.rs:5a9c69572594
+    - crates/itaruby_semantic/src/check.rs:71468368c256
+    - crates/itaruby_semantic/src/check.rs:72106fb548a8
+    - crates/itaruby_semantic/src/check.rs:73c492f249d5
+    - crates/itaruby_semantic/src/check.rs:751256ec0d4b
+    - crates/itaruby_semantic/src/check.rs:87bf6be5a4ce
+    - crates/itaruby_semantic/src/check.rs:87e3dad5dbca
+    - crates/itaruby_semantic/src/check.rs:8d5534b46dc8
+    - crates/itaruby_semantic/src/check.rs:8fc1480a5989
+    - crates/itaruby_semantic/src/check.rs:94596e9c78a5
+    - crates/itaruby_semantic/src/check.rs:9979422a4f25
+    - crates/itaruby_semantic/src/check.rs:a14120978fa0
+    - crates/itaruby_semantic/src/check.rs:a3590e316d3f
+    - crates/itaruby_semantic/src/check.rs:abdf56e0ae54
+    - crates/itaruby_semantic/src/check.rs:b02bb8f148cd
+    - crates/itaruby_semantic/src/check.rs:c19618009716
+    - crates/itaruby_semantic/src/check.rs:c88b512f7799
+    - crates/itaruby_semantic/src/check.rs:cf7747ee2c0d
+    - crates/itaruby_semantic/src/check.rs:d1b3f822289e
+    - crates/itaruby_semantic/src/check.rs:d7c2b5278cce
+    - crates/itaruby_semantic/src/check.rs:e184468f5b25
+    - crates/itaruby_semantic/src/check.rs:f3c0ee9bf993
+    - crates/itaruby_semantic/src/check.rs:f3c23060c6f8
+    - crates/itaruby_semantic/src/core.rs:0df86fe13a7f
+    - crates/itaruby_semantic/src/core.rs:30bf801ee4e2
+    - crates/itaruby_semantic/src/core.rs:31cc29764b48
+    - crates/itaruby_semantic/src/core.rs:7e073417bcce
+    - crates/itaruby_semantic/src/core.rs:979fc615a5b6
+    - crates/itaruby_semantic/src/core.rs:ea543dbed589
+    - crates/itaruby_semantic/src/index.rs:125d75981763
+    - crates/itaruby_semantic/src/index.rs:23d66a957734
+    - crates/itaruby_semantic/src/index.rs:28795c4d5b8b
+    - crates/itaruby_semantic/src/index.rs:29b21bca3942
+    - crates/itaruby_semantic/src/index.rs:2d5d8998c8d6
+    - crates/itaruby_semantic/src/index.rs:3151796f1503
+    - crates/itaruby_semantic/src/index.rs:442d6f64c17c
+    - crates/itaruby_semantic/src/index.rs:45476b116f6f
+    - crates/itaruby_semantic/src/index.rs:94596e9c78a5
+    - crates/itaruby_semantic/src/index.rs:baaf272ed5f1
+    - testdata/inline_casts/untyped_cast_assignment_silences_method_call.rb:8ad0939772eb
+    - testdata/inline_casts/untyped_cast_erases_arg_silent.rb:dcf0d86a5ee6
+    - testdata/inline_casts/untyped_cast_no_leak_sibling_accuses.rb:ec7110318c2d

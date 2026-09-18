@@ -1,0 +1,21 @@
+#!/bin/sh
+# Enable with: git config core.hooksPath .githooks
+set -eu
+
+# verify first: a check that no longer fires would make the run below
+# meaningless, and it is the cheaper failure to discover.
+sf verify
+sf check
+
+# `--changed` is not a nicety. The L2 rules that read a DIRECTION —
+# POLICY_ONLY_TIGHTENS above all — have nothing to compare against without a
+# base revision, so a plain `sf check` reports them green while they are
+# inert. Measured 2026-08-26: disabling a rule in policy passed `sf check`
+# and was caught only by `sf check --changed`. CI already passes
+# `--changed origin/<base>`; this is the same guarantee for the commit that
+# never reaches CI.
+sf check --changed HEAD
+
+# Beads was retired from the fleet on 2026-09-03. Its compatibility shim
+# exits 3, which set -e treats as fatal before the old skip handler runs.
+# Project tracking lives in GitHub Issues; no tracker export belongs here.

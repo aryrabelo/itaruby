@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+# Single entry point for a human or an agent on a clean machine: prepare it,
+# then run the gates. Three verbs only — this script is the contract, not a
+# suggestion; see AGENTS.md for the gate table and the multi-machine flow.
+#
+#   setup   idempotent machine prep + prints which gates this machine can run
+#   gates   delegates to scripts/gauntlet-gates.sh, propagating its exit code
+#   anchor  runs the gates on the corpora machine (work) over ssh
+#   prove   local gates + anchor, and demands their union cover every corpus
+#
+# Corpus paths are machine-local and never versioned: scripts/corpora-local.txt
+# (gitignored) maps each generic id from scripts/corpus-baseline.txt to a real
+# path on this machine, one `<id> <path>` line per corpus — `<path>` is either
+# absolute, or relative to $CORPORA_ROOT (default $HOME/Sites). The `anchor`
+# verb ssh's to $WORK_HOST and runs scripts/gauntlet-gates.sh there, which
+# reads that machine's OWN scripts/corpora-local.txt — the mapping never
+# travels over ssh.
+#
+# ponytail: bash with subcommands, not `cargo xtask`/cargo-make/a Makefile.
+# xtask is the right idiom when contributors are cross-platform and shouldn't
+# have to install anything — here it would be a new crate that only shells
+# out to the bash script that already exists and works, for a fleet of two
+# Macs. Upgrade trigger: the first non-Unix contributor, or a Windows CI
+# runner. Until then this is the lazier and equally correct choice.
+set -uo pipefail
+
+cd "$(dirname "$0")/.."
+ROOT=$PWD
+CORPORA_ROOT=${CORPORA_ROOT:-$HOME/Sites}
+CORPORA_MAP=$ROOT/scripts/corpora-local.txt
+WORK_HOST=${WORK_HOST:-work}
+
+usage() {
+  cat >&2 <<EOF
+usage: scripts/dev <setup|gates|anchor|prove>
+
+  setup   prepare this machine (idempotent), report which gates it can run
+  gates   run scripts/gauntlet-gates.sh here, propagate its exit code
+  anchor  run the gates on \$WORK_HOST (default: work) over ssh
+  prove   gates + anchor; exit 0 only if every declared corpus was proved
+EOF
+}
+
+say() { printf '\n=== %s\n' "$1"; }
+
+cmd_setup() {
+  say 'git hooks'
+  git config core.hooksPath .githooks
+  echo "core.hooksPath -> .githooks"
+
+  if ! command -v cargo >/dev/null; then
+    echo 'FAIL: cargo not found — install Rust (https://rustup.rs)' >&2
+    exit 1
+  fi
+
+  say 'cargo build --release'
+  cargo build --release || exit 1
+
+  say 'sf (software-factory)'
+  if command -v sf >/dev/null; then
+    echo 'sf already installed'
+  else
+    echo 'installing sf...'
+    cargo install --git https://github.com/nicolasmelo1/software-factory --locked || exit 1
+  fi
+
+  say 'bd (beads)'
+  if ! command -v bd >/dev/null; then
+    echo 'FAIL: bd not found — install with:' >&2
+    echo '  curl -sSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash' >&2
+    exit 1
+  fi
+  if [[ -d $ROOT/.beads/embeddeddolt ]]; then
+    echo 'beads DB already initialized'
+  else
+    echo 'initializing beads DB...'
+    bd init --reinit-local --prefix ita --skip-agents && bd import .beads/issues.jsonl || exit 1
+  fi
+
+  say 'gates available on this machine'
+  echo 'sf check, cargo test --workspace, mutation probes: always (no corpora needed)'
+  declared=$(sed -n 's/^corpus \([^ ]*\).*/\1/p' scripts/corpus-baseline.txt)
+  found=()
+  missing=()
+  for id in $declared; do
+    path=""
+    if [[ -f $CORPORA_MAP ]]; then
+      path=$(awk -v id="$id" '$1 == id { print $2; exit }' "$CORPORA_MAP")
+    fi
+    if [[ -z $path ]]; then
+      missing+=("$id (no mapping in scripts/corpora-local.txt)")
+      continue
+    fi
+    case $path in
+      /*) root=$path ;;
+      *)  root="$CORPORA_ROOT/$path" ;;
+    esac
+    if [[ -d $root ]]; then
+      found+=("$id")
+    else
+      missing+=("$id (mapped to $root, not found)")
+    fi
+  done
+  if (( ${#found[@]} )); then
+    echo "corpus diff + warning ceilings: yes for ${found[*]}"
+  fi
+  if (( ${#missing[@]} )); then
+    echo "corpus diff + warning ceilings: NO for: ${missing[*]}"
+    echo 'this machine cannot prove those corpora. the anchor run is the proof:'
+    echo '  ./scripts/dev anchor'
+  fi
+}
+
+cmd_gates() {
+  exec ./scripts/gauntlet-gates.sh "$@"
+}
+
+# Captures the remote run so the union of proved corpora can be checked. Exit 2
+# is legitimate here: no single machine holds every corpus, so "incomplete" is
+# the normal remote answer. What is NOT legitimate is a remote run that proved
+# nothing — that means the corpora machine lost its corpora, and the whole
+# anchor is theatre.
+cmd_anchor() {
+  local branch sha out status
+  branch=$(git rev-parse --abbrev-ref HEAD)
+  sha=$(git rev-parse HEAD)
+  if [[ -z $(git branch -r --contains "$sha" 2>/dev/null) ]]; then
+    # The remote machine can only fetch what a remote already has; without this
+    # the failure surfaces as a cryptic `git checkout` error over ssh.
+    echo "commit ${sha:0:7} is not on any remote: push before anchoring" >&2
+    exit 65
+  fi
+  say "anchor run on $WORK_HOST — $branch @ ${sha:0:7}"
+  # Checking out the local HEAD there is the point: an anchor run against
+  # whatever the remote machine happened to have checked out is a false green.
+  out=$(ssh "$WORK_HOST" "cd ~/Sites/itaruby && git fetch -q && git checkout -q $sha \
+    && PATH=\"\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh" 2>&1)
+  status=$?
+  printf '%s\n' "$out"
+  if [[ $status -ne 0 && $status -ne 2 ]]; then
+    echo "anchor failed at ${sha:0:7}: exit $status" >&2
+    exit "$status"
+  fi
+  ANCHOR_PROVED=$(printf '%s\n' "$out" | sed -n 's/^corpus gate proved: //p' | tail -1)
+  if [[ -z ${ANCHOR_PROVED// /} ]]; then
+    echo "anchor proved zero corpora on $WORK_HOST: did its corpora disappear?" >&2
+    exit 1
+  fi
+}
+
+# The only command that answers "is this commit actually proved?". Neither
+# machine holds every corpus, so a single green run never means full coverage:
+# this unions what each machine proved and demands it cover every corpus the
+# baseline declares.
+cmd_prove() {
+  local declared local_proved union missing
+  declared=$(sed -n 's/^corpus \([^ ]*\) .*/\1/p' scripts/corpus-baseline.txt | sort)
+  local_out=$(cmd_gates 2>&1); local_status=$?
+  printf '%s\n' "$local_out"
+  if [[ $local_status -ne 0 && $local_status -ne 2 ]]; then
+    echo "local gates failed: exit $local_status" >&2
+    exit "$local_status"
+  fi
+  local_proved=$(printf '%s\n' "$local_out" | sed -n 's/^corpus gate proved: //p' | tail -1)
+  cmd_anchor
+  union=$(printf '%s %s' "$local_proved" "$ANCHOR_PROVED" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+  missing=$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$union") | tr '\n' ' ')
+  say 'proof'
+  echo "declared: $(printf '%s' "$declared" | tr '\n' ' ')"
+  echo "proved:   $(printf '%s' "$union" | tr '\n' ' ')"
+  if [[ -n ${missing// /} ]]; then
+    echo "PROOF INCOMPLETE — no machine proved: $missing" >&2
+    exit 1
+  fi
+  echo 'PROOF COMPLETE — every declared corpus was proved on some machine'
+}
+
+case "${1:-}" in
+  setup)  cmd_setup ;;
+  gates)  shift; cmd_gates "$@" ;;
+  anchor) cmd_anchor ;;
+  prove)  cmd_prove ;;
+  # 64 (EX_USAGE, sysexits.h) so it never collides with gates' own 0/1/2 space.
+  *)      usage; exit 64 ;;
+esac

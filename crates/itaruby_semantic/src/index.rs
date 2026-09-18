@@ -1,0 +1,5928 @@
+//! Definition index: per-file extraction (`file_defs`) merged into a global
+//! `project_index`. Incrementality invariant: `file_defs` depends only on its
+//! own file's text; editing a method body without changing signatures yields
+//! a structurally-equal `FileDefs`, so salsa early-cutoff keeps the global
+//! index untouched.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use itaruby_syntax::ruby_prism::{self, Node, Visit};
+use itaruby_syntax::{LineIndex, SourceFile};
+
+use crate::core;
+use crate::rbs_comment::{parse_rbs_comment, RbsSig};
+use crate::types::{ClassId, Ty};
+use crate::ProjectFiles;
+
+/// `self.table_name = ...` as written in a model, distinguishing a literal
+/// override (bead ita-yho's model->table contract gives it priority over
+/// convention) from a dynamic one (silence: a dynamic override means the
+/// convention guess cannot be trusted either).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TableNameDecl {
+    Literal(String),
+    Dynamic,
+}
+
+/// Why a class fragment was marked `open` (bead ita-anc, census only — see
+/// `ProjectIndex::inconclusive_reason`). Recorded at every `open = true`
+/// site in `DefWalker`/`merge_declared_fragment`; first reason wins when
+/// fragments merge (a class reopened in two files, or opened for two
+/// reasons in one file, keeps whichever came first).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum OpenReason {
+    /// Superclass expression is not a resolvable constant path (`< Struct.new(...)`).
+    DynamicSuperclass,
+    /// Defines `method_missing` / `respond_to_missing?`.
+    MethodMissing,
+    /// The `raise NotImplementedError` abstract-class text-scan idiom.
+    AbstractRaise,
+    /// `include`/`extend`/`prepend` with a non-self explicit receiver.
+    DynamicMixinReceiver,
+    /// `include`/`extend`/`prepend` with a non-constant-path argument.
+    DynamicMixinArg,
+    /// A symbol-list class-body call (`attr_reader`/`attr_writer`/
+    /// `attr_accessor`) with a non-symbol arg. Real visibility modifiers
+    /// (`private`/`public`/`protected`) never open a class at all — they
+    /// only recurse into a wrapped `def` — so despite the earlier name
+    /// this variant is exclusively the `attr_*` shape.
+    DynamicAttrArg,
+    /// `define_method` with a non-literal name.
+    DynamicDefineMethod,
+    /// `alias_method` with a non-literal name.
+    DynamicAliasMethod,
+    /// `class_eval`/`module_eval`/`instance_eval`/`send`/`public_send`/
+    /// `__send__`/`delegate`/`define_singleton_method`.
+    EvalOrSend,
+    /// The catch-all `_ =>` arm: some class-body call we do not model.
+    /// In a Rails app this is `validates` / `belongs_to` / `scope` /
+    /// `before_action` — the population an allowlist or generated-method
+    /// model could close.
+    UnknownClassBodyCall,
+    /// A block attached to a class-body call that is not `define_method`:
+    /// `included do ... end` (`ActiveSupport::Concern`), `FIELDS.each do`.
+    /// Split out of `UnknownClassBodyCall` on purpose (bead ita-o1n): it
+    /// is a DIFFERENT fix — the block body has to be walked in class
+    /// scope — and lumping the two hides which one the corpora need.
+    ClassBodyBlock,
+    /// `class << <non-self expr>`: a singleton class on something we
+    /// cannot resolve. Not a class-body call at all; own variant so the
+    /// DSL bucket stays honest.
+    SingletonClassExpr,
+    /// `merge_declared_fragment`: `declarations/gems.rbi` force-opens the entry.
+    DeclaredExternal,
+    /// Bead ita-h6l (mechanism B): `class X ... end` whose path `X` names a
+    /// Ruby core class, a `declarations/stdlib_constants.txt` constant, or
+    /// a `declarations/gems.rbi` namespace — a REOPENING of a class this
+    /// checker never modeled, not the declaration of a brand-new closed
+    /// project class. Set at index time in `DefWalker`'s `ClassNode` arm,
+    /// by path only, independent of `closed_world`/`requires` (fail-closed:
+    /// invariant #1 prefers silence on the rare name collision over the
+    /// guaranteed false-positive cascade on the real reopening —
+    /// `Pathname#exist?`, `Range#overlap?`, `Mail::Message#...`, none of
+    /// which this checker's own inventory ever saw defined).
+    ReopenedExternal,
+    /// An ancestor that is `open` with no reason recorded — a bug in this
+    /// attribution, not a Ruby construct. Exists so such a class shows up
+    /// as a visible non-zero in `anc_other` instead of silently leaving
+    /// the ancestry census entirely.
+    Unattributed,
+}
+
+/// What actually blocks a `MethodLookup::Inconclusive` from concluding
+/// (bead ita-anc, census only — never consulted by the real check path).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Blocker {
+    /// An ancestor NAME in the chain never resolved in the index at all —
+    /// we do not even know what it is. Strictly harder than `Declared`
+    /// and it survives the `Declared` fix, so it wins whenever both are
+    /// present: the counterfactual question is "would giving real methods
+    /// to every declared external ancestor close this site?", and here the
+    /// answer stays no.
+    Unresolved,
+    /// Every external blocker in the chain is a name we DID resolve, to a
+    /// `declarations/gems.rbi` entry that `merge_declared_fragment`
+    /// force-opens (bead ita-3gs declares the constant and deliberately
+    /// nothing else). Closable by giving that name a real method set —
+    /// Tapioca RBI or a curated list — without any new name resolution.
+    Declared,
+    /// Every open ancestor in the chain is project-side. THIS is the
+    /// closable population.
+    Project(OpenReason),
+}
+
+/// Public framework calls that appear in a class body, register a hook or
+/// a validator, and define NO method on the class (bead ita-o1n). Every
+/// name here is documented public API of Rails/ActiveJob/Sidekiq, so this
+/// is the same category as `declarations/gems.rbi` — a declaration about a
+/// public gem surface, never a lookup table of app symbols. The
+/// anti-gaming rule still stands: a name that exists only in one client's
+/// code must NEVER appear here.
+///
+/// The exclusions are the whole safety argument, because allowlisting a
+/// call that DOES define something closes a class that should stay open
+/// and turns every call to the generated method into a false `E0101`.
+/// Deliberately absent, all method generators: `belongs_to`, `has_many`,
+/// `has_one`, `has_and_belongs_to_many`, `scope`, `enum`, `attribute`,
+/// `store`, `store_accessor`, `alias_attribute`, `composed_of`,
+/// `accepts_nested_attributes_for`, `has_secure_password`,
+/// `has_secure_token`, `has_one_attached`, `has_many_attached`,
+/// `monetize`, `enumerize`, `devise`, every `acts_as_*`. `delegate` is
+/// excluded too — it already opens the class via `EvalOrSend`.
+///
+/// ponytail: a flat name match, not a framework model. It cannot tell a
+/// Rails `validates` from a same-named method on an unrelated class, and
+/// it does not need to — a false match only ever CLOSES a class that a
+/// real generator would have opened, which the corpus gate catches as a
+/// new diagnostic. Upgrade path if that ever fires: require the enclosing
+/// class to have a resolvable framework ancestor before trusting the name.
+fn defines_no_method(name: &str) -> bool {
+    matches!(
+        name,
+        // validations: register validators, define nothing
+        "validates"
+            | "validate"
+            | "validates_with"
+            | "validates_each"
+            | "validates_presence_of"
+            | "validates_uniqueness_of"
+            | "validates_length_of"
+            | "validates_format_of"
+            | "validates_numericality_of"
+            | "validates_inclusion_of"
+            | "validates_exclusion_of"
+            | "validates_associated"
+            | "validates_acceptance_of"
+            | "validates_confirmation_of"
+            | "validates_absence_of"
+            // ActiveRecord lifecycle callbacks
+            | "before_validation"
+            | "after_validation"
+            | "before_save"
+            | "after_save"
+            | "around_save"
+            | "before_create"
+            | "after_create"
+            | "around_create"
+            | "before_update"
+            | "after_update"
+            | "around_update"
+            | "before_destroy"
+            | "after_destroy"
+            | "around_destroy"
+            | "after_commit"
+            | "after_rollback"
+            | "after_initialize"
+            | "after_find"
+            | "after_touch"
+            // controller filters and config
+            | "before_action"
+            | "after_action"
+            | "around_action"
+            | "skip_before_action"
+            | "skip_after_action"
+            | "skip_around_action"
+            | "prepend_before_action"
+            | "prepend_after_action"
+            | "prepend_around_action"
+            | "rescue_from"
+            | "protect_from_forgery"
+            | "layout"
+            | "http_basic_authenticate_with"
+            // `helper_method` exposes an EXISTING method to views and
+            // `helper` mixes a module into the view context — neither adds
+            // anything to this class.
+            | "helper"
+            | "helper_method"
+            // job / worker configuration
+            | "queue_as"
+            | "retry_on"
+            | "discard_on"
+            | "sidekiq_options"
+            // ActiveRecord configuration that defines no accessor: the
+            // column readers come from the schema (beads ita-yho/ita-muf),
+            // these calls only annotate them.
+            | "serialize"
+            | "attr_readonly"
+            | "default_scope"
+    )
+}
+
+fn is_schema_rb_path(path: &std::path::Path) -> bool {
+    path.file_name().and_then(|n| n.to_str()) == Some("schema.rb")
+        && path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("db")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodDef {
+    pub name: String,
+    pub required: u32,
+    pub optional: u32,
+    pub rest: bool,
+    /// (name, required)
+    pub keywords: Vec<(String, bool)>,
+    pub kwrest: bool,
+    pub block: bool,
+    pub sig: Option<RbsSig>,
+    /// Raw text of a preceding sorbet `sig { ... }`'s `.returns(...)`
+    /// argument (bead ita-uh1) — e.g. `"T.nilable(String)"`. `None` for
+    /// `.void`, for no sig at all, and for any sig shape `index.rs`'s
+    /// `extract_sig_return` doesn't recognize. Deliberately separate from
+    /// `sig` above (which comes from this project's own `#:` RBS
+    /// comments and drives arity checking): a Tapioca-rendered RBI sig
+    /// can go stale relative to the gem actually installed, so this
+    /// field NEVER feeds arity — only `sorbet_sig::sorbet_ret_ty` ever
+    /// consumes it, to type the call's return, never its parameters.
+    pub sorbet_ret: Option<String>,
+    /// If true, arity/args are unchecked (synthetic: `define_method`, alias).
+    pub arity_unknown: bool,
+    /// The def body contains `raise NotImplementedError` — an abstract
+    /// stub (2026-09-03, rails dd1c8848^). The stub's own signature is
+    /// not the one that runs: under the template-method idiom the runtime
+    /// receiver is a family instance and any member redefining the name
+    /// shadows the stub, so `check.rs` skips arity on a shadowed stub.
+    pub abstract_stub: bool,
+    pub name_span: (usize, usize),
+    pub def_span: (usize, usize),
+}
+
+impl MethodDef {
+    fn synthetic(name: String, required: u32, span: (usize, usize)) -> Self {
+        MethodDef {
+            name,
+            required,
+            optional: 0,
+            rest: false,
+            keywords: Vec::new(),
+            kwrest: false,
+            block: false,
+            sig: None,
+            sorbet_ret: None,
+            arity_unknown: false,
+            abstract_stub: false,
+            name_span: span,
+            def_span: span,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassFragment {
+    /// Fully nested constant path, e.g. `Foo::Bar`.
+    pub path: String,
+    /// Real lexical `Module.nesting` chain in effect where this fragment's
+    /// own body/header was written, outermost first, ENDING with this
+    /// fragment's own `path` (bead ita-519). Distinct from splitting
+    /// `path` on `::`: a compact-syntax `class A::B::C` pushes exactly ONE
+    /// level (`nesting == [..outer, "A::B::C"]`), never separate `A`/`A::B`
+    /// entries — the whole point this field exists for. See
+    /// `ProjectIndex::resolve_const`'s doc comment for the bug this fixes.
+    pub nesting: Vec<String>,
+    pub is_module: bool,
+    /// Superclass as written (constant path literal), if any.
+    pub superclass: Option<String>,
+    pub includes: Vec<String>,
+    pub prepends: Vec<String>,
+    pub extends: Vec<String>,
+    /// `mixes_in_class_methods ::X` args (Sorbet `T::Helpers` — Tapioca's
+    /// RBI rendering of the `included do extend X end` /
+    /// `ActiveSupport::Concern` `ClassMethods` idiom). Never consulted by
+    /// project-side method lookup (`X`'s methods really do land on the
+    /// includer's singleton, exactly like a real `extend`, but modeling
+    /// that for project code is out of scope here) — the call still
+    /// force-opens the fragment exactly as before this field existed, so
+    /// real-project ancestry stays as conservative as ever. Populated
+    /// only so `compute_rbi_method_closure` (bead ita-xze) can walk it as
+    /// a singleton-track edge, the same as a real `extend`.
+    pub mixes_in_class_methods: Vec<String>,
+    pub methods: Vec<MethodDef>,
+    pub singleton_methods: Vec<MethodDef>,
+    /// Simple names of constants assigned in this fragment.
+    pub consts: Vec<String>,
+    /// Metaprogramming detected: everything about this class is Unknown.
+    pub open: bool,
+    /// Why `open` is set (bead ita-anc); `None` while closed. First-reason-wins.
+    pub open_reason: Option<OpenReason>,
+    /// `self.table_name = ...` as written in this fragment, if any.
+    pub table_name: Option<TableNameDecl>,
+}
+
+impl ClassFragment {
+    fn new(path: String, is_module: bool, nesting: Vec<String>) -> Self {
+        ClassFragment {
+            path,
+            nesting,
+            is_module,
+            superclass: None,
+            includes: Vec::new(),
+            prepends: Vec::new(),
+            extends: Vec::new(),
+            methods: Vec::new(),
+            singleton_methods: Vec::new(),
+            consts: Vec::new(),
+            open: false,
+            open_reason: None,
+            table_name: None,
+            mixes_in_class_methods: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileDefs {
+    pub fragments: Vec<ClassFragment>,
+    /// Malformed `#:` comments: (start, end, message) -> E0105.
+    pub sig_errors: Vec<(usize, usize, String)>,
+    /// This file monkeypatches a core class in a shape no fragment
+    /// records (bead ita-2ve: top-level `include M`, `String.prepend(M)`,
+    /// `Kernel.class_eval { def ... }`, top-level `def method_missing`).
+    /// Forces the closed-world core lookup to stand down run-wide.
+    pub core_mixin: bool,
+    /// Every refinement target this file names, as `(target text minus
+    /// any leading `::`, lexical nesting at the call site)` — e.g.
+    /// `refine Integer do ... end` -> `[("Integer", [])]`. A refinement
+    /// adds methods to a class through no fragment at all, so every
+    /// closed-world core lookup on those classes must stand down. The
+    /// nesting rides along because the target may be a constant ALIAS
+    /// (`I = Integer; refine I`), and aliases can only be chased once
+    /// every file is merged (`resolve_refined_core`).
+    pub refine_targets: Vec<(String, Vec<String>)>,
+    /// This file refines a target it could not name (`refine klass do`).
+    /// Fail-closed: "some core class was refined, unknown which" stands
+    /// every core class down, not none.
+    pub refined_unknown: bool,
+    /// Every class name this file hands a body no AST can read, as
+    /// `(target text minus any leading `::`, lexical nesting at the call
+    /// site)` — `Integer.class_eval("def +(o) = 'x'")` and the block form
+    /// of the same call. Same contract and same two-phase alias
+    /// resolution as `refine_targets` above, for the same reason: the
+    /// methods arrive through no fragment at all. See `FileScan`'s
+    /// `note_opaque_eval`.
+    pub eval_targets: Vec<(String, Vec<String>)>,
+    /// This file string-evals a body into a receiver it could not name
+    /// (`klass.class_eval(str)`), or evals one anywhere at all
+    /// (`eval(str)`, `Kernel.eval`, `binding.eval`). Fail-closed exactly
+    /// like `refined_unknown`: "some class got a body we cannot read,
+    /// unknown which" stands every core class down.
+    pub eval_unknown: bool,
+    /// Every pollution source this file aims at a class, WITH the method
+    /// names it can define: `(target — `None` for a class the file
+    /// cannot name — nesting at the site, what it can define)`. The
+    /// blanket fields above answer "could anything have been added?" for
+    /// the closed-world core lookup; this one answers "could `+` have
+    /// been added?" for E0108, which is a different question with a
+    /// measured different answer (`PollutionSource`,
+    /// `resolve_keyed_pollution`, `Checker::core_ops_unpolluted`).
+    pub keyed_pollution: Vec<(Option<String>, Vec<String>, PollutionSource)>,
+    /// Value constants assigned at class/module-body or toplevel level
+    /// (w12 closure, E0104 did-you-mean): `(qualified name, span)` as
+    /// written, e.g. `("Foo::Bar", span-of-BAR)` for `module Foo; Bar = 1`.
+    /// Names only, no values — suggestions and `defined at` need exactly
+    /// this and nothing more. Deliberately NOT folded into
+    /// `ClassFragment::consts` (simple names, resolution-only, no spans):
+    /// different lifetime, different consumer, never merged together.
+    pub consts: Vec<(String, usize, usize)>,
+    /// Distinct literal `require '<lib>'` targets in this file (W3
+    /// require/autoload). Prism 1.9 has no `RequireNode` — `require 'x'` is
+    /// a plain `CallNode` — so this is collected in the walk's `CallNode`
+    /// arm. `require_relative`/dynamic requires are deliberately NOT
+    /// collected: relative targets never define stdlib constants, and a
+    /// non-literal require can name anything (invariant #1: silence).
+    pub requires: Vec<String>,
+    /// Bare `CONST = ...` written at true file toplevel — outside every
+    /// class/module body (`frag_idx == None` in `DefWalker`'s
+    /// `ConstantWriteNode` arm). Bead ita-exc defect B: distinct from
+    /// `consts` above, which feeds ONLY the resolution-inert did-you-mean
+    /// map — see `ProjectIndex::toplevel_consts` for why a top-level
+    /// constant needs a bucket resolution can actually reach.
+    pub toplevel_consts: Vec<String>,
+    /// `(owner, simple)` for every constant PATH write (`A::B = ...`) in
+    /// this file — bead ita-exc defect B's third shape. Resolved against
+    /// the owner's fragment only once every project file's fragments are
+    /// merged; see `resolve_qualified_const_writes`.
+    pub qualified_writes: Vec<(String, String)>,
+    /// Bead ita-54k: constant-alias write sites (`X = Y`, or qualified
+    /// `A::B = C::D`) whose RHS is ITSELF a literal constant path —
+    /// `(full LHS path as written, lexical nesting at the WRITE site,
+    /// RHS path as written)`. See `ProjectIndex::const_aliases` for the
+    /// resolution contract (suppression-only, chased from `const_exists`,
+    /// never from `resolve_const`).
+    pub const_aliases: Vec<(String, Vec<String>, String)>,
+    /// Bead ita-o8l.1: literal-constant `include`/`extend`/`prepend`
+    /// targets reached through a DYNAMIC receiver (present, not a
+    /// constant path, not literal `self` — the exact shape bead ita-a8z's
+    /// own `DynamicMixinScan` flagged, e.g.
+    /// `builder_class.include(ActionMethods)` where `builder_class` is a
+    /// local variable) anywhere in this file, INCLUDING inside method
+    /// bodies — `DefWalker`'s own contour-limited walk never visits
+    /// those, which is why this is collected by a SEPARATE full-tree
+    /// scan (`FileScan`), not `DefWalker` itself. `(track, name
+    /// as written, nesting chain at the call site)`: `name`/`nesting`
+    /// are exactly what `ProjectIndex::resolve_const` needs to resolve
+    /// the mixed-in module for real, which can only happen once every
+    /// project file's fragments are merged (the module's own definition
+    /// may live in a different file than the dynamic `include` call) —
+    /// see `resolve_dynamic_mixin_targets`.
+    pub dynamic_mixin_targets: Vec<(MixinTrack, String, Vec<String>)>,
+}
+
+/// Extract definitions from one file. Depends only on this file's text.
+#[salsa::tracked]
+pub fn file_defs(db: &dyn salsa::Database, file: SourceFile) -> FileDefs {
+    parse_defs_text(file.text(db))
+}
+
+/// Pure parse, independent of salsa/`SourceFile` (mirrors `schema.rs`'s
+/// `parse_schema_text`) — lets `declarations.rs` extract fragments from
+/// embedded RBI text (bead ita-3gs) without needing a fake `SourceFile`
+/// salsa input just to reuse this walk.
+pub fn parse_defs_text(text: &str) -> FileDefs {
+    let parse = ruby_prism::parse(text.as_bytes());
+    let line_index = LineIndex::new(text);
+
+    // `#:` comments by the 0-based line they END on, so a def on line L+1
+    // picks up the sig comment on line L.
+    let mut sig_comments: HashMap<u32, (usize, usize)> = HashMap::new();
+    for comment in parse.comments() {
+        let loc = comment.location();
+        let ctext = text[loc.start_offset()..loc.end_offset()].trim_end();
+        if let Some(after_marker) = ctext.strip_prefix("#:") {
+            // RDoc visibility directives (`#:nodoc:`, `#:doc:`, `#:yields:`,
+            // ...) glue a word directly onto `#:` with no separating space
+            // or punctuation. No valid RBS sig form starts that way — every
+            // real form's first non-space character after `#:` is `(`,
+            // `[`, or `-` (of `->`); see rbs_comment.rs's grammar and its
+            // `malformed` test (`"Integer -> String"` is rejected even by
+            // the parser itself). Checked on the UNTRIMMED remainder so a
+            // real sig attempt with a leading space (`#: String ->`) is
+            // never touched — only literally glued, letter-first forms are
+            // RDoc directives, not sigs (bead ita-ekg).
+            let glued_word = after_marker.starts_with(|c: char| c.is_alphanumeric() || c == '_');
+            if !glued_word {
+                let (line, _) = line_index.line_col(text, loc.start_offset());
+                sig_comments.insert(line, (loc.start_offset(), loc.start_offset() + ctext.len()));
+            }
+        }
+    }
+
+    let mut w = DefWalker {
+        text,
+        line_index: &line_index,
+        sig_comments: &sig_comments,
+        fragments: Vec::new(),
+        sig_errors: Vec::new(),
+        core_mixin: false,
+        consts: Vec::new(),
+        requires: Vec::new(),
+        toplevel_consts: Vec::new(),
+        qualified_writes: Vec::new(),
+        const_aliases: Vec::new(),
+        pending_sorbet_ret: None,
+    };
+    w.walk_body("", &[], false, &parse.node());
+    // ONE file-wide traversal answering both "does this shape appear
+    // ANYWHERE in this file" questions — dynamic mixins and refinements.
+    let mut scan = FileScan {
+        nesting: Vec::new(),
+        targets: Vec::new(),
+        refine_targets: Vec::new(),
+        refined_unknown: false,
+        eval_targets: Vec::new(),
+        eval_unknown: false,
+        keyed_pollution: Vec::new(),
+        nested: 0,
+    };
+    scan.visit(&parse.node());
+    FileDefs {
+        fragments: w.fragments,
+        sig_errors: w.sig_errors,
+        core_mixin: w.core_mixin,
+        refine_targets: scan.refine_targets,
+        refined_unknown: scan.refined_unknown,
+        eval_targets: scan.eval_targets,
+        eval_unknown: scan.eval_unknown,
+        keyed_pollution: scan.keyed_pollution,
+        consts: w.consts,
+        requires: w.requires,
+        toplevel_consts: w.toplevel_consts,
+        qualified_writes: w.qualified_writes,
+        const_aliases: w.const_aliases,
+        dynamic_mixin_targets: scan.targets,
+    }
+}
+
+/// Bead ita-o8l.1: which method-lookup track a dynamically-mixed-in
+/// module's OWN methods land on for the includer. `include`/`prepend`
+/// put the module's instance methods on the includer's INSTANCE track
+/// (`ProjectIndex::lookup_method`'s walk); `extend` puts them on the
+/// includer's SINGLETON track — exactly like a static `extend` already
+/// does in `lookup_singleton`'s own `class.extends` handling, which
+/// reads the extended module's `methods` map (never `singleton_methods`)
+/// onto the extender's singleton. `dynamic_mixin_covers` reads the same
+/// `methods` map for both tracks for this reason — see that function.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MixinTrack {
+    Instance,
+    Singleton,
+}
+
+/// What ONE pollution source can add to the class it targets — the
+/// name-keyed half of the core-pollution question (`FileDefs::keyed_pollution`).
+///
+/// The blanket question the closed-world core lookup asks ("could
+/// ANYTHING have been added to this class?") and the question E0108 asks
+/// ("could `+` or a coercion hook have been added to this class?") are
+/// different questions, and the measurement that separates them is
+/// recorded in `AGENTS.md`: across rails, mastodon and discourse, 248
+/// methods are defined directly inside core-class reopenings and ZERO of
+/// them is an operator or `coerce`/`to_str`/`to_int`. So every source is
+/// collected WITH the names it can define, and a source whose names
+/// cannot be read is `Opaque` — fail-closed, exactly as before.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PollutionSource {
+    /// Exactly these method names, read off a body this checker can see.
+    Names(Vec<String>),
+    /// Every method of this module (`Integer.include M`, `class Integer;
+    /// include M; end`), resolved project-wide once every file is merged
+    /// — see `resolve_keyed_pollution`.
+    Module(String),
+    /// A body no AST here can read (a string eval, a dynamic
+    /// `define_method`, a class-body block, an unrecognized macro): any
+    /// method name at all.
+    Opaque,
+}
+
+/// One full-file prism traversal answering every "does this shape appear
+/// ANYWHERE in this file" question the position-keyed `DefWalker` cannot:
+/// dynamic mixins (below) and refinements (`visit_call_node`'s `refine`
+/// half). They share a traversal deliberately — a second `Visit` over
+/// every file measured 7.87 ms against `check/project_index`'s 7.04 ms
+/// ceiling, and a name comparison inside the existing one is free.
+///
+/// Bead ita-o8l.1 (replaces bead ita-a8z's measurement-only
+/// `A8zCandidate`/`DynamicMixinScan`, both deleted): full-tree scan
+/// (unlike `DefWalker`, which never visits inside a `def` body) for
+/// `<dynamic-receiver>.include/extend/prepend(<literal constant>)` — the
+/// `builder_class.include(ActionMethods)` shape (receiver present, not a
+/// constant path, not literal `self`). ita-a8z measured and REJECTED
+/// keying this on the RECEIVING class (`Global`: opens every class,
+/// silenced 100% of one private corpus's real errors; `BuilderName`:
+/// opens every class named `*Builder`, measured to silence a real,
+/// unrelated E0101 three files away). This scan instead keys on the
+/// method NAME at the lookup site — see `ProjectIndex::
+/// dynamic_mixin_covers` — so it never opens any class at all; it only
+/// ever collects candidate MODULES (the literal argument), tracked with
+/// the lexical nesting in effect at the call site so
+/// `ProjectIndex::resolve_const` can resolve them for real once every
+/// file is merged (`resolve_dynamic_mixin_targets`). Always runs — no
+/// env-gate — because it can only ever soften an existing `NotFound`
+/// into `Inconclusive` (invariant #1: strictly less diagnostic, never
+/// more), unlike ita-a8z's two rejected candidates, which could and did
+/// hide real errors.
+struct FileScan {
+    /// Real `Module.nesting` chain in effect at the current point in the
+    /// walk, outermost first — same discipline as `DefWalker`'s own
+    /// `nesting` (bead ita-519): one entry per `class`/`module` keyword,
+    /// never per `::`-segment, and `class << self` pushes nothing.
+    nesting: Vec<String>,
+    targets: Vec<(MixinTrack, String, Vec<String>)>,
+    /// Every refinement target this file names, with the nesting it was
+    /// written in — see `FileDefs::refine_targets` and the `refine` half
+    /// of `visit_call_node`.
+    refine_targets: Vec<(String, Vec<String>)>,
+    /// A refinement whose target could not be named — see
+    /// `FileDefs::refined_unknown`.
+    refined_unknown: bool,
+    /// Every core-class-pollution target from an unreadable eval body —
+    /// see `FileDefs::eval_targets` and `note_opaque_eval`.
+    eval_targets: Vec<(String, Vec<String>)>,
+    /// An eval body whose target could not be named — see
+    /// `FileDefs::eval_unknown`.
+    eval_unknown: bool,
+    /// Name-keyed pollution: every source this file aims at a class,
+    /// `(target, nesting at the site, what it can define)`. `None` as a
+    /// target means the source hit a class this file cannot name, so it
+    /// counts against EVERY class — with `Opaque` that is the old
+    /// project-wide stand-down, and with `Names` it is bounded to those
+    /// names. See `FileDefs::keyed_pollution`.
+    keyed_pollution: Vec<(Option<String>, Vec<String>, PollutionSource)>,
+    /// How many `def`/block bodies deep the walk currently is. Zero plus
+    /// an empty `nesting` is TRUE file toplevel — the only place a bare
+    /// `include M` really lands on `Object` and a bare `def` really
+    /// defines an `Object` method. Without this the scan read every
+    /// `RSpec.describe do include Foo end` as an `Object` mixin and
+    /// stood `Object` down on all three public corpora (measured: 81
+    /// phantom `Object` methods on mastodon, plus an `Opaque` from the
+    /// first unresolvable spec helper), which is exactly the strictness
+    /// the blanket collector never had.
+    nested: usize,
+}
+
+impl FileScan {
+    /// Push one nesting level for `path_node` (a class/module's own
+    /// `constant_path()`), scoped under whatever is already on the
+    /// stack — mirrors `DefWalker`'s `join_path(scope, &path)` exactly.
+    /// `None` (a dynamic class/module path, e.g. `class self.class::X`)
+    /// pushes nothing: vanishingly rare, and any dynamic-mixin call
+    /// found inside just keeps resolving against the OUTER nesting
+    /// instead — a false negative, never a false positive.
+    fn push_scope(&mut self, path_node: &Node<'_>) {
+        if let Some(path) = const_path_str(path_node) {
+            let scope = self.nesting.last().map_or("", String::as_str);
+            self.nesting.push(join_path(scope, &path));
+        }
+    }
+
+    fn pop_scope(&mut self, path_node: &Node<'_>) {
+        if const_path_str(path_node).is_some() {
+            self.nesting.pop();
+        }
+    }
+}
+
+impl<'pr> Visit<'pr> for FileScan {
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        let path = node.constant_path();
+        self.push_scope(&path);
+        ruby_prism::visit_class_node(self, node);
+        self.pop_scope(&path);
+    }
+
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        let path = node.constant_path();
+        self.push_scope(&path);
+        ruby_prism::visit_module_node(self, node);
+        self.pop_scope(&path);
+    }
+
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        // A top-level `def method_missing` lands on `Object`, so EVERY
+        // receiver — core included — dispatches through it (bead ita-2ve
+        // condition (b), where `DefWalker` flags it project-wide). Keyed
+        // by name here: it is exactly `method_missing` on `Object`, and
+        // E0108 asks after that name specifically.
+        if self.nesting.is_empty() && self.nested == 0 && node.receiver().is_none() {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            if name == "method_missing" || name == "respond_to_missing?" {
+                self.keyed_pollution.push((
+                    Some("Object".to_string()),
+                    Vec::new(),
+                    PollutionSource::Names(vec![name]),
+                ));
+            }
+        }
+        self.nested += 1;
+        ruby_prism::visit_def_node(self, node);
+        self.nested -= 1;
+    }
+
+    fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        self.nested += 1;
+        ruby_prism::visit_block_node(self, node);
+        self.nested -= 1;
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.note_dynamic_mixin(node);
+        self.note_refinement(node);
+        self.note_opaque_eval(node);
+        self.note_injection(node);
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+impl FileScan {
+    /// `<dynamic-receiver>.include/extend/prepend(<literal constant>)` —
+    /// see this struct's doc comment for why the RECEIVER is never the
+    /// key.
+    fn note_dynamic_mixin(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let track = match node.name().as_slice() {
+            b"include" | b"prepend" => MixinTrack::Instance,
+            b"extend" => MixinTrack::Singleton,
+            _ => return,
+        };
+        let dynamic_receiver = node
+            .receiver()
+            .is_some_and(|recv| const_path_str(&recv).is_none() && recv.as_self_node().is_none());
+        if !dynamic_receiver {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        for arg in &args.arguments() {
+            if let Some(name) = const_path_str(&arg) {
+                self.targets.push((track, name, self.nesting.clone()));
+            }
+        }
+    }
+
+    /// A refinement (`refine Integer do def +(o) ... end end`) adds
+    /// methods to a class through neither a class fragment (`by_path`)
+    /// nor a method-injection call (`core_mixin`), so without this the
+    /// closed-world core lookup stays conclusive on a class whose
+    /// operator has been replaced, and E0108 accuses `1 + "s"` on a
+    /// program MRI runs clean (measured: `using` a module that refines
+    /// `Integer#+` prints `"refined s"`, exit 0).
+    ///
+    /// Collected in the file-wide scan, and not as an arm in
+    /// `DefWalker::walk_body`, which is round 4's whole point: the body
+    /// walker only reaches class/module-body and toplevel statements, so
+    /// three shapes MRI runs clean were still accused — `refine` inside
+    /// `def self.install` (a method body), inside `Module.new do ...
+    /// end` (a block), and inside `SomeMod.module_eval do ... end`. This
+    /// visit recurses into defs, blocks and conditionals, so every one
+    /// of them is seen. It rides the traversal the dynamic-mixin scan
+    /// already does: a SECOND `Visit` over every file was measured at
+    /// 112% of the `check/project_index` perf ceiling (7.87 ms vs
+    /// 7.04 ms), and a name comparison inside the existing one is free.
+    ///
+    /// The mark is project-wide and ignores `using`'s lexical scope
+    /// entirely: tracking which files a refinement is activated in buys
+    /// only false positives if the tracking is ever wrong, and a
+    /// refinement of a core class is rare enough that the false negative
+    /// costs nothing measurable (zero `refine` calls in all four
+    /// corpora).
+    ///
+    /// Requiring a block keeps a project method merely NAMED `refine`
+    /// from poisoning anything unless it also takes one. A block
+    /// ARGUMENT (`refine Integer, &blk`) counts: it is free, since MRI
+    /// rejects that form outright with `ArgumentError: can't pass a Proc
+    /// as a block to Module#refine`.
+    fn note_refinement(&mut self, node: &ruby_prism::CallNode<'_>) {
+        if node.name().as_slice() != b"refine" || node.block().is_none() {
+            return;
+        }
+        // The name-keyed half: a refinement body is ordinary readable
+        // Ruby, so what it can define is exactly what `block_pollution`
+        // reads off it — `refine Integer do def zz ... end end` cannot
+        // change `+`, which E0108 now proves instead of assuming.
+        let target = node
+            .arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .and_then(|a| const_path_str(&a))
+            .map(|p| p.trim_start_matches("::").to_string());
+        let sources = block_pollution(node.block().as_ref());
+        self.push_keyed(target.as_deref(), sources);
+        match node
+            .arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .and_then(|a| const_path_str(&a))
+        {
+            // `::Integer` and `Integer` are the same class; a project
+            // constant (`Foo`, `Foo::Bar`) is kept as written, so it
+            // matches no core name and poisons nothing. A target that
+            // cannot be named at all (`refine klass do`) is fail-closed:
+            // "some core class was refined and we do not know which" is
+            // exactly the state in which no core receiver can be proven,
+            // so it stands EVERY core class down rather than none.
+            Some(path) => self
+                .refine_targets
+                .push((path.trim_start_matches("::").to_string(), self.nesting.clone())),
+            None => self.refined_unknown = true,
+        }
+    }
+
+    /// `Integer.class_eval("def +(o) = 'x'")` replaces a core operator
+    /// through a body no AST can read, exactly like `refine` adds one
+    /// through no fragment: measured on ruby 3.4.2, that line followed by
+    /// `p 1 + "s"` prints `"evaled"` and exits 0, while E0108 accused it.
+    ///
+    /// The toplevel/class-body contour of the literal-receiver shape was
+    /// already covered by `core_injection_call` (which sets the
+    /// project-wide `core_mixin`). What reaches here is every contour
+    /// that walk never visits — a method body, a block, a conditional —
+    /// plus the two shapes a literal-receiver test can never see: a
+    /// receiver spelled as a constant ALIAS, and a receiver that cannot
+    /// be named at all. All eleven were measured as live false positives
+    /// before this arm existed (`ita check` accusing, `ruby` exit 0); the
+    /// fixtures are `crates/itaruby_semantic/tests/operand_types.rs`'s
+    /// eval section, each one executed by MRI in the same table as the
+    /// refinement sources.
+    ///
+    /// What counts as a body nobody showed us:
+    ///
+    /// - any positional argument to `class_eval`/`module_eval`/
+    ///   `instance_eval`: those three take a STRING and nothing else, so
+    ///   an argument of any shape (literal, heredoc, interpolated, or a
+    ///   variable) is a body. `instance_eval` is in the list because
+    ///   `define_method` inside it defines an INSTANCE method —
+    ///   `Integer.instance_eval("define_method(:+) { |o| 'ie' }")` really
+    ///   prints `"ie"` (measured), so "`instance_eval` only touches the
+    ///   singleton" is false;
+    /// - a block on any of those, or on `class_exec`/`module_exec`/
+    ///   `instance_exec`. A block IS walkable, and reading its defs
+    ///   instead would be more precise — but the walker-reachable contour
+    ///   already treats the block form as pollution whatever its body
+    ///   (`core_injection_call` lists `class_eval` with no look at the
+    ///   argument), and one program must not mean two things depending on
+    ///   whether it sits in a method body or at toplevel. The cost is a
+    ///   measured false negative kept identical to the toplevel one: a
+    ///   block that defines something else
+    ///   (`Integer.class_eval { def doubled = self * 2 }`) stops accusing
+    ///   `1 + "s"` (see `a_block_eval_body_that_defines_nothing_relevant_is_a_false_negative`).
+    ///
+    /// The polluted class is the RECEIVER: a constant path as written
+    /// (chased through aliases in `resolve_eval_polluted_core`), or the
+    /// innermost lexical nesting for `self.class_eval`/receiverless
+    /// `class_eval` — the Rails `class_eval <<~RUBY` idiom, whose
+    /// implicit receiver is the enclosing class. That fallback is what
+    /// keeps the idiom from escalating to the project-wide mark below,
+    /// and a project class matches no core name and poisons nothing.
+    ///
+    /// A receiver that cannot be named plus a STRING body
+    /// (`klass.class_eval(str)`, `Object.const_get(x).class_eval(str)`)
+    /// is the `refined_unknown` decision again: "some class got a body we
+    /// cannot read, and we do not know which class" is exactly the state
+    /// in which no core receiver is provable, so it stands EVERY core
+    /// class down rather than none. The same unnamable receiver with a
+    /// BLOCK deliberately does not: `x.instance_eval { ... }` is ordinary
+    /// DSL code in every Ruby project (25 such sites in rails, 16 in
+    /// discourse), and marking on a shape that names no class at all
+    /// would turn E0108 off everywhere for free.
+    ///
+    /// `eval`/`Kernel.eval`/`binding.eval` with any argument stands every
+    /// core class down for the same reason: the string can define
+    /// anything anywhere, and `eval("class Integer; def +(o) = 'x'; end")`
+    /// followed by `p 1 + "s"` is a program MRI runs clean. E0108's
+    /// locals map does NOT already cover this (measured both ways):
+    /// `OperandLocalScan::visit_call_node` bails the scope it is scanning,
+    /// which is why `x = 1; eval("x = 'str'"); x + 1` is silent — but two
+    /// LITERAL operands need no local at all, and
+    /// `eval(...); p 1 + "s"` accused. The price is real and accepted,
+    /// and it is smaller than it first looked: measured with prism over
+    /// the three public corpora, rails has 62 `eval` sites with an
+    /// argument and discourse 120, so both carry this mark — but neither
+    /// project had E0108 alive BEFORE this arm existed either (probe:
+    /// a `p 1 + "s"` file added to each clone, checked with the parent
+    /// revision's binary — 0 E0108 rows on all three corpora), because
+    /// `core_mixin` and a project reopening of `Object`/`Kernel` already
+    /// stood every core class down. Only mastodon has no unknown mark at
+    /// all, and its `1 + "s"` is blocked by a project reopening of
+    /// `Numeric`, not by any eval.
+    ///
+    /// So parsing a LITERAL eval body as a sub-program and marking only
+    /// what it really touches — the obvious next step — was measured and
+    /// is NOT worth building: of the sites that stand every core class
+    /// down, only 4 of 98 in rails and 46 of 123 in discourse have a
+    /// literal body at all, and both projects keep dozens of genuinely
+    /// dynamic ones (`eval(local)`, `eval(call)`, an interpolated
+    /// `class_eval <<-CODE`), so the project-wide mark survives either
+    /// way and no corpus changes verdict. See AGENTS.md's
+    /// `Removed — do not reintroduce`. What WOULD move the capability is
+    /// name-keyed pollution (ask whether a reopening can touch
+    /// `+ - * /` or a coercion hook): across all three corpora, 248
+    /// methods are defined directly in core-class reopenings and ZERO of
+    /// them is an operator or `coerce`/`to_str`/`to_int`.
+    fn note_opaque_eval(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let id = node.name();
+        let name = id.as_slice();
+        let has_arg = node
+            .arguments()
+            .is_some_and(|a| a.arguments().iter().next().is_some());
+        if name == b"eval" {
+            self.eval_unknown |= has_arg;
+            // Unchanged policy, now expressed in the keyed collection
+            // too: a bare `eval(<string>)` can define anything anywhere,
+            // so it stands every class down for every name. Whether that
+            // is the right price for a RUNTIME string is the one switch
+            // this change deliberately leaves to the owner (CHANGELOG).
+            if has_arg {
+                self.push_keyed(None, vec![PollutionSource::Opaque]);
+            }
+            return;
+        }
+        if !matches!(
+            name,
+            b"class_eval"
+                | b"module_eval"
+                | b"instance_eval"
+                | b"class_exec"
+                | b"module_exec"
+                | b"instance_exec"
+        ) {
+            return;
+        }
+        let string_body = has_arg && matches!(name, b"class_eval" | b"module_eval" | b"instance_eval");
+        if !string_body && node.block().is_none() {
+            return;
+        }
+        let target = self.eval_target(node);
+        match &target {
+            Some(path) => self
+                .eval_targets
+                .push((path.trim_start_matches("::").to_string(), self.nesting.clone())),
+            None if string_body => self.eval_unknown = true,
+            None => {}
+        }
+        let keyed_target = target.map(|p| p.trim_start_matches("::").to_string());
+        self.note_eval_keyed(node, keyed_target.as_deref(), string_body);
+    }
+
+    /// Which class an eval-family call runs its body in: the receiver if
+    /// it can be named, the enclosing class for a receiverless or `self`
+    /// receiver (the Rails `class_eval <<~RUBY` idiom), `None` for a
+    /// receiver this file cannot name.
+    fn eval_target(&self, node: &ruby_prism::CallNode<'_>) -> Option<String> {
+        let Some(recv) = node.receiver() else {
+            return self.nesting.last().cloned();
+        };
+        if recv.as_self_node().is_some() {
+            return self.nesting.last().cloned();
+        }
+        const_path_str(&recv)
+    }
+
+    /// The name-keyed half of `note_opaque_eval`.
+    ///
+    /// A BLOCK body is readable Ruby, so it contributes exactly the names
+    /// `block_pollution` reads off it. A STRING body stays `Opaque`:
+    /// parsing a literal eval body as a sub-program was measured against
+    /// all three public corpora and rejected (AGENTS.md, `Removed — do
+    /// not reintroduce`), so "this class got a body we cannot read" is
+    /// still the honest answer, now scoped to the class it names instead
+    /// of all of them.
+    fn note_eval_keyed(
+        &mut self,
+        node: &ruby_prism::CallNode<'_>,
+        target: Option<&str>,
+        string_body: bool,
+    ) {
+        if string_body {
+            // The string case keeps the shipped contract exactly: a body
+            // no AST can read stands its class down, and an unnamable
+            // receiver stands every class down.
+            self.push_keyed(target, vec![PollutionSource::Opaque]);
+            return;
+        }
+        // A BLOCK case with an unnamable receiver records NOTHING, and
+        // that is a deliberate limit rather than an oversight: the
+        // shipped blanket collector recorded nothing there either
+        // (`note_opaque_eval`'s `None => {}` arm), and treating it as
+        // fail-closed instead stood every core class down on mastodon —
+        // `obj.instance_exec(&blk)` is everywhere in real code, and the
+        // probe measured E0108 dead project-wide because of it. The gap
+        // it leaves is the pre-existing one: a block body evaled into a
+        // receiver nobody can name.
+        if target.is_none() {
+            return;
+        }
+        let sources = block_pollution(node.block().as_ref());
+        self.push_keyed(target, sources);
+    }
+
+    /// Record one source against `target` — `None` meaning "a class this
+    /// file cannot name", which counts against every class (see
+    /// `FileScan::keyed_pollution`). Empty `sources` is the common case
+    /// and records nothing: a body that defines no method pollutes no
+    /// name.
+    fn push_keyed(&mut self, target: Option<&str>, sources: Vec<PollutionSource>) {
+        let nesting = self.nesting.clone();
+        for src in sources {
+            self.keyed_pollution
+                .push((target.map(ToString::to_string), nesting.clone(), src));
+        }
+    }
+
+    /// `Integer.include M` / `String.define_method(:+) { }` /
+    /// `Hash.send(:alias_method, :x, :y)` / top-level `include M` — every
+    /// injection shape `core_injection_call` flags project-wide, now
+    /// carrying the names it can actually inject.
+    ///
+    /// The eval family is deliberately NOT handled here:
+    /// `note_opaque_eval` above already owns those shapes, including
+    /// their receiver resolution and their string/block split.
+    fn note_injection(&mut self, node: &ruby_prism::CallNode<'_>) {
+        // Cheap name test before anything allocates: this runs on EVERY
+        // call node in every file, and `definer_sources` collects the
+        // argument list into a `Vec` (measured: the allocation, not the
+        // work, is what a per-call collector costs at corpus scale).
+        if !is_definer_name(node.name().as_slice()) {
+            return;
+        }
+        let sources = definer_sources(node);
+        if sources.is_empty() {
+            return;
+        }
+        let Some(target) = self.injection_target(node) else {
+            return;
+        };
+        self.push_keyed(Some(target.as_str()), sources);
+    }
+
+    /// Which class an injection call adds to, or `None` for the shapes
+    /// this collector deliberately does not record.
+    ///
+    /// A bare `include M` at true top level mixes into `Object`; inside a
+    /// class/module body it is that body's own business, and the merged
+    /// fragment already carries it. Bare `extend`/`prepend` at top level
+    /// only touch `main`'s singleton — not a core patch, exactly as
+    /// `DefWalker` has it.
+    ///
+    /// A receiver this file cannot name (`klass.include M`) is not
+    /// recorded either: `core_injection_call`'s project-wide mark
+    /// requires a constant receiver too, so poisoning here would make
+    /// the keyed question STRICTER than the blanket one it refines — and
+    /// the shape is everywhere (50 sites in rails alone), so it would
+    /// stand every core class down on every real project. The gap it
+    /// leaves is the pre-existing one `dynamic_mixin_covers` softens for
+    /// E0101.
+    fn injection_target(&self, node: &ruby_prism::CallNode<'_>) -> Option<String> {
+        let Some(recv) = node.receiver() else {
+            let bare_toplevel_include = node.name().as_slice() == b"include"
+                && self.nesting.is_empty()
+                && self.nested == 0;
+            return bare_toplevel_include.then(|| "Object".to_string());
+        };
+        if recv.as_self_node().is_some() {
+            return self.nesting.last().cloned();
+        }
+        const_path_str(&recv).map(|p| p.trim_start_matches("::").to_string())
+    }
+
+}
+
+/// What a block body can define — the `refine`/`class_eval { }`
+/// source. A block with no body defines nothing.
+fn block_pollution(block: Option<&ruby_prism::Node<'_>>) -> Vec<PollutionSource> {
+    let Some(block) = block else { return Vec::new() };
+    let Some(block) = block.as_block_node() else {
+        // A block ARGUMENT (`refine Integer, &blk`,
+        // `class_eval(&blk)`): a body this file does not contain, so
+        // `Opaque` rather than "defines nothing". Measured on ruby
+        // 3.4.2, the `refine` spelling of it raises `ArgumentError:
+        // can't pass a Proc as a block to Module#refine` before any
+        // operand runs, so this arm costs a false negative only on
+        // code that already crashes — and `class_eval(&blk)`, which is
+        // legal, needs exactly this.
+        return vec![PollutionSource::Opaque];
+    };
+    let body = block.body();
+    statements_pollution(body.as_ref(), 0)
+}
+
+/// Every method name a class body / block body can define, or
+/// `Opaque` for each statement whose effect cannot be read.
+///
+/// Fail-closed by construction: a `def` and a recognized definer
+/// macro contribute NAMES, anything else that could run code at
+/// definition time — an unrecognized receiverless macro, a block, a
+/// dynamic `define_method` — contributes `Opaque`. Measured against
+/// the three public corpora before it was written: the only
+/// receiverless calls that appear inside a core reopening there are
+/// `alias_method` (12), `include` (3), `private` (2) and
+/// `module_function` (2), so reading exactly those plus `def` costs
+/// nothing real and the `Opaque` fallback stays honest.
+fn statements_pollution(body: Option<&ruby_prism::Node<'_>>, depth: usize) -> Vec<PollutionSource> {
+    let mut out = Vec::new();
+    let Some(body) = body else { return out };
+    // A conditional/`begin` wrapper is transparent; deeper than this
+    // is not worth a walk, and `Opaque` is the fail-closed answer.
+    if depth > 3 {
+        out.push(PollutionSource::Opaque);
+        return out;
+    }
+    if let Some(stmts) = body.as_statements_node() {
+        for st in &stmts.body() {
+            out.extend(statement_pollution(&st, depth));
+        }
+        return out;
+    }
+    out.extend(statement_pollution(body, depth));
+    out
+}
+
+/// One statement of a class body / block body.
+fn statement_pollution(st: &Node<'_>, depth: usize) -> Vec<PollutionSource> {
+    if let Some(def) = st.as_def_node() {
+        let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+        return vec![PollutionSource::Names(vec![name])];
+    }
+    if let Some(al) = st.as_alias_method_node() {
+        return match literal_method_name(&al.new_name()) {
+            Some(n) => vec![PollutionSource::Names(vec![n])],
+            None => vec![PollutionSource::Opaque],
+        };
+    }
+    if let Some(call) = st.as_call_node() {
+        return call_statement_pollution(&call, depth);
+    }
+    // `class << self`, `if`/`unless`/`else`, `begin`: transparent
+    // wrappers around more statements.
+    nested_statements(st)
+        .iter()
+        .flat_map(|inner| statements_pollution(Some(inner), depth + 1))
+        .collect()
+}
+
+/// The statement lists a wrapper statement holds — the only nodes whose
+/// children can still define a method on the body's own class. Anything
+/// else (a constant write, an assignment, a nested class or module with
+/// its own target) contributes nothing and yields an empty list here.
+fn nested_statements<'a>(st: &Node<'a>) -> Vec<Node<'a>> {
+    if let Some(sc) = st.as_singleton_class_node() {
+        return sc.body().into_iter().collect();
+    }
+    if let Some(n) = st.as_if_node() {
+        let then = n.statements().map(|s| s.as_node());
+        return then.into_iter().chain(n.subsequent()).collect();
+    }
+    if let Some(n) = st.as_unless_node() {
+        let then = n.statements().map(|s| s.as_node());
+        let other = n.else_clause().map(|e| e.as_node());
+        return then.into_iter().chain(other).collect();
+    }
+    if let Some(n) = st.as_else_node() {
+        return n.statements().map(|s| s.as_node()).into_iter().collect();
+    }
+    if let Some(n) = st.as_begin_node() {
+        return n.statements().map(|s| s.as_node()).into_iter().collect();
+    }
+    Vec::new()
+}
+
+/// One statement-position call inside a class/refinement body.
+fn call_statement_pollution(call: &ruby_prism::CallNode<'_>, depth: usize) -> Vec<PollutionSource> {
+    let mut out = Vec::new();
+    // `private def foo` / `module_function def bar`: the visibility
+    // macro is inert, the `def` in its arguments is not.
+    if let Some(args) = call.arguments() {
+        for arg in &args.arguments() {
+            if let Some(def) = arg.as_def_node() {
+                out.push(PollutionSource::Names(vec![String::from_utf8_lossy(
+                    def.name().as_slice(),
+                )
+                .into_owned()]));
+            }
+        }
+    }
+    let definers = definer_sources(call);
+    if !definers.is_empty() {
+        out.extend(definers);
+        return out;
+    }
+    if call.receiver().is_some() {
+        // An explicit receiver defines on THAT object, not on the
+        // body's own class — and the eval family is `note_opaque_eval`'s.
+        return out;
+    }
+    if call.block().is_some() {
+        // `FIELDS.each { define_method ... }`, `included do ... end`:
+        // exactly `OpenReason::ClassBodyBlock`, unreadable.
+        out.push(PollutionSource::Opaque);
+        return out;
+    }
+    let name = call.name();
+    if !out.is_empty() || INERT_BODY_CALLS.contains(&name.as_slice()) {
+        return out;
+    }
+    // An unrecognized receiverless macro in a core-class body can be
+    // a definer this checker has never heard of.
+    let _ = depth;
+    out.push(PollutionSource::Opaque);
+    out
+}
+
+/// Receiverless calls that appear in class bodies and define no method:
+/// visibility and bookkeeping. Everything not listed is `Opaque` in a
+/// core-class body — see `FileScan::call_statement_pollution`.
+const INERT_BODY_CALLS: &[&[u8]] = &[
+    b"private",
+    b"public",
+    b"protected",
+    b"module_function",
+    b"private_class_method",
+    b"public_class_method",
+    b"private_constant",
+    b"public_constant",
+    b"require",
+    b"require_relative",
+    b"freeze",
+    b"raise",
+    b"puts",
+    b"warn",
+    b"using",
+];
+
+/// The names one INJECTION call can define, whatever its receiver:
+/// `define_method`/`alias_method`/`attr_*`/`delegate` with literal names
+/// are read; `include`/`prepend`/`extend` carry the whole module;
+/// `send(:define_method, ...)` unwraps one level; a dynamic name is
+/// `Opaque`. An empty result means "this call defines nothing", which is
+/// every other call in the language.
+/// Could a call with this name define a method? The one-line filter in
+/// front of `definer_sources`, which must agree with its match arms —
+/// every name below has an arm there, and nothing else does.
+fn is_definer_name(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"define_method"
+            | b"define_singleton_method"
+            | b"alias_method"
+            | b"attr_accessor"
+            | b"attr_reader"
+            | b"attr_writer"
+            | b"attr"
+            | b"include"
+            | b"prepend"
+            | b"extend"
+            | b"delegate"
+            | b"delegate_missing_to"
+            | b"def_delegator"
+            | b"def_delegators"
+            | b"def_instance_delegator"
+            | b"send"
+            | b"public_send"
+            | b"__send__"
+    )
+}
+
+fn definer_sources(call: &ruby_prism::CallNode<'_>) -> Vec<PollutionSource> {
+    let id = call.name();
+    let name = id.as_slice();
+    let args: Vec<Node<'_>> = call
+        .arguments()
+        .map(|a| a.arguments().iter().collect())
+        .unwrap_or_default();
+    definer_sources_named(name, &args)
+}
+
+/// `definer_sources` on an already-unwrapped `(name, args)` pair, so the
+/// `send(:define_method, :+)` shape can reuse every rule exactly.
+fn definer_sources_named(name: &[u8], args: &[Node<'_>]) -> Vec<PollutionSource> {
+    let one = |i: usize| match args.get(i).and_then(literal_method_name) {
+        Some(m) => vec![PollutionSource::Names(vec![m])],
+        None => vec![PollutionSource::Opaque],
+    };
+    match name {
+        b"define_method" | b"define_singleton_method" | b"alias_method" => one(0),
+        b"attr_accessor" | b"attr_reader" | b"attr_writer" | b"attr" => attr_sources(name, args),
+        b"include" | b"prepend" | b"extend" => mixin_sources(args),
+        // `delegate :foo, :bar, to: :baz` defines `foo`/`bar`;
+        // `delegate_missing_to` installs `method_missing` itself.
+        b"delegate" => delegate_sources(args),
+        b"delegate_missing_to" => vec![PollutionSource::Names(vec![
+            "method_missing".to_string(),
+            "respond_to_missing?".to_string(),
+        ])],
+        // Forwardable: readable in principle, unread here on purpose —
+        // zero sites in the corpora, and `Opaque` is one class, not all.
+        b"def_delegator" | b"def_delegators" | b"def_instance_delegator" => {
+            vec![PollutionSource::Opaque]
+        }
+        // `Integer.send(:define_method, :+) { }`: unwrap one level and
+        // every rule above applies unchanged.
+        b"send" | b"public_send" | b"__send__" => match args.first().and_then(literal_method_name) {
+            Some(inner) => definer_sources_named(inner.as_bytes(), &args[1..]),
+            None => vec![PollutionSource::Opaque],
+        },
+        _ => Vec::new(),
+    }
+}
+
+/// `attr_accessor :a, :b` -> `a`, `a=`, `b`, `b=`; `attr_reader` drops
+/// the writers, `attr_writer` the readers. One non-literal argument makes
+/// the whole call unreadable.
+fn attr_sources(name: &[u8], args: &[Node<'_>]) -> Vec<PollutionSource> {
+    let mut names = Vec::new();
+    for arg in args {
+        let Some(m) = literal_method_name(arg) else {
+            return vec![PollutionSource::Opaque];
+        };
+        if name != b"attr_writer" {
+            names.push(m.clone());
+        }
+        if matches!(name, b"attr_accessor" | b"attr_writer") {
+            names.push(format!("{m}="));
+        }
+    }
+    if names.is_empty() {
+        return Vec::new();
+    }
+    vec![PollutionSource::Names(names)]
+}
+
+/// `include A, B` -> one `Module` source each; a non-constant argument is
+/// a method set nobody can read.
+fn mixin_sources(args: &[Node<'_>]) -> Vec<PollutionSource> {
+    args.iter()
+        .map(|arg| match const_path_str(arg) {
+            Some(p) => PollutionSource::Module(p.trim_start_matches("::").to_string()),
+            None => PollutionSource::Opaque,
+        })
+        .collect()
+}
+
+/// `delegate :foo, :bar, to: :baz` — the literal names, ignoring the
+/// keyword hash, and `Opaque` on anything else.
+fn delegate_sources(args: &[Node<'_>]) -> Vec<PollutionSource> {
+    let mut names = Vec::new();
+    for arg in args {
+        match literal_method_name(arg) {
+            Some(m) => names.push(m),
+            // The `to:`/`prefix:` keyword hash is not a name.
+            None if arg.as_keyword_hash_node().is_some() => {}
+            None => return vec![PollutionSource::Opaque],
+        }
+    }
+    if names.is_empty() {
+        return Vec::new();
+    }
+    vec![PollutionSource::Names(names)]
+}
+
+struct DefWalker<'a> {
+    text: &'a str,
+    line_index: &'a LineIndex,
+    sig_comments: &'a HashMap<u32, (usize, usize)>,
+    fragments: Vec<ClassFragment>,
+    sig_errors: Vec<(usize, usize, String)>,
+    /// Set when this file monkeypatches a core class without creating a
+    /// fragment (bead ita-2ve) — see `core_injection_call` and the
+    /// top-level `include`/`method_missing` arms below.
+    core_mixin: bool,
+    /// Qualified value-constant assignments (w12 closure) — see
+    /// `FileDefs::consts`.
+    consts: Vec<(String, usize, usize)>,
+    /// Distinct literal `require '<lib>'` targets in this file (W3) —
+    /// see `FileDefs::requires`.
+    requires: Vec<String>,
+    /// Bare `CONST = ...` written at true file toplevel — see
+    /// `FileDefs::toplevel_consts`.
+    toplevel_consts: Vec<String>,
+    /// `(owner, simple)` for every constant PATH write — see
+    /// `FileDefs::qualified_writes`.
+    qualified_writes: Vec<(String, String)>,
+    /// See `FileDefs::const_aliases`.
+    const_aliases: Vec<(String, Vec<String>, String)>,
+    /// Raw `.returns(...)` text of the most recently walked `sig { ... }`
+    /// statement (bead ita-uh1), threaded from one class-body statement
+    /// to the immediately next one by `walk_stmts` so the `def` that
+    /// follows a `sig` can pick it up in `method_def`. Cleared before any
+    /// statement that is neither a `sig` call nor a `def` — only
+    /// direct-adjacency counts, matching the contract's "def vier
+    /// precedido de um sig".
+    pending_sorbet_ret: Option<String>,
+}
+
+impl DefWalker<'_> {
+    /// Walk statements that form the body of a class/module (or toplevel,
+    /// scope == ""). `in_singleton` is true inside `class << self`.
+    /// `nesting` is the REAL `Module.nesting` chain in effect INSIDE this
+    /// body (already includes this class/module itself as the innermost
+    /// entry — bead ita-519); the caller computes it, never derived here
+    /// by splitting `scope` on `::` (that's exactly the bug this bead
+    /// fixes).
+    fn walk_body(&mut self, scope: &str, nesting: &[String], in_singleton: bool, node: &Node<'_>) {
+        // Fragment for this scope: created lazily; multiple `walk_body`
+        // calls for the same scope produce multiple fragments (reopening),
+        // merged by `project_index`.
+        let frag_idx = if scope.is_empty() {
+            None
+        } else {
+            self.fragments
+                .push(ClassFragment::new(scope.to_string(), false, nesting.to_vec()));
+            Some(self.fragments.len() - 1)
+        };
+        self.walk_stmts(scope, nesting, frag_idx, in_singleton, node);
+    }
+
+    /// Mark fragment `i` open for `reason` (bead ita-anc). First-reason-wins
+    /// with ONE precedence (2026-09-03, discourse `ImportScripts::Base`
+    /// measured): `AbstractRaise` is the WEAKEST reason — it is the only
+    /// one instance lookups may pass through — so a later, stronger open
+    /// on the same fragment (a class-body delegate loop, an eval, a
+    /// `method_missing`) must REPLACE it. Plain first-reason-wins let a
+    /// class that opens with a raise stub and later loops `%i[...].each {
+    /// delegate ... }` masquerade as a pure abstract stub.
+    fn open_class(&mut self, i: usize, reason: OpenReason) {
+        let f = &mut self.fragments[i];
+        f.open = true;
+        if f.open_reason.is_none()
+            || (f.open_reason == Some(OpenReason::AbstractRaise)
+                && reason != OpenReason::AbstractRaise)
+        {
+            f.open_reason = Some(reason);
+        }
+    }
+
+    /// Defect A (bead ita-exc): literal constant writes directly inside a
+    /// class-body call's block — `enums do; Alpha = new(...); end`, or
+    /// the fixture's invented `constvis_enums do; ... end` (any method
+    /// name, never a hardcoded list; see the call site below). Constant
+    /// *definition* is lexical: `instance_eval`/`instance_exec`/
+    /// `class_eval` rebind `self`, never the cref, so a literal
+    /// `CONST = ...` written straight in such a block still defines the
+    /// constant on the LEXICALLY ENCLOSING class `i` — exactly the same
+    /// self/cref asymmetry bead ita-sit recorded from the other
+    /// direction. A block that never runs at all simply never defines
+    /// the constant at runtime: a false negative, which invariant #1
+    /// permits.
+    ///
+    /// Deliberately shallow, mirroring the `define_method` carve-out
+    /// above rather than a general traversal: only the block's own
+    /// top-level statements are inspected. `def`s, nested classes,
+    /// conditionals, and anything else in the block body are left alone
+    /// by this pass — recursing into those would risk the same
+    /// false-E0101 exposure a broader traversal already cost bead
+    /// ita-d0j. A qualified write (`A::B = ...`) found here is routed
+    /// through the same `qualified_writes` merge-time resolution as a
+    /// top-level one (defect B) rather than blindly attributed to `i` —
+    /// it may not even name a constant on THIS class.
+    fn harvest_block_consts(&mut self, i: usize, block: &Node<'_>) {
+        let Some(b) = block.as_block_node() else { return };
+        let Some(body) = b.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        for stmt in &stmts.body() {
+            if let Some(cw) = stmt.as_constant_write_node() {
+                let name = String::from_utf8_lossy(cw.name().as_slice()).into_owned();
+                self.fragments[i].consts.push(name);
+            } else if let Some(cpw) = stmt.as_constant_path_write_node() {
+                if let Some(path) = const_path_str(&cpw.target().as_node()) {
+                    let full = path.trim_start_matches("::");
+                    if let Some((owner, simple)) = full.rsplit_once("::") {
+                        self.qualified_writes.push((owner.to_string(), simple.to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+
+    /// Bead ita-1yw: the canonical hook shape `def self.included(base)`
+    /// whose body calls `base.attr_accessor :x` / `base.define_method(:x)`
+    /// defines instance methods on every includer — none of which this
+    /// walker otherwise sees (def bodies are never walked). Only the
+    /// literal shape is modeled: exactly one required positional parameter
+    /// (no optionals/rest/posts/keywords/kwrest/block), and only top-level
+    /// body statements whose receiver is a bare read of THAT parameter
+    /// (shallow scan, same discipline as `harvest_block_consts`). attr_*
+    /// registers all-or-nothing (a single non-literal argument skips the
+    /// whole call — never a partial guess); `define_method` registers only
+    /// via `literal_method_name`. Discovered names land on the module's own
+    /// fragment, so `include Mod -> ancestors -> Mod.methods` resolves them
+    /// with zero new lookup mechanism. Deliberately NO `open_class`
+    /// fallback: a hook doing anything else (the common `base.class_eval`
+    /// string form, `send`, dynamic names) simply registers nothing — the
+    /// includer's real methods stay a documented false negative
+    /// (invariant #1), never a false positive.
+    fn harvest_included_hook(&mut self, i: usize, def: &ruby_prism::DefNode) {
+        let Some(pname) = Self::hook_receiver_param_name(def) else { return };
+        let Some(body) = def.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        for stmt in &stmts.body() {
+            let Some(call) = stmt.as_call_node() else { continue };
+            let Some(recv) = call.receiver() else { continue };
+            let Some(read) = recv.as_local_variable_read_node() else { continue };
+            if String::from_utf8_lossy(read.name().as_slice()) != pname {
+                continue;
+            }
+            let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+            match name.as_str() {
+                "attr_reader" | "attr_writer" | "attr_accessor" => {
+                    self.harvest_hook_attr(i, &name, &call);
+                }
+                "define_method" => {
+                    if let Some(m) = call
+                        .arguments()
+                        .and_then(|a| a.arguments().iter().next())
+                        .and_then(|a| literal_method_name(&a))
+                    {
+                        let mut md = MethodDef::synthetic(m, 0, span_of(&stmt));
+                        md.arity_unknown = true;
+                        self.fragments[i].methods.push(md);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// attr_* arm of `harvest_included_hook` — all-or-nothing: a single
+    /// non-literal argument skips the whole call, never a partial guess.
+    fn harvest_hook_attr(&mut self, i: usize, name: &str, call: &ruby_prism::CallNode) {
+        let mut attrs: Vec<(String, (usize, usize))> = Vec::new();
+        if let Some(args) = call.arguments() {
+            for arg in &args.arguments() {
+                let Some(sym) = arg.as_symbol_node() else { return };
+                attrs.push((
+                    String::from_utf8_lossy(sym.unescaped()).into_owned(),
+                    span_of(&arg),
+                ));
+            }
+        }
+        for (attr, aspan) in attrs {
+            if name != "attr_writer" {
+                self.fragments[i]
+                    .methods
+                    .push(MethodDef::synthetic(attr.clone(), 0, aspan));
+            }
+            if name != "attr_reader" {
+                self.fragments[i]
+                    .methods
+                    .push(MethodDef::synthetic(format!("{attr}="), 1, aspan));
+            }
+        }
+    }
+
+
+    /// The hook's receiver parameter name when `def` is exactly the literal
+    /// `def self.included(base)` shape — one required positional parameter
+    /// and nothing else (no optionals/rest/posts/keywords/kwrest/block).
+    fn hook_receiver_param_name(def: &ruby_prism::DefNode) -> Option<String> {
+        let params = def.parameters()?;
+        let mut requireds = params.requireds().iter();
+        let param = requireds.next()?;
+        if requireds.next().is_some()
+            || params.optionals().iter().next().is_some()
+            || params.rest().is_some()
+            || params.posts().iter().next().is_some()
+            || params.keywords().iter().next().is_some()
+            || params.keyword_rest().is_some()
+            || params.block().is_some()
+        {
+            return None;
+        }
+        let rp = param.as_required_parameter_node()?;
+        Some(String::from_utf8_lossy(rp.name().as_slice()).into_owned())
+    }
+
+    /// Walk every arm of a `begin/rescue/else/ensure` (bead ita-o8l.5):
+    /// the primary body, every `rescue` clause in the chain (`subsequent()`
+    /// links a second `rescue Foo` onto the first), the `else` clause (runs
+    /// only when nothing raised), and `ensure` (always runs). Shared by
+    /// `walk_stmts`' own `as_begin_node` case (a class/module body directly
+    /// wrapped in `begin ... end`) and `walk_stmt`'s `Node::BeginNode` arm
+    /// (a `begin` used as one class-body statement among several) — same
+    /// "conservative: walk every arm" discipline `if/else` uses just below,
+    /// since which arm actually executes is unknowable statically and an
+    /// indexed name can only turn an existing `NotFound` diagnostic off,
+    /// never fabricate a new one (invariant #1).
+    fn walk_begin_arms(
+        &mut self,
+        scope: &str,
+        nesting: &[String],
+        frag_idx: Option<usize>,
+        in_singleton: bool,
+        begin: &ruby_prism::BeginNode,
+    ) {
+        self.walk_begin_arm(scope, nesting, frag_idx, in_singleton, begin.statements());
+        let mut rescue = begin.rescue_clause();
+        while let Some(r) = rescue {
+            self.walk_begin_arm(scope, nesting, frag_idx, in_singleton, r.statements());
+            rescue = r.subsequent();
+        }
+        if let Some(e) = begin.else_clause() {
+            self.walk_begin_arm(scope, nesting, frag_idx, in_singleton, e.statements());
+        }
+        if let Some(ens) = begin.ensure_clause() {
+            self.walk_begin_arm(scope, nesting, frag_idx, in_singleton, ens.statements());
+        }
+    }
+
+    /// One arm of a `begin`. Extracted to keep `walk_begin_arms` under the
+    /// complexity ceiling: the four arms differ only in which accessor
+    /// yields the statements, so the shared step is worth a name — the
+    /// ceiling made the split the cheaper option, which is the point of it.
+    fn walk_begin_arm(
+        &mut self,
+        scope: &str,
+        nesting: &[String],
+        frag_idx: Option<usize>,
+        in_singleton: bool,
+        stmts: Option<ruby_prism::StatementsNode<'_>>,
+    ) {
+        if let Some(stmts) = stmts {
+            self.walk_stmts(scope, nesting, frag_idx, in_singleton, &stmts.as_node());
+        }
+    }
+
+    fn walk_stmts(
+        &mut self,
+        scope: &str,
+        nesting: &[String],
+        frag_idx: Option<usize>,
+        in_singleton: bool,
+        node: &Node<'_>,
+    ) {
+        if let Some(stmts) = node.as_statements_node() {
+            for stmt in &stmts.body() {
+                // Bead ita-uh1: a `sig { ... }` immediately followed by a
+                // `def` threads its captured `.returns(...)` text into
+                // that `def` via `pending_sorbet_ret` (set in the
+                // `Node::CallNode` arm below, consumed in `method_def`).
+                // Any statement that is neither the `sig` call itself nor
+                // the `def` breaks the adjacency — clear it so an
+                // unrelated later `def` never inherits a stale sig.
+                if !is_sig_call_or_def(&stmt) {
+                    self.pending_sorbet_ret = None;
+                }
+                self.walk_stmt(scope, nesting, frag_idx, in_singleton, &stmt);
+            }
+        } else if let Some(begin) = node.as_begin_node() {
+            self.walk_begin_arms(scope, nesting, frag_idx, in_singleton, &begin);
+        } else if let Some(prog) = node.as_program_node() {
+            self.walk_stmts(scope, nesting, frag_idx, in_singleton, &prog.statements().as_node());
+        } else {
+            self.walk_stmt(scope, nesting, frag_idx, in_singleton, node);
+        }
+    }
+
+    fn walk_stmt(
+        &mut self,
+        scope: &str,
+        nesting: &[String],
+        frag_idx: Option<usize>,
+        in_singleton: bool,
+        node: &Node<'_>,
+    ) {
+        match node {
+            Node::ClassNode { .. } => {
+                let class = node.as_class_node().unwrap();
+                if let Some(path) = const_path_str(&class.constant_path()) {
+                    let full = join_path(scope, &path);
+                    // Bead ita-519: exactly ONE new `Module.nesting` entry
+                    // per `class`/`module` keyword, whether written
+                    // compact (`class A::B::C`) or not — never one entry
+                    // per `::`-segment in `full`. See `ProjectIndex::
+                    // resolve_const`'s doc comment for why that
+                    // distinction matters.
+                    let mut child_nesting = nesting.to_vec();
+                    child_nesting.push(full.clone());
+                    let superclass = class.superclass().and_then(|s| const_path_str(&s));
+                    if let Some(body) = class.body() {
+                        self.walk_body(&full, &child_nesting, false, &body);
+                    } else {
+                        self.fragments
+                            .push(ClassFragment::new(full.clone(), false, child_nesting));
+                    }
+                    // superclass lives on the fragment(s) just created for
+                    // `full`; attach to the last one with that path. A
+                    // dynamic superclass expression (`< Struct.new(...)`)
+                    // makes the ancestry unknowable: open.
+                    if let Some(f) = self.fragments.iter_mut().rev().find(|f| f.path == full) {
+                        match superclass {
+                            Some(sc) => f.superclass = Some(sc),
+                            None if class.superclass().is_some() => {
+                                f.open = true;
+                                if f.open_reason.is_none() {
+                                    f.open_reason = Some(OpenReason::DynamicSuperclass);
+                                }
+                            }
+                            None => {}
+                        }
+                        // Bead ita-h6l (mechanism B): reopening a
+                        // core/stdlib/gem class — never modeled ancestry,
+                        // must stay open regardless of who wrote this
+                        // block. First-reason-wins: a dynamic superclass
+                        // above already explains the open, if present.
+                        if is_known_external_class_path(&full) {
+                            f.open = true;
+                            if f.open_reason.is_none() {
+                                f.open_reason = Some(OpenReason::ReopenedExternal);
+                            }
+                        }
+                    }
+                }
+            }
+            Node::ModuleNode { .. } => {
+                let m = node.as_module_node().unwrap();
+                if let Some(path) = const_path_str(&m.constant_path()) {
+                    let full = join_path(scope, &path);
+                    let mut child_nesting = nesting.to_vec();
+                    child_nesting.push(full.clone());
+                    if let Some(body) = m.body() {
+                        self.walk_body(&full, &child_nesting, false, &body);
+                    } else {
+                        self.fragments
+                            .push(ClassFragment::new(full.clone(), true, child_nesting));
+                    }
+                    if let Some(f) = self.fragments.iter_mut().rev().find(|f| f.path == full) {
+                        f.is_module = true;
+                    }
+                }
+            }
+            Node::SingletonClassNode { .. } => {
+                let sc = node.as_singleton_class_node().unwrap();
+                // Only `class << self` is modeled. `class << self` does
+                // NOT push a `Module.nesting` entry in real Ruby, so
+                // `nesting` passes through unchanged.
+                if sc.expression().as_self_node().is_some() {
+                    if let Some(body) = sc.body() {
+                        self.walk_stmts(scope, nesting, frag_idx, true, &body);
+                    }
+                } else if let Some(i) = frag_idx {
+                    self.open_class(i, OpenReason::SingletonClassExpr);
+                }
+            }
+            Node::DefNode { .. } => {
+                let def = node.as_def_node().unwrap();
+                let mut md = self.method_def(&def);
+                let treated_as_singleton =
+                    in_singleton || def.receiver().is_some_and(|r| r.as_self_node().is_some());
+                let name = md.name.clone();
+                if let Some(i) = frag_idx {
+                    if name == "method_missing" || name == "respond_to_missing?" {
+                        self.open_class(i, OpenReason::MethodMissing);
+                    }
+                    // ponytail: text scan, not AST — `raise NotImplementedError`
+                    // is Ruby's abstract-class idiom; such classes call
+                    // subclass hooks we can't see. Proper abstract-method
+                    // modeling is v1. The same scan marks the def itself
+                    // an abstract stub: its signature is not the one that
+                    // runs (`MethodDef::abstract_stub`).
+                    let abstract_stub =
+                        self.text[md.def_span.0..md.def_span.1].contains("NotImplementedError");
+                    if abstract_stub {
+                        self.open_class(i, OpenReason::AbstractRaise);
+                    }
+                    md.abstract_stub = abstract_stub;
+                    if treated_as_singleton {
+                        self.fragments[i].singleton_methods.push(md);
+                        // Bead ita-1yw: `def self.included(base)` may add
+                        // instance methods to every includer — harvest the
+                        // literal shape (helper is a no-op otherwise).
+                        if name == "included" {
+                            self.harvest_included_hook(i, &def);
+                        }
+                    } else {
+                        self.fragments[i].methods.push(md);
+                    }
+                } else if name == "method_missing" || name == "respond_to_missing?" {
+                    // A top-level `def method_missing` lands on Object:
+                    // EVERY receiver — core included — dispatches through
+                    // it (bead ita-2ve condition (b)). No fragment is
+                    // created for toplevel defs, so flag it globally.
+                    self.core_mixin = true;
+                }
+                // def with a non-self receiver (`def obj.foo`) is ignored.
+            }
+            Node::ConstantWriteNode { .. } => {
+                let cw = node.as_constant_write_node().unwrap();
+                let name = String::from_utf8_lossy(cw.name().as_slice()).into_owned();
+                match frag_idx {
+                    Some(i) => self.fragments[i].consts.push(name.clone()),
+                    // Defect B (bead ita-exc): a true toplevel write —
+                    // `frag_idx == None` — used to land ONLY in the
+                    // resolution-inert map below; `ProjectIndex::toplevel_consts`
+                    // is what makes it visible to `const_exists`.
+                    None => self.toplevel_consts.push(name.clone()),
+                }
+                // w12 closure: qualified + span for E0104 did-you-mean,
+                // recorded even at toplevel (frag_idx None) — `Bar = 1` at
+                // toplevel is as suggestible as `module Foo; Bar = 1; end`.
+                let loc = cw.name_loc();
+                self.consts.push((
+                    join_path(scope, &name),
+                    loc.start_offset(),
+                    loc.end_offset(),
+                ));
+                // Bead ita-54k: RHS itself a literal constant path is an
+                // alias (`X = Y`) — followed by `const_exists` only, via
+                // `ProjectIndex::resolve_const_via_alias`. `resolve_const`
+                // itself never consults this (invariant #1: widening it
+                // could manufacture a type where none was proven).
+                if let Some(target) = const_path_str(&cw.value()) {
+                    self.const_aliases.push((
+                        join_path(scope, &name),
+                        nesting.to_vec(),
+                        target.trim_start_matches("::").to_string(),
+                    ));
+                }
+            }
+            Node::ConstantPathWriteNode { .. } => {
+                // Qualified value-constant assignment (`A::B::C = ...` —
+                // Tapioca's standard form for gem constants, W3). The
+                // target IS a constant path; harvest the fully-qualified
+                // name into `consts` (suppression/suggestion only, never
+                // a type — same contract as the simple-write arm above).
+                if let Some(cpw) = node.as_constant_path_write_node() {
+                    if let Some(path) = const_path_str(&cpw.target().as_node()) {
+                        let full = path.trim_start_matches("::").to_string();
+                        let (s, e) = span_of(node);
+                        self.consts.push((full.clone(), s, e));
+                        // Defect B (bead ita-exc): also index this write
+                        // for resolution, not just did-you-mean — see
+                        // `resolve_qualified_const_writes`.
+                        match full.rsplit_once("::") {
+                            Some((owner, simple)) => {
+                                self.qualified_writes.push((owner.to_string(), simple.to_string()));
+                            }
+                            // Bead ita-9he: no `::` left after trimming the
+                            // leading cbase marker means the target WAS the
+                            // cbase form of a single segment (`::X = v`,
+                            // `cpw.target()`'s `parent()` is `None` — see
+                            // `const_path_str`'s cbase branch). Ruby defines
+                            // this on `Object` exactly like a bare toplevel
+                            // `X = v` — route it into the SAME channel the
+                            // `ConstantWriteNode` arm's `frag_idx == None`
+                            // case feeds, regardless of `frag_idx`/lexical
+                            // nesting here: cbase ignores enclosing
+                            // class/module bodies entirely, so a `::X = v`
+                            // written inside a class still defines top-level
+                            // `X`, not a member of that class.
+                            None => self.toplevel_consts.push(full.clone()),
+                        }
+                        // Bead ita-54k: same alias contract as the simple
+                        // write arm above, for the qualified LHS shape
+                        // (`A::B = C::D`).
+                        if let Some(target) = const_path_str(&cpw.value()) {
+                            self.const_aliases.push((
+                                full,
+                                nesting.to_vec(),
+                                target.trim_start_matches("::").to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+            Node::CallNode { .. } => {
+                let call = node.as_call_node().unwrap();
+                // bead ita-2ve: a method-injection call whose receiver is
+                // a constant naming a core class/mixin (`String.prepend(M)`,
+                // `Kernel.class_eval { def ... }`, `Hash.send(:define_method,
+                // ...)`) adds methods no fragment records, so the
+                // closed-world core lookup must stand down for the run.
+                if call
+                    .receiver()
+                    .is_some_and(|r| core_injection_call(&r, call.name().as_slice()))
+                {
+                    self.core_mixin = true;
+                }
+                // A block running at class-body level (`FIELDS.each do
+                // define_method ... end`, `included do ... end`) can define
+                // anything: open, whatever the receiver — except
+                // `define_method` itself with a literal name (symbol or
+                // string): that's the one block-taking call whose defined
+                // method we actually know, so it indexes instead of
+                // blinding the whole class (bead ita-53y); and, bead
+                // ita-4xy, a RECOGNIZED `sig { ... }` block (see
+                // `sig_block_is_recognized`'s doc comment): pure Sorbet
+                // type metadata that never itself defines a method, same
+                // reasoning as the `define_method` carve-out. Any other
+                // shape (dynamic `define_method` name, explicit receiver,
+                // an UNRECOGNIZED `sig` block, or a block on any other
+                // call) still opens it — narrowing further would risk a
+                // false E0101 the way bead ita-d0j's dynamic-include gap
+                // did.
+                if call.block().is_some_and(|b| b.as_block_node().is_some()) {
+                    let Some(i) = frag_idx else { return };
+                    if call.name().as_slice() == b"define_method" && call.receiver().is_none() {
+                        let name = call
+                            .arguments()
+                            .and_then(|a| a.arguments().iter().next())
+                            .and_then(|a| literal_method_name(&a));
+                        match name {
+                            Some(m) => {
+                                let mut md = MethodDef::synthetic(m, 0, span_of(node));
+                                md.arity_unknown = true;
+                                self.fragments[i].methods.push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicDefineMethod),
+                        }
+                    } else if call.name().as_slice() == b"sig" && call.receiver().is_none() {
+                        // Sorbet `sig { ... }` (bead ita-uh1): captured
+                        // purely as data for the immediately-following
+                        // `def` (threaded through `pending_sorbet_ret` by
+                        // `walk_stmts`). Bead ita-4xy narrows the open
+                        // marking: only an UNRECOGNIZED shape still opens
+                        // — `extract_sig_return`/`sig_block_is_recognized`
+                        // share one shape check, so "recognized" here is
+                        // exactly "the text `method_return`'s fallback
+                        // could ever consume, or a `void` sig with none to
+                        // consume", never a broader guess. A `sig` call
+                        // this bead can't classify (multi-statement block,
+                        // unrecognized outermost call, ...) is exactly as
+                        // unknown as before — still opens.
+                        self.pending_sorbet_ret = extract_sig_return(self.text, &call);
+                        if !sig_block_is_recognized(&call) {
+                            self.open_class(i, OpenReason::ClassBodyBlock);
+                        }
+                    } else {
+                        if let Some(block) = call.block() {
+                            self.harvest_block_consts(i, &block);
+                        }
+                        self.open_class(i, OpenReason::ClassBodyBlock);
+                    }
+                    return;
+                }
+                // `self.table_name = "literal"` / `self.table_name = expr`:
+                // the model->table override this bead's contract gives
+                // priority over convention. A dynamic RHS is captured too
+                // (as `Dynamic`) so the convention fallback doesn't kick in
+                // for a class that clearly overrides it some other way —
+                // silence over a wrong guess.
+                if call.name().as_slice() == b"table_name="
+                    && call.receiver().is_some_and(|r| r.as_self_node().is_some())
+                {
+                    if let Some(i) = frag_idx {
+                        let arg = call.arguments().and_then(|a| a.arguments().iter().next());
+                        self.fragments[i].table_name =
+                            Some(match arg.as_ref().and_then(Node::as_string_node) {
+                                Some(s) => TableNameDecl::Literal(
+                                    String::from_utf8_lossy(s.unescaped()).into_owned(),
+                                ),
+                                None => TableNameDecl::Dynamic,
+                            });
+                    }
+                    return;
+                }
+                // `include`/`extend`/`prepend` are checked before the
+                // generic receiver bailout below: a receiver that isn't
+                // implicit self (`T.unsafe(self).include Foo`) means we
+                // don't know which object is actually being mixed into, so
+                // the class is open regardless of the argument shape —
+                // otherwise dynamic mixins reached through a wrapper call
+                // silently kept the class closed and produced a false
+                // E0101 (bead ita-d0j). Implicit or explicit `self`
+                // receiver keeps resolving exactly as before: a literal
+                // constant path argument still closes ancestry normally,
+                // any other argument shape still opens it.
+                if matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend") {
+                    // Top-level (fragment-less) bare `include M` mixes
+                    // into Object, so every core receiver can gain M's
+                    // methods (bead ita-2ve condition (b)). Bare
+                    // top-level `extend`/`prepend` only touch `main`'s
+                    // singleton — not a core-class patch.
+                    if frag_idx.is_none() {
+                        if call.receiver().is_none() && call.name().as_slice() == b"include" {
+                            self.core_mixin = true;
+                        }
+                        return;
+                    }
+                    let i = frag_idx.expect("non-None: guarded above");
+                    let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+                    let implicit_or_self =
+                        call.receiver().is_none_or(|r| r.as_self_node().is_some());
+                    if !implicit_or_self {
+                        self.open_class(i, OpenReason::DynamicMixinReceiver);
+                        return;
+                    }
+                    if let Some(args) = call.arguments() {
+                        for arg in &args.arguments() {
+                            if let Some(path) = const_path_str(&arg) {
+                                match name.as_str() {
+                                    "include" => self.fragments[i].includes.push(path),
+                                    "extend" => self.fragments[i].extends.push(path),
+                                    _ => self.fragments[i].prepends.push(path),
+                                }
+                            } else {
+                                // Dynamic mixin: can't know the ancestry.
+                                self.open_class(i, OpenReason::DynamicMixinArg);
+                            }
+                        }
+                    }
+                    return;
+                }
+                // W3 require/autoload: literal `require '<lib>'` with an
+                // implicit receiver, at any nesting level — Ruby's
+                // `require` is process-global, so a lib required anywhere
+                // in the project defines its constants everywhere. This
+                // runs BEFORE the `frag_idx` bailout so toplevel requires
+                // (the overwhelmingly common shape) are captured too.
+                // Only a StringNode argument counts: `require var` can
+                // name anything, and never feeding a non-literal into the
+                // stdlib gate keeps it fact-based (invariant #1).
+                if call.name().as_slice() == b"require" && call.receiver().is_none() {
+                    if let Some(lib) = call
+                        .arguments()
+                        .and_then(|a| a.arguments().iter().next())
+                        .and_then(|a| a.as_string_node())
+                    {
+                        let lib = String::from_utf8_lossy(lib.unescaped()).into_owned();
+                        if !lib.is_empty() && !self.requires.contains(&lib) {
+                            self.requires.push(lib);
+                        }
+                    }
+                    return;
+                }
+                if call.receiver().is_some() {
+                    return;
+                }
+                let Some(i) = frag_idx else { return };
+                let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+                let span = span_of(node);
+                match name.as_str() {
+                    "attr_reader" | "attr_writer" | "attr_accessor" => {
+                        let mut all_symbols = true;
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                if let Some(sym) = arg.as_symbol_node() {
+                                    let attr =
+                                        String::from_utf8_lossy(sym.unescaped()).into_owned();
+                                    let aspan = span_of(&arg);
+                                    if name != "attr_writer" {
+                                        self.fragments[i].methods.push(MethodDef::synthetic(
+                                            attr.clone(),
+                                            0,
+                                            aspan,
+                                        ));
+                                    }
+                                    if name != "attr_reader" {
+                                        self.fragments[i].methods.push(MethodDef::synthetic(
+                                            format!("{attr}="),
+                                            1,
+                                            aspan,
+                                        ));
+                                    }
+                                } else {
+                                    all_symbols = false;
+                                }
+                            }
+                        }
+                        if !all_symbols {
+                            self.open_class(i, OpenReason::DynamicAttrArg);
+                        }
+                    }
+                    // ActiveSupport's `mattr_accessor` family (`cattr_*` is
+                    // the same macro under its older name). It defines BOTH
+                    // tracks: the class-object accessor and, unless told
+                    // otherwise, the instance accessor. Until now the index
+                    // modeled neither — `mattr_accessor` appeared zero
+                    // times in this file — which is why
+                    // `ActiveRecord::Migrator.migrations_paths=` and
+                    // `ActiveSupport::JSON::Encoding.json_encoder` looked
+                    // absent from a class whose ancestry the index
+                    // considered closed.
+                    //
+                    // Additive to the index only: it can make a lookup
+                    // Found that used to be NotFound/Inconclusive, never
+                    // the reverse, so it is monotonically LESS diagnostic
+                    // (invariant #1). Options are honored because getting
+                    // them wrong invents a method that does not exist:
+                    // `instance_accessor: false` suppresses both instance
+                    // sides, `instance_reader:`/`instance_writer: false`
+                    // one each. Anything not understood (a dynamic name, a
+                    // non-symbol option key) opens the class instead of
+                    // guessing, exactly as the `attr_*` arm above does.
+                    "mattr_accessor" | "mattr_reader" | "mattr_writer" | "cattr_accessor"
+                    | "cattr_reader" | "cattr_writer" => {
+                        let wants_reader = !name.ends_with("_writer");
+                        let wants_writer = !name.ends_with("_reader");
+                        let mut instance_reader = wants_reader;
+                        let mut instance_writer = wants_writer;
+                        let mut attrs: Vec<(String, (usize, usize))> = Vec::new();
+                        let mut all_known = true;
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                if let Some(sym) = arg.as_symbol_node() {
+                                    attrs.push((
+                                        String::from_utf8_lossy(sym.unescaped()).into_owned(),
+                                        span_of(&arg),
+                                    ));
+                                } else if let Some(kw) = arg.as_keyword_hash_node() {
+                                    for el in &kw.elements() {
+                                        let key = el
+                                            .as_assoc_node()
+                                            .map(|a| (a.key(), a.value()));
+                                        let Some((k, v)) = key else {
+                                            all_known = false;
+                                            continue;
+                                        };
+                                        let Some(ks) = k.as_symbol_node() else {
+                                            all_known = false;
+                                            continue;
+                                        };
+                                        let is_false = v.as_false_node().is_some();
+                                        match String::from_utf8_lossy(ks.unescaped()).as_ref() {
+                                            "instance_accessor" if is_false => {
+                                                instance_reader = false;
+                                                instance_writer = false;
+                                            }
+                                            "instance_reader" if is_false => {
+                                                instance_reader = false;
+                                            }
+                                            "instance_writer" if is_false => {
+                                                instance_writer = false;
+                                            }
+                                            // `default:` and friends create
+                                            // no method and need no opening.
+                                            _ => {}
+                                        }
+                                    }
+                                } else {
+                                    all_known = false;
+                                }
+                            }
+                        }
+                        for (attr, aspan) in attrs {
+                            if wants_reader {
+                                self.fragments[i].singleton_methods.push(
+                                    MethodDef::synthetic(attr.clone(), 0, aspan),
+                                );
+                            }
+                            if wants_writer {
+                                self.fragments[i].singleton_methods.push(
+                                    MethodDef::synthetic(format!("{attr}="), 1, aspan),
+                                );
+                            }
+                            if instance_reader {
+                                self.fragments[i].methods.push(MethodDef::synthetic(
+                                    attr.clone(),
+                                    0,
+                                    aspan,
+                                ));
+                            }
+                            if instance_writer {
+                                self.fragments[i].methods.push(MethodDef::synthetic(
+                                    format!("{attr}="),
+                                    1,
+                                    aspan,
+                                ));
+                            }
+                        }
+                        // OPENNESS IS PRESERVED, deliberately. Before this
+                        // arm existed the macro fell through to the `_`
+                        // catch-all and opened the class
+                        // (`UnknownClassBodyCall`). Handling it here would
+                        // otherwise CLOSE classes that used to be open, and
+                        // closing a class does not add knowledge — it only
+                        // unmasks whatever the index already could not see.
+                        // Measured on discourse 2026-09-17: `TopicQuery`'s
+                        // only class-body opener is
+                        // `cattr_accessor :results_filter_callbacks`, and
+                        // closing it produced 28 new E0101 on methods that
+                        // are real — installed by the plugin API
+                        // (`add_to_class(:topic_query, :list_group_topics_assigned)`)
+                        // from another file, which no index here can model.
+                        // So this arm records the accessors and leaves the
+                        // class exactly as open as it was: strictly
+                        // additive knowledge, zero diagnostic drift
+                        // (invariant #1). The resolution gain is gated on
+                        // class openness, which is a separate problem —
+                        // see the mattr_accessor tests.
+                        self.open_class(i, OpenReason::UnknownClassBodyCall);
+                        if !all_known {
+                            self.open_class(i, OpenReason::DynamicAttrArg);
+                        }
+                    }
+                    "define_method" => {
+                        let sym = call
+                            .arguments()
+                            .and_then(|a| a.arguments().iter().next())
+                            .and_then(|a| literal_method_name(&a));
+                        match sym {
+                            Some(m) => {
+                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.fragments[i].methods.push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicDefineMethod),
+                        }
+                    }
+                    "alias_method" => {
+                        let mut args = call
+                            .arguments()
+                            .map(|a| a.arguments().iter().collect::<Vec<_>>())
+                            .unwrap_or_default()
+                            .into_iter();
+                        let new = args.next().and_then(|a| {
+                            a.as_symbol_node()
+                                .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                        });
+                        match new {
+                            Some(m) => {
+                                let mut md = MethodDef::synthetic(m, 0, span);
+                                md.arity_unknown = true;
+                                self.fragments[i].methods.push(md);
+                            }
+                            None => self.open_class(i, OpenReason::DynamicAliasMethod),
+                        }
+                    }
+                    "class_eval"
+                    | "module_eval"
+                    | "instance_eval"
+                    | "send"
+                    | "public_send"
+                    | "__send__"
+                    | "delegate"
+                    | "define_singleton_method" => {
+                        self.open_class(i, OpenReason::EvalOrSend);
+                    }
+                    // Sorbet `T::Helpers#mixes_in_class_methods ::X` — the
+                    // `ActiveSupport::Concern` `ClassMethods` idiom
+                    // (`included do extend X end`), rendered literally by
+                    // Tapioca into every RBI that reopens a Concern. Real
+                    // runtime behavior: `X`'s instance methods land on the
+                    // includer's SINGLETON, same as an actual `extend`.
+                    // Project-side lookup still treats this exactly like
+                    // any other unmodeled class-body call (opens the
+                    // fragment, unconditionally, below) — modeling the
+                    // real effect for project code is out of scope here.
+                    // The argument is captured purely so the RBI-only
+                    // method closure (bead ita-xze) can walk it as a
+                    // singleton-track edge.
+                    "mixes_in_class_methods" => {
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                if let Some(path) = const_path_str(&arg) {
+                                    self.fragments[i].mixes_in_class_methods.push(path);
+                                }
+                            }
+                        }
+                        self.open_class(i, OpenReason::UnknownClassBodyCall);
+                    }
+                    // Visibility modifiers: harmless, but `private def foo`
+                    // wraps the def as an argument — index it.
+                    "private"
+                    | "public"
+                    | "protected"
+                    | "module_function"
+                    | "private_class_method"
+                    | "public_class_method" => {
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                if arg.as_def_node().is_some() {
+                                    self.walk_stmt(scope, nesting, frag_idx, in_singleton, &arg);
+                                }
+                            }
+                        }
+                    }
+                    // Known no-ops for method definition purposes.
+                    "require" | "require_relative" | "private_constant" | "public_constant"
+                    | "freeze" | "puts" | "raise" => {}
+                    // Bead ita-o1n, the same idea one step further. The
+                    // blocker census found classes whose ONLY reason for
+                    // being open is a framework call that registers a hook
+                    // or a validator and defines nothing — 23.9% of
+                    // corpus-a's `ancestry open`, 18.2% of corpus-b's,
+                    // and by `inconclusive_reason`'s precedence rule all of
+                    // it on chains with NO external blocker, so closing
+                    // them is a real conclusiveness gain needing zero gem
+                    // knowledge. See `defines_no_method` for why the
+                    // exclusions are the safety argument.
+                    n if defines_no_method(n) => {}
+                    // Any other bare call in a class body is a DSL or
+                    // metaprogramming (`has_many`, Dry's `option`,
+                    // `each do ... define_method ... end`): it may define
+                    // methods we cannot see. Invariant #1: open the class.
+                    _ => {
+                        self.open_class(i, OpenReason::UnknownClassBodyCall);
+                    }
+                }
+            }
+            // `alias foo bar` keyword form.
+            Node::AliasMethodNode { .. } => {
+                let al = node.as_alias_method_node().unwrap();
+                if let Some(i) = frag_idx {
+                    if let Some(sym) = al.new_name().as_symbol_node() {
+                        let mut md = MethodDef::synthetic(
+                            String::from_utf8_lossy(sym.unescaped()).into_owned(),
+                            0,
+                            span_of(node),
+                        );
+                        md.arity_unknown = true;
+                        self.fragments[i].methods.push(md);
+                    }
+                }
+            }
+            // if/unless guards around defs etc. — conservative: walk both arms.
+            Node::IfNode { .. } => {
+                let n = node.as_if_node().unwrap();
+                if let Some(s) = n.statements() {
+                    self.walk_stmts(scope, nesting, frag_idx, in_singleton, &s.as_node());
+                }
+                if let Some(s) = n.subsequent() {
+                    self.walk_stmts(scope, nesting, frag_idx, in_singleton, &s);
+                }
+            }
+            Node::UnlessNode { .. } => {
+                let n = node.as_unless_node().unwrap();
+                if let Some(s) = n.statements() {
+                    self.walk_stmts(scope, nesting, frag_idx, in_singleton, &s.as_node());
+                }
+            }
+            Node::ElseNode { .. } => {
+                let n = node.as_else_node().unwrap();
+                if let Some(s) = n.statements() {
+                    self.walk_stmts(scope, nesting, frag_idx, in_singleton, &s.as_node());
+                }
+            }
+            // `begin ... rescue ... else ... ensure ... end` used as a
+            // class-body statement (bead ita-o8l.5), e.g. the corpus site
+            // `activesupport/.../instrumenter.rb`'s two alternative
+            // `def now_cpu` — one in the `begin` arm, one in `rescue`.
+            // Same "conservative: walk every arm" discipline as `if/else`
+            // right above: which arm actually runs is unknowable
+            // statically, so a `def` in ANY of them is indexed.
+            // Suppression-only under invariant #1 — an indexed name can
+            // only turn an existing NotFound diagnostic off, never
+            // fabricate a new one. Shared with `walk_stmts`' own
+            // `as_begin_node` case (a class/module body directly wrapped
+            // in `begin/rescue`) via `walk_begin_arms`, so both shapes
+            // get the same rescue/else/ensure coverage from one place.
+            // The sibling arms above reach for `.unwrap()` after matching,
+            // but those predate the policy ratchet and are frozen by it;
+            // new code takes the `if let` chain instead. Matching the shape
+            // and then unwrapping the accessor is dispatch done twice, and
+            // the second one is the one that can panic.
+            Node::BeginNode { .. } => {
+                if let Some(n) = node.as_begin_node() {
+                    self.walk_begin_arms(scope, nesting, frag_idx, in_singleton, &n);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn method_def(&mut self, def: &ruby_prism::DefNode<'_>) -> MethodDef {
+        let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+        let name_loc = def.name_loc();
+        let def_loc = def.location();
+
+        let mut md = MethodDef {
+            name,
+            required: 0,
+            optional: 0,
+            rest: false,
+            keywords: Vec::new(),
+            kwrest: false,
+            block: false,
+            sig: None,
+            sorbet_ret: self.pending_sorbet_ret.take(),
+            arity_unknown: false,
+            abstract_stub: false,
+            name_span: (name_loc.start_offset(), name_loc.end_offset()),
+            def_span: (def_loc.start_offset(), def_loc.end_offset()),
+        };
+
+        if let Some(params) = def.parameters() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "a single `def`'s parameter count is bounded by the source file it was parsed from, far below u32::MAX"
+            )]
+            {
+                md.required =
+                    (params.requireds().iter().count() + params.posts().iter().count()) as u32;
+                md.optional = params.optionals().iter().count() as u32;
+            }
+            md.rest = params.rest().is_some()
+                // `def foo(...)` (Ruby 3.0 forwarding, ita-7g9): prism
+                // parses `...` as the params' `keyword_rest` field holding
+                // a `ForwardingParameterNode`, not `rest`. Forwarding
+                // relays whatever positional/keyword/block args the
+                // caller passes, so it models the same "no cap" arity as
+                // a bare `*args` — treat it as rest for `check_arity`
+                // (crates/itaruby_semantic/src/check.rs), which already
+                // skips both the min and max check when `rest` is true.
+                || params
+                    .keyword_rest()
+                    .is_some_and(|kr| kr.as_forwarding_parameter_node().is_some());
+            for kw in &params.keywords() {
+                if let Some(k) = kw.as_required_keyword_parameter_node() {
+                    md.keywords.push((
+                        String::from_utf8_lossy(k.name().as_slice()).into_owned(),
+                        true,
+                    ));
+                } else if let Some(k) = kw.as_optional_keyword_parameter_node() {
+                    md.keywords.push((
+                        String::from_utf8_lossy(k.name().as_slice()).into_owned(),
+                        false,
+                    ));
+                }
+            }
+            md.kwrest = params.keyword_rest().is_some();
+            md.block = params.block().is_some();
+        }
+
+        // `#:` sig on the line right above the def.
+        let (def_line, _) = self.line_index.line_col(self.text, def_loc.start_offset());
+        if def_line > 0 {
+            if let Some(&(cstart, cend)) = self.sig_comments.get(&(def_line - 1)) {
+                let body = self.text[cstart..cend].trim_start_matches("#:").trim();
+                match parse_rbs_comment(body) {
+                    Ok(sig) => md.sig = Some(sig),
+                    Err(e) => self.sig_errors.push((cstart, cend, e)),
+                }
+            }
+        }
+        md
+    }
+}
+
+fn span_of(node: &Node<'_>) -> (usize, usize) {
+    let loc = node.location();
+    (loc.start_offset(), loc.end_offset())
+}
+
+/// True for a `def`, or for a bare `sig { ... }` call — the two shapes
+/// `walk_stmts`' adjacency check (bead ita-uh1) never clears
+/// `pending_sorbet_ret` for. Deliberately loose about whether the `sig`
+/// call's block is actually a recognized return-type shape: even an
+/// unrecognized `sig` still legitimately precedes the `def` it types
+/// (with `sorbet_ret` staying `None`), so it must not be treated as an
+/// unrelated statement that breaks adjacency.
+fn is_sig_call_or_def(node: &Node<'_>) -> bool {
+    node.as_def_node().is_some()
+        || node.as_call_node().is_some_and(|c| {
+            c.name().as_slice() == b"sig" && c.receiver().is_none() && c.block().is_some()
+        })
+}
+
+/// Shared block-unwrapping for a `sig { ... }` call: the block's single
+/// statement, or `None` for a call with no block, a block whose body
+/// isn't exactly one statement, or an empty block. Factored out so
+/// `extract_sig_return` (the `.returns(X)` text extractor) and
+/// `sig_block_is_recognized` (bead ita-4xy's open-class carve-out) share
+/// one shape check instead of two.
+fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
+    let block = call.block()?.as_block_node()?;
+    let body = block.body()?;
+    match body.as_statements_node() {
+        Some(stmts) => {
+            let mut iter = stmts.body().iter();
+            let first = iter.next()?;
+            if iter.next().is_some() {
+                return None;
+            }
+            Some(first)
+        }
+        None => Some(body),
+    }
+}
+
+/// Raw text of a `sig { ... }` call's `.returns(...)` argument (bead
+/// ita-uh1). Recognizes exactly the shapes Tapioca actually emits in
+/// gem RBIs: `sig { returns(X) }`, `sig { void }`, `sig {
+/// params(...).returns(X) }`, `sig { params(...).void }`, and any of
+/// those with a leading `override.`/`abstract.` (`sig(:final)`'s own
+/// argument is irrelevant here — only the block body matters). The block
+/// body must be exactly one statement whose OUTERMOST call is `returns`
+/// with exactly one positional argument; `void`, more than one
+/// statement, more than one `returns` argument, or any other shape all
+/// return `None` — never a guess, matching every other `None` this
+/// walker produces.
+fn extract_sig_return(text: &str, call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    let stmt = sig_block_stmt(call)?;
+    let outer = stmt.as_call_node()?;
+    if outer.name().as_slice() != b"returns" {
+        return None;
+    }
+    let args = outer.arguments()?;
+    let mut arg_iter = args.arguments().iter();
+    let arg = arg_iter.next()?;
+    if arg_iter.next().is_some() {
+        return None;
+    }
+    let (s, e) = span_of(&arg);
+    Some(text[s..e].trim().to_string())
+}
+
+/// Bead ita-4xy: does `call`'s block classify as a RECOGNIZED sig shape
+/// — same `sig_block_stmt` shape check `extract_sig_return` uses, outer
+/// call named `returns` (exactly one positional argument, exactly like
+/// `extract_sig_return` requires before it slices the text) OR bare
+/// `void` (zero return-type text to consume, but still a real,
+/// classified sig — see `extract_sig_return`'s own doc comment: `void`
+/// legitimately returns `None` there without being "unrecognized").
+/// `false` for anything `extract_sig_return` would also refuse to guess
+/// at: multi-statement block, no block at all, or an outermost call
+/// that's neither `returns` nor `void`. The `Node::CallNode` arm above
+/// is the only caller — this decides whether the class-body `sig` call
+/// opens the class, never anything about the type it maps to.
+fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
+        return false;
+    };
+    match outer.name().as_slice() {
+        b"returns" => outer.arguments().is_some_and(|args| {
+            let mut iter = args.arguments().iter();
+            iter.next().is_some() && iter.next().is_none()
+        }),
+        b"void" => true,
+        _ => false,
+    }
+}
+
+fn join_path(scope: &str, name: &str) -> String {
+    if scope.is_empty() || name.starts_with("::") {
+        name.trim_start_matches("::").to_string()
+    } else {
+        format!("{scope}::{name}")
+    }
+}
+
+/// Bead ita-47y: `target` (an alias's chased leaf text, possibly itself
+/// RBI-only) followed by every remaining `::`-segment an original
+/// reference still carries past the segment that alias replaced. See
+/// `ProjectIndex::expand_unresolved_alias_target`'s doc comment.
+fn join_remaining<'a>(target: &str, rest: impl Iterator<Item = &'a str>) -> String {
+    let rest: Vec<&str> = rest.collect();
+    if rest.is_empty() {
+        target.to_string()
+    } else {
+        format!("{target}::{}", rest.join("::"))
+    }
+}
+
+/// Literal constant path (`Foo`, `Foo::Bar`, `::Foo`) as a string; None for
+/// dynamic expressions.
+pub fn const_path_str(node: &Node<'_>) -> Option<String> {
+    if let Some(c) = node.as_constant_read_node() {
+        return Some(String::from_utf8_lossy(c.name().as_slice()).into_owned());
+    }
+    if let Some(c) = node.as_constant_path_node() {
+        let name = c.name()?;
+        let name = String::from_utf8_lossy(name.as_slice()).into_owned();
+        return match c.parent() {
+            Some(parent) => {
+                let prefix = const_path_str(&parent)?;
+                Some(format!("{prefix}::{name}"))
+            }
+            None => Some(format!("::{name}")), // `::Foo` — cbase
+        };
+    }
+    None
+}
+
+/// Is `recv.method_name` a method-injection call on a core class/mixin
+/// (bead ita-2ve)? `String.prepend(M)`, `Kernel.class_eval { def ... }`,
+/// `Hash.send(:define_method, :x)` — each can add instance methods to a
+/// core class without creating any fragment, which `by_path` alone can
+/// never see. Only constant receivers naming a core namespace count:
+/// `Foo.prepend(M)` patches a project class (visible as a fragment), and
+/// a dynamic receiver can't be named at all — both stay exactly as v0.
+fn core_injection_call(recv: &Node<'_>, name: &[u8]) -> bool {
+    const INJECTIONS: &[&str] = &[
+        "include",
+        "extend",
+        "prepend",
+        "class_eval",
+        "module_eval",
+        "instance_eval",
+        "class_exec",
+        "module_exec",
+        "instance_exec",
+        "send",
+        "public_send",
+        "__send__",
+        "define_method",
+        "define_singleton_method",
+        "alias_method",
+        "attr_accessor",
+        "attr_reader",
+        "attr_writer",
+    ];
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    INJECTIONS.contains(&name)
+        && const_path_str(recv).is_some_and(|p| {
+            p.rsplit("::")
+                .next()
+                .is_some_and(crate::core::is_core_namespace)
+        })
+}
+
+/// Literal method name from a `define_method` first argument: a symbol or
+/// plain string literal names the method being defined at compile time
+/// (bead ita-53y); a variable, interpolation, or call is dynamic and
+/// unknowable.
+pub fn literal_method_name(node: &Node<'_>) -> Option<String> {
+    if let Some(s) = node.as_symbol_node() {
+        return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+    }
+    if let Some(s) = node.as_string_node() {
+        return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Global index
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MethodSig {
+    pub required: u32,
+    pub optional: u32,
+    pub rest: bool,
+    pub keywords: Vec<(String, bool)>,
+    pub kwrest: bool,
+    pub sig: Option<RbsSig>,
+    /// Bead ita-4xy: raw text of a preceding sorbet `sig { ... }`'s
+    /// `.returns(...)` argument, copied verbatim from `MethodDef::sorbet_ret`
+    /// (see that field's doc comment — same text, same "arity never reads
+    /// this" rule). `None` for `#:` RBS methods, `.void` sigs, and plain
+    /// unsigned defs alike; `method_return` in `check.rs` only consults it
+    /// when body inference itself lands on `Ty::Unknown`.
+    pub sorbet_ret: Option<String>,
+    pub arity_unknown: bool,
+    /// Copied from `MethodDef::abstract_stub`: the def body raises
+    /// `NotImplementedError`. `check.rs` skips arity on a shadowed stub —
+    /// any family member redefining the name supplies the signature that
+    /// actually runs.
+    pub abstract_stub: bool,
+    /// Where the method is defined, for cross-file return inference.
+    pub file: SourceFile,
+    pub def_span: (usize, usize),
+    /// Span of just the method name identifier, for go-to-definition.
+    pub name_span: (usize, usize),
+    /// Set only for setter methods synthesized from `db/schema.rb` (bead
+    /// ita-yho): the column's raw declared type name (`"integer"`,
+    /// `"date"`, ...), used by the permissive E0106 literal-cast check in
+    /// `check.rs`. `None` for every ordinary method, including schema
+    /// attribute readers (their type already flows through `sig`).
+    pub schema_col_type: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassDef {
+    pub path: String,
+    /// Real lexical `Module.nesting` chain for this class (bead ita-519,
+    /// see `ClassFragment::nesting`) — first fragment merged wins, same
+    /// "first wins" rule as `superclass` below. Empty only for a class
+    /// never seen with a real project/declared fragment (superclass and
+    /// includes/prepends are then necessarily empty too, so nothing ever
+    /// tries to resolve through an empty chain).
+    pub nesting: Vec<String>,
+    pub is_module: bool,
+    pub open: bool,
+    /// Why `open` is set (bead ita-anc); `None` while closed. First-reason-wins
+    /// across every fragment/declaration merged into this class.
+    pub open_reason: Option<OpenReason>,
+    pub superclass: Option<String>,
+    pub includes: Vec<String>,
+    pub prepends: Vec<String>,
+    pub extends: Vec<String>,
+    pub methods: FxHashMap<String, MethodSig>,
+    pub singleton_methods: FxHashMap<String, MethodSig>,
+    pub consts: Vec<String>,
+    /// Table this class maps to, if it looks like an `ActiveRecord` model.
+    pub table_name: Option<TableNameDecl>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct ProjectIndex {
+    pub classes: Vec<ClassDef>,
+    pub by_path: FxHashMap<String, ClassId>,
+    /// Any checked file monkeypatched a core class without a fragment
+    /// (bead ita-2ve): the closed-world conclusive core lookup stands
+    /// down for the whole run. Absent/unset keeps v0 behavior.
+    pub core_mixin: bool,
+    /// Every class name any checked file refines (`refine Integer do`),
+    /// merged across the project, alias-resolved, and independent of
+    /// `using`'s lexical scope — see `FileDefs::refine_targets` and
+    /// `resolve_refined_core`.
+    pub refined_core: FxHashSet<String>,
+    /// Staging for `refined_core`: raw targets plus the nesting they
+    /// were written in, resolved through constant aliases once every
+    /// file is merged (`resolve_refined_core`), the same two-phase shape
+    /// `dynamic_mixin_raw` uses.
+    refine_raw: Vec<(String, Vec<String>)>,
+    /// Any checked file refined a target that could not be named — see
+    /// `FileDefs::refined_unknown`.
+    pub refined_unknown: bool,
+    /// Every class name any checked file hands an unreadable eval body
+    /// (`Integer.class_eval("def +(o) = 'x'")`), merged across the
+    /// project and alias-resolved — see `FileDefs::eval_targets` and
+    /// `resolve_eval_polluted_core`.
+    pub eval_polluted_core: FxHashSet<String>,
+    /// Staging for `eval_polluted_core`, the same two-phase shape
+    /// `refine_raw` uses.
+    eval_raw: Vec<(String, Vec<String>)>,
+    /// Any checked file evaled a body into a target it could not name —
+    /// see `FileDefs::eval_unknown`.
+    pub eval_polluted_unknown: bool,
+    /// Name-keyed pollution, the E0108 half of the same question: class
+    /// name -> every method name some source can have added to it. Read
+    /// only by `Checker::core_ops_unpolluted`; the blanket fields above
+    /// still answer the closed-world core lookup, byte-identically.
+    pub polluted_methods: FxHashMap<String, FxHashSet<String>>,
+    /// Class names that got a source whose names could not be read (a
+    /// string eval, a class-body block, an unresolvable module): any
+    /// method name, this class only.
+    pub polluted_opaque: FxHashSet<String>,
+    /// Method names some source added to a class this project cannot
+    /// name (`klass.class_eval { def zz; end }`): those names, every
+    /// class. Bounded by the names — the blanket case is
+    /// `polluted_unknown`.
+    pub polluted_any_class: FxHashSet<String>,
+    /// A source that could define ANY name on ANY class — a bare
+    /// `eval(<string>)`, or an unreadable body on an unnamable receiver.
+    /// Every core class stands down for every name, which is exactly
+    /// today's project-wide behavior.
+    pub polluted_unknown: bool,
+    /// Staging for the four fields above, the same two-phase shape
+    /// `refine_raw` uses: module references and constant aliases can
+    /// only be chased once every file is merged
+    /// (`resolve_keyed_pollution`).
+    keyed_raw: Vec<(Option<String>, Vec<String>, PollutionSource)>,
+    /// Direct subclasses, keyed by parent. Built once at the end of
+    /// `project_index`, after every merge, so any `superclass` name that
+    /// can resolve does. Exists because a self-send dispatches on the
+    /// RUNTIME class: a method missing from a subclassed class may be
+    /// supplied by a descendant, and claiming `NotFound` there is a false
+    /// positive (see `descendant_defines`).
+    pub subclasses: FxHashMap<ClassId, Vec<ClassId>>,
+    /// Distinct literal `require '<lib>'` targets across every project
+    /// file (W3 require/autoload). Ruby's `require` is process-global, so
+    /// the stdlib gate consults this project-wide set, never per-file:
+    /// a lib required in one file defines its constants for every file.
+    pub requires: FxHashSet<String>,
+    /// Reverse index: method name -> every project class whose OWN
+    /// fragment declares it as an instance method (bead ita-dqo). Built
+    /// once, at the end of `project_index` (`build_methods_by_name`,
+    /// same "index once, query O(definers) later" pattern as
+    /// `subclasses`/`build_subclass_map`) — never a scan of every class
+    /// per call site (bead ita-9p9's standing lesson). A hit here is
+    /// NOT yet a trustworthy candidate: `closed_candidates_for` filters
+    /// by ancestry closedness at query time.
+    pub methods_by_name: FxHashMap<String, Vec<ClassId>>,
+    /// Bare constant names written at true file toplevel (`FOO = ...`
+    /// outside every class/module — bead ita-exc defect B), plus the
+    /// full `Owner::Name` spelling of a qualified write (`A::B = ...`)
+    /// whose owner never resolved to a real project class (see
+    /// `resolve_qualified_const_writes`). `DefWalker`'s
+    /// `ConstantWriteNode` arm otherwise fed ONLY the resolution-inert
+    /// `FileDefs::consts`/`project_consts` map (documented "never
+    /// resolution") when `frag_idx` was `None` — and `const_exists`'s
+    /// own bare-name widening loop structurally never reaches an empty
+    /// lexical scope (`if !walked.is_empty()` guards every iteration),
+    /// so a top-level constant was invisible to resolution however it
+    /// was referenced. Consulted only from `const_exists`, only as the
+    /// TERMINAL fallback after every lexical/ancestor check already
+    /// missed: a hit here only suppresses E0104, exactly like
+    /// `stdlib_declares` (invariant #1) — `resolve_const` itself never
+    /// consults this and stays lexical-only.
+    pub toplevel_consts: FxHashSet<String>,
+    /// Bead ita-54k: constant-alias write sites (`X = Y`, or qualified
+    /// `A::B = C::D`) whose RHS is ITSELF a literal constant path — full
+    /// LHS path as written -> (lexical nesting at the WRITE site, RHS
+    /// path as written). Resolved exactly like `resolve_const`'s own
+    /// candidates (`find_const_alias`), but the RHS resolves in the
+    /// ALIAS's OWN scope, not the reference site's — matching real Ruby,
+    /// where the assignment's right-hand side is evaluated once, at
+    /// definition time. First write wins (`entry(...).or_insert_with`),
+    /// mirroring every other merge-time map here. Consulted ONLY from
+    /// `const_exists` (`resolve_const_via_alias`), strictly suppression-
+    /// only: `resolve_const` itself never chases an alias (see its own
+    /// doc comment — widening it could manufacture a false E0101/E0102/
+    /// E0103, invariant #1).
+    pub const_aliases: FxHashMap<String, (Vec<String>, String)>,
+    /// Bead ita-o8l.1: raw `(track, name, nesting)` entries collected
+    /// from every merged file's `FileDefs::dynamic_mixin_targets`, not
+    /// yet resolved to a `ClassId` — resolution needs the FULL merged
+    /// `by_path` (project fragments + curated `declarations/gems.rbi` +
+    /// `Gemfile.lock` namespace reopenings), so it happens exactly once,
+    /// last, in `resolve_dynamic_mixin_targets`, mirroring
+    /// `resolve_qualified_const_writes`'s own "resolve last" discipline.
+    /// Emptied (`std::mem::take`) by that pass; never read after
+    /// `project_index` returns.
+    dynamic_mixin_raw: Vec<(MixinTrack, String, Vec<String>)>,
+    /// Bead ita-o8l.1: resolved, deduplicated modules the project mixes
+    /// in through a dynamic (non-const, non-self) receiver, split by
+    /// track (`MixinTrack`) exactly like `lookup_method`/
+    /// `lookup_singleton` themselves split instance vs. singleton
+    /// dispatch. Consulted ONLY by `dynamic_mixin_covers`, itself called
+    /// ONLY from `soften_not_found` — i.e. only after
+    /// `lookup_method`/`lookup_singleton` already committed to
+    /// `NotFound` on their own. See `dynamic_mixin_covers`'s doc comment
+    /// for the exact suppression rule and why it replaces bead ita-a8z's
+    /// rejected `Global`/`BuilderName` candidates.
+    pub dynamic_mixin_instance_targets: Vec<ClassId>,
+    pub dynamic_mixin_singleton_targets: Vec<ClassId>,
+}
+
+/// Merge all files' `file_defs` into the global class table.
+#[salsa::tracked]
+pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
+    let mut index = ProjectIndex::default();
+    let mut qualified_writes: Vec<(String, String)> = Vec::new();
+    if let Some(project) = ProjectFiles::try_get(db) {
+        for &file in project.files(db) {
+            merge_file_fragments(db, file, &mut index, &mut qualified_writes);
+        }
+        merge_schema_declarations(db, project, &mut index);
+    }
+    // bead ita-3gs: curated external gem declarations, embedded in the
+    // binary — merged last, and only into names the project itself never
+    // defined (see `merge_declared_fragment`), so `ita check`/`ita
+    // server`/every test see the exact same curated set with zero extra
+    // wiring, and real project code always wins over a declaration.
+    for frag in &crate::declarations::declared_fragments() {
+        merge_declared_fragment(&mut index, frag);
+    }
+    // Bead ita-547: generalizes mechanism B (bead ita-h6l) past the
+    // curated set above — a gem this project's own `Gemfile.lock` names
+    // (`discovery.rs`'s `GemfileLockNamespaces`, read once per process,
+    // never per class here) forces open every class the project itself
+    // already reopens under that gem's guessed top-level namespace. See
+    // `apply_gem_reopenings`'s doc comment for the fail-closed contract.
+    if let Some(gem_ns) = crate::discovery::GemfileLockNamespaces::try_get(db) {
+        apply_gem_reopenings(&mut index, gem_ns.namespaces(db));
+    }
+    // Bead ita-c8h: generalizes past `apply_gem_reopenings` itself — a
+    // reopening under a namespace no project file ever wrapped bare stays
+    // open even when no `Gemfile.lock` gem's guessed name happens to
+    // match. See `apply_undeclared_namespace_reopenings`'s doc comment.
+    apply_undeclared_namespace_reopenings(&mut index);
+    // bead ita-vto (client-project `sorbet/rbi`) is deliberately NOT
+    // merged here: 2.3M lines across ~1900 files at the reference corpus
+    // can never be parsed eagerly on every `project_index` recompute. It
+    // is instead resolved on demand, one constant at a time, from
+    // `check.rs`'s own constant-resolution walk — see
+    // `ProjectIndex::resolve_or_load_rbi`.
+    // Bead ita-exc defect B: resolved last, after every real project
+    // fragment AND every curated external declaration is merged, so an
+    // owner name resolves against the full index rather than whatever
+    // subset had been merged when its file was walked.
+    resolve_qualified_const_writes(&mut index, qualified_writes);
+    // Bead ita-o8l.1: resolve every raw dynamic-mixin target collected
+    // above into a real `ClassId`, once, now that every project
+    // fragment, curated declaration, and gem-reopening pass has already
+    // run — see `resolve_dynamic_mixin_targets`'s doc comment. Replaces
+    // bead ita-a8z's env-gated `apply_a8z_candidate` (deleted): this
+    // pass always runs and never opens a class, only ever feeding
+    // `soften_not_found`'s NotFound->Inconclusive softening.
+    resolve_dynamic_mixin_targets(&mut index);
+    resolve_refined_core(&mut index);
+    resolve_eval_polluted_core(&mut index);
+    // Name-keyed pollution resolves LAST of the three: it is the only
+    // one that reads other classes' method sets (`Module(...)`), so
+    // every fragment, declaration and gem-reopening pass must already
+    // have landed.
+    resolve_keyed_pollution(&mut index);
+    build_subclass_map(&mut index);
+    build_methods_by_name(&mut index);
+    index
+}
+
+/// Qualified value-constant name -> where it's assigned (w12 closure):
+/// feeds ONLY E0104's did-you-mean/defined-at payload — never resolution,
+/// which keeps running through `ProjectIndex::const_exists`, so WHEN
+/// E0104 fires is byte-identical to before this map existed. First
+/// assignment wins, mirroring `merge_declared_fragment`. Deliberately
+/// NOT a `ProjectIndex` field: `project_index`'s return is cloned once
+/// per checked file, and a project's constant writes (1000+ at the
+/// reference corpus) would ride along on every one of them; an
+/// `Arc`-returning query of its own keeps that clone a refcount bump,
+/// paid only by the suggestion path that reads it.
+type ConstDefSites = HashMap<String, (SourceFile, (usize, usize))>;
+
+#[salsa::tracked]
+pub fn project_consts(
+    db: &dyn salsa::Database,
+) -> std::sync::Arc<ConstDefSites> {
+    let mut out: ConstDefSites = HashMap::new();
+    if let Some(project) = ProjectFiles::try_get(db) {
+        for &file in project.files(db) {
+            for (name, start, end) in &file_defs(db, file).consts {
+                out.entry(name.clone()).or_insert((file, (*start, *end)));
+            }
+        }
+    }
+    std::sync::Arc::new(out)
+}
+
+/// Reverse the `superclass` edges once, at the end of indexing. O(n)
+/// resolves here rather than a scan of every class on each miss — the
+/// naive version would run on the E0101 candidate path, which is hot
+/// (bead ita-9p9 is the standing reminder of what that costs).
+fn build_subclass_map(index: &mut ProjectIndex) {
+    let edges: Vec<(ClassId, ClassId)> = (0..index.classes.len())
+        .filter_map(|i| {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "class-table index bounded by `index.classes.len()`, far below u32::MAX for any real Ruby project"
+            )]
+            let child = ClassId(i as u32);
+            let class = &index.classes[i];
+            let sup = class.superclass.as_deref()?;
+            let parent = index.resolve_superclass_const(child, &class.nesting, sup)?;
+            (parent != child).then_some((parent, child))
+        })
+        .collect();
+    for (parent, child) in edges {
+        index.subclasses.entry(parent).or_default().push(child);
+    }
+}
+
+/// Reverse index of `method name -> every project class whose OWN
+/// fragment declares it` (bead ita-dqo), built once at the end of
+/// `project_index` — same "build the index once, filter it cheaply per
+/// query" shape as `build_subclass_map`. Candidate validity (closed
+/// ancestry) is checked at query time by `closed_candidates_for`, not
+/// here: a class's own ancestry can change independently of which other
+/// classes define the same method name.
+fn build_methods_by_name(index: &mut ProjectIndex) {
+    let mut entries: Vec<(String, ClassId)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        for name in class.methods.keys() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "class-table index bounded by `index.classes.len()`, far below u32::MAX for any real Ruby project"
+            )]
+            entries.push((name.clone(), ClassId(i as u32)));
+        }
+    }
+    for (name, id) in entries {
+        index.methods_by_name.entry(name).or_default().push(id);
+    }
+}
+
+/// One file's `file_defs` merged into the global class table. Split out of
+/// `project_index` to stay under the complexity ceiling (bead ita-3gs added
+fn merge_file_fragments(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    index: &mut ProjectIndex,
+    qualified_writes: &mut Vec<(String, String)>,
+) {
+    let defs = file_defs(db, file);
+    index.core_mixin |= defs.core_mixin;
+    index.refine_raw.extend(defs.refine_targets.iter().cloned());
+    index.refined_unknown |= defs.refined_unknown;
+    index.eval_raw.extend(defs.eval_targets.iter().cloned());
+    index.eval_polluted_unknown |= defs.eval_unknown;
+    index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
+    index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
+    index.requires.extend(defs.requires.iter().cloned());
+    index.toplevel_consts.extend(defs.toplevel_consts.iter().cloned());
+    qualified_writes.extend(defs.qualified_writes.iter().cloned());
+    // Bead ita-54k: first write wins, mirroring `toplevel_consts`/`by_path`.
+    for (name, write_nesting, target) in &defs.const_aliases {
+        index
+            .const_aliases
+            .entry(name.clone())
+            .or_insert_with(|| (write_nesting.clone(), target.clone()));
+    }
+    for frag in &defs.fragments {
+        let id = index.intern(&frag.path);
+        let class = &mut index.classes[id.0 as usize];
+        class.is_module |= frag.is_module;
+        class.open |= frag.open;
+        // Same precedence as `open_class`: a non-AbstractRaise reason
+        // always beats an existing AbstractRaise (2026-09-03, measured).
+        if class.open_reason.is_none()
+            || (class.open_reason == Some(OpenReason::AbstractRaise)
+                && frag.open_reason.is_some_and(|r| r != OpenReason::AbstractRaise))
+        {
+            class.open_reason = frag.open_reason;
+        }
+        if class.nesting.is_empty() {
+            class.nesting.clone_from(&frag.nesting);
+        }
+        if class.superclass.is_none() {
+            class.superclass.clone_from(&frag.superclass);
+        }
+        if class.table_name.is_none() {
+            class.table_name.clone_from(&frag.table_name);
+        }
+        class.includes.extend(frag.includes.iter().cloned());
+        class.prepends.extend(frag.prepends.iter().cloned());
+        class.extends.extend(frag.extends.iter().cloned());
+        class.consts.extend(frag.consts.iter().cloned());
+        for md in &frag.methods {
+            class.methods.insert(md.name.clone(), method_sig(md, file));
+        }
+        for md in &frag.singleton_methods {
+            class
+                .singleton_methods
+                .insert(md.name.clone(), method_sig(md, file));
+        }
+    }
+}
+
+/// Bead ita-exc defect B: resolve every constant PATH write (`A::B =
+/// value`) harvested by `DefWalker`'s `ConstantPathWriteNode` arm once
+/// every file's fragments (and every curated external declaration) are
+/// already in `index` — so `owner` resolves against the FULL project,
+/// never just whichever files happened to merge before this one. A
+/// literal owner that resolves lands `simple` directly on that class's
+/// own `consts` bucket — the exact bucket `const_in_ancestors` already
+/// reads, so no new lookup path is needed. An owner this pass can't
+/// resolve (a namespace the project never declares under that literal
+/// spelling, or one that only resolves via lexical scope rather than
+/// the absolute text as written) falls back to `toplevel_consts`, keyed
+/// by the full written path, so `const_exists`'s qualified branch still
+/// has somewhere to look. Suppression-only: an unresolved owner never
+/// diagnoses anything, it only misses a suppression (invariant #1).
+fn resolve_qualified_const_writes(index: &mut ProjectIndex, writes: Vec<(String, String)>) {
+    for (owner, simple) in writes {
+        match index.by_path.get(&owner) {
+            Some(&id) => index.classes[id.0 as usize].consts.push(simple),
+            None => {
+                index.toplevel_consts.insert(format!("{owner}::{simple}"));
+            }
+        }
+    }
+}
+
+/// `db/schema.rb`/`db/structure.sql` attribute application (beads ita-yho,
+/// ita-muf). Split out of `project_index` to stay under the complexity
+/// ceiling.
+fn merge_schema_declarations(
+    db: &dyn salsa::Database,
+    project: ProjectFiles,
+    index: &mut ProjectIndex,
+) {
+    if let Some(schema_file) = project
+        .files(db)
+        .iter()
+        .copied()
+        .find(|f| is_schema_rb_path(f.path(db)))
+    {
+        let schema = crate::schema::schema_of_file(db, schema_file);
+        crate::schema::apply_schema_attributes(index, schema, schema_file);
+    } else if let Some(sql_project) = crate::StructureSqlProject::try_get(db) {
+        // bead ita-muf: only reached when no `db/schema.rb` was found
+        // above — `schema.rb` always wins when both are wired (see
+        // `StructureSqlProject`'s doc comment).
+        let sql_file = *sql_project.file(db);
+        let schema = crate::structure_sql::structure_sql_of_file(db, sql_file);
+        crate::schema::apply_schema_attributes(index, schema, sql_file);
+    }
+}
+
+/// Merge one curated external declaration (bead ita-3gs, see
+/// `declarations.rs`) into the index. Forces `open = true`
+/// unconditionally — a declared gem namespace resolves the constant and
+/// nothing else: we do not know the real gem's method surface (does it
+/// have `method_missing`? does it get monkeypatched?), so any ancestry
+/// running through one of these must never close (invariant #1). Mirrors
+/// `schema.rs`'s "explicit project code always wins over an external
+/// declaration" rule: if the project itself already defines this exact
+/// path (e.g. a `config/initializers` reopening of `ActiveRecord::Base`),
+/// that real definition's own `open`/methods/ancestry stand untouched —
+/// the declaration only fills a name the project never defined. Methods
+/// are deliberately never merged from a declaration fragment: resolving a
+/// name is all a declaration is allowed to do.
+fn merge_declared_fragment(index: &mut ProjectIndex, frag: &ClassFragment) {
+    if index.by_path.contains_key(&frag.path) {
+        return;
+    }
+    let id = index.intern(&frag.path);
+    let class = &mut index.classes[id.0 as usize];
+    class.is_module = frag.is_module;
+    class.open = true;
+    class.open_reason = Some(OpenReason::DeclaredExternal);
+}
+
+/// Bead ita-547: force open every class the project itself already
+/// interned (a real `class`/`module` node this project wrote — never a
+/// name invented here, unlike `merge_declared_fragment`) whose TOP-LEVEL
+/// path segment matches one of `namespaces` exactly. `namespaces` is
+/// `GemfileLockNamespaces`'s guessed-namespace set (`discovery.rs`'s
+/// `gem_namespace`), read once by the caller — this function never
+/// touches the filesystem or re-derives the set per class.
+///
+/// Top-level match, not exact full-path match like
+/// `is_known_external_class_path`'s curated lists: we only know a gem's
+/// OWN top namespace (`Mail`), never its internal class list (`SMTP`,
+/// `Message`, `Address`, ...) the way the curated `gems.rbi` allowlist
+/// enumerates full paths by hand. Widening from "one exact path" to
+/// "everything under this namespace" only ever produces MORE silence
+/// (invariant #1's accepted false-negative direction: e.g. a project's
+/// own unrelated `Mail::TestHelper` would also go open) — it can never
+/// fabricate a diagnostic, so it stays inside the invariant even though
+/// it is coarser than mechanism B's curated form.
+fn apply_gem_reopenings(index: &mut ProjectIndex, namespaces: &std::collections::HashSet<String>) {
+    if namespaces.is_empty() {
+        return;
+    }
+    let ids: Vec<ClassId> = index
+        .by_path
+        .iter()
+        .filter(|(path, _)| namespaces.contains(path.split("::").next().unwrap_or(path.as_str())))
+        .map(|(_, &id)| id)
+        .collect();
+    for id in ids {
+        let class = &mut index.classes[id.0 as usize];
+        class.open = true;
+        // ReopenedExternal blinds lookups — it beats AbstractRaise
+        // (2026-09-03, same precedence as `open_class`).
+        if class.open_reason.is_none_or(|r| r == OpenReason::AbstractRaise) {
+            class.open_reason = Some(OpenReason::ReopenedExternal);
+        }
+    }
+}
+
+/// Bead ita-c8h: structural fallback for a reopening `apply_gem_reopenings`
+/// cannot see because its own top-level namespace was never (directly OR
+/// transitively) named by a `Gemfile.lock` gem — measured Round-5 audit:
+/// `class Rack::Attack::Request` (mastodon's `config/initializers/
+/// rack_attack.rb`) reopens the `rack-attack` gem's own class, whose REAL
+/// superclass (`Rack::Request`, with `ip`/`path`/`params`) is declared
+/// only inside `rack` — every one of those inherited calls turned into a
+/// false E0101 before this bead. `apply_gem_reopenings` happens to close
+/// that specific gap already (mastodon's lock separately names the `rack`
+/// gem, whose plain-camelize guess `Rack` matches `Rack::Attack::Request`'s
+/// own top segment) — but that coverage is coincidental: nothing requires
+/// a hyphenated gem's implied namespace segment to also be its own
+/// separately-locked gem, and a project with no `Gemfile.lock` at all
+/// (`GemfileLockNamespaces` absent) gets zero coverage from that mechanism.
+///
+/// This generalizes past gem names entirely: a project class/module path
+/// with a `::` in it whose TOP-LEVEL segment was never itself the subject
+/// of ANY `class`/`module` keyword this project wrote (real code, a
+/// `merge_schema_declarations` attribute owner, a curated `gems.rbi`
+/// declaration, or a `GemfileLockNamespaces` guess — anything already
+/// merged into `by_path` by the time this runs) can only be a REOPENING of
+/// a namespace defined elsewhere — the project never declared the
+/// enclosing namespace, so it cannot be the one who closed this class
+/// either. A bare top-level path (no `::`) is untouched: `class Foo`
+/// naming a brand-new project class must keep accusing (invariant #1 — a
+/// project genuinely inventing `Foo` is exactly the case this checker
+/// exists to cover, and it is indistinguishable from a first-time gem
+/// reopening by path shape alone).
+///
+/// Fail-closed by construction, not by a curated list: the ONLY way this
+/// widens past `apply_gem_reopenings` is checking a bare top segment
+/// against `by_path`'s full key set instead of a Gemfile-derived guess —
+/// a false "this namespace is unknown" verdict only ever ADDS silence
+/// (invariant #1's accepted false-negative direction), never fabricates a
+/// diagnostic. Idiomatic Rails-generator style (`module Admin; class
+/// FooController < BaseController; ...; end; end`, one file per
+/// controller) already interns the bare namespace (`Admin`) as its own
+/// fragment the first time ANY file wraps it that way, so a project using
+/// that convention is unaffected — only a namespace NO file ever wraps
+/// bare gets treated as external. Run after `apply_gem_reopenings` (order
+/// does not matter for correctness — both are additive-only and respect
+/// first-reason-wins — but this is the more general, coarser-grained
+/// fallback, so it reads naturally as the last resort).
+fn apply_undeclared_namespace_reopenings(index: &mut ProjectIndex) {
+    let ids: Vec<ClassId> = index
+        .by_path
+        .iter()
+        .filter(|(path, _)| match path.split_once("::") {
+            // A top segment present ONLY because a curated declarations
+            // file names it (`OpenReason::DeclaredExternal`) is not the
+            // project declaring it — bead ita-dpg.1's generated pack put
+            // hundreds of gem namespaces into `by_path`, which would
+            // otherwise silently shrink this fallback for every project
+            // class nested under one of them (caught by
+            // `gem_reopen_lockfile.rs`).
+            Some((top, _rest)) => index.by_path.get(top).is_none_or(|&id| {
+                index.classes[id.0 as usize].open_reason == Some(OpenReason::DeclaredExternal)
+            }),
+            None => false,
+        })
+        .map(|(_, &id)| id)
+        .collect();
+    for id in ids {
+        let class = &mut index.classes[id.0 as usize];
+        class.open = true;
+        // ReopenedExternal blinds lookups — it beats AbstractRaise
+        // (2026-09-03, same precedence as `open_class`).
+        if class.open_reason.is_none_or(|r| r == OpenReason::AbstractRaise) {
+            class.open_reason = Some(OpenReason::ReopenedExternal);
+        }
+    }
+}
+
+/// Bead ita-o8l.1: resolve every `(track, name, nesting)` entry
+/// collected project-wide (`ProjectIndex::dynamic_mixin_raw`) into a
+/// `ClassId`, once, after every fragment — real project source, curated
+/// `declarations/gems.rbi`, `Gemfile.lock` namespace reopenings — is
+/// already merged into `by_path`, exactly like
+/// `resolve_qualified_const_writes`'s own "resolve last, against the
+/// full index" discipline (a dynamically-mixed module's OWN definition
+/// commonly lives in a different file than the `include`/`extend`/
+/// `prepend` call site — `Rails::ActionMethods`/`app_base.rb`'s own
+/// canonical example). A name that never resolves anywhere in the
+/// project (a pure-gem module this checker has no fragment for at all)
+/// is simply dropped: a false negative — this checker can't see the
+/// module's methods either way — never treated as a signal to widen
+/// anything else (invariant #1).
+fn resolve_dynamic_mixin_targets(index: &mut ProjectIndex) {
+    for (track, name, nesting) in std::mem::take(&mut index.dynamic_mixin_raw) {
+        if let Some(id) = index.resolve_const(&nesting, &name) {
+            match track {
+                MixinTrack::Instance => index.dynamic_mixin_instance_targets.push(id),
+                MixinTrack::Singleton => index.dynamic_mixin_singleton_targets.push(id),
+            }
+        }
+    }
+    index.dynamic_mixin_instance_targets.sort_unstable();
+    index.dynamic_mixin_instance_targets.dedup();
+    index.dynamic_mixin_singleton_targets.sort_unstable();
+    index.dynamic_mixin_singleton_targets.dedup();
+}
+
+/// Turn every raw refinement target (`ProjectIndex::refine_raw`) into the
+/// class NAMES `Checker::core_class_unpolluted` compares against, once
+/// every file is merged so constant aliases can be chased.
+///
+/// Two names can come out of one target, and both are recorded because
+/// either spelling may be the one a pollution list carries: the target as
+/// written (`refine Integer` -> `Integer`, and a project constant like
+/// `Foo::Bar` -> `Foo::Bar`, which matches no core name and so poisons
+/// nothing), plus — when the target is a constant ALIAS whose chain
+/// leaves the project (`I = Integer`) — the alias's final target text
+/// (`Integer`), via `expand_unresolved_alias_target`. Round-4 review
+/// measured `I = Integer; refine I do def +(o) ... end end` accused on a
+/// program MRI runs clean: the raw spelling `I` matched no core name.
+fn resolve_refined_core(index: &mut ProjectIndex) {
+    for (name, nesting) in std::mem::take(&mut index.refine_raw) {
+        index.refined_core.insert(name.clone());
+        if let Some(expanded) = index.expand_unresolved_alias_target(&nesting, &name) {
+            index.refined_core.insert(expanded.trim_start_matches("::").to_string());
+        }
+    }
+}
+
+/// Turn every raw eval-pollution target (`ProjectIndex::eval_raw`) into
+/// the class NAMES `Checker::core_class_unpolluted` compares against,
+/// once every file is merged so constant aliases can be chased — the same
+/// two-phase shape and the same two recorded spellings as
+/// `resolve_refined_core` above, and for the same measured reason:
+/// `I = Integer; I.class_eval("def +(o) = 'aliased'")` prints
+/// `"aliased"` under MRI, and the raw spelling `I` matches no core name.
+fn resolve_eval_polluted_core(index: &mut ProjectIndex) {
+    for (name, nesting) in std::mem::take(&mut index.eval_raw) {
+        index.eval_polluted_core.insert(name.clone());
+        if let Some(expanded) = index.expand_unresolved_alias_target(&nesting, &name) {
+            index.eval_polluted_core.insert(expanded.trim_start_matches("::").to_string());
+        }
+    }
+}
+
+/// Turn every raw name-keyed source (`ProjectIndex::keyed_raw`) into the
+/// four maps `Checker::core_ops_unpolluted` reads, once every file is
+/// merged: only then can a `Module(...)` reference be resolved to a real
+/// method set, and only then can a constant alias be chased.
+///
+/// Both spellings of a target are recorded, exactly as
+/// `resolve_refined_core` does and for the same measured reason
+/// (`I = Integer; I.class_eval { def +(o) = 'x' }` runs clean under
+/// MRI). Targets that name no core class are dropped here rather than
+/// stored: the map would otherwise carry every project class in the
+/// repository, and E0108 only ever asks about the fourteen core names.
+fn resolve_keyed_pollution(index: &mut ProjectIndex) {
+    for (target, nesting, source) in std::mem::take(&mut index.keyed_raw) {
+        let names: Vec<String> = match &source {
+            PollutionSource::Names(n) => n.clone(),
+            PollutionSource::Opaque => Vec::new(),
+            // An unresolvable module — a gem's, a `DeclaredExternal`
+            // namespace's, or one this project reopens dynamically — can
+            // carry any method at all.
+            PollutionSource::Module(path) => {
+                if let Some(n) = module_method_names(index, &nesting, path) {
+                    n
+                } else {
+                    mark_opaque(index, target.as_ref(), &nesting);
+                    continue;
+                }
+            }
+        };
+        if matches!(source, PollutionSource::Opaque) {
+            mark_opaque(index, target.as_ref(), &nesting);
+            continue;
+        }
+        match target {
+            None => index.polluted_any_class.extend(names),
+            Some(t) => {
+                for spelling in target_spellings(index, &nesting, &t) {
+                    index
+                        .polluted_methods
+                        .entry(spelling)
+                        .or_default()
+                        .extend(names.iter().cloned());
+                }
+            }
+        }
+    }
+    resolve_fragment_pollution(index);
+}
+
+/// The reopening source: every FRAGMENT whose name is a core class, read
+/// off the merged index rather than off any one file's AST.
+///
+/// A second reader over the class BODY was written first and then deleted,
+/// measured: every shape it could see, this pass already sees, because
+/// the walker attributes the same statements to the same fragment — a
+/// `def` and a literal `define_method`/`attr_*`/`alias_method` land in
+/// `methods`, and every shape it cannot read opens the class with a
+/// reason `pollution_is_unreadable` treats as `Opaque`. The mutation
+/// matrix is what settled it: with the body reader removed the whole
+/// suite stayed green (`scripts/operand-types-mutants.sh`, round 6), and
+/// a mechanism no test can distinguish is not a safeguard. Reading the
+/// merged fragment also buys the shape the body reader could NOT see:
+/// a reopening through a constant ALIAS (`I = Integer; class I; def
+/// +(o) = 1; end` prints nothing and exits 0 under MRI), since the file
+/// scan would have had to collect every project class's body to catch
+/// `I`.
+fn resolve_fragment_pollution(index: &mut ProjectIndex) {
+    let mut readable: Vec<(String, Vec<String>)> = Vec::new();
+    let mut opaque: Vec<String> = Vec::new();
+    let mut modules: Vec<(String, String)> = Vec::new();
+    for (id, spelling) in core_fragment_candidates(index) {
+        let class = &index.classes[id.0 as usize];
+        // Not `class.open` — the REASON, measured: every reopening of a
+        // core class is `open` by construction
+        // (`OpenReason::ReopenedExternal`, because the class is defined
+        // outside the project), which read as "unreadable" silenced even
+        // `class Integer; def zz; end`. `open` answers "do we know this
+        // class's WHOLE surface"; pollution asks "do we know what this
+        // project ADDED", and only the reasons `pollution_is_unreadable`
+        // lists are evidence against that.
+        if pollution_is_unreadable(class.open_reason) {
+            opaque.push(spelling);
+            continue;
+        }
+        readable.push((
+            spelling.clone(),
+            class
+                .methods
+                .keys()
+                .chain(class.singleton_methods.keys())
+                .cloned()
+                .collect(),
+        ));
+        for m in class.includes.iter().chain(&class.prepends) {
+            modules.push((spelling.clone(), m.clone()));
+        }
+    }
+    for name in opaque {
+        index.polluted_opaque.insert(name);
+    }
+    for (name, methods) in readable {
+        index.polluted_methods.entry(name).or_default().extend(methods);
+    }
+    for (name, module) in modules {
+        match module_method_names(index, &[], &module) {
+            Some(n) => index.polluted_methods.entry(name).or_default().extend(n),
+            None => {
+                index.polluted_opaque.insert(name);
+            }
+        }
+    }
+}
+
+/// Every fragment that reopens a core class, as `(fragment, the core name
+/// it pollutes)`.
+///
+/// Inverted on purpose: ask the fourteen core names whether the project
+/// reopened them, plus the (few) constant aliases, instead of asking
+/// every fragment in the repository whether it is a core name. The
+/// straightforward direction cost 19% of `check/project_index` (7.19 ms
+/// against a 7.04 ms ceiling, paired against 6.04 ms on the parent
+/// revision in the same window) because `target_spellings` chases an
+/// alias, and an alias chase per project class is a lookup per class.
+fn core_fragment_candidates(index: &ProjectIndex) -> Vec<(ClassId, String)> {
+    let mut out: Vec<(ClassId, String)> = Vec::new();
+    for name in crate::core::core_namespace_names() {
+        if let Some(&id) = index.by_path.get(*name) {
+            out.push((id, (*name).to_string()));
+        }
+    }
+    for alias in index.const_aliases.keys() {
+        let Some(&id) = index.by_path.get(alias) else { continue };
+        for spelling in target_spellings(index, &[], alias) {
+            out.push((id, spelling));
+        }
+    }
+    out
+}
+
+/// Does this `open_reason` mean "the project added methods here that
+/// this checker cannot name"? The name-keyed pollution question, which
+/// is not the closed-world question `open` itself answers.
+///
+/// `Yes` for every shape that runs unreadable code at definition time.
+/// `No` for the reasons that say only "this class lives outside the
+/// project" (`ReopenedExternal`, `DeclaredExternal`, `DynamicSuperclass`)
+/// — those are why a core reopening is open AT ALL, and reading them as
+/// unreadable makes the whole name-keying inert. `MethodMissing` is
+/// `No` on purpose and loses nothing: the method is in the class's own
+/// `methods` map, and `method_missing` is in every key set.
+fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
+    match reason {
+        Some(
+            OpenReason::DynamicMixinReceiver
+            | OpenReason::DynamicMixinArg
+            | OpenReason::DynamicAttrArg
+            | OpenReason::DynamicDefineMethod
+            | OpenReason::DynamicAliasMethod
+            | OpenReason::EvalOrSend
+            | OpenReason::UnknownClassBodyCall
+            | OpenReason::ClassBodyBlock
+            | OpenReason::SingletonClassExpr
+            | OpenReason::AbstractRaise
+            | OpenReason::Unattributed,
+        ) => true,
+        Some(
+            OpenReason::ReopenedExternal
+            | OpenReason::DeclaredExternal
+            | OpenReason::DynamicSuperclass
+            | OpenReason::MethodMissing,
+        )
+        | None => false,
+    }
+}
+
+/// Both recorded spellings of a keyed target, filtered to core names —
+/// see `resolve_keyed_pollution`.
+fn target_spellings(index: &ProjectIndex, nesting: &[String], target: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if crate::core::is_core_namespace(target) {
+        out.push(target.to_string());
+    }
+    // Two chasers, because a REOPENING through an alias resolves in
+    // project after all and `expand_unresolved_alias_target` bails on
+    // exactly that: `I = Integer; class I; def +(o) = 1; end` creates a
+    // fragment named `I`, so the alias has to be read from the alias
+    // table itself. Measured: that program prints nothing and exits 0
+    // under MRI, and it accused until this line existed.
+    let chased = index
+        .expand_unresolved_alias_target(nesting, target)
+        .or_else(|| index.chase_alias_target_text(nesting, target));
+    if let Some(expanded) = chased {
+        let expanded = expanded.trim_start_matches("::").to_string();
+        if crate::core::is_core_namespace(&expanded) && !out.contains(&expanded) {
+            out.push(expanded);
+        }
+    }
+    out
+}
+
+/// Record "this class got a body we cannot read": one class if it can be
+/// named, every class for every name if it cannot.
+fn mark_opaque(index: &mut ProjectIndex, target: Option<&String>, nesting: &[String]) {
+    match target {
+        None => index.polluted_unknown = true,
+        Some(t) => {
+            for spelling in target_spellings(index, nesting, t) {
+                index.polluted_opaque.insert(spelling);
+            }
+        }
+    }
+}
+
+/// Every method name a module reference can inject: its own methods plus
+/// those of the modules it includes, chased to a small depth. `None`
+/// means "unreadable" — the module does not resolve in this project, or
+/// it (or something it includes) is itself an open class, which is the
+/// index's own way of saying "a body nobody showed this checker".
+fn module_method_names(
+    index: &ProjectIndex,
+    nesting: &[String],
+    path: &str,
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    let mut queue = vec![(path.to_string(), 0usize)];
+    let mut seen: Vec<String> = Vec::new();
+    while let Some((name, depth)) = queue.pop() {
+        if depth > 3 {
+            return None;
+        }
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name.clone());
+        let id = index.resolve_const(nesting, &name)?;
+        let class = &index.classes[id.0 as usize];
+        if class.open {
+            return None;
+        }
+        out.extend(class.methods.keys().cloned());
+        out.extend(class.singleton_methods.keys().cloned());
+        for inc in class.includes.iter().chain(&class.prepends) {
+            queue.push((inc.clone(), depth + 1));
+        }
+    }
+    Some(out)
+}
+
+/// Does the client's discovered `sorbet/rbi` genuinely declare `name` as a
+/// class/module fragment — not just a scanner false positive from phase
+/// 1's cheap line scan (bead ita-vto)? Called from `check.rs`'s
+/// `Checker::check_const_ref`, immediately after the project's own index
+/// has already failed to resolve `name`, one constant at a time, exactly
+/// as `check.rs`'s existing walk discovers each one — never a separate
+/// pre-pass over the whole project. Parses, via the same `parse_defs_text`
+/// every project file already uses, only the one file phase 1 pointed at
+/// for this name; `rbi_file_fragments` memoizes that read+parse process-
+/// wide, so the same file is never re-read whether many project files
+/// reference the same constant or the same file declares several distinct
+/// ones a project references separately.
+///
+/// A confirmed match resolves the constant (suppresses E0104) but is
+/// deliberately never interned into `ProjectIndex`, unlike the curated
+/// `gems.rbi` (`merge_declared_fragment`, merged once, unconditionally,
+/// into the small shared index every `project_index` call already
+/// builds): the reference corpus's `sorbet/rbi` names tens of thousands of
+/// distinct constants, and growing the shared, cross-file `ProjectIndex`
+/// once per demanded constant means every one of ~2400 project files
+/// would clone (or otherwise touch) an index sized by however many other
+/// files already triggered a load — exactly the O(files x index size)
+/// cost this bead exists to avoid (measured: cloning `ProjectIndex` once
+/// per checked file, instead of never, turned a ~0.6s check into 25s+).
+/// Every RBI declaration is `open = true` by contract (see
+/// `merge_declared_fragment`'s doc comment) — a class with zero methods
+/// and no known ancestry — so typing its references as `Ty::Unknown`
+/// instead of `Ty::Class`/`Ty::Instance` changes nothing observable:
+/// `Unknown` never diagnoses (invariant #1), exactly like an `open`
+/// class's `Inconclusive` method lookups never do. A spelled reference
+/// that doesn't match a fully-qualified RBI name is simply never found —
+/// a false negative, never a false positive. Bead ita-k9j.3: `rbi_map`
+/// now maps a name to EVERY declaring file, never just one — a stub
+/// reopening and the real declaration are both real at runtime, so the
+/// name resolves the moment ANY candidate file's own fragment carries
+/// the exact qualified path; short-circuits on the first candidate that
+/// resolves, same "per-file question" discipline `resolve_method_node`
+/// uses.
+pub fn rbi_declares<S: std::hash::BuildHasher>(name: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> bool {
+    let name = name.trim_start_matches("::");
+    let Some(paths) = rbi_map_candidates(name, rbi_map) else {
+        return false;
+    };
+    paths
+        .iter()
+        .any(|path| rbi_file_fragments(path).iter().any(|f| f.path == name))
+}
+
+/// Bead ita-y0s: phase 1's line scanner (`rbi.rs::scan_class_name`) trims
+/// leading whitespace, so a `class`/`module` header NESTED inside another
+/// block in a `.rbi` file (`module Origem; module Coisa; ...; end; end`)
+/// registers `rbi_map` under its BARE last simple name ("Coisa"), never
+/// the fully qualified path ("`Origem::Coisa`") phase 2's real prism parse
+/// (`rbi_file_fragments`) computes for that same fragment via genuine
+/// nesting tracking. An exact-key lookup on the full qualified name then
+/// dies before phase 2 is ever consulted, even though phase 2 would have
+/// answered correctly — measured against a real corpus: `Coisa` reopened
+/// under `Origem` in Tapioca's own compact-vs-nested emission is not a
+/// hypothetical shape.
+///
+/// On an exact-key miss, retry under `name`'s bare last `::`-segment —
+/// the map's own worst-case key for that name — and return WHATEVER
+/// candidates that key carries. This only ever WIDENS which files a
+/// caller's own per-file refilter (`f.path == name`, `rbi_declares`'s own
+/// exact match; `f.path == owner`, `rbi_qualified_const_declares`'s) gets
+/// a chance to inspect; it never widens what counts as a match. A bare
+/// name shared by two UNRELATED namespaces in two different `.rbi` files
+/// (`Origem::Coisa` and `Baz::Coisa`, both nested, both keyed under
+/// bare `"Coisa"`) still degrades to a silent miss for whichever one the
+/// query does NOT name: the refilter's exact qualified-path comparison
+/// runs against phase 2's real parse of EVERY candidate, so a homonym
+/// contributes nothing unless its own real fragment path is the exact
+/// name asked for. No fallback at all when `name` already carries no
+/// `::` (nothing coarser than the exact key exists to retry).
+fn rbi_map_candidates<'a, S: std::hash::BuildHasher>(name: &str, rbi_map: &'a HashMap<String, Vec<PathBuf>, S>) -> Option<&'a Vec<PathBuf>> {
+    rbi_map.get(name).or_else(|| {
+        let last = name.rsplit("::").next()?;
+        if last == name {
+            return None;
+        }
+        rbi_map.get(last)
+    })
+}
+
+/// Bead ita-47y (RBI-target extension): does the client's Tapioca/Sorbet
+/// `sorbet/rbi` declare `qualified` — either as a class/module
+/// (`rbi_declares`), or as a plain qualified value-constant write
+/// (`Owner::Simple = T.let(...)`, the shape a `gems/*.rbi` writes with
+/// the FULL path on the LHS, never nested inside the owner's own
+/// class/module body — the real `language_server-protocol` gem's own
+/// enum-member constants) recorded in that RBI file's own
+/// `FileDefs::qualified_writes`, or a plain bare write NESTED inside the
+/// owner's own fragment body (`FileDefs::fragments[_].consts`)?
+/// Consulted only from `Checker::check_const_ref`, only after
+/// `ProjectIndex::expand_unresolved_alias_target` already handed back an
+/// alias's raw target text `resolve_const` could not resolve in-project
+/// (the measured ruby-lsp shape: `Interface =
+/// LanguageServer::Protocol::Interface`, whose real target lives only in
+/// a vendorized `sorbet/rbi/gems/language_server-protocol@*.rbi`, never
+/// as a project `ClassId`). Suppression-only, same contract as every
+/// other RBI channel (`rbi_declares`'s own doc comment): a hit only
+/// silences E0104, never produces a `Ty` (invariant #1) — this project's
+/// `ProjectIndex` is never touched.
+pub fn rbi_qualified_const_declares<S: std::hash::BuildHasher>(qualified: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> bool {
+    let qualified = qualified.trim_start_matches("::");
+    if rbi_declares(qualified, rbi_map) {
+        return true;
+    }
+    let Some((owner, simple)) = qualified.rsplit_once("::") else {
+        return false;
+    };
+    // Bead ita-y0s: same bare-last-segment fallback as `rbi_declares`
+    // (see `rbi_map_candidates`'s doc comment) — `owner` itself can be a
+    // nested `.rbi` module/class phase 1 only ever keyed under its bare
+    // simple name. The per-file refilter right below (`o == owner` /
+    // `f.path == owner`, both exact string comparisons against phase 2's
+    // real parse) is what keeps a bare-name collision a silent miss
+    // rather than a wrong hit — unchanged by this fallback, only fed
+    // more candidate files to run against.
+    let Some(paths) = rbi_map_candidates(owner, rbi_map) else {
+        return false;
+    };
+    paths.iter().any(|path| {
+        let defs = rbi_file_defs(path);
+        defs.qualified_writes.iter().any(|(o, s)| o == owner && s == simple)
+            || defs
+                .fragments
+                .iter()
+                .any(|f| f.path == owner && f.consts.iter().any(|c| c == simple))
+    })
+}
+
+/// Bead ita-4wq: guard against a pathological RBI alias cycle
+/// (`A = B` / `B = A`, both written INSIDE a vendored `.rbi`) — same
+/// role as `ProjectIndex::CONST_ALIAS_CHAIN_CAP` for the project-side
+/// chase, sized the same for the same reason (a real alias chain is one
+/// or two hops; this only guards against a pathological one).
+const RBI_ALIAS_CHAIN_CAP: usize = 32;
+
+/// Bead ita-4wq: is `name` itself the LHS of a qualified const-write
+/// INSIDE a vendored RBI whose RHS parses as a literal constant path —
+/// the real tapioca/ruby-lsp shape `RubyLsp::Constant =
+/// LanguageServer::Protocol::Constant` (a Sorbet RBI re-exporting one
+/// gem's namespace under another, written directly in the `.rbi`, never
+/// in project code)? Every `.rbi` file is parsed by the exact same
+/// `DefWalker` project files are (`rbi_file_defs` -> `parse_defs_text`),
+/// so this data was ALREADY harvested into `FileDefs::const_aliases`
+/// (bead ita-54k) — no consumer had ever read an RBI file's own
+/// `const_aliases` before this bead; every existing alias-chase function
+/// (`ProjectIndex::resolve_const_via_alias`,
+/// `expand_unresolved_alias_target`) only ever walks the PROJECT's
+/// merged `const_aliases`, built exclusively from project files.
+/// `owner`'s own candidate files are found the same bare-nesting-aware
+/// way `rbi_qualified_const_declares` finds them (`rbi_map_candidates`,
+/// bead ita-y0s) — an aliased namespace can itself be nested. `None`
+/// when `name` carries no `::` (a bare LHS is out of this bead's
+/// measured scope — every real tapioca alias shape found so far writes
+/// a fully qualified LHS) or no candidate file's own `const_aliases`
+/// names `name` exactly.
+fn rbi_alias_lookup<S: std::hash::BuildHasher>(name: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> Option<String> {
+    let (owner, _simple) = name.rsplit_once("::")?;
+    let paths = rbi_map_candidates(owner, rbi_map)?;
+    paths.iter().find_map(|path| {
+        rbi_file_defs(path)
+            .const_aliases
+            .iter()
+            .find(|(lhs, ..)| lhs == name)
+            .map(|(_, _, target)| target.clone())
+    })
+}
+
+/// Bead ita-4wq: fully chase an RBI alias chain starting from an ALREADY
+/// CONFIRMED first-hop target (`rbi_alias_lookup`'s return), the same
+/// "keep going until the target is no longer itself an alias" shape
+/// `ProjectIndex::chase_alias_target_text` uses for the project-side
+/// extension — except every hop here is looked up in the RBI's own
+/// `const_aliases`, never the project index. Cycle-guarded
+/// (`RBI_ALIAS_CHAIN_CAP` iterations, `visited` set): a pathological
+/// `A = B` / `B = A` pair written inside one or more `.rbi` files
+/// degrades to `None`, never hangs.
+fn rbi_alias_leaf<S: std::hash::BuildHasher>(first_target: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> Option<String> {
+    let mut cur = first_target.to_string();
+    let mut visited = std::collections::HashSet::new();
+    visited.insert(cur.clone());
+    for _ in 0..RBI_ALIAS_CHAIN_CAP {
+        match rbi_alias_lookup(&cur, rbi_map) {
+            None => return Some(cur), // leaf: no further alias hop past this target
+            Some(next) => {
+                if !visited.insert(next.clone()) {
+                    return None; // cycle
+                }
+                cur = next;
+            }
+        }
+    }
+    None // cap exceeded without terminating
+}
+
+/// Bead ita-4wq: does SOME prefix of `qualified` (from the shortest
+/// two-segment candidate outward to everything but the final segment)
+/// name an RBI-declared alias? If so, return the fully-chased target
+/// TEXT (`rbi_alias_leaf`) with `qualified`'s remaining `::`-segments
+/// re-appended (`join_remaining`, bead ita-47y's own helper) — the
+/// expanded candidate a caller retries against the ordinary RBI channels
+/// (`rbi_declares`/`rbi_qualified_const_declares`). The SHORTEST hit
+/// wins: mirrors left-to-right segment resolution (the earliest point in
+/// the path an alias hop could occur). Suppression-only, same contract
+/// as every other RBI channel: a hit only silences E0104, never produces
+/// a `Ty` (invariant #1) — this project's `ProjectIndex` is never
+/// touched, and an alias target that itself resolves nowhere (in the RBI
+/// OR the project) simply leaves the reference exactly as unresolved as
+/// it was before this bead, never worse.
+pub fn rbi_alias_expand<S: std::hash::BuildHasher>(qualified: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> Option<String> {
+    let qualified = qualified.trim_start_matches("::");
+    let segments: Vec<&str> = qualified.split("::").collect();
+    for i in 1..segments.len() {
+        let owner = segments[..i].join("::");
+        if let Some(first_target) = rbi_alias_lookup(&owner, rbi_map) {
+            let leaf = rbi_alias_leaf(&first_target, rbi_map)?;
+            return Some(join_remaining(&leaf, segments[i..].iter().copied()));
+        }
+    }
+    None
+}
+
+/// Distinct `.rbi` files `rbi_declares` has actually read and parsed so
+/// far in this process — bead ita-vto's acceptance evidence that phase 2
+/// stays lazy (nowhere close to every file `RbiProject`'s phase-1 scan
+/// found).
+pub fn rbi_files_parsed_count() -> usize {
+    rbi_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
+/// Process-wide memo of `path -> parsed fragments`, so the same `.rbi`
+/// file is read and parsed at most once across an entire `ita check` run
+/// no matter how many project files reference constants it declares. A
+/// plain `Mutex`-guarded map rather than a salsa-tracked query:
+/// `RbiProject`'s map is wired once per process and a client's `.rbi` tree
+/// never changes mid-run (LSP's incremental-edit case is out of this
+/// bead's scope — see `AGENTS.md`), so there is nothing here for salsa's
+/// revision tracking to buy; a hand-rolled cache is the plain, correct
+/// choice.
+fn rbi_cache() -> &'static std::sync::Mutex<HashMap<PathBuf, FileDefs>> {
+    use std::sync::{LazyLock, Mutex};
+    static CACHE: LazyLock<Mutex<HashMap<PathBuf, FileDefs>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &CACHE
+}
+
+fn rbi_file_defs(path: &Path) -> FileDefs {
+    let mut guard = rbi_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(defs) = guard.get(path) {
+        return defs.clone();
+    }
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let defs = parse_defs_text(&text);
+    guard.insert(path.to_path_buf(), defs.clone());
+    defs
+}
+
+fn rbi_file_fragments(path: &Path) -> Vec<ClassFragment> {
+    rbi_file_defs(path).fragments
+}
+
+// -- W3 require/autoload: external (RBI) ancestry for constant lookup ----
+
+/// Every constant simple-name reachable from `start`'s external ancestor
+/// closure — the namespaces the project's own index could NOT resolve,
+/// walked through the client's Tapioca RBIs exactly the way Ruby walks
+/// cref ancestors: superclass edges plus `include`/`prepend` edges (`extend`
+/// is deliberately absent — it lands on the singleton, which lexical cref
+/// lookup never consults). At each visited namespace the constants are its
+/// own `CONST = ...` assignments, its direct child namespaces, and the
+/// fully-qualified value assignments Tapioca writes at file toplevel
+/// (`A::B::C = T.let(...)`, harvested as `FileDefs::consts`).
+///
+/// Suppression-only, like every RBI channel (see `rbi_declares`): a hit
+/// silences E0104 and never produces a type, so a wrong edge here can
+/// only cost a warning, never invent a diagnostic (invariant #1).
+/// Memoized per start name — the distinct unresolved-superclass names in
+/// a real project are a handful, and each closure is a few nodes over
+/// one or two already-cached RBI files.
+///
+/// ponytail: closure capped at 48 visited namespaces — the deepest real
+/// gem ancestry (graphql's Object -> Member -> `GraphQLTypeNames`) is 3;
+/// a cap exists only so a pathological cyclic declaration can't spin.
+fn rbi_ancestor_closure<S: std::hash::BuildHasher>(
+    start: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> std::sync::Arc<std::collections::HashSet<String>> {
+    let key = start.trim_start_matches("::").to_string();
+    if let Some(hit) = closure_memo_get(&key) {
+        return hit;
+    }
+    let out = std::sync::Arc::new(compute_rbi_ancestor_closure(&key, rbi_map));
+    closure_memo_put(key, out.clone());
+    out
+}
+
+fn closure_memo(
+) -> &'static std::sync::Mutex<HashMap<String, std::sync::Arc<std::collections::HashSet<String>>>> {
+    use std::sync::{Arc, LazyLock, Mutex};
+    static MEMO: LazyLock<Mutex<HashMap<String, Arc<std::collections::HashSet<String>>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &MEMO
+}
+
+fn closure_memo_get(key: &str) -> Option<std::sync::Arc<std::collections::HashSet<String>>> {
+    closure_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+fn closure_memo_put(key: String, val: std::sync::Arc<std::collections::HashSet<String>>) {
+    closure_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, val);
+}
+
+/// The BFS itself (W3): see `rbi_ancestor_closure`'s doc comment for the
+/// contract and the suppression-only safety argument. Bead ita-k9j.3: a
+/// visited node's constants/edges are the UNION over every file that
+/// declares it, never just one — a stub reopening still contributes
+/// whatever ancestry it names.
+fn compute_rbi_ancestor_closure<S: std::hash::BuildHasher>(
+    start: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> std::collections::HashSet<String> {
+    let mut consts = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut work: Vec<String> = vec![start.to_string()];
+    // ponytail: closure capped at 48 visited namespaces — the deepest real
+    // gem ancestry (graphql's Object -> Member -> GraphQLTypeNames) is 3;
+    // the cap only keeps a pathological cyclic declaration from spinning.
+    while let Some(node) = work.pop() {
+        if visited.contains(&node) || visited.len() >= 48 {
+            continue;
+        }
+        visited.insert(node.clone());
+        let Some(files) = rbi_map.get(&node) else {
+            continue;
+        };
+        for file in files {
+            let defs = rbi_file_defs(file);
+            harvest_rbi_consts(&defs, &node, &mut consts);
+            queue_rbi_edges(&defs, &node, &mut work);
+        }
+    }
+    consts
+}
+
+/// Constants declared ON `node`: its own `CONST = ...` assignments, its
+/// direct child namespaces (`class Node::Child` headers — one level
+/// only, matching Ruby's cref lookup), and Tapioca's toplevel
+/// fully-qualified value writes (`A::B::C = T.let(...)`).
+fn harvest_rbi_consts(defs: &FileDefs, node: &str, consts: &mut std::collections::HashSet<String>) {
+    let prefix = format!("{node}::");
+    for name in defs
+        .fragments
+        .iter()
+        .filter(|f| f.path == node)
+        .flat_map(|f| f.consts.iter().cloned())
+    {
+        consts.insert(name);
+    }
+    let direct: Vec<String> = defs
+        .fragments
+        .iter()
+        .filter_map(|f| direct_child(&f.path, &prefix))
+        .chain(
+            defs.consts
+                .iter()
+                .filter_map(|(q, ..)| direct_child(q, &prefix)),
+        )
+        .collect();
+    consts.extend(direct);
+}
+
+/// `Some(child)` when `path` is exactly `prefix + child` with no deeper
+/// `::` — a one-level-cref name on the prefix's owner.
+fn direct_child(path: &str, prefix: &str) -> Option<String> {
+    let rest = path.strip_prefix(prefix)?;
+    (!rest.contains("::")).then(|| rest.to_string())
+}
+
+/// Ancestry edges out of `node`'s own fragment: the written superclass
+/// and every `include`/`prepend` (`extend` never reaches cref lookup).
+fn queue_rbi_edges(defs: &FileDefs, node: &str, work: &mut Vec<String>) {
+    let Some(frag) = defs.fragments.iter().find(|f| f.path == node) else {
+        return;
+    };
+    if let Some(sc) = &frag.superclass {
+        work.push(sc.trim_start_matches("::").to_string());
+    }
+    for edge in frag.includes.iter().chain(frag.prepends.iter()) {
+        work.push(edge.trim_start_matches("::").to_string());
+    }
+}
+
+/// W3: does `name`, referenced from lexical `scope`, resolve through an
+/// EXTERNAL ancestor — a superclass or mixin the project's own index
+/// could not resolve, but the client's Tapioca RBIs declare (with its
+/// constants and its own ancestry)? This is the `ID`/`Boolean`/`Int`
+/// shape: graphql-ruby apps reference the `GraphQLTypeNames` mixin's
+/// constants from inside `class Types::Query < GraphQL::Schema::Object`,
+/// and the constant is real exactly because the gem's ancestry carries
+/// it — invisible to a project-only index, plain as day in the RBI.
+///
+/// Consulted only from `check.rs::check_const_ref`, only after the
+/// project's own `const_exists` failed and the flat `rbi_declares` (name
+/// as written) missed. Like both, a hit only suppresses E0104 — the
+/// reference still types as `Ty::Unknown`, so no new E0101/E0102/E0103
+/// can appear (invariant #1).
+pub fn rbi_ancestor_declares<S: std::hash::BuildHasher>(
+    index: &ProjectIndex,
+    nesting: &[String],
+    name: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> bool {
+    let (starts, simple) = index.external_lookup_starts(nesting, name);
+    if starts.is_empty() {
+        return false;
+    }
+    starts
+        .iter()
+        .any(|s| rbi_ancestor_closure(s, rbi_map).contains(simple))
+}
+
+/// Instance method names, then SINGLETON method names, that a start
+/// name's RBI ancestry declares — mapped to the RAW `.returns(...)`
+/// source text of the method's `.rbi` sig (bead ita-uh1's
+/// `MethodDef::sorbet_ret`), `None` for a method with no sig. Text, not
+/// `Ty` (bead ita-tjr): the memo below is keyed on the start name alone
+/// and shared by every call site, so it cannot depend on any one call's
+/// `ProjectIndex` — resolving a PROJECT class name inside the sig
+/// (`sig { returns(::Package) }` in a DSL RBI) needs that index, so the
+/// text-to-`Ty` conversion (`sorbet_sig::resolve_ret_ty`) happens at the
+/// lookup call site instead, where the index is in hand. A hit is still
+/// a hit whether or not the text resolves to something other than
+/// `Ty::Unknown` (see `rbi_method_lookup`/`dsl_method_lookup`). The
+/// order is load-bearing: `extend` and `mixes_in_class_methods` move a
+/// module's *instance* methods into the singleton slot (that is how
+/// `Model.where` exists), so swapping the two silently turns every
+/// class-method hit into an instance-method hit. `Arc` because the memo
+/// hands the same maps to many call sites.
+type RbiMethodSets = std::sync::Arc<(HashMap<String, Option<String>>, HashMap<String, Option<String>>)>;
+
+/// One BFS work item: the RBI name to resolve next, which method-
+/// dispatch track it travels on, and — when it names an edge queued
+/// FROM another fragment (`queue_method_edges`) — that parent
+/// fragment's own file and fully-qualified path (bead ita-tjr). The
+/// parent context is what lets `resolve_method_node` try the SAME file
+/// before ever touching the cross-file `rbi_map`; the very first work
+/// item (the walk's `start`) carries `parent: None` and always resolves
+/// through `rbi_map`, exactly as before this field existed.
+struct MethodWorkItem {
+    node: String,
+    on_singleton_track: bool,
+    parent: Option<(PathBuf, String)>,
+}
+
+/// Method-name BFS over the RBI world, keeping instance and singleton
+/// methods in separate maps — but NOT a plain mirror of
+/// `rbi_ancestor_closure`'s constant walk, because method dispatch has an
+/// edge `queue_rbi_edges` doesn't model: `extend`. Four rules, measured
+/// against a real `sorbet/rbi/gems/activerecord@*.rbi` (lead review,
+/// bead ita-xze, 2026-08-21):
+///
+/// 1. `include`/`prepend` of `X` walked from an INSTANCE-track node keeps
+///    walking `X` on the INSTANCE track — `X`'s own `methods` land in
+///    the instance map.
+/// 2. `extend X` from an INSTANCE-track node switches to a
+///    SINGLETON-track walk of `X` — `X`'s `methods` (not
+///    `singleton_methods`) land in the SINGLETON map. This is why
+///    `Model.where` exists at all: `where` is an INSTANCE method of
+///    `ActiveRecord::Querying`, and `ActiveRecord::Base` does
+///    `extend ::ActiveRecord::Querying`.
+/// 3. `mixes_in_class_methods X` (Sorbet's literal rendering of the
+///    `ActiveSupport::Concern` `ClassMethods` idiom) is the same
+///    singleton-track switch as rule 2 — see `ClassFragment`'s doc
+///    comment on the field.
+/// 4. `def self.x` / `class << self` on ANY visited node — instance or
+///    singleton track — lands in the SINGLETON map unconditionally
+///    (`frag.singleton_methods`, harvested at every node regardless of
+///    how it was reached).
+///
+/// Once on the singleton track, only rules 1/4 continue the walk — a
+/// nested `extend`/`mixes_in_class_methods` inside the extended module's
+/// OWN body affects that module's own singleton, never the original
+/// start's, so it is not followed a second time (matches real Ruby:
+/// `extend` pulls in the target's ANCESTOR chain, not the target's own
+/// singleton).
+///
+/// A fifth rule, added for the Tapioca DSL RBIs a client's OWN app
+/// models carry (bead ita-tjr, not gem RBIs): `resolve_method_node`
+/// resolves every edge against the PARENT fragment's own file before
+/// ever touching the global `rbi_map` — a DSL RBI reopens a project
+/// class and, in the SAME file, nests the real module the class
+/// unqualifiedly `include`s (`class Package; include
+/// GeneratedAssociationMethods; end` with `module
+/// Package::GeneratedAssociationMethods` nested later in that same
+/// file). The global map cannot be trusted for these names: phase 1
+/// (`rbi.rs::build_rbi_index`) is a naive per-line scan that records
+/// every `module GeneratedAssociationMethods` header it sees — nested or
+/// not — as a TOP-LEVEL name, first file wins; a real project's
+/// `sorbet/rbi/dsl/` carries that identical generated module name in
+/// every model's own DSL file (~1587 at the measured reference corpus),
+/// so resolving through the global map would silently attribute one
+/// arbitrary model's accessors to every other model.
+///
+/// Name collision within one walk (bead ita-uh1): the FIRST visit wins
+/// — `compute_rbi_method_closure` never overwrites an already-recorded
+/// name — because the walk already runs in MRO order; if two ancestors
+/// disagree on a method's return type, the nearer one is the one that
+/// actually answers at runtime.
+///
+/// Memoized per `start`, exactly like `rbi_ancestor_closure`: the bead
+/// this feeds (ita-xze, extended by ita-uh1, ita-tjr) is consulted once
+/// per `Inconclusive` call site, and the distinct start names in a real
+/// project are a handful (external ancestors) to one-per-model (DSL
+/// starts) shared by many call sites — re-walking the same RBI chain per
+/// call site would be the exact O(files-times-call-sites) reparse cost
+/// `rbi_declares`'s doc comment measures at 25s+ for interning alone;
+/// this reuses `rbi_file_defs`'s own process-wide read+parse cache and
+/// adds a memo on the BFS result itself on top.
+///
+/// The memo is keyed on the START NAME alone, not on which `rbi_map`
+/// supplied it — correct for `ita check` and the LSP, where one process
+/// serves one project, and the reason a single run never re-walks
+/// `ActiveRecord::Base` for each of thousands of models. It does mean two
+/// different RBI trees in ONE process serve each other's cached method
+/// set: harmless in production, but it makes tests fail by run order, so
+/// every test in `rbi_methods.rs`/`dsl_rbi.rs` uses a distinct start
+/// name.
+/// ponytail: key on `(start, rbi tree root)` if a caller ever needs two
+/// projects live in one process.
+fn rbi_method_closure<S: std::hash::BuildHasher>(start: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> RbiMethodSets {
+    let key = start.trim_start_matches("::").to_string();
+    if let Some(hit) = method_closure_memo_get(&key) {
+        return hit;
+    }
+    let out = std::sync::Arc::new(compute_rbi_method_closure(&key, rbi_map));
+    method_closure_memo_put(key, out.clone());
+    out
+}
+
+/// Bead ita-k9j: read-only accessor over `rbi_method_closure`'s BFS
+/// result — instance names, then singleton names, sorted — so
+/// `scripts/gen-activerecord-inventory.rs` can harvest a start name's
+/// real declared API through the EXACT SAME four edge rules
+/// `rbi_escalate`/`lookup_method_rbi` consult at check time (see
+/// `rbi_method_closure`'s doc comment for the four rules), instead of a
+/// second, independently invented RBI walk. Names only: the mapped
+/// `.rbi` sig text this bead's callers don't need is dropped here.
+/// Never called from the check path itself.
+pub fn rbi_method_closure_names<S: std::hash::BuildHasher>(
+    start: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> (Vec<String>, Vec<String>) {
+    let (instance, singleton) = &*rbi_method_closure(start, rbi_map);
+    let mut inst: Vec<String> = instance.keys().cloned().collect();
+    let mut sing: Vec<String> = singleton.keys().cloned().collect();
+    inst.sort();
+    sing.sort();
+    (inst, sing)
+}
+
+fn method_closure_memo() -> &'static std::sync::Mutex<HashMap<String, RbiMethodSets>> {
+    use std::sync::{LazyLock, Mutex};
+    static MEMO: LazyLock<Mutex<HashMap<String, RbiMethodSets>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+    &MEMO
+}
+
+fn method_closure_memo_get(key: &str) -> Option<RbiMethodSets> {
+    method_closure_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .cloned()
+}
+
+fn method_closure_memo_put(key: String, val: RbiMethodSets) {
+    method_closure_memo()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(key, val);
+}
+
+/// Cap on distinct `(node, track)` pairs visited by `compute_rbi_method_closure`.
+/// A pure anti-cycle guard, NOT a depth budget: `rbi_ancestor_closure`'s
+/// 48 was sized for the deepest real CONSTANT chain (3 hops); method
+/// dispatch through a framework base class is a different shape entirely
+/// — `sorbet/rbi/gems/activerecord@*.rbi`'s `ActiveRecord::Base` alone
+/// carries 123 direct `include`/`extend` edges (lead review, bead
+/// ita-xze, 2026-08-21), several of which (e.g.
+/// `ActiveRecord::AttributeMethods`) recurse into a dozen more. A cap
+/// tuned to that shape has to clear low thousands of nodes; 48 would
+/// truncate the walk long before it ever reached the methods that make
+/// this bead worth doing, turning a measured win into a false near-zero.
+/// Do not shrink this back toward `rbi_ancestor_closure`'s constant.
+const RBI_METHOD_CLOSURE_CAP: usize = 4096;
+
+/// Resolve one BFS work item to the fully-qualified fragment path it
+/// actually names, PLUS every file that contributes to it (bead
+/// ita-tjr, extended to a union by bead ita-k9j.3). Three tries, in
+/// order, and the order is load-bearing (see `rbi_method_closure`'s doc
+/// comment for the measured collision this exists to avoid):
+///
+/// (a) the edge text itself, as an exact fragment path already present
+///     in the PARENT's own file (an ordinary un-nested reopening the
+///     same file also happens to declare under this literal name);
+/// (b) `<parent path>::<edge text>` in the parent's own file — the
+///     nested Tapioca DSL shape (`Package::GeneratedAssociationMethods`
+///     nested inside `class Package`, `include`d unqualified);
+/// (c) the global `rbi_map`, exactly the only path that existed before
+///     this bead — correct and sufficient for ordinary gem RBIs, one
+///     class per file, no nesting.
+///
+/// (a) and (b) are PER-FILE questions answered against the ONE parent
+/// file this work item actually carries — a stub reopening never
+/// changes that: each candidate file a walk visits pushes its OWN
+/// edges with itself as parent (see `compute_rbi_method_closure`), so
+/// a downstream edge's (a)/(b) trial is always scoped to the single
+/// file it came from, never blended across candidates. Only (c), the
+/// last-resort global map, can name several files at once (bead
+/// ita-k9j.3: a stub reopening and the real declaration are both real
+/// at runtime) — every one of them is returned, and
+/// `compute_rbi_method_closure` walks each in turn. This stays safe
+/// against the `dsl/` bare-name collision `rbi.rs`'s module doc warns
+/// about: whichever files (c) returns are still individually refiltered
+/// by `frag.path == resolved` before contributing a single method, so a
+/// file that only nests the name (never declares it at true top level)
+/// contributes nothing — a collision still degrades to a miss, never a
+/// wrong type.
+///
+/// The very first work item (a walk's `start`) carries no parent, so it
+/// always falls straight through to (c).
+fn resolve_method_node<S: std::hash::BuildHasher>(
+    node: &str,
+    parent: Option<&(PathBuf, String)>,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<(String, Vec<PathBuf>)> {
+    if let Some((parent_file, parent_path)) = parent {
+        let defs = rbi_file_defs(parent_file);
+        if defs.fragments.iter().any(|f| f.path == node) {
+            return Some((node.to_string(), vec![parent_file.clone()]));
+        }
+        let qualified = format!("{parent_path}::{node}");
+        if defs.fragments.iter().any(|f| f.path == qualified) {
+            return Some((qualified, vec![parent_file.clone()]));
+        }
+    }
+    rbi_map.get(node).map(|files| (node.to_string(), files.clone()))
+}
+
+/// The BFS itself: see `rbi_method_closure`'s doc comment for the
+/// four-plus-one-rule contract and the first-visit-wins collision rule.
+/// `filter` (not `find`) over fragments matching the resolved path, like
+/// `harvest_rbi_consts`: a single `.rbi` file can reopen the same path
+/// more than once (Tapioca emits a fresh `sig`-guarded block per overload
+/// set), and a `find` would silently drop every method after the first
+/// block. `visited` keys on `(resolved path, track)`, not the raw edge
+/// text: two DIFFERENT edges spelled the same way (`include
+/// GeneratedAssociationMethods` in two unrelated DSL files) resolve to
+/// two DIFFERENT qualified paths via `resolve_method_node`, and must
+/// never be treated as the same node. `entry(...).or_insert_with(...)`
+/// everywhere a name is recorded, never `insert`/`extend`: that is what
+/// makes the first visit win.
+///
+/// Bead ita-k9j.3: `resolved` can now name SEVERAL files at once (a stub
+/// reopening plus the real declaration) — every one of them is walked
+/// under the SAME `visited` entry, contributing its own fragments'
+/// methods (union of names, first-file-in-`files`-order wins a same-name
+/// conflict — deterministic, since `files` is built from
+/// `discover_rbi_files`'s sorted output) and queuing its own edges with
+/// ITSELF as the parent file, so a stub's edges never get resolved
+/// against the full declaration's file or vice versa.
+fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
+    start: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> (HashMap<String, Option<String>>, HashMap<String, Option<String>>) {
+    let mut instance: HashMap<String, Option<String>> = HashMap::new();
+    let mut singleton: HashMap<String, Option<String>> = HashMap::new();
+    let mut visited: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
+    let mut work: Vec<MethodWorkItem> = vec![MethodWorkItem {
+        node: start.to_string(),
+        on_singleton_track: false,
+        parent: None,
+    }];
+    while let Some(item) = work.pop() {
+        let Some((resolved, files)) =
+            resolve_method_node(&item.node, item.parent.as_ref(), rbi_map)
+        else {
+            continue;
+        };
+        let key = (resolved.clone(), item.on_singleton_track);
+        if visited.contains(&key) || visited.len() >= RBI_METHOD_CLOSURE_CAP {
+            continue;
+        }
+        visited.insert(key);
+        for file in &files {
+            let defs = rbi_file_defs(file);
+            for frag in defs.fragments.iter().filter(|f| f.path == resolved) {
+                harvest_frag_methods(frag, item.on_singleton_track, &mut instance, &mut singleton);
+                queue_method_edges(frag, item.on_singleton_track, file, &mut work);
+            }
+        }
+    }
+    (instance, singleton)
+}
+
+
+/// Rules 1/2/4: a node's own `def self.x` always lands in `singleton`,
+/// while its INSTANCE methods land in whichever map the track that
+/// reached it selects. First visit wins (`or_insert_with`) because the
+/// walk already runs in MRO order — the nearest ancestor is the one that
+/// really answers at runtime. Values are the raw `.returns(...)` sig
+/// text (`MethodDef::sorbet_ret`), `None` for an unsigned method — see
+/// `RbiMethodSets`'s doc comment for why the `Ty` conversion is deferred
+/// to the lookup call site.
+fn harvest_frag_methods(
+    frag: &ClassFragment,
+    on_singleton_track: bool,
+    instance: &mut HashMap<String, Option<String>>,
+    singleton: &mut HashMap<String, Option<String>>,
+) {
+    for m in &frag.singleton_methods {
+        singleton.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+    }
+    let target = if on_singleton_track { singleton } else { instance };
+    for m in &frag.methods {
+        target.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+    }
+}
+
+/// Rules 1/2/3: `superclass`/`include`/`prepend` keep the current track;
+/// `extend`/`mixes_in_class_methods` switch TO the singleton track, and
+/// only from the instance track — see `rbi_method_closure`'s doc comment
+/// for why a second switch never happens. Every pushed item carries
+/// `frag`'s own file and path as its parent context (bead ita-tjr), so
+/// `resolve_method_node` tries this SAME file first when the edge is
+/// popped.
+fn queue_method_edges(
+    frag: &ClassFragment,
+    on_singleton_track: bool,
+    file: &Path,
+    work: &mut Vec<MethodWorkItem>,
+) {
+    let strip = |n: &String| n.trim_start_matches("::").to_string();
+    let parent = Some((file.to_path_buf(), frag.path.clone()));
+    for edge in frag.superclass.iter().chain(frag.includes.iter()).chain(frag.prepends.iter()) {
+        work.push(MethodWorkItem {
+            node: strip(edge),
+            on_singleton_track,
+            parent: parent.clone(),
+        });
+    }
+    if !on_singleton_track {
+        for edge in frag.extends.iter().chain(frag.mixes_in_class_methods.iter()) {
+            work.push(MethodWorkItem {
+                node: strip(edge),
+                on_singleton_track: true,
+                parent: parent.clone(),
+            });
+        }
+    }
+}
+
+/// Shared walk for `rbi_method_lookup`/`dsl_method_lookup` (bead
+/// ita-tjr): try each start name's RBI method closure in order, and on
+/// the first name that DECLARES `method` (instance or singleton side per
+/// `singleton`), convert its raw sig text to `Ty` via
+/// `sorbet_sig::resolve_ret_ty` — the conversion needs `index` (to
+/// resolve a project class name inside the sig), which `rbi_method_closure`'s
+/// memo deliberately does not carry (see `RbiMethodSets`'s doc comment).
+fn method_lookup_via_starts<S: std::hash::BuildHasher>(
+    starts: &[String],
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+    index: &ProjectIndex,
+) -> Option<Ty> {
+    starts.iter().find_map(|start| {
+        let (instance, singleton_methods) = &*rbi_method_closure(start, rbi_map);
+        let map = if singleton { singleton_methods } else { instance };
+        map.get(method)
+            .map(|raw| crate::sorbet_sig::resolve_ret_ty(raw.as_deref(), index))
+    })
+}
+
+/// Does some EXTERNAL ancestor of `id` — a name the project's own index
+/// could not resolve, or a `declarations/gems.rbi` force-open entry
+/// (`OpenReason::DeclaredExternal`) — declare `method` in the client's
+/// Tapioca RBIs (bead ita-xze), and if so, what return `Ty` does its sig
+/// map to (bead ita-uh1)? Called only after `lookup_method`/
+/// `lookup_singleton` already returned `Inconclusive`: the ancestry-open
+/// census this bead's parent measurement ran found 61-86% of that bucket
+/// blocked by exactly this — an external ancestor a project-only index
+/// can never see into.
+///
+/// `None` = miss: no external ancestor declares `method` anywhere in its
+/// RBI closure. Changes NOTHING (the call site stays `Inconclusive`,
+/// typed `Ty::Unknown`, exactly today's behavior).
+///
+/// `Some(ty)` = hit, and `ty` is very often `Ty::Unknown` itself (no sig,
+/// or a sig shape this bead doesn't map) — that is still a hit: the call
+/// site is conclusive either way, only the TYPE differs. Aditive-only by
+/// construction, which is what keeps a false positive impossible here:
+/// arity is never checked on a hit (no `MethodSig`/`RbsSig` rides along,
+/// deliberately — see the batch contract), and `sorbet_sig::resolve_ret_ty`
+/// only ever produces a core `Ty`, a collection of one, or a project
+/// `Ty::Instance`/`Ty::Class` it can prove via `index` — so a wrong `ty`
+/// can only ever be a wrong core-type guess or a wrong resolution of a
+/// spelled-out class name, feeding invariant #1's existing
+/// "Unknown/core receiver never conclusively diagnoses without
+/// `ClosedWorld`" guarantee, never invent a project-class fact out of
+/// nothing. No `NotFound` is ever produced from an RBI signal, on
+/// purpose: Tapioca coverage is never asserted complete, so "the RBI
+/// doesn't declare it" proves nothing about the real gem's surface.
+pub fn rbi_method_lookup<S: std::hash::BuildHasher>(
+    index: &ProjectIndex,
+    id: ClassId,
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<Ty> {
+    method_lookup_via_starts(&index.external_ancestor_starts(id), method, singleton, rbi_map, index)
+}
+
+/// Does the client's Tapioca DSL RBI for `id` ITSELF — or for a PROJECT
+/// ancestor of `id` (one that resolves in the project's own index, e.g.
+/// a shared concern module) — declare `method` (bead ita-tjr)? The DSL
+/// RBIs Tapioca writes under `sorbet/rbi/dsl/` reopen the app's OWN
+/// model classes (`class Package; include GeneratedAssociationMethods;
+/// ...; end`), never an external gem namespace, so the start names here
+/// are PROJECT paths (`id`'s own `path`, then every project ancestor's
+/// `path` in MRO order) — the opposite population from
+/// `rbi_method_lookup`'s external-ancestor walk, and never combined with
+/// it: an ancestor this project could not resolve at all has no `path`
+/// to look a DSL file up by, and a `DeclaredExternal` ancestor is
+/// external by construction. `None` = miss, changes nothing (aditive-
+/// only, same contract as `rbi_method_lookup` — see that function's doc
+/// comment for the full false-positive argument, which applies
+/// unchanged here).
+pub fn dsl_method_lookup<S: std::hash::BuildHasher>(
+    index: &ProjectIndex,
+    id: ClassId,
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<Ty> {
+    method_lookup_via_starts(&index.project_ancestor_starts(id), method, singleton, rbi_map, index)
+}
+
+/// Instance method names each fragment set declares per core namespace —
+/// the pure half of the Tapioca closed-world lookup (w12 closure). Only
+/// `fragments`' own `methods` (instance methods): `def self.x` in a gem's
+/// `class String` reopening lands on String-the-class-object, which no
+/// `Ty::Str` receiver ever dispatches through. Names only, no arity: the
+/// conclusive lookup asks exactly "does this method exist", and a
+/// declared method exists whatever its signature.
+pub fn core_methods_of(
+    fragments: &[ClassFragment],
+) -> HashMap<String, std::collections::HashSet<String>> {
+    let mut out: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    for frag in fragments {
+        if crate::core::is_core_namespace(&frag.path) {
+            out.entry(frag.path.clone())
+                .or_default()
+                .extend(frag.methods.iter().map(|m| m.name.clone()));
+        }
+    }
+    out
+}
+
+/// `core namespace -> instance method names declared across every `.rbi`
+/// reopening of it` (w12 closure, Tapioca closed world). Memoized by
+/// salsa on the `RbiCoreReopenings` input (wired once per process), with
+/// the per-file read+parse itself memoized by `rbi_cache` — so however
+/// many call sites consult it, the reopenings' RBIs are parsed exactly
+/// once per run. Never called outside the closed-world conclusive path,
+/// so projects without full Tapioca coverage never pay the parse.
+#[salsa::tracked]
+pub fn rbi_core_methods(
+    db: &dyn salsa::Database,
+) -> HashMap<String, std::collections::HashSet<String>> {
+    let mut out: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let Some(reopenings) = crate::RbiCoreReopenings::try_get(db) else {
+        return out;
+    };
+    for files in reopenings.map(db).values() {
+        for file in files {
+            for (ns, methods) in core_methods_of(&rbi_file_fragments(file)) {
+                out.entry(ns).or_default().extend(methods);
+            }
+        }
+    }
+    out
+}
+
+fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
+    MethodSig {
+        required: md.required,
+        optional: md.optional,
+        rest: md.rest,
+        keywords: md.keywords.clone(),
+        kwrest: md.kwrest,
+        sig: md.sig.clone(),
+        sorbet_ret: md.sorbet_ret.clone(),
+        arity_unknown: md.arity_unknown,
+        abstract_stub: md.abstract_stub,
+        file,
+        def_span: md.def_span,
+        name_span: md.name_span,
+        schema_col_type: None,
+    }
+}
+
+/// Result of a method lookup on a project class.
+#[derive(Debug)]
+pub enum MethodLookup<'a> {
+    Found(&'a MethodSig, ClassId),
+    /// Ancestry fully resolved and closed; the method does not exist.
+    NotFound,
+    /// Open class or unresolved ancestry: everything is Unknown.
+    Inconclusive,
+}
+
+impl ProjectIndex {
+    fn intern(&mut self, path: &str) -> ClassId {
+        if let Some(&id) = self.by_path.get(path) {
+            return id;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "class-table index bounded by `self.classes.len()`, far below u32::MAX for any real Ruby project"
+        )]
+        let id = ClassId(self.classes.len() as u32);
+        self.classes.push(ClassDef {
+            path: path.to_string(),
+            nesting: Vec::new(),
+            is_module: false,
+            open: false,
+            open_reason: None,
+            superclass: None,
+            includes: Vec::new(),
+            prepends: Vec::new(),
+            extends: Vec::new(),
+            methods: FxHashMap::default(),
+            singleton_methods: FxHashMap::default(),
+            consts: Vec::new(),
+            table_name: None,
+        });
+        self.by_path.insert(path.to_string(), id);
+        id
+    }
+
+    pub fn class(&self, id: ClassId) -> &ClassDef {
+        &self.classes[id.0 as usize]
+    }
+
+    /// Resolve `name` (a constant path as written) from the REAL lexical
+    /// `Module.nesting` chain in effect at the reference site (`nesting`,
+    /// outermost first — see `ClassFragment::nesting`'s doc comment).
+    /// Ruby lexical lookup approximation: innermost nesting level
+    /// outward, then toplevel.
+    ///
+    /// Bead ita-519: this used to take a flat `scope: &str` and derive
+    /// "outer levels" by truncating it at every `::`, which is wrong for
+    /// a compact-syntax class/module (`class A::B::C` has
+    /// `Module.nesting == [A::B::C]`, ONE level — `A::B` and `A` are NOT
+    /// separately searchable lexical scopes there, even though they are
+    /// real classes elsewhere in the project). That silently resolved a
+    /// bare name against a SIBLING class instead of a top-level one (6
+    /// confirmed FPs in rails/rails, e.g. `TestServer` inside a compact
+    /// `class ActionCable::Connection::AuthorizationTest` resolving to
+    /// the sibling `ActionCable::Connection::TestServer` instead of the
+    /// real top-level `::TestServer`). `nesting` now carries the REAL
+    /// chain, built by the walker as it actually recurses (`DefWalker`/
+    /// `check.rs`'s `Checker`, both push exactly one level per
+    /// `class`/`module` keyword, never per `::`-segment), so no
+    /// per-call truncation guesswork is needed here at all.
+    pub fn resolve_const(&self, nesting: &[String], name: &str) -> Option<ClassId> {
+        if let Some(rest) = name.strip_prefix("::") {
+            return self.by_path.get(rest).copied();
+        }
+        let single_segment = !name.contains("::");
+        for level in nesting.iter().rev() {
+            let candidate = format!("{level}::{name}");
+            if let Some(&id) = self.by_path.get(&candidate) {
+                return Some(id);
+            }
+            // A plain `NAME = expr` in this lexical scope shadows any outer
+            // class of the same name (`Result = Struct.new` vs a real
+            // `Deployment::Result` class): resolution fails to Unknown.
+            if single_segment {
+                if let Some(&sid) = self.by_path.get(level) {
+                    if self.class(sid).consts.iter().any(|c| c == name) {
+                        return None;
+                    }
+                }
+            }
+        }
+        self.by_path.get(name).copied()
+    }
+
+    /// Resolve the constant written as a class's superclass (`class X <
+    /// NAME`) — bead ita-t6m, the Pundit `class Scope < Scope` shape
+    /// (`app/policies/*_policy.rb < ApplicationPolicy`, re-declaring
+    /// `Scope` in every policy that subclasses it). Ruby evaluates the
+    /// superclass expression BEFORE `X` exists, so `resolve_const`'s
+    /// plain lexical walk is wrong here in two ways: (1) a candidate that
+    /// happens to resolve back to `id` itself — the class currently being
+    /// defined — is not a real answer, it's `nesting`'s own path
+    /// reconstructed from an outer level (`DataImportPolicy` + `::Scope`
+    /// == `DataImportPolicy::Scope`, which IS `id`); (2) once lexical
+    /// nesting is exhausted, Ruby's real algorithm falls through to the
+    /// ancestors of the innermost ENCLOSING class, not straight to a
+    /// top-level constant — `ApplicationPolicy::Scope` is reached because
+    /// `DataImportPolicy < ApplicationPolicy`, not because it's lexically
+    /// nested inside `DataImportPolicy`. Order matters: a nearer ancestor
+    /// must win over an unrelated top-level same-named class (mutant
+    /// table entry b in the ita-t6m report; see
+    /// `testdata/pundit_scope/outer_scope_vs_ancestor_scope.rb`).
+    /// Provably unresolved either way stays `None` — every caller here
+    /// already treats that as leaving the ancestry open (invariant #1:
+    /// never a false E0101 from a superclass this index can't pin down).
+    fn resolve_superclass_const(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
+        self.resolve_superclass_lexical(id, nesting, name)
+            .or_else(|| self.resolve_superclass_fallback(id, nesting, name))
+    }
+
+    /// Lexical half of `resolve_superclass_const`: same per-level walk as
+    /// `resolve_const`, except a candidate resolving to `id` itself is
+    /// skipped (keep walking outward) rather than accepted, and — unlike
+    /// `resolve_const` — no top-level fallback: that's `resolve_superclass_
+    /// fallback`'s job, run only after the real ancestor chain has had its
+    /// turn (a nearer ancestor must outrank an unrelated top-level name).
+    fn resolve_superclass_lexical(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
+        if let Some(rest) = name.strip_prefix("::") {
+            return self.by_path.get(rest).copied().filter(|&r| r != id);
+        }
+        let single_segment = !name.contains("::");
+        for level in nesting.iter().rev() {
+            let candidate = format!("{level}::{name}");
+            match self.by_path.get(&candidate) {
+                Some(&found) if found != id => return Some(found),
+                Some(_) => {} // resolves to `id` itself: keep walking outward
+                None if single_segment => {
+                    if let Some(&sid) = self.by_path.get(level) {
+                        if self.class(sid).consts.iter().any(|c| c == name) {
+                            return None;
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        None
+    }
+
+    /// Ancestor-then-top-level half of `resolve_superclass_const`: once
+    /// lexical nesting is exhausted, walk the ancestors of the innermost
+    /// ENCLOSING class (`nesting`'s second-to-last entry — the last entry
+    /// is always `id` itself, see `resolve_const`'s doc comment) nearest
+    /// first, checking each ancestor's own nested-class namespace for
+    /// `name`. Only once no real ancestor answers does a bare top-level
+    /// constant get a look — mirroring `Object` being the final, least
+    /// specific link in every ancestor chain in real Ruby.
+    fn resolve_superclass_fallback(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
+        if let Some(found) = self.resolve_superclass_ancestor(id, nesting, name) {
+            return Some(found);
+        }
+        self.by_path.get(name).copied().filter(|&r| r != id)
+    }
+
+    fn resolve_superclass_ancestor(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
+        let enclosing = nesting.get(nesting.len().checked_sub(2)?)?;
+        let enclosing_id = *self.by_path.get(enclosing)?;
+        let (chain, _complete) = self.ancestors(enclosing_id);
+        chain.into_iter().find_map(|a| {
+            let candidate = format!("{}::{name}", self.class(a).path);
+            self.by_path.get(&candidate).copied().filter(|&r| r != id)
+        })
+    }
+
+    /// MRO linearization: prepends (reversed) -> self -> includes (reversed)
+    /// -> superclass chain. Cycle-safe via visited set. `complete` is false
+    /// when any named superclass/mixin failed to resolve in the index —
+    /// callers must then treat lookups as Inconclusive.
+    pub fn ancestors(&self, id: ClassId) -> (Vec<ClassId>, bool) {
+        let mut out = Vec::new();
+        let mut complete = true;
+        let mut visited = std::collections::HashSet::new();
+        self.linearize(id, &mut out, &mut visited, &mut complete);
+        (out, complete)
+    }
+
+    /// Census only (bead ita-anc): "what blocks a conclusion" for `id`'s
+    /// ancestry, mirroring `lookup_method`/`lookup_singleton`'s walk but
+    /// classifying the block instead of returning a method — the
+    /// counterfactual `ita check --stats` needs to answer "would this
+    /// Inconclusive close if we fixed only project-side opens?" `None`
+    /// means this lookup is not ancestry-blocked at all (nothing open,
+    /// chain fully resolved).
+    ///
+    /// External wins unconditionally: an ancestor open because
+    /// `declarations/gems.rbi` declared it, or a named ancestor that never
+    /// resolved, means closing every project-side open in the chain would
+    /// still leave the lookup Inconclusive — real gem knowledge (Tapioca
+    /// RBI) is what would close it, not a project-side fix. Otherwise the
+    /// FIRST project-side reason in ancestor order (nearest the receiver
+    /// class first) is reported — the whole chain is walked (not
+    /// short-circuited at the first open ancestor like `lookup_method`)
+    /// so a `DeclaredExternal` further down the chain is never missed.
+    ///
+    /// MEASURED CEILING, and it is not small (bead ita-o1n, 2026-08-21):
+    /// this function is per-CLASS and never sees the method name, while
+    /// `lookup_method` returns `Found` the moment any ancestor carries the
+    /// method — it consults `complete` only after the whole chain misses.
+    /// So "External wins" is pessimistic: closing a project-side open can
+    /// unblock a site this function labeled `Unresolved`, because the
+    /// now-closed ancestor answers the lookup before completeness is ever
+    /// Proof: adding `defines_no_method` moved 835 corpus-a call
+    /// sites from blind to checked while `anc_dsl` did not budge — every
+    /// one of those was booked under `unresolved name`/`declared open`.
+    /// Read the project-side buckets as a FLOOR on the closable
+    /// population, never as its size. Upgrade path: attribute per
+    /// (class, method) at the call site instead of per class.
+    ///
+    /// ponytail: `singleton` is accepted for symmetry with
+    /// `lookup_singleton` (which has its own extra module-on-singleton
+    /// Inconclusive exit, unrelated to ancestry) but unused — the
+    /// ancestor chain itself is the same walk either way. No memo: this
+    /// runs at most once per Inconclusive call site, only under
+    /// `Checker::census`, never on the hot check path; add one if a
+    /// corpus run shows repeat lookups on the same `id` dominating.
+    pub fn inconclusive_reason(&self, id: ClassId, _singleton: bool) -> Option<Blocker> {
+        let (ancestors, complete) = self.ancestors(id);
+        let mut declared = false;
+        let mut first_project: Option<OpenReason> = None;
+        for &a in &ancestors {
+            let class = self.class(a);
+            match class.open_reason {
+                Some(OpenReason::DeclaredExternal) => declared = true,
+                Some(r) if first_project.is_none() => first_project = Some(r),
+                // An ancestor that is `open` with no recorded reason would
+                // otherwise vanish from the census and be counted as "not
+                // ancestry" — a silent hole. Every `open = true` site sets
+                // a reason today, so this stays zero; if it ever moves,
+                // `anc_other` is the alarm rather than a wrong total.
+                None if class.open && first_project.is_none() => {
+                    first_project = Some(OpenReason::Unattributed);
+                }
+                _ => {}
+            }
+        }
+        // Precedence is the counterfactual, not proximity: each blocker
+        // listed here survives the fix for every blocker below it.
+        if !complete {
+            Some(Blocker::Unresolved)
+        } else if declared {
+            Some(Blocker::Declared)
+        } else {
+            first_project.map(Blocker::Project)
+        }
+    }
+
+    /// Bead ita-k9j: is `id`'s `Blocker::Declared` (if it has one) caused
+    /// specifically by the declared-external ancestor named `path`?
+    /// Originated (entrega 1) as named-ablation-by-query instead of
+    /// remove-and-rebuild (the RUN-LOG 2026-08-22 `ActiveRecord::Base`
+    /// ablation numbers); entrega 2 promotes it to a real check-path
+    /// predicate too — `Checker::rbi_escalate`'s third step calls this
+    /// exact function to decide whether a curated-inventory hit is even
+    /// eligible before consulting the name sets. Same precedence as
+    /// `inconclusive_reason`: an incomplete chain never counts here even
+    /// if `path` is also declared-open somewhere in it, because
+    /// `Unresolved` survives fixing every `Declared` entry (see that
+    /// function's doc comment). A chain can carry more than one
+    /// `declarations/gems.rbi` entry (a model that also mixes in
+    /// `Sidekiq::Worker`, say) — this checks PRESENCE of `path` among the
+    /// chain's declared-external ancestors, exactly what deleting that
+    /// one `gems.rbi` entry would remove.
+    pub fn declared_by(&self, id: ClassId, path: &str) -> bool {
+        let (ancestors, complete) = self.ancestors(id);
+        if !complete {
+            return false;
+        }
+        ancestors.iter().any(|&a| {
+            let class = self.class(a);
+            class.open_reason == Some(OpenReason::DeclaredExternal) && class.path == path
+        })
+    }
+
+    fn linearize(
+        &self,
+        id: ClassId,
+        out: &mut Vec<ClassId>,
+        visited: &mut std::collections::HashSet<ClassId>,
+        complete: &mut bool,
+    ) {
+        if !visited.insert(id) {
+            return; // cycle or diamond: first occurrence wins
+        }
+        let class = self.class(id);
+        let nesting = &class.nesting;
+        for name in class.prepends.iter().rev() {
+            match self.resolve_const(nesting, name) {
+                Some(m) => self.linearize(m, out, visited, complete),
+                None => *complete = false,
+            }
+        }
+        out.push(id);
+        for name in class.includes.iter().rev() {
+            match self.resolve_const(nesting, name) {
+                Some(m) => self.linearize(m, out, visited, complete),
+                None => *complete = false,
+            }
+        }
+        if let Some(sc) = &class.superclass {
+            match self.resolve_superclass_const(id, nesting, sc) {
+                Some(s) => self.linearize(s, out, visited, complete),
+                None => *complete = false,
+            }
+        }
+        // No written superclass: implicit Object terminator (core table).
+    }
+
+    /// Look up an instance method on a project class.
+    ///
+    /// An ancestor open with `OpenReason::AbstractRaise` no longer blinds
+    /// the walk (2026-09-03, rails dd1c8848^): that idiom means "subclasses
+    /// complete me", not "anything goes" — the class is treated as closed,
+    /// its own methods resolve, and a resulting `NotFound` softens to
+    /// `Inconclusive` only when `abstract_family_defines` proves some
+    /// member of the RECEIVER's subtree defines `name` (or a fail-closed
+    /// refinement fires). The scope is the receiver, never the abstract
+    /// ancestor: a bare self-send dispatches on an instance of the
+    /// receiver or one of its descendants, so a sibling family member's
+    /// open mixin (rails' `Tags::ActionText` pulls in an open
+    /// `FormTagHelper`) can never answer a call that dispatches on
+    /// `Tags::SearchField` — walking the ancestor's whole family there
+    /// would silence the real `request` `NameError` the fix exists to find.
+    pub fn lookup_method(&self, id: ClassId, name: &str) -> MethodLookup<'_> {
+        let (ancestors, complete) = self.ancestors(id);
+        for &a in &ancestors {
+            let class = self.class(a);
+            if class.open && class.open_reason != Some(OpenReason::AbstractRaise) {
+                return MethodLookup::Inconclusive;
+            }
+            if let Some(m) = class.methods.get(name) {
+                return MethodLookup::Found(m, a);
+            }
+        }
+        // A module's instance methods run with `self` = the including
+        // class, which we don't know from here: never claim NotFound.
+        if complete && !self.class(id).is_module && !self.abstract_family_defines(id, name) {
+            MethodLookup::NotFound
+        } else {
+            MethodLookup::Inconclusive
+        }
+    }
+
+    /// Does any descendant of `id` define `name`? A self-send inside a
+    /// subclassed class dispatches on the RUNTIME class, so a template
+    /// method whose hook lives in the subclass resolves fine at runtime —
+    /// `NotFound` there is a false positive, not a latent bug. Found by
+    /// review of one private benchmark corpus (corpus-a, 2026-08-20): an abstract base whose
+    /// template method self-sends three hooks, all three defined by its
+    /// single subclass — the only class ever instantiated — and all three
+    /// reported as E0101. Three of the six baseline "errors" were wrong
+    /// about the code.
+    ///
+    /// This is the general form of the `NotImplementedError` text scan in
+    /// `DefWalker` (which only fires when the author happened to write an
+    /// explicit raising stub). It narrows nothing that was already sound:
+    /// a leaf class keeps full precision, and a descendant must actually
+    /// define the name: the corpus's discriminating case is a class that
+    /// IS subclassed where the one subclass inherits the broken method and
+    /// never defines the missing identifier either — still an error.
+    pub fn descendant_defines(&self, id: ClassId, name: &str, singleton: bool) -> bool {
+        let mut stack = vec![id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(kids) = self.subclasses.get(&cur) else {
+                continue;
+            };
+            for &kid in kids {
+                let class = self.class(kid);
+                let map = if singleton {
+                    &class.singleton_methods
+                } else {
+                    &class.methods
+                };
+                if class.open || map.contains_key(name) {
+                    return true;
+                }
+                stack.push(kid);
+            }
+        }
+        false
+    }
+
+    /// The refined instance-track counterpart of `descendant_defines`
+    /// (2026-09-03, rails dd1c8848^), walked from the RECEIVER: a base
+    /// carrying `raise NotImplementedError` used to be blanket-open,
+    /// silencing EVERY instance lookup on it and every descendant — the
+    /// mechanism that hid the real production `NameError` on
+    /// `ActionView::Helpers::Tags::SearchField#render` (`request` exists
+    /// on no member of the whole Tags family). With such classes no longer
+    /// blanket-open, a resulting `NotFound` softens to `Inconclusive` only
+    /// when this walk proves some member of the receiver's subtree defines
+    /// `name` — keyed on the method NAME and the structural descendant
+    /// set, never on the class name or a receiver-name pattern. The
+    /// subtree IS the runtime dispatch set of a self-send at this
+    /// receiver: an ancestor's abstractness never widens it, so a
+    /// SIBLING's open mixin cannot silence a lookup it can never answer.
+    ///
+    /// This replaces the plain `descendant_defines` on the instance track
+    /// (the singleton track keeps the original — abstract stubs there
+    /// stay blanket-open). Same corpus-a finding as before (2026-08-20,
+    /// template hooks supplied by the only instantiated subclass), with
+    /// three refinements:
+    ///
+    /// - a member open for any reason OTHER than `AbstractRaise`
+    ///   (`method_missing`, dynamic mixin, non-literal
+    ///   `define_method`/`alias_method`, class-body block, dynamic
+    ///   superclass, `DeclaredExternal`, ...) could define anything: the
+    ///   walk stays `Inconclusive` (refinement (a));
+    /// - a member defining `method_missing`/`respond_to_missing?` answers
+    ///   every name: silence;
+    /// - a closed member's OWN chain must be complete and free of
+    ///   non-AbstractRaise opens — `ancestors` walks its includes and
+    ///   prepends too, so an open mixin or an unresolved/declared-external
+    ///   link under the receiver silences the subtree. The chain above the
+    ///   receiver is already proven by the caller (`complete` plus the
+    ///   ancestor walk's non-AbstractRaise exit);
+    /// - a definition is keyed on the method NAME alone: the member's own
+    ///   `methods` map (`def`, literal `define_method`, `attr_*`, literal
+    ///   `alias`/`alias_method` all land there as synthetic entries), or
+    ///   anything inherited along the member's own chain — a closed module
+    ///   a member includes counts, exactly as it would at runtime.
+    ///
+    /// Members open ONLY via their own `AbstractRaise` pass through: their
+    /// bodies call subclass hooks, which is the very idiom being modeled —
+    /// their descendants are still walked for the name.
+    fn abstract_family_defines(&self, receiver: ClassId, name: &str) -> bool {
+        let mut stack = vec![receiver];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(cur) = stack.pop() {
+            if !seen.insert(cur) {
+                continue;
+            }
+            let Some(kids) = self.subclasses.get(&cur) else {
+                continue;
+            };
+            for &kid in kids {
+                let class = self.class(kid);
+                if class.methods.contains_key(name)
+                    || class.methods.contains_key("method_missing")
+                    || class.methods.contains_key("respond_to_missing?")
+                {
+                    return true;
+                }
+                if class.open {
+                    if class.open_reason == Some(OpenReason::AbstractRaise) {
+                        stack.push(kid);
+                    } else {
+                        return true;
+                    }
+                    continue;
+                }
+                let (chain, complete) = self.ancestors(kid);
+                // The member's full chain can also SUPPLY the name — a
+                // closed module it includes defines `request`, say. One
+                // pass answers both questions: silence on any definition
+                // (the hook resolves at runtime) or any non-AbstractRaise
+                // open (the member's surface is unprovable).
+                if !complete
+                    || chain.iter().any(|&a| {
+                        let c = self.class(a);
+                        c.methods.contains_key(name)
+                            || (c.open && c.open_reason != Some(OpenReason::AbstractRaise))
+                    })
+                {
+                    return true;
+                }
+                stack.push(kid);
+            }
+        }
+        false
+    }
+
+    /// Look up a singleton (class-level) method: singleton methods along the
+    /// ancestry, plus instance methods of `extend`ed modules.
+    pub fn lookup_singleton(&self, id: ClassId, name: &str) -> MethodLookup<'_> {
+        let (ancestors, complete) = self.ancestors(id);
+        for &a in &ancestors {
+            let class = self.class(a);
+            if class.open {
+                return MethodLookup::Inconclusive;
+            }
+            if let Some(m) = class.singleton_methods.get(name) {
+                return MethodLookup::Found(m, a);
+            }
+            for ext in &class.extends {
+                if let Some(mid) = self.resolve_const(&class.nesting, ext) {
+                    if let Some(m) = self.class(mid).methods.get(name) {
+                        return MethodLookup::Found(m, mid);
+                    }
+                } else {
+                    return MethodLookup::Inconclusive;
+                }
+            }
+        }
+        if complete && !self.descendant_defines(id, name, true) {
+            MethodLookup::NotFound
+        } else {
+            MethodLookup::Inconclusive
+        }
+    }
+
+    /// Bead ita-6bq: does a class's OWN singleton `new` show up somewhere
+    /// this checker can actually see, walking the SAME ancestry/`extend`
+    /// chain `lookup_singleton` uses — SKIPPING an ancestor whose openness
+    /// is caused purely by a `declarations/gems.rbi` reopening
+    /// (`OpenReason::DeclaredExternal`, `merge_declared_fragment`'s
+    /// force-open)? Plain `lookup_singleton` would stop dead the moment
+    /// it hits ANY open ancestor, gem-declared or project-side alike —
+    /// correct for a general singleton-method dispatch, but too coarse
+    /// for THIS specific question. Bead ita-k9j (entrega 2) already
+    /// established the precedent this generalizes: a project subclass's
+    /// OWN `initialize` governs `.new`'s arity even when the ancestry
+    /// passes through a force-opened `ActiveRecord::Base` — that gem stub
+    /// carries zero real methods by contract, so it is exactly as silent
+    /// on `self.new` as it is on everything else, never a reason to
+    /// distrust the project's own code. Measured regression without this
+    /// carve-out: EVERY `ActiveRecord` model's `.new` arity check would go
+    /// silently `Inconclusive`, because `ActiveRecord::Base` sits in
+    /// every one of their ancestor chains — the checker's single most
+    /// common receiver shape in a Rails corpus, not a rare edge case.
+    ///
+    /// A PROJECT-side open ancestor (unresolved DSL, dynamic mixin, a
+    /// class-body block like `instance_methods.each { |m| undef_method
+    /// m }` — bead ita-d0j, the actual `rails/activesupport`
+    /// `DeprecationProxy` shape) still stops the walk and returns
+    /// `Inconclusive`: that ancestor's real surface — possibly including
+    /// a genuine `self.new` override this checker cannot see — is
+    /// exactly the risk `.new`'s Found-branch above exists to catch, and
+    /// skipping it would silently reopen the false positive this bead was
+    /// filed to fix in the first place.
+    ///
+    /// The chain's own `complete` flag (an ancestor NAME that never
+    /// resolved anywhere in the project's own index — e.g. `class Foo <
+    /// SomeGem::Base` where only a Tapioca RBI, not project code,
+    /// declares `SomeGem::Base`) is deliberately NOT consulted for the
+    /// final `NotFound` verdict either, for the same "external, not
+    /// project-suspicious" reasoning as the `DeclaredExternal` skip above
+    /// — this checker's own `external_ancestor_starts` already groups
+    /// unresolved-name ancestors and `DeclaredExternal` ancestors as the
+    /// SAME population for RBI-escalation purposes. Bead ita-xze's own
+    /// fixtures (`rbi_call_resolution.rs`) pin the precedent: a project
+    /// class whose superclass name is external-and-unresolved still
+    /// resolves `.new` through its OWN directly-defined `initialize`,
+    /// exactly as it did before this bead — an unresolved ancestor name
+    /// no more hides a project-relevant `self.new` than a declared one
+    /// does. A genuinely OPEN project-side ancestor is still caught above
+    /// (that check runs first, over every ancestor this function DOES
+    /// walk) — this only widens what "no further ancestors to check"
+    /// means once the walk runs off the end of a resolvable chain.
+    pub fn lookup_singleton_own(&self, id: ClassId, name: &str) -> MethodLookup<'_> {
+        let (ancestors, _complete) = self.ancestors(id);
+        for &a in &ancestors {
+            let class = self.class(a);
+            if class.open {
+                if class.open_reason == Some(OpenReason::DeclaredExternal) {
+                    continue;
+                }
+                return MethodLookup::Inconclusive;
+            }
+            if let Some(m) = class.singleton_methods.get(name) {
+                return MethodLookup::Found(m, a);
+            }
+            for ext in &class.extends {
+                if let Some(mid) = self.resolve_const(&class.nesting, ext) {
+                    if let Some(m) = self.class(mid).methods.get(name) {
+                        return MethodLookup::Found(m, mid);
+                    }
+                } else {
+                    return MethodLookup::Inconclusive;
+                }
+            }
+        }
+        if self.descendant_defines(id, name, true) {
+            MethodLookup::Inconclusive
+        } else {
+            MethodLookup::NotFound
+        }
+    }
+
+    /// `lookup_method` with the two ita-4xy follow-up fallbacks applied
+    /// to a `NotFound` verdict (bead ita-4xy carve-out closed classes
+    /// that used to stay `open`, unmasking two pre-existing lookup gaps
+    /// — see `soften_not_found`'s doc comment). Every other outcome is
+    /// `lookup_method`'s own, unchanged: this only ever turns an
+    /// existing `NotFound` into `Inconclusive`, monotonically LESS
+    /// diagnostic (invariant #1), never the reverse. `rbi_map` mirrors
+    /// every other RBI-aware call (`rbi_method_lookup`, `rbi_declares`):
+    /// `None` when no client `sorbet/rbi` was discovered, degrading
+    /// byte-for-byte to `lookup_method`'s own behavior.
+    pub fn lookup_method_rbi(
+        &self,
+        id: ClassId,
+        name: &str,
+        rbi_map: Option<&HashMap<String, Vec<PathBuf>>>,
+    ) -> MethodLookup<'_> {
+        match self.lookup_method(id, name) {
+            MethodLookup::NotFound => self.soften_not_found(id, name, false, rbi_map),
+            other => other,
+        }
+    }
+
+    /// Singleton counterpart of `lookup_method_rbi` — see that
+    /// function's and `soften_not_found`'s doc comments.
+    pub fn lookup_singleton_rbi(
+        &self,
+        id: ClassId,
+        name: &str,
+        rbi_map: Option<&HashMap<String, Vec<PathBuf>>>,
+    ) -> MethodLookup<'_> {
+        match self.lookup_singleton(id, name) {
+            MethodLookup::NotFound => self.soften_not_found(id, name, true, rbi_map),
+            other => other,
+        }
+    }
+
+    /// The two NotFound-softening fallbacks (bead ita-4xy follow-up),
+    /// consulted only after `lookup_method`/`lookup_singleton`'s own
+    /// walk — `descendant_defines` included — already committed to
+    /// `NotFound`:
+    ///
+    /// 1. Gem-reopening (`gem_reopens`): the project's own index sees
+    ///    `id`'s ancestry as fully closed, but SOME ancestor in that
+    ///    closed chain — `id` itself, or any class/module reached via a
+    ///    fully-resolved include/prepend/superclass link — is a
+    ///    reopening of a class whose PRIMARY definition lives in a gem
+    ///    (`class ::Foo` where a Tapioca RBI also declares `Foo`) — the
+    ///    project's view of THAT ancestor is provably partial, so
+    ///    `NotFound` can never be proven here. Bead ita-oaq (2026-08-25,
+    ///    measured against ruby-lsp's own test suite): the original
+    ///    version of this check looked at `id` alone, which misses the
+    ///    common two-hop shape `class FooTest < TestCase` where
+    ///    `TestCase < Minitest::Test` and the PROJECT itself reopens
+    ///    `module Minitest; class Test; include ProjectHelper; end; end`
+    ///    (a common "mix project test helpers into the gem's base test
+    ///    class" pattern) — `Minitest::Test` resolves as a genuine,
+    ///    CLOSED project ancestor two links up from the receiver, so the
+    ///    chain looks fully closed and `assert_equal`/every Minitest
+    ///    DSL method the project itself never redeclares reports a
+    ///    fabricated E0101, though the same gem RBI that would have
+    ///    silenced an `unresolved name` ancestor is sitting right there
+    ///    under `Minitest::Test`'s own path. Typed resolution, when the
+    ///    RBI's own sig maps one, still happens with NO new BFS:
+    ///    `check.rs::Checker::rbi_escalate` (already wired on every
+    ///    `Inconclusive` outcome) tries `dsl_method_lookup` FIRST, whose
+    ///    `project_ancestor_starts` already seeds EVERY ancestor's own
+    ///    path in MRO order — `rbi_map` is one flat `constant -> file`
+    ///    map over the whole `sorbet/rbi` tree (gems, dsl, annotations
+    ///    alike), so a gem RBI reopening any ancestor's exact path
+    ///    resolves through that EXISTING walk exactly as if it were a
+    ///    DSL reopening. Returning `Inconclusive` here is the only thing
+    ///    this bead needed to add.
+    /// 2. Kernel/Object (`core::kernel_object_instance_method`/
+    ///    `core::kernel_object_singleton_method`): every Ruby object (an
+    ///    instance query) or class object (a singleton query — `def
+    ///    self.x` bodies) answers to Kernel's own surface (`proc`,
+    ///    `lambda`, ...) and Object/BasicObject's (plus Class/Module's,
+    ///    singleton side) own methods, regardless of whether the
+    ///    receiving project class is closed. A bare self-send of one of
+    ///    these inside a closed class's method body is never a real
+    ///    `NotFound`. No `Ty` is ever modeled for a hit here (unlike gap
+    ///    1, no RBI sig exists to map) — `Inconclusive` (silence) is the
+    ///    correct, final answer.
+    /// 3. Dynamic mixin (bead ita-o8l.1, replaces ita-a8z): `name` is
+    ///    directly defined by a module the project dynamically mixes in
+    ///    through a receiver this checker can never resolve
+    ///    (`builder_class.include(Module)`). See `ProjectIndex::
+    ///    dynamic_mixin_covers`'s doc comment for the exact rule
+    ///    (including the measured-and-abandoned `method_missing`
+    ///    clause) — unlike gaps 1/2 this is keyed on the METHOD NAME,
+    ///    never on `id`/the receiving class.
+    fn soften_not_found(
+        &self,
+        id: ClassId,
+        name: &str,
+        singleton: bool,
+        rbi_map: Option<&HashMap<String, Vec<PathBuf>>>,
+    ) -> MethodLookup<'_> {
+        if rbi_map.is_some_and(|map| self.gem_reopens(id, map)) {
+            return MethodLookup::Inconclusive;
+        }
+        let kernel_hit = if singleton {
+            core::kernel_object_singleton_method(name)
+        } else {
+            core::kernel_object_instance_method(name)
+        };
+        if kernel_hit {
+            return MethodLookup::Inconclusive;
+        }
+        let targets = if singleton {
+            &self.dynamic_mixin_singleton_targets
+        } else {
+            &self.dynamic_mixin_instance_targets
+        };
+        if self.dynamic_mixin_covers(targets, name) {
+            return MethodLookup::Inconclusive;
+        }
+        MethodLookup::NotFound
+    }
+
+    /// Bead ita-o8l.1: does an about-to-be-`NotFound` lookup for `name`
+    /// soften, because `name` is directly defined by a module the
+    /// project dynamically mixes in? `targets` is
+    /// `dynamic_mixin_instance_targets` or
+    /// `dynamic_mixin_singleton_targets` (the caller, `soften_not_found`,
+    /// picks by track). Deliberately shallow: only the target module's
+    /// OWN `methods` map, never that module's own ancestry — the
+    /// audited shape needs nothing deeper (`Rails::ActionMethods`'s
+    /// `attr_reader :options` is a direct, literal method), and a
+    /// second unbounded chase through an arbitrary module's own mixins
+    /// risks silencing far more than this bead measured. Keyed on
+    /// `name` alone, never on the receiving class `id` — see
+    /// `FileScan`'s doc comment for why ita-a8z's two
+    /// class-keyed candidates were both rejected.
+    ///
+    /// ABANDON, measured: the task's third clause — soften whenever
+    /// some target module merely DEFINES `method_missing`, regardless
+    /// of `name` — was built, then five-corpus-measured, then reverted.
+    /// It is NOT narrower than the rejected `Global` candidate: any
+    /// real corpus with even ONE dynamically-mixed `method_missing`
+    /// target UNRELATED to this cluster (rails has two — `ActiveRecord
+    /// ::TestFixtures` on the instance track, `ActionDispatch::
+    /// Integration::Runner` on the singleton track, both legitimate,
+    /// neither anything to do with `Rails::ActionMethods`) silences
+    /// EVERY project-wide `NotFound` on that track — this checker has
+    /// no way to scope by receiving class (forbidden by this bead's own
+    /// design) or by which dynamic-`include` call site is actually
+    /// reachable from a given receiver. Measured against a freshly
+    /// built binary: enabling the clause silenced 222/222 (100%) of
+    /// rails' baseline E0101 and 207/207 (100%) of zammad's — the exact
+    /// failure shape `Global` was rejected for, at a larger scale.
+    /// Direct-name-only, without it: 41 rails + 7 discourse = 48 sites
+    /// silenced project-wide, zero appeared, and the 8 `class_eval`-
+    /// generated `Rails::ActionMethods` forwarding methods (`template`,
+    /// `copy_file`, `directory`, `empty_directory`, `inside`,
+    /// `empty_directory_with_keep_file`, `create_file`, `chmod`,
+    /// `shebang` — string-interpolated inside a heredoc passed to
+    /// `class_eval`, invisible to any static per-`def`-node scan) stay
+    /// a documented false negative (invariant #1 permits this; a
+    /// fabricated diagnostic is never permitted).
+    fn dynamic_mixin_covers(&self, targets: &[ClassId], name: &str) -> bool {
+        targets.iter().any(|&mid| self.class(mid).methods.contains_key(name))
+    }
+
+    /// Gap 1's detection signal: does the client's Tapioca gem RBI tree
+    /// ALSO declare `id`'s OWN fully-qualified path, or the path of any
+    /// ancestor reached by walking `id`'s already-closed, already-
+    /// resolved MRO (`ancestors`, which includes `id` itself first) —
+    /// i.e. is `id`, or some class/module it inherits from or mixes in,
+    /// a project reopening of a class primarily defined in a gem, not a
+    /// genuinely project-original one? Bead ita-oaq extends this from
+    /// "`id` alone" to the whole chain: `soften_not_found` only ever
+    /// calls this after `lookup_method`/`lookup_singleton` already
+    /// walked the SAME chain and found it fully resolved (`complete`)
+    /// and nowhere `open`, so re-walking it here costs one more cheap
+    /// `ancestors` call, never a project-wide scan — see that function's
+    /// doc comment (gap 1) for the false-positive shape this closes.
+    /// `rbi_map` is `RbiProject`'s phase-1 `constant name -> EVERY
+    /// declaring file` map (`rbi.rs::build_rbi_index`), TOP-LEVEL names
+    /// only — reliable for a top-level constant (Tapioca always writes
+    /// the fully qualified name on the `class`/`module` header line),
+    /// but known to miss a NESTED name coming from `sorbet/rbi/dsl/`
+    /// (bead ita-iyz: the phase-1 scanner has no indentation tracking,
+    /// so a nested `module Foo::Bar` inside a DSL file can be recorded
+    /// under the wrong key or missed). Every ancestor's `path` here is
+    /// always that class's own written name (`Foo`, `Foo::Bar`, ...), so
+    /// both cases are safe: the only failure mode on the nested/DSL side
+    /// is a false NEGATIVE (this fallback simply doesn't fire for that
+    /// one ancestor, exactly as if this bead didn't exist), never a
+    /// false positive. `contains_key` alone (bead ita-k9j.3): whether
+    /// the map now holds one file or several for a name changes nothing
+    /// here — this only asks IF a gem reopens the ancestor's path, never
+    /// which file, so the Vec value type is unaffected.
+    fn gem_reopens(&self, id: ClassId, rbi_map: &HashMap<String, Vec<PathBuf>>) -> bool {
+        let (chain, _complete) = self.ancestors(id);
+        chain.iter().any(|&a| rbi_map.contains_key(&self.class(a).path))
+    }
+
+    /// Scan `ancestors[start..]`, applying the same `open`/`Found`/
+    /// `NotFound` rule as `lookup_method`/`lookup_singleton`, just from an
+    /// arbitrary starting position instead of the chain's head. Shared by
+    /// `super_lookup` (bead ita-53y): `super` never restarts the chain, it
+    /// continues from wherever the currently executing method actually
+    /// sits.
+    fn lookup_from(
+        &self,
+        ancestors: &[ClassId],
+        complete: bool,
+        start: usize,
+        name: &str,
+        singleton: bool,
+    ) -> MethodLookup<'_> {
+        for &a in ancestors.iter().skip(start) {
+            let class = self.class(a);
+            if class.open {
+                return MethodLookup::Inconclusive;
+            }
+            let map = if singleton {
+                &class.singleton_methods
+            } else {
+                &class.methods
+            };
+            if let Some(m) = map.get(name) {
+                return MethodLookup::Found(m, a);
+            }
+        }
+        if complete {
+            MethodLookup::NotFound
+        } else {
+            MethodLookup::Inconclusive
+        }
+    }
+
+    /// `super`/`super(...)` navigation (bead ita-53y): resolve to the
+    /// ancestor located strictly after the one that physically defines the
+    /// currently executing method — never the start of the chain, and
+    /// never a guess. A method defined directly on a class continues into
+    /// that class's own superclass chain. A method defined inside a module
+    /// reached only via `include`/`prepend` has no chain of its own: it
+    /// continues into every class in the whole project whose ancestry
+    /// actually mixes the module in, starting right after the module's
+    /// slot in that specific class's MRO. If two consuming classes would
+    /// answer differently, the module is consumed nowhere in the project,
+    /// or any relevant chain is incomplete: silence — never a wrong guess.
+    ///
+    /// ponytail: singleton `super` reached only through `extend` isn't
+    /// modeled — `extend` doesn't sit inside the `ancestors()` chain at
+    /// all (see `lookup_singleton`), so "the next ancestor" isn't well
+    /// defined there; add it when a fixture needs it.
+    pub fn super_lookup(&self, owner: ClassId, singleton: bool, name: &str) -> MethodLookup<'_> {
+        if self.class(owner).is_module {
+            return if singleton {
+                MethodLookup::Inconclusive
+            } else {
+                self.super_lookup_module(owner, name)
+            };
+        }
+        let (ancestors, complete) = self.ancestors(owner);
+        match ancestors.iter().position(|&a| a == owner) {
+            Some(pos) => self.lookup_from(&ancestors, complete, pos + 1, name, singleton),
+            None => MethodLookup::Inconclusive,
+        }
+    }
+
+    /// The module branch of `super_lookup`, split out to stay under the
+    /// complexity ceiling: scans every class in the project for one whose
+    /// ancestry actually mixes `module` in, and continues that specific
+    /// class's linearization from right after the module's slot.
+    fn super_lookup_module(&self, module: ClassId, name: &str) -> MethodLookup<'_> {
+        let mut outcome: Option<Result<(&MethodSig, ClassId), ()>> = None;
+        for i in 0..self.classes.len() {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "class-table index bounded by `self.classes.len()`, far below u32::MAX for any real Ruby project"
+            )]
+            let consumer = ClassId(i as u32);
+            if self.class(consumer).is_module {
+                continue;
+            }
+            let (ancestors, complete) = self.ancestors(consumer);
+            let Some(pos) = ancestors.iter().position(|&a| a == module) else {
+                continue;
+            };
+            let here = match self.lookup_from(&ancestors, complete, pos + 1, name, false) {
+                MethodLookup::Inconclusive => return MethodLookup::Inconclusive,
+                MethodLookup::NotFound => Err(()),
+                MethodLookup::Found(m, a) => Ok((m, a)),
+            };
+            if !outcomes_agree(outcome, here) {
+                return MethodLookup::Inconclusive;
+            }
+            outcome = Some(here);
+        }
+        match outcome {
+            Some(Ok((m, a))) => MethodLookup::Found(m, a),
+            Some(Err(())) => MethodLookup::NotFound,
+            // The module is never actually mixed into any indexed class:
+            // no consumer chain to continue from, so no navigable target.
+            None => MethodLookup::Inconclusive,
+        }
+    }
+    /// Bead ita-54k: does `name`, referenced from lexical `nesting`, name
+    /// a constant written as an alias (`X = Y`, or qualified `A::B =
+    /// C::D`, RHS itself a literal constant path — see
+    /// `ProjectIndex::const_aliases`)? Mirrors `resolve_const`'s own
+    /// candidate generation (innermost nesting level outward, then the
+    /// bare name) so a bare alias reference resolves from the SAME
+    /// candidate scopes a real class reference would — just looked up in
+    /// `const_aliases` instead of `by_path`. Suppression-only:
+    /// `resolve_const` itself never calls this, and never will (widening
+    /// it could manufacture a false type per invariant #1).
+    fn find_const_alias(&self, nesting: &[String], name: &str) -> Option<&(Vec<String>, String)> {
+        if let Some(rest) = name.strip_prefix("::") {
+            return self.const_aliases.get(rest);
+        }
+        for level in nesting.iter().rev() {
+            let candidate = format!("{level}::{name}");
+            if let Some(alias) = self.const_aliases.get(&candidate) {
+                return Some(alias);
+            }
+        }
+        self.const_aliases.get(name)
+    }
+
+    /// ponytail: generous ceiling for an alias chain — no real idiom
+    /// (`X = SomeGem::Y`) is longer than one or two hops; raise only if a
+    /// real fixture needs more.
+    const CONST_ALIAS_CHAIN_CAP: usize = 32;
+
+    /// Bead ita-54k: does `name` resolve to a real project class by
+    /// following one or more constant-alias hops (`X = Y`, `Y = Z`, ...)?
+    /// Each hop resolves the RHS from ITS OWN write-site lexical scope
+    /// (`find_const_alias`'s stored nesting), not the original
+    /// reference's — matching real Ruby, where an assignment's
+    /// right-hand side is evaluated once, at definition time, in
+    /// whatever scope wrote it. `visited` guards a cycle (`X = Y; Y =
+    /// X`); `CONST_ALIAS_CHAIN_CAP` guards a pathologically long chain.
+    /// Either exit degrades to `None` — a silent miss, never a panic or
+    /// an infinite loop — because this is consulted only as a fallback
+    /// inside `const_exists`, which only ever SUPPRESSES E0104 on a hit
+    /// (invariant #1: a wrong miss here costs a warning, never a false
+    /// diagnostic).
+    fn resolve_const_via_alias(&self, nesting: &[String], name: &str) -> Option<ClassId> {
+        let mut cur_nesting = nesting.to_vec();
+        let mut cur_name = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..Self::CONST_ALIAS_CHAIN_CAP {
+            if !visited.insert(cur_name.clone()) {
+                return None; // cycle
+            }
+            let (next_nesting, target) = self.find_const_alias(&cur_nesting, &cur_name)?.clone();
+            if let Some(id) = self.resolve_const(&next_nesting, &target) {
+                return Some(id);
+            }
+            cur_nesting = next_nesting;
+            cur_name = target;
+        }
+        None
+    }
+
+    /// Bead ita-47y: resolve a constant path through literal-alias hops
+    /// at ANY `::`-segment, not only the last-but-one
+    /// `resolve_const_via_alias` chases. The measured ruby-lsp shape
+    /// (`Interface = LanguageServer::Protocol::Interface`, then
+    /// `Interface::CompletionItemKind::FIELD` — TWO segments past the
+    /// alias, not one) never resolved through `const_exists`'s qualified
+    /// branch: that branch only ever tries an alias on the text
+    /// immediately left of the FINAL `::`, so a reference two-or-more
+    /// segments past the alias always fell through to
+    /// `toplevel_consts`/`stdlib_declares` and warned a false E0104 even
+    /// though the alias itself, and a one-segment-nested reference
+    /// through it, already resolved.
+    ///
+    /// Unlike `resolve_const_via_alias` (suppression-only, `const_exists`'s
+    /// private fallback, never returns a type), this returns a real
+    /// `ClassId` — the SAME class a direct reference to the alias's
+    /// target would resolve to — so a caller (`check.rs::infer_const`)
+    /// can type the reference `Ty::Class(id)` exactly as if the alias had
+    /// never been in the way. That is what both kills the false E0104 AND
+    /// legitimately unlocks E0101/E0103 for a bogus member reached
+    /// through the alias (a class this checker now knows is closed can
+    /// diagnose a wrong method call on it, same as any other resolved
+    /// class) — the anti-suppression half of invariant #1 still holds:
+    /// only a segment that genuinely resolves ever produces a `ClassId`,
+    /// so a wrong member past a real alias keeps accusing exactly like a
+    /// wrong member past a real class would.
+    ///
+    /// Ruby only ever lexically searches the FIRST segment of a constant
+    /// path expression from the reference site's nesting; every later
+    /// segment is a literal child lookup of whatever the previous segment
+    /// resolved to (never re-searched lexically) — so only the first
+    /// segment tries `resolve_const`'s nesting walk (falling back to
+    /// `resolve_const_via_alias` for that one segment, exactly
+    /// `const_exists`'s existing single-hop behavior), and every
+    /// following segment is looked up as an EXACT qualified path
+    /// (`resolve_alias_segment`), itself falling back to
+    /// `resolve_const_via_alias` keyed by that exact qualified name for
+    /// an interior alias hop (`Owner::Seg = ...`).
+    ///
+    /// Still literal-path-only (ita-exc): every hop chased here was
+    /// already recorded by `const_aliases`, which only ever records a
+    /// RHS that parsed as a bare/qualified constant path — nothing here
+    /// widens WHAT counts as an alias, only how many `::`-segments past
+    /// one a caller may walk. `resolve_const` itself stays untouched and
+    /// lexical-only, per its own doc comment. A miss at any segment
+    /// degrades to `None` — a silent miss, never a panic — the same
+    /// failure mode `resolve_const`/`resolve_const_via_alias` already
+    /// have.
+    pub fn resolve_const_through_aliases(&self, nesting: &[String], name: &str) -> Option<ClassId> {
+        if let Some(id) = self.resolve_const(nesting, name) {
+            return Some(id);
+        }
+        let (first_nesting, first) = match name.strip_prefix("::") {
+            Some(rest) => (&[][..], rest),
+            None => (nesting, name),
+        };
+        let mut segments = first.split("::");
+        let first_seg = segments.next()?;
+        let mut owner = self
+            .resolve_const(first_nesting, first_seg)
+            .or_else(|| self.resolve_const_via_alias(first_nesting, first_seg))?;
+        for seg in segments {
+            owner = self.resolve_alias_segment(owner, seg)?;
+        }
+        Some(owner)
+    }
+
+    /// One interior `::`-segment step past an already-resolved `owner`
+    /// (bead ita-47y): a plain child lookup (`by_path`), or — if the
+    /// exact qualified name is itself a literal-path alias write —
+    /// chased via `resolve_const_via_alias` keyed by that exact qualified
+    /// path. No lexical search: see
+    /// `resolve_const_through_aliases`'s doc comment for why only the
+    /// FIRST segment of a path expression is ever lexically searched.
+    fn resolve_alias_segment(&self, owner: ClassId, seg: &str) -> Option<ClassId> {
+        let qualified = format!("{}::{seg}", self.class(owner).path);
+        if let Some(&id) = self.by_path.get(&qualified) {
+            return Some(id);
+        }
+        self.resolve_const_via_alias(&[], &format!("::{qualified}"))
+    }
+
+    /// Bead ita-47y (RBI-target extension): fully chase a literal-alias
+    /// chain and return the FINAL target TEXT — unlike
+    /// `resolve_const_via_alias` (`Option<ClassId>`, a silent miss the
+    /// moment a target never resolves to a project `ClassId`), this
+    /// keeps going until it finds a leaf that is NOT itself a further
+    /// alias, and hands that leaf's raw spelling back so a caller can
+    /// check it against something OTHER than this project's own index —
+    /// specifically a client's vendorized `sorbet/rbi` (the measured
+    /// ruby-lsp shape: `Interface = LanguageServer::Protocol::Interface`,
+    /// whose real target is declared only in
+    /// `sorbet/rbi/gems/language_server-protocol@*.rbi`, never as a
+    /// project `ClassId`). Returns `None` when `name` is not an alias at
+    /// all, the chain resolves to a real project `ClassId` after all (not
+    /// this fallback's job — `resolve_const_through_aliases` already
+    /// covers that), or the chain cycles.
+    fn chase_alias_target_text(&self, nesting: &[String], name: &str) -> Option<String> {
+        let mut cur_nesting = nesting.to_vec();
+        let mut cur_name = name.to_string();
+        let mut visited = std::collections::HashSet::new();
+        for _ in 0..Self::CONST_ALIAS_CHAIN_CAP {
+            if !visited.insert(cur_name.clone()) {
+                return None; // cycle
+            }
+            let (next_nesting, target) = self.find_const_alias(&cur_nesting, &cur_name)?.clone();
+            if self.resolve_const(&next_nesting, &target).is_some() {
+                return None; // resolves in-project after all: not this fallback's job
+            }
+            if self.find_const_alias(&next_nesting, &target).is_none() {
+                return Some(target); // leaf: no further alias hop past this target
+            }
+            cur_nesting = next_nesting;
+            cur_name = target;
+        }
+        None
+    }
+
+    /// Bead ita-47y (RBI-target extension): like
+    /// `resolve_const_through_aliases`, walk `name` one `::`-segment at a
+    /// time (only the FIRST segment lexically searched, every later
+    /// segment a literal child of whatever came before) — but instead of
+    /// stopping at the first segment this project's own index cannot
+    /// resolve, check whether THAT exact segment is itself a literal
+    /// alias whose target ALSO never resolves in-project
+    /// (`chase_alias_target_text`). If so, return the alias's raw target
+    /// text concatenated with every remaining `::`-segment — the exact
+    /// expanded path `Checker::check_const_ref` should retry against a
+    /// client's `sorbet/rbi` next. `None` when no alias is involved at
+    /// the failing segment at all (a genuinely undefined project
+    /// constant, unrelated to this extension) — the caller only reaches
+    /// this after `resolve_const_through_aliases`/`const_exists` already
+    /// failed, so this can only ever ADD a suppression, never remove one
+    /// (invariant #1).
+    pub fn expand_unresolved_alias_target(&self, nesting: &[String], name: &str) -> Option<String> {
+        let (first_nesting, first) = match name.strip_prefix("::") {
+            Some(rest) => (&[][..], rest),
+            None => (nesting, name),
+        };
+        let mut segments = first.split("::");
+        let first_seg = segments.next()?;
+        let Some(mut owner) = self.resolve_const(first_nesting, first_seg) else {
+            let target = self.chase_alias_target_text(first_nesting, first_seg)?;
+            return Some(join_remaining(&target, segments));
+        };
+        for seg in segments.by_ref() {
+            let qualified = format!("{}::{seg}", self.class(owner).path);
+            if let Some(&id) = self.by_path.get(&qualified) {
+                owner = id;
+                continue;
+            }
+            let target = self.chase_alias_target_text(&[], &format!("::{qualified}"))?;
+            return Some(join_remaining(&target, segments));
+        }
+        None // every segment resolved in-project after all — nothing to expand
+    }
+
+
+    /// Is `name` resolvable as a constant from `scope`? Checks class paths
+    /// and plain `CONST = ...` definitions, in each lexical scope and then
+    /// in that scope's ancestors — Ruby's real order is lexical nesting
+    /// first, then the ancestors of the innermost cref, and skipping the
+    /// second half made every inherited or mixed-in constant look
+    /// unresolved (a constant reached through an `include`d sibling module;
+    /// a constant defined on the superclass).
+    ///
+    /// Only ever used to SUPPRESS E0104, never to produce a type: a hit
+    /// here makes strictly fewer diagnostics, so widening it cannot invent
+    /// a false positive. `resolve_const` deliberately stays lexical-only,
+    /// because widening *it* would turn `Ty::Unknown` into `Ty::Class`
+    /// and could manufacture a new E0101/E0102/E0103 (invariant #1).
+    ///
+    /// Bead ita-54k: when the qualified branch's prefix fails to resolve
+    /// via `resolve_const`, it also tries `resolve_const_via_alias` — the
+    /// prefix itself may be a constant alias (`X = Y`) rather than a real
+    /// class, and a reference through it (`X::Something`) must resolve
+    /// exactly as `Y::Something` would. Bead ita-47y widens this to
+    /// `resolve_const_through_aliases`, which also chases a prefix that is
+    /// itself MULTIPLE segments past the alias (`X::Y::Something`, not
+    /// only `X::Something`) — see that function's doc comment.
+    pub fn const_exists(&self, nesting: &[String], name: &str) -> bool {
+        if self.resolve_const_through_aliases(nesting, name).is_some() {
+            return true;
+        }
+        // Plain constants: check simple-name membership in the owning class
+        // of each lexical candidate scope.
+        let (owner, simple) = match name.rsplit_once("::") {
+            Some((prefix, simple)) => {
+                // Bead ita-yh1: DO NOT trim a leading `::` off `prefix`
+                // here — `resolve_const_through_aliases`/`resolve_const`
+                // treat a leading `::` as "top level only" (see
+                // `resolve_const`'s `strip_prefix("::")`), which is exactly
+                // real Ruby cbase semantics. Stripping it before this
+                // lookup let a same-named lexically-nested module SHADOW
+                // the real top-level owner (`::Tapioca::TAPIOCA_DIR`
+                // resolving `Tapioca` to a nested `RubyLsp::Tapioca`
+                // instead of the top-level `::Tapioca`), producing a false
+                // E0104. A `prefix` with no leading `::` is unaffected —
+                // this only changes behavior for a genuinely cbase-
+                // prefixed `name`.
+                let owner = self.resolve_const_through_aliases(nesting, prefix);
+                let Some(owner) = owner else {
+                    // Bead ita-exc defect B, third shape: an unresolved
+                    // owner is exactly the case `resolve_qualified_const_writes`
+                    // falls back to `toplevel_consts` for, keyed by the
+                    // full written path — check it before giving up on
+                    // the project side entirely.
+                    //
+                    // Bead ita-9he: an EMPTY `prefix` here only ever comes
+                    // from a cbase single-segment reference (`::X`,
+                    // rsplit_once("::") on `"::X"` yields `("", "X")` —
+                    // see this arm's own doc comment above). That is the
+                    // read-side twin of the write-side fix: `toplevel_consts`
+                    // is keyed by the BARE simple name for a true top-level
+                    // constant (both the `ConstantWriteNode` arm's
+                    // `frag_idx == None` case and the new cbase
+                    // `ConstantPathWriteNode` case push the bare name, never
+                    // a `::`-prefixed one), so looking up the untrimmed
+                    // `name` (`"::X"`) here would always miss even after a
+                    // matching write was indexed. A non-empty `prefix`
+                    // (`Foo::Bar` where `Foo` doesn't resolve) is the
+                    // pre-existing qualified-write shape and is untouched:
+                    // `resolve_qualified_const_writes` keys THAT fallback
+                    // as the full `"owner::simple"` text, which `name`
+                    // already equals for that shape.
+                    return self.toplevel_consts.contains(if prefix.is_empty() { simple } else { name })
+                        || stdlib_declares(&self.requires, nesting, name);
+                };
+                (Some(owner), simple)
+            }
+            None => (None, name),
+        };
+        if let Some(owner) = owner {
+            self.const_in_ancestors(owner, simple)
+                // W3: stdlib fallback runs after every project-side
+                // check failed — see `stdlib_declares`.
+                || stdlib_declares(&self.requires, nesting, name)
+        } else {
+            // Bead ita-519: real nesting levels, innermost first —
+            // never a string-truncation walk over a flat scope (see
+            // `resolve_const`'s doc comment for why that over-widens
+            // past compact-syntax class/module boundaries).
+            for level in nesting.iter().rev() {
+                if let Some(&id) = self.by_path.get(level) {
+                    if self.const_in_ancestors(id, simple) {
+                        return true;
+                    }
+                }
+            }
+            // Bead ita-exc defect B: every real lexical scope has now
+            // been consulted and none carried `simple`. This is the
+            // TERMINAL step — a true toplevel constant was
+            // unreachable before this bucket existed. A hit only
+            // suppresses E0104, same contract as `stdlib_declares`
+            // right beside it (invariant #1).
+            self.toplevel_consts.contains(name) || stdlib_declares(&self.requires, nesting, name)
+        }
+    }
+    /// Does `simple` name a constant on `id` or any of its ancestors —
+    /// either a `CONST = ...` assignment or a nested class/module? MRO
+    /// incompleteness is irrelevant: only a positive hit is used, and it
+    /// only ever silences a warning.
+    fn const_in_ancestors(&self, id: ClassId, simple: &str) -> bool {
+        let (chain, _complete) = self.ancestors(id);
+        chain.into_iter().any(|a| {
+            let c = self.class(a);
+            c.consts.iter().any(|k| k == simple)
+                || self.by_path.contains_key(&format!("{}::{simple}", c.path))
+        })
+    }
+
+    /// (external-ancestry start namespaces, simple name) for a failed
+    /// constant lookup (W3) — mirrors `const_exists`'s own split: a
+    /// qualified name starts from its prefix's class chain, a bare name
+    /// from every lexical scope class. The starts are where external
+    /// knowledge (Tapioca RBI) has to take over, i.e. exactly
+    /// `external_ancestor_starts`' two populations: ancestor names the
+    /// project never resolved, AND ancestors that resolved onto a curated
+    /// force-open declaration.
+    ///
+    /// The second population is load-bearing, measured (bead ita-dpg.1):
+    /// while only `unresolved_ancestors` was consulted here, `Types::Base
+    /// < GraphQL::Schema::Object` reached the gem RBI only because that
+    /// superclass name resolved NOWHERE. Declaring the namespace in
+    /// `declarations/rbs_collection.rbi` made it resolve, so the RBI walk
+    /// never started and 2567 corpus-c E0104 warnings came back
+    /// (`ID`/`Boolean`/`Int`, graphql-ruby's mixin names) — a declaration
+    /// meant to REMOVE warnings adding them instead.
+    fn external_lookup_starts<'a>(&self, nesting: &[String], name: &'a str) -> (Vec<String>, &'a str) {
+        if let Some((prefix, simple)) = name.rsplit_once("::") {
+            match self.resolve_const(nesting, prefix.trim_start_matches("::")) {
+                Some(owner) => (self.external_ancestor_starts(owner), simple),
+                None => (Vec::new(), simple),
+            }
+        } else {
+            let mut starts = Vec::new();
+            for level in nesting.iter().rev() {
+                if let Some(&id) = self.by_path.get(level) {
+                    starts.extend(self.external_ancestor_starts(id));
+                }
+            }
+            (starts, name)
+        }
+    }
+
+    /// Names written in `id`'s ancestor chain that the project's own
+    /// index could not resolve — the external-ancestry entry points
+    /// (W3). Mirrors `linearize`'s walk (same per-class resolution rule,
+    /// same cycle guard), collecting the FAILED superclass / include /
+    /// prepend names instead of the resolved ids.
+    fn unresolved_ancestors(&self, id: ClassId) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut visited = std::collections::HashSet::new();
+        self.collect_unresolved(id, &mut out, &mut visited);
+        out
+    }
+
+    fn collect_unresolved(
+        &self,
+        id: ClassId,
+        out: &mut Vec<String>,
+        visited: &mut std::collections::HashSet<ClassId>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        let class = self.class(id);
+        let nesting = &class.nesting;
+        for name in class.prepends.iter().chain(class.includes.iter()) {
+            match self.resolve_const(nesting, name) {
+                Some(m) => self.collect_unresolved(m, out, visited),
+                None => out.push(name.trim_start_matches("::").to_string()),
+            }
+        }
+        if let Some(sc) = &class.superclass {
+            match self.resolve_superclass_const(id, nesting, sc) {
+                Some(s) => self.collect_unresolved(s, out, visited),
+                None => out.push(sc.trim_start_matches("::").to_string()),
+            }
+        }
+    }
+
+    /// Start namespaces where EXTERNAL knowledge (Tapioca RBI) has to
+    /// take over for `id`'s own ancestry (bead ita-xze) — two distinct
+    /// populations, both measured as real share of the `ancestry open`
+    /// census bucket (45.7% and 40.2% respectively at the reference
+    /// corpus), so a walk that only covered one would leave most of the
+    /// bucket exactly as blind as before:
+    ///
+    /// 1. Names in `id`'s chain that never resolved in the project's own
+    ///    index at all (`unresolved_ancestors` — same population
+    ///    `external_lookup_starts` already walks for constant lookup: a
+    ///    superclass/mixin spelled in project code but never defined
+    ///    anywhere the project's own index reaches).
+    /// 2. Ancestors that DID resolve but landed on a
+    ///    `declarations/gems.rbi` force-open entry
+    ///    (`OpenReason::DeclaredExternal`, see `merge_declared_fragment`):
+    ///    the name is real and in the index, but that entry carries zero
+    ///    methods by contract — only the real gem (Tapioca RBI) has them.
+    ///    `unresolved_ancestors` cannot see these at all: they are not a
+    ///    resolution failure, they resolve to a deliberately empty stub.
+    ///    The start name for this population is the resolved ancestor's
+    ///    own `path` (the RBI's fully-qualified header), not a name
+    ///    written in project code.
+    ///
+    /// Walks `id`'s own resolved chain (`ancestors`, which includes `id`
+    /// itself) for population 2 rather than reusing `inconclusive_reason`'s
+    /// classification: that function reports only the FIRST project-side
+    /// reason per call (a census aggregate), while every `DeclaredExternal`
+    /// ancestor in the chain is a genuine, independent start point here.
+    fn external_ancestor_starts(&self, id: ClassId) -> Vec<String> {
+        let mut starts = self.unresolved_ancestors(id);
+        let (chain, _complete) = self.ancestors(id);
+        for a in chain {
+            let class = self.class(a);
+            if class.open_reason == Some(OpenReason::DeclaredExternal) {
+                starts.push(class.path.clone());
+            }
+        }
+        starts
+    }
+
+    /// Start namespaces for the Tapioca DSL-RBI method lookup
+    /// (`dsl_method_lookup`, bead ita-tjr): `id`'s own `path`, then every
+    /// PROJECT ancestor's `path` in MRO order (`ancestors`, which already
+    /// includes `id` itself first). Deliberately the opposite population
+    /// from `external_ancestor_starts`: a DSL RBI reopens the app's OWN
+    /// class, under the exact name the project's own index already
+    /// resolves it by — an ancestor this project could not resolve at
+    /// all has no `path` of its own to look a DSL file up by (that's
+    /// `unresolved_ancestors`' population, already covered by
+    /// `external_ancestor_starts`), and a `DeclaredExternal` ancestor
+    /// (`declarations/gems.rbi`) is external by construction. No
+    /// filtering beyond that: `rbi_method_closure`'s own `rbi_map` lookup
+    /// (case (c) of `resolve_method_node`) is what turns a name with no
+    /// matching DSL file into a cheap, harmless miss.
+    fn project_ancestor_starts(&self, id: ClassId) -> Vec<String> {
+        let (chain, _complete) = self.ancestors(id);
+        chain.into_iter().map(|a| self.class(a).path.clone()).collect()
+    }
+
+    /// Project classes that CONCLUSIVELY define `method` as an instance
+    /// method (bead ita-dqo): their own fragment declares it
+    /// (`methods_by_name`), AND their full ancestor chain — every class
+    /// in it, including themselves — is both fully resolved
+    /// (`ancestors().1`) and never `open`. An unresolved superclass/mixin
+    /// name, or an `open` class anywhere in the chain (dynamic
+    /// metaprogramming, `method_missing`, a curated external
+    /// declaration), means some other, unknown definition could exist
+    /// too — not a trustworthy positive proof for constraint
+    /// contradiction (invariant #1: only PROVEN facts may narrow).
+    /// Bounded by `methods_by_name[method].len()`, never a project-wide
+    /// scan (bead ita-9p9's standing lesson) — the reverse index already
+    /// narrowed to the classes that could possibly qualify.
+    pub fn closed_candidates_for(&self, method: &str) -> Vec<ClassId> {
+        let Some(ids) = self.methods_by_name.get(method) else {
+            return Vec::new();
+        };
+        ids.iter()
+            .copied()
+            .filter(|&id| {
+                let (chain, complete) = self.ancestors(id);
+                complete && chain.iter().all(|&a| !self.class(a).open)
+            })
+            .collect()
+    }
+}
+
+// -- W3 require/autoload: stdlib constants gated on the project's own
+// `require` calls -----------------------------------------------
+
+/// `constant path -> every stdlib lib whose `require` defines it`, parsed
+/// once per process from the mechanically harvested inventory embedded at
+/// compile time (`declarations/stdlib_constants.txt`, generator versioned
+/// at `scripts/gen-stdlib-inventory.rb` — the anti-gaming rule's
+/// generated-content exception, same pattern as `core_inventory.txt`).
+fn stdlib_const_libs() -> &'static HashMap<&'static str, Vec<&'static str>> {
+    use std::sync::LazyLock;
+    static MAP: LazyLock<HashMap<&'static str, Vec<&'static str>>> = LazyLock::new(|| {
+        const TXT: &str = include_str!("../declarations/stdlib_constants.txt");
+        let mut map: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
+        for line in TXT.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            if let Some((lib, path)) = line.split_once('\t') {
+                map.entry(path).or_default().push(lib);
+            }
+        }
+        map
+    });
+    &MAP
+}
+
+/// Every path `declarations/gems.rbi` declares (bead ita-3gs), as a
+/// lookup set for `is_known_external_class_path`. Deliberately a raw
+/// line scan of the embedded text, NOT `declarations::declared_fragments`
+/// (which parses via the real `DefWalker`): `DefWalker`'s own `ClassNode`
+/// arm calls `is_known_external_class_path` (bead ita-h6l) for every
+/// class it walks, so parsing `gems.rbi` through it here would recurse
+/// into THIS SAME `LazyLock` while it is still being computed — a
+/// deadlock, not just wasted work. `gems.rbi`'s contract (enforced by
+/// `declarations::tests::declares_open_namespaces_only_no_methods`) is
+/// one bare `class`/`module <Path>; end` per line — a substring scan
+/// buys nothing a real parse would add.
+fn declared_gem_paths() -> &'static std::collections::HashSet<&'static str> {
+    use std::sync::LazyLock;
+    static SET: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        crate::declarations::GEMS_RBI
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                let rest = line
+                    .strip_prefix("class ")
+                    .or_else(|| line.strip_prefix("module "))?;
+                rest.split(';').next().map(str::trim)
+            })
+            .collect()
+    });
+    &SET
+}
+
+/// Bead ita-h6l (mechanism B): does `path` name a Ruby core class, a
+/// stdlib constant this checker's inventory knows, or a curated gem
+/// namespace? `class <path> ... end` written in project source for one of
+/// these is Ruby's REOPENING syntax — the real class's ancestry and
+/// method surface extend far past what this checker ever modeled
+/// (`Pathname#exist?`, `Range#overlap?`, `Mail::Message#...`) — never the
+/// declaration of a brand-new, closed project class. Detection is by path
+/// only, independent of `closed_world`/`requires`: a project that spells
+/// `class Pathname` unambiguously means the stdlib class, Gemfile or not.
+/// Exact match only (no prefix/suffix): `Foo::Pathname` is a project
+/// namespace, not a reopening, even though `Pathname` alone is not.
+fn is_known_external_class_path(path: &str) -> bool {
+    crate::core::is_known_core_constant(path)
+        || stdlib_const_libs().contains_key(path)
+        || declared_gem_paths().contains(path)
+}
+
+/// Does `name`, referenced from lexical `scope`, name a stdlib constant
+/// whose defining lib this project actually requires (W3)? Consulted only
+/// from `const_exists`, only after every project-side check failed — a
+/// hit suppresses E0104 and nothing else (declaration, open ancestry, the
+/// exact contract `declarations/gems.rbi` set). Without the matching
+/// `require` in the project the constant keeps warning: gem-bundled
+/// transitive requires are invisible here, and guessing them would turn
+/// the gate into a blanket suppressor.
+///
+/// Exact paths only, never a truncated prefix: suppressing `Foo::Bar`
+/// because `Foo` is stdlib-defined would hide a genuinely missing `Bar`.
+/// Two candidate spellings, mirroring Ruby's cref lookup: the name as
+/// written, and — for a bare name — the cref-qualified form, so a bare
+/// `ParserError` inside an app-reopened `module JSON` still resolves to
+/// `JSON::ParserError`.
+pub fn stdlib_declares<S: std::hash::BuildHasher>(
+    requires: &std::collections::HashSet<String, S>,
+    nesting: &[String],
+    name: &str,
+) -> bool {
+    if requires.is_empty() {
+        return false;
+    }
+    let map = stdlib_const_libs();
+    let name = name.trim_start_matches("::");
+    // Every cref spelling, innermost out — `ParserError` inside
+    // `module JSON; class X` resolves as `JSON::ParserError` through the
+    // real lexical nesting (bead ita-519: never a string-truncation walk
+    // over a flat scope — see `resolve_const`'s doc comment).
+    if map
+        .get(name)
+        .is_some_and(|libs| libs.iter().any(|lib| requires.contains(&**lib)))
+    {
+        return true;
+    }
+    for level in nesting.iter().rev() {
+        let cand = format!("{level}::{name}");
+        if map
+            .get(cand.as_str())
+            .is_some_and(|libs| libs.iter().any(|lib| requires.contains(&**lib)))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Do two `super_lookup_module` consumer outcomes agree well enough to
+/// keep resolving `super` for a module shared by more than one consuming
+/// class? No prior outcome always agrees; two `Found`s must name the exact
+/// same method definition; two `NotFound`s agree with each other; anything
+/// else is a genuine disagreement between consumers, which `super_lookup`
+/// must treat as unresolvable rather than pick a side.
+fn outcomes_agree(
+    prior: Option<Result<(&MethodSig, ClassId), ()>>,
+    here: Result<(&MethodSig, ClassId), ()>,
+) -> bool {
+    match (prior, here) {
+        (None, _) => true,
+        (Some(Ok((pm, _))), Ok((m, _))) => (pm.file, pm.name_span) == (m.file, m.name_span),
+        (Some(Err(())), Err(())) => true,
+        _ => false,
+    }
+}

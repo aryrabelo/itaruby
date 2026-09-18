@@ -1,0 +1,8 @@
+source "https://rubygems.org"
+
+# ita-2ve fixture: this Gemfile exists only to be DISCOVERED. Checking
+# this directory as its own root (`ita check .../with_gemfile`) turns
+# closed-world core checking off -> the typo in narrowing_core_typo.rb
+# stays silent. Checking testdata/ as the root does NOT see it (discovery
+# only walks upward), so the same typo fires there — both directions are
+# asserted by crates/itaruby/tests/core_closed_world_cli.rs.

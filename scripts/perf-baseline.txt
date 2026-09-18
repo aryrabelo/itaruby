@@ -1,0 +1,33 @@
+# Performance ceilings, one per criterion benchmark. Read by
+# scripts/perf-gate.sh; the benchmark itself is
+# crates/itaruby_semantic/benches/check.rs.
+#
+# Columns:  <bench-id>  <ci_ceiling_ns>  <dev_ceiling_ns>
+#
+# The gate picks the `ci` column when $CI is set and the `dev` column
+# otherwise. Two columns because a hosted runner is not a measurement
+# instrument — shared, throttled, several times slower — so one number
+# cannot be both non-flaky there and meaningful here. CI's job is to catch
+# an order-of-magnitude regression; the dev column is the one that ratchets.
+#
+# MEASURED: 2026-08-26 on m5 (Apple M5), release/bench profile, machine
+# otherwise idle, criterion 100 samples:
+#   check/project_index          median 6.12 ms  (CI band +/- 0.8%)
+#   check/index_and_check_all    median 37.71 ms (CI band +/- 0.6%)
+#
+# Ceilings: dev = measured x 1.15, which is far outside criterion's own
+# confidence band and still fails on any regression worth a bisect. ci =
+# measured x 5, sized for a cold shared runner rather than for precision.
+#
+# The dev column is an m5 number. A slower dev machine will read closer to
+# its ceiling; that is a reason to record a second column for that machine,
+# never a reason to raise this one. Slack is debt, not margin (AGENTS.md,
+# binding): a run that lands comfortably under its ceiling tightens the
+# ceiling in the same commit.
+#
+# The synthetic corpus the benchmark builds is fixed forever (40 files). If
+# it ever changes, every number above is void and must be re-measured — a
+# ceiling compared against a different input is worse than no ceiling.
+
+check/project_index        30600000   7040000
+check/index_and_check_all  188550000  43400000

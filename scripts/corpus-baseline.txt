@@ -1,0 +1,191 @@
+# Corpus baseline — the sacred numbers, in machine-readable form.
+#
+# WHY HASHES, NOT TEXT: an `err` line from `ita check` contains a client's
+# file path (and sometimes a client class/method name). This file is public
+# git history (see AGENTS.md — repo is private with intent to open). So no
+# error line is ever written here in the clear: each declared corpus lists
+# the SHA-256 (first 16 hex chars) of its expected error lines, normalized
+# by stripping the corpus's mapped path (see scripts/corpora-local.txt,
+# gitignored, one machine-local `<id> <path>` line per corpus) from the
+# front of each `ita check` output line and replacing it with `<id>/` before
+# hashing — one trailing newline included, i.e.:
+#
+#   printf '%s\n' "$line" | shasum -a 256 | cut -c1-16
+#
+# where $line already had its corpus root replaced by `<id>/`. This keeps
+# the hash independent of both the machine (no absolute mount point survives
+# it) and the corpus's own directory layout (no client repo name or nesting
+# survives it either) — a corpus can move, get renamed, or nest one level
+# deeper on its host without moving a single hash in this file. The gate
+# recomputes hashes from a fresh run and compares the SET, never the text.
+# When a run drifts, the gate writes the actual in-clear lines to
+# `target/gauntlet/corpus-<id>-drift.txt` — gitignored, stays on the machine
+# that has the corpus — and the transcript only prints counts (how many new,
+# how many gone) plus that filename.
+#
+# `warn_ceiling` is a ceiling, not an equality: warnings are the
+# external-declaration gap (bead ita-10d), so they may fall freely and must
+# never rise. A rise is either OUR regression (revert it) or corpus drift
+# (these are living client repos) — and the second case is only ever settled
+# by measurement, never by assumption. The `measured` comment on each corpus
+# records the .rb file count its ceiling was taken against, so the next
+# drift is attributable in one step instead of a git-archive bisect (bead
+# ita-vbj: a stale-checkout ceiling once read as a false regression for a
+# day).
+#
+# The `corpus_rev` comment on each corpus carries the same duty for the
+# revision: the corpus HEAD its ceiling and hashes were measured against. A
+# bare git sha identifies no client, and without it a red gate d cannot
+# distinguish our detection changing from the client repo moving — which is
+# exactly the day that got burned on 2026-09-18 (see AGENTS.md's Rules of
+# proof). Every ratchet updates it in the same commit as the number.
+#
+# Corpus ids are generic (corpus-a, corpus-b, corpus-c) on purpose: their
+# real paths are client-identifying and live only in the gitignored,
+# machine-local scripts/corpora-local.txt — never in this file, never in git
+# history. A corpus is checked only on a machine whose
+# scripts/corpora-local.txt maps its id to an existing directory; absent
+# corpora (missing mapping file, or no line for that id) are skipped
+# individually, by id — see AGENTS.md's Gates table for why full proof needs
+# two machines (m5 + work).
+#
+# Format: one `corpus <id> warn_ceiling=<n>` line declares a corpus,
+# followed by zero or more `err <id> <hash>` lines (its expected error-hash
+# set). A corpus with zero expected errors (corpus-b) has no `err` lines at
+# all.
+#
+# The hashes on record were regenerated 2026-08-25 under the `<id>/`
+# normalization (corpus-a: 2 errors, corpus-b: 0, corpus-c: 3 — same sets
+# as the previous path-based hashes, re-derived from clean `ita check`
+# runs on the machines holding each corpus).
+
+# measured 2026-08-21 @ 2188 .rb files (was 526 @ 2083 — corpus grew, ita-vbj)
+# a corpus-a error hash — full round trip on 2026-08-21, all inside bead
+# ita-uye's branch. REMOVED (bead ita-4xy: self-sends in blocks made never
+# conclusive, because instance_exec can rebind self, which silenced this
+# real dormant NameError too; invariant #1 ranked that trade correct at the
+# time — 3 FPs died for it on another corpus). Then RESTORED by admitting a
+# `Ty::Unknown`-receiver arm (an allowlisted iteration method on an untyped
+# receiver keeps lexical self, on the argument that Enumerable#each's
+# published contract forbids rebinding). Then REMOVED AGAIN at review: that
+# argument is not proof — it stands on the method NAME, never on knowing who
+# runs it — and invariant #1 forbids shipping unproven conclusiveness even
+# for a 1-site gain. This site is a read-verified true positive and is now
+# a DELIBERATE false negative, not an oversight; do not "fix" this baseline
+# by deleting this note.
+#
+# The site, read directly (not inferred from the bead's own notes): a name
+# assigned as a local inside an INNER block and read after that block
+# closed, still inside an OUTER block — the block-local scope is gone, so
+# Ruby parses the read as a self-send, and the class defines no such method.
+# It fires on the successful path, every time.
+#
+# The Unknown-receiver arm that recovered it briefly, measured before it was
+# adopted and before it was reverted: it produced exactly ONE new
+# diagnostic across the 5866 .rb files of all three corpora, this one, with
+# every other error hash and all three warning ceilings unchanged. That
+# single-site measurement is why it was adopted at all, and why it still
+# wasn't enough to survive review once weighed against invariant #1.
+#
+# warn_ceiling unchanged by bead ita-exc, and that ZERO is itself the
+# finding: ita-exc audited this corpus for E0104 false positives (up to 11
+# roots looked app-defined under a nesting-blind awk) and found NONE — every
+# candidate was a gem-name collision on the root segment, or a genuinely
+# renamed/dead reference, correctly warned. Two real FP mechanisms WERE
+# found and fixed on the other two corpora; this corpus not moving by a
+# single warning is the independent confirmation that its 11 were phantom.
+#
+# This corpus's mapped path on its host has moved twice historically (one
+# level deeper, then into a different parent directory after a fleet
+# reorg) — both times identity was confirmed by re-hashing the same two
+# sites under the new location and getting the same two hashes back (under
+# the OLD normalization, which kept the corpus's own path segment in the
+# hash input). Under the normalization this file now documents — strip the
+# mapped path, replace it with `corpus-a/` — a path move on the host no
+# longer touches this file at all: only scripts/corpora-local.txt needs
+# updating.
+# 603 -> 328 (anchored 2026-08-26 on the machine holding corpus-a/corpus-b,
+# sha 0b7ede7): wave 7/8/9 gains never anchored here — errors byte-identical
+# to the two hashes below, so the whole drop is warnings that stopped being
+# emitted. Slack is debt: tightened in the same commit as the anchor.
+# 328 -> 312 (wave 10, sha 05470dc) -> 284 (wave 11+12, sha 2c5c5c0): 16 curated gem
+# namespaces + 17 more collection gems in the pack; errors byte-identical.
+# 284 -> 251 (wave 14, 2026-09-18, anchored on the machine holding
+# corpus-a/corpus-b at repo sha 8135e83 + the wave-14 gems.rbi patch): 11
+# curated public gem namespaces silenced 39 warnings (23 money, 6 karafka,
+# 6 activeresource, 3 flipper, 1 activestorage), errors byte-identical (the
+# same single hash before and after). Slack is debt: tightened in the same
+# commit as the measurement.
+# corpus_rev 038a25ea4 — the corpus HEAD the 251 was measured against
+# (clean tree, 2026-09-18). A bare git sha names no client. The previous pin
+# was 3acfe772 (its last commit on or before 2026-08-26, when 284 was taken);
+# it is superseded because 251 was measured on today's content, and pinning
+# the old revision next to a new number is exactly the unattributable state
+# this field exists to prevent. The 71-commit / 158-.rb-file drift between
+# those two revisions is why gate d was red on 2026-09-18 with zero
+# detection change (see AGENTS.md's Rules of proof).
+corpus corpus-a warn_ceiling=251
+err corpus-a 639b38e1e239db52
+err corpus-a df454e7f1dccfb54
+
+# measured 2026-08-21 @ 315 .rb files
+# 103 -> 92 (bead ita-exc): 11 occurrences over 2 roots were a real FP — a
+# top-level `Name = Class.new(StandardError)` custom-exception constant was
+# invisible to const_exists, because a top-level constant write never
+# reached any bucket resolution consults.
+# 92 -> 65 (anchored 2026-08-26, sha 0b7ede7, same run as corpus-a above):
+# zero errors before and after, so the drop is warnings only.
+# 65 -> 61 (wave 10) -> 48 (wave 11+12, sha 2c5c5c0, same anchor run).
+# corpus_rev 4e538a69 — same measurement rule as corpus-a above (last commit
+# on or before 2026-08-26, recovered 2026-09-18). On 2026-09-18 this corpus
+# had advanced 38 commits / 21 .rb files past this revision.
+# Wave 14 (2026-09-18): measured 51 at corpus_rev cb612198 with the
+# wave-14 declarations — 1 warning silenced (activestorage), errors still
+# zero. 51 is still ABOVE this ceiling, so the number below is deliberately
+# NOT touched and NOT relaxed: the residual is content drift (38 commits
+# past the pin) plus first-party private-gem namespaces no public
+# declaration file may carry. The pin below therefore still describes the
+# 48 measurement, not today's run.
+corpus corpus-b warn_ceiling=48
+
+# measured 2026-08-22 @ 2363 .rb files
+# 2298 -> 1525 (bead ita-exc, -773 / -33.6%): constants written inside a
+# class-body call block were never indexed at all, so every reference to
+# one was E0104. E0104 is 100% of this corpus's warnings.
+# 1525 -> 373 (bead ita-k9j.3, -1152 / -75.5%): `RbiIndex.constants` kept
+# ONE declaring file per name, chosen by `read_dir` order, and THREE files
+# in this corpus's `sorbet/rbi/gems` declare `ActiveRecord::Base` (123, 8
+# and 5 direct edges). The stubs were winning the race here, so every
+# constant whose real declaring file lost it was E0104. This ratchet is the
+# proof that the bug was ACTIVE on the machine holding this corpus, not
+# latent: the union fix changes no rule about what deserves a warning.
+# 373 -> 303 (beads ita-083/ita-54k/ita-gjb, 2026-08-25, -70): T::Struct/
+# TracePoint curated declarations, constant-alias following (X = Y), and
+# fail-closed `.new` on classes with no visible initialize — three FP
+# mechanisms silenced, error hashes byte-identical, so the ceiling tightens
+# in the same commit (ratchet slack paid down, no debt carried).
+# 303 -> 179 (wave 7/8 gains not yet ratcheted, measured 2026-08-26 on the
+# machine holding corpus-c): slack is debt — a 124-warning cushion greens
+# a 124-warning regression, which is exactly how this ratchet almost let
+# bead ita-dpg.1's +2567 E0104 spike hide behind a stale number.
+# corpus_rev e10255bf93 — the revision the last green m5 run judged
+# (2026-09-17: error hashes matched exactly, 179 warnings against a 179
+# ceiling). Recorded 2026-09-18 from that run, not from a fresh measurement;
+# the corpus working tree carried 3 uncommitted files at that run, so a future
+# unexplained delta of that size is the first thing to check.
+corpus corpus-c warn_ceiling=179
+err corpus-c b183a1b03e93cb09
+err corpus-c cd39871949cd29b2
+# 3rd err added 2026-08-21 (bead ita-4xy): surfaced by the sig{} carve-out
+# closing previously-open classes. Proven true positive by reading the
+# site: a bare method call in a rescue path on a class that defines no such
+# reader anywhere (the nearby happy path correctly uses the @ivar form) — a
+# dormant NameError that fires exactly when that error path runs.
+err corpus-c de6fab5dc1f10706
+# 4th err added 2026-09-03: surfaced by open-reason precedence (an abstract
+# raise is now the weakest open reason) plus the abstract-raise lookup
+# softening. Proven true positive by reading the site: a call to a name the
+# receiver's family never defines anywhere, whose base only carries a
+# `raise NotImplementedError` stub — so it is a real dormant NoMethodError,
+# firing every time that path runs.
+err corpus-c 33aded51a652e5b7

@@ -1,0 +1,16 @@
+# Files allowed at the repository root. Adding a line here is the
+# deliberate act; NOTES.md appearing without one is the reflex.
+.gitignore
+Cargo.lock
+Cargo.toml
+rust-toolchain.toml
+README.md
+LICENSE
+AGENTS.md
+.githooks
+.github
+.software-factory
+crates
+docs
+testdata
+scripts

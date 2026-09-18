@@ -1,0 +1,31 @@
+[package]
+name = "itaruby_semantic"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+itaruby_syntax = { path = "../itaruby_syntax" }
+ruby-prism = { workspace = true }
+salsa = { workspace = true }
+rustc-hash = "2"
+
+[dev-dependencies]
+# The performance baseline. `L6.PERFORMANCE_REGRESSION_IS_GUARDED` names
+# criterion as one of the tools it accepts for Rust; before this the rule
+# was enabled in policy and frozen for the whole language in the ratchet,
+# which is the same as off.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bin]]
+name = "gen-activerecord-inventory"
+path = "../../scripts/gen-activerecord-inventory.rs"
+
+[[bench]]
+name = "check"
+harness = false
+
+[lints]
+workspace = true

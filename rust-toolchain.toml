@@ -1,0 +1,11 @@
+# Pinned so that "it compiles on my machine" and "it compiles in CI" are the
+# same claim. This repository has already paid for the opposite: 58 clippy
+# warnings lived unnoticed because the only place that would have failed on
+# them could not run (AGENTS.md, measured 2026-08-24).
+#
+# The nightly `races` job in CI asks for its toolchain explicitly with
+# `cargo +nightly`, which overrides this pin for that job only —
+# ThreadSanitizer needs a std rebuild that stable cannot do.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

@@ -1,0 +1,110 @@
+name: software factory
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  factory:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install sf
+        # Pinned so an upstream push can't silently change this CI's result;
+        # bumping this sha is a deliberate act. Resolved via
+        # `gh api repos/nicolasmelo1/software-factory/commits/HEAD --jq .sha`
+        # (2026-08-24, upstream main).
+        run: cargo install --git https://github.com/nicolasmelo1/software-factory --rev 76ec836dd0264712844fa86abc3fc26b35ccac4f --locked
+      # verify first: a check that stopped firing makes the run below
+      # meaningless, and it is the cheaper failure to discover.
+      - name: Prove the checks still fire
+        run: sf verify
+      - name: Check the repository
+        run: sf check --changed origin/${{ github.base_ref || 'main' }}
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust test suite
+        run: cargo test --workspace
+      - name: Gem test suite
+        run: |
+          cd scripts/ruby-lsp-itaruby
+          ruby -Itest test/addon_test.rb
+          ruby -Itest test/server_client_test.rb
+
+  hazards:
+    runs-on: ubuntu-latest
+    # gitleaks-action v2 reads the PR's commits via the pulls API; the
+    # workflow-level `contents: read` alone makes that call fail with
+    # "Resource not accessible by integration" (measured 2026-08-25, run
+    # 32895841304). contents:read stays for the checkout/fetch itself.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Committed secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Dependency vulnerabilities
+        uses: taiki-e/install-action@cargo-audit
+      - run: cargo audit
+      - name: Insecure patterns and dead code
+        # `--workspace` is explicit: the lint policy itself lives in
+        # `[workspace.lints]`, so this command only has to add what a lint
+        # table cannot express (`dead_code` as an error) and make the scope
+        # unambiguous.
+        run: cargo clippy --workspace --all-targets -- -D warnings -D dead_code
+
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The launch bar for this project is beating an established
+      # typechecker on speed, and until now nothing in CI would have
+      # noticed a ten-times regression. The ceiling that decides pass/fail
+      # lives in `scripts/perf-baseline.txt`; a hosted runner is too noisy
+      # to be the authority, so the gate script compares against a
+      # deliberately loose ceiling here and the tight one on a dev machine,
+      # the same split the corpus gate already uses.
+      - name: Benchmark with criterion
+        run: cargo bench -p itaruby_semantic --bench check -- --noplot
+      - name: Compare against the committed ceiling
+        # The loose column, asked for explicitly: a hosted runner is several
+        # times slower than a dev machine, and the gate refuses to guess.
+        env:
+          PERF_COLUMN: ci
+        run: ./scripts/perf-gate.sh --no-run
+
+  races:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # `ita check` fans every file out across threads and the LSP server
+      # shares a queue plus a cancel set between two threads, so this is
+      # not a single-threaded program that could honestly disable the rule.
+      # ThreadSanitizer needs nightly and its own std rebuild; the pinned
+      # `rust-toolchain.toml` covers the stable jobs, so nightly is asked
+      # for explicitly here.
+      - name: Install nightly with the sanitizer's std
+        run: rustup toolchain install nightly --profile minimal --component rust-src
+      - name: ThreadSanitizer over the test suite
+        env:
+          RUSTFLAGS: -Zsanitizer=thread
+          RUSTDOCFLAGS: -Zsanitizer=thread
+          TSAN_OPTIONS: halt_on_error=1
+        run: >
+          cargo +nightly test -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p itaruby_semantic -p itaruby_syntax -p itaruby_server

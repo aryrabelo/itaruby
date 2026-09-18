@@ -15,11 +15,12 @@
 #          -> sclass_call_attr_reader_arity_is_checked must fail: the
 #             filed method was what carried E0102 to the wrong-arity call
 #   MUT-B  `class_attribute`'s predicate filing is cut
-#          -> class_attribute_instance_predicate_false_removes_the_predicate
-#             must fail: the fixture expects the predicate ABSENT, so a
-#             mutant that stops filing it makes the fixture and the code
-#             agree vacuously — the control that catches it is the
-#             positive side, class_attribute_is_filed_on_both_tracks
+#          -> class_attribute_is_filed_on_both_tracks must fail: the
+#             POSITIVE side is the only control that can catch this one.
+#             class_attribute_instance_predicate_false_removes_the_predicate
+#             expects the predicate ABSENT, so a mutant that stops filing
+#             it makes that fixture and the code agree vacuously — the
+#             header used to name exactly that blind test as the control
 #   MUT-C  the thread_mattr_* variants drop out of the mattr arm
 #          -> thread_mattr_accessor_is_indexed_on_both_tracks must fail
 #   MUT-D  gem_namespace_key degrades to exact equality (the 865fea9
@@ -32,6 +33,10 @@
 #          -> any_instance_softens_when_a_mock_gem_is_locked must fail:
 #             with rspec-mocks in the lock the lookup must soften to
 #             Inconclusive; a cut returns it to conclusive NotFound
+#   MUT-F  the `_exec` family drops out of the BODY_DEF_NAMES prefilter
+#          -> every_dynamic_def_shape_opens_its_class must fail
+#   MUT-G  the concern-edge gate on the `class_methods do` harvest is cut
+#          -> a_non_concern_class_methods_block_invents_nothing must fail
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -64,7 +69,11 @@ failing=
 # command substitution, because a subshell's assignments die with it and
 # "did not compile" would read as "green".
 run_suite() {
-  CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby_semantic \
+  # `--no-fail-fast` is load-bearing, not hygiene: cargo stops after the
+  # first failing test BINARY, so without it a mutant whose control lives
+  # in a later suite reported "expected X to fail" while X had never run
+  # (the defect operand-types-mutants.sh hit as M15 in round 6).
+  CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby_semantic --no-fail-fast \
     --test singleton_track --test gem_reopen_lockfile \
     --test mock_singleton_surface >"$LOG" 2>&1
   if grep -q 'could not compile' "$LOG"; then compiles=0; else compiles=1; fi

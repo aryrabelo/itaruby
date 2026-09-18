@@ -263,6 +263,7 @@ def required(name, art, proved)
   when 'c1'  then %w[const-missing-mutants.txt operand-types-mutants.txt singleton-mutants.txt]
   when 'c2'  then %w[unwrap.txt]
   when 'c2b' then %w[instrument-mutants.txt gate-digest-selftest.txt]
+  when 'c2c' then %w[gate-triage-selftest.txt]
   when 'c3'  then %w[perf.txt]
   when 'd'   then proved.flat_map { |id| ["corpus-#{id}.txt", "corpus-#{id}-error-hashes.txt"] }
   when 'f'   then %w[public.txt]

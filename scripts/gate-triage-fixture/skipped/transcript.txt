@@ -1,0 +1,35 @@
+=== gate 0 — sf check
+PASS sf check
+PASS sf check --changed HEAD (the guardrail only tightened)
+=== gate a — cargo test --workspace
+PASS cargo test
+=== gate b — build release binary
+PASS cargo build --release
+=== gate c — mutation probe (testdata/)
+PASS mutation probe (planted bugs caught, correct code silent)
+=== gate c1 — per-fix source mutants (each decision accused by a named test)
+PASS const-missing mutants (every mutant accused, source restored byte-identical)
+PASS operand-types mutants (every mutant accused, source restored byte-identical)
+PASS singleton mutants (every mutant accused, source restored byte-identical)
+=== gate c2 — unwrap shape (production source)
+PASS unwrap shape (only prism downcasts, each guarded by its match arm)
+=== gate c2b — evidence instruments (two-sided)
+PASS evidence instruments (each defect reproduces under mutation, shipped scripts clean)
+PASS gate digest (each fixture reported exactly, every mutant accused by its case)
+=== gate c3 — performance ceiling
+PASS performance ceiling (2 bench(es) under ceiling; see target/gauntlet/perf.txt)
+=== gate d — corpus diff
+SKIP corpus gate skipped (not hosted on this machine): corpus-b
+PASS corpus errors match baseline exactly (corpus-a) [rev aaa1111, baseline pinned aaa1111]
+PASS warning ceiling (corpus-a): 3 <= 5 [rev aaa1111, baseline pinned aaa1111]
+=== gate e — navigation oracle
+PASS navigation oracle: scripts/navfixture/oracle.jsonl (ita definition matches the runtime)
+=== gate f — public corpus
+PASS public errors match baseline exactly (rails)
+PASS public time ceiling (rails): 12.500s <= 30.0s
+=== gate g — inference bench (annotation-free, MRI as ground truth)
+PASS inference bench
+=== summary
+corpus gate proved: corpus-a
+corpus gate skipped (not hosted on this machine): corpus-b
+RESULT: PASS (incomplete)

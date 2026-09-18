@@ -209,6 +209,19 @@ if GATE_DIGEST_LAB="$ART/gate-digest-selftest" \
 else
   bad 'gate digest (see target/gauntlet/gate-digest-selftest.txt)'
 fi
+# Same family, one level further: scripts/gate-triage reads the digest a
+# reader trusts and routes the repair. A router that fires on green or
+# misses a known failure shape costs the lead a wasted repair, so it gets
+# the same two-sided proof — eight fixture runs routed exactly (green routes
+# NOTHING), ten cmp-guarded mutants each accused by its named guard, and the
+# state it sends to the model proved a pure function of digest.json (the
+# secrecy wall travels with the digest). Offline by construction.
+if GATE_TRIAGE_LAB="$ART/gate-triage-selftest" \
+   "$ROOT/scripts/gate-triage-selftest.sh" >"$ART/gate-triage-selftest.txt" 2>&1; then
+  ok 'gate triage (each fixture routed exactly, every mutant accused by its guard)'
+else
+  bad 'gate triage (see target/gauntlet/gate-triage-selftest.txt)'
+fi
 
 # --- gate c3: performance ceiling. The launch bar for this project is speed
 # against an established typechecker, and nothing used to notice a regression.

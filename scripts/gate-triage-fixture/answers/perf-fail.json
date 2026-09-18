@@ -1,0 +1,6 @@
+{
+  "root_cause": {"type": "choice", "choice": "contends_maquina", "probabilities": {"contends_maquina": 0.96, "target_dir_compartilhado": 0.04, "regressao_real": 0, "binario_stale": 0, "investigar": 0}, "confidence": 0.94},
+  "parent_comparado": {"type": "noul", "noul": 0.04},
+  "bloqueia_merge": {"type": "noul", "noul": 0.17},
+  "proxima_acao": {"type": "choice", "choice": "re-medir", "probabilities": {"re-medir": 0.98, "rebuild": 0.02, "investigar_codigo": 0, "auditar_drift": 0, "escalar_humano": 0}, "confidence": 0.96}
+}

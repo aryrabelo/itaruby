@@ -1,0 +1,303 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# gate-triage — routes a finished gauntlet run to its next action.
+#
+# Reads target/gauntlet/digest.json (scripts/gate-digest's output — the ~2 KB
+# object a reader trusts INSTEAD of the ~115 MB of artifacts) and turns the
+# failure shapes AGENTS.md already paid for into named routing actions. A
+# `run` adds four Jev judgments (typesafe/jev-1.13) over the same digest;
+# measured 2026-09-18: ~0.6 s and ~US$0.00005 per call.
+#
+# Three rules it must never break:
+#
+#   1. ADVISORY ONLY, FAIL-OPEN. This is a router, not a gate: the gauntlet's
+#      exit codes are untouched, a transport failure prints one advice line
+#      and exits 4, and a probabilistic verdict never becomes a blocking
+#      condition (jev-accept precedent, 2026-09-18).
+#   2. DIGEST-ONLY STATE (the secrecy wall travels with the digest). The
+#      state sent to the model is built from digest.json alone — never from
+#      an artifact file. The digest already withholds private-corpus
+#      content; this script must not become the path around it.
+#   3. JUDGMENTS ROUTE, PROOF STAYS WITH THE READER. The deterministic rules
+#      over digest features carry the routing; a Jev answer may annotate or
+#      order an action, never create, dismiss, or block one.
+#
+# Stdlib only. Exit: 0 ok · 2 unusable args or answers · 4 transport (run
+# only). Subcommands:
+#
+#   state     print the exact JSON that would be sent (offline, free — audit me)
+#   classify  offline routing over digest features (plus optional --answers)
+#   run       state -> Jev -> classify (OPENROUTER_API_KEY or `omp token`)
+
+require 'json'
+require 'net/http'
+require 'uri'
+
+MODEL = 'typesafe/jev-1.13'
+ENDPOINT = 'https://openrouter.ai/api/alpha/decisions'
+EXIT_ARGS = 2
+EXIT_TRANSPORT = 4
+
+CONTEXT_RULES = [
+  'A perf verdict is only reportable when the same window also measures the parent revision, and the two are compared to each other before either is compared to the ceiling.',
+  'Evidence captured from ./target/release/ita proves the binary, not the code, unless the capture followed a checked cargo build --release.',
+  'Two worktrees of this repo can share one cargo target dir; a lone red from a shared-dir run is re-run pinned before it is believed.',
+  'A corpus baseline that does not pin the corpus revision cannot tell detection drift from content drift.'
+].freeze
+
+QUESTIONS = {
+  'root_cause' => {
+    'type' => 'choice',
+    'instructions' => 'Classify the most likely root cause of the failure in `digest`, given `context_rules`.',
+    'criteria' => {
+      'contends_maquina' => 'ceiling breach without a same-window parent-revision comparison; machine load is plausible',
+      'regressao_real' => 'clean machine, parent compared, still red or over the ceiling',
+      'binario_stale' => 'evidence may come from a binary the checked build did not produce',
+      'target_dir_compartilhado' => 'another worktree building the same crate into a shared cargo target dir',
+      'investigar' => 'digest carries too little signal to classify'
+    }
+  },
+  'parent_comparado' => {
+    'type' => 'noul',
+    'instructions' => 'Does `digest` contain a parent-revision measurement from the same window for the failing measurement?'
+  },
+  'bloqueia_merge' => {
+    'type' => 'noul',
+    'instructions' => 'Given `context_rules`, should the change behind `digest` block merging right now?'
+  },
+  'proxima_acao' => {
+    'type' => 'choice',
+    'instructions' => 'What should the lead do next?',
+    'criteria' => {
+      're-medir' => 're-measure with the parent revision in the same window, machine idle',
+      'rebuild' => 'force a checked release build and re-run the failing gates',
+      'investigar_codigo' => 'treat as a real regression and bisect the code',
+      'auditar_drift' => 'order the audit of the new diagnostics before trusting the run',
+      'escalar_humano' => 'novel failure shape; needs the owner'
+    }
+  }
+}.freeze
+
+ALLOWED_ANSWERS = %w[root_cause parent_comparado bloqueia_merge proxima_acao].freeze
+
+class ArgError < StandardError; end
+class TransportError < StandardError; end
+
+Action = Struct.new(:id, :advice)
+
+# --------------------------------------------------------------------- state
+# The state a model may see: digest fields only. `digest_path` exists so the
+# selftest can prove this function reads NOTHING from the artifacts directory.
+def prune_digest(d)
+  {
+    'schema' => d['schema'], 'result' => d['result'], 'counts' => d['counts'],
+    'corpus' => d['corpus'],
+    'gates' => (d['gates'] || []).map { |g| g.select { |k, _| %w[name status reason numbers].include?(k) } },
+    'machine' => d['machine']
+  }
+end
+
+def build_state(digest, digest_path)
+  { 'digest' => prune_digest(digest), 'context_rules' => CONTEXT_RULES }
+end
+
+# ------------------------------------------------------------------ answers
+def validate_answers!(ans)
+  raise ArgError, 'answers must be a JSON object' unless ans.is_a?(Hash)
+
+  unknown = ans.keys - ALLOWED_ANSWERS
+  raise ArgError, "unknown answer key(s): #{unknown.join(', ')}" unless unknown.empty?
+
+  ALLOWED_ANSWERS.each do |k|
+    next unless ans.key?(k)
+
+    a = ans[k]
+    case a['type']
+    when 'noul'
+      ok = a['noul'].is_a?(Numeric) && a['noul'] >= 0.0 && a['noul'] <= 1.0
+      raise ArgError, "#{k}: noul must be a number in [0,1]" unless ok
+    when 'choice'
+      has = a['choice'] && a['probabilities'].is_a?(Hash) && a['probabilities'].key?(a['choice'])
+      raise ArgError, "#{k}: choice must appear in its own probabilities" unless has
+    else
+      raise ArgError, "#{k}: unknown answer type #{a['type'].inspect}"
+    end
+  end
+  nil
+end
+
+# ------------------------------------------------------------------- rules
+def gate(d, name)
+  (d['gates'] || []).find { |g| g['name'] == name }
+end
+
+def classify(digest, answers)
+  actions = []
+  fail_count = digest.dig('counts', 'fail') || 0
+
+  if gate(digest, 'c3')&.[]('status') == 'FAIL'
+    actions << Action.new('perf_over_without_parent_comparison',
+                          're-measure the parent revision in the same window, machine idle, before believing; a ceiling verdict on a loaded host is not a measurement')
+  end
+
+  skipped = digest.dig('corpus', 'skipped') || []
+  unless skipped.empty?
+    actions << Action.new('corpus_skipped_here',
+                          "skipped here: #{skipped.join(', ')} — full proof needs the anchor on the machine that hosts them; a SKIP where the machine should host the corpus is a rotted path, not absence")
+  end
+
+  corpora = gate(digest, 'd')&.dig('numbers', 'corpora') || []
+  d_fail = gate(digest, 'd')&.[]('status') == 'FAIL'
+  if d_fail && corpora.any? { |c| c['rev'] && c['pinned'] && c['rev'] != c['pinned'] }
+    actions << Action.new('corpus_rev_drift',
+                          'the corpus revision moved off the baseline-pinned sha — separate content drift from detection drift before bisecting code')
+  end
+  if d_fail && corpora.any? { |c| (c['new'] || 0).positive? || (c['gone'] || 0).positive? }
+    actions << Action.new('corpus_error_drift',
+                          'new/gone diagnostics against a pinned corpus — prove each one a true positive by reading the flagged code, or revert')
+  end
+
+  (digest['gates'] || []).each do |g|
+    next unless g['reason'].to_s.include?('artifact absent')
+
+    actions << Action.new('artifact_absent',
+                          "#{g['name']}: a PASS had no evidence to show — the producer wrote nothing or never ran; absence is never agreement")
+    break
+  end
+
+  if gate(digest, 'f')&.[]('status') == 'FAIL'
+    actions << Action.new('public_drift_unaudited',
+                          'public drift is a detector, not a verdict — order the audit per family in the ledger before trusting the run')
+  end
+
+  load1 = digest.dig('machine', 'load1')
+  if load1 && load1 > 8.0
+    actions << Action.new('measured_under_load',
+                          "load1 #{load1} at gate start — contention alone once produced a measured 3x phantom regression; every ceiling verdict here is suspect")
+  end
+
+  # Jev refines; it never opens or closes an action on its own.
+  if answers
+    pc = answers.dig('parent_comparado', 'noul')
+    if pc && pc < 0.5 && actions.any? { |a| a.id == 'perf_over_without_parent_comparison' }
+      actions << Action.new('jev_no_parent_measured',
+                            "jev: no parent-revision measurement in this window (P=#{format('%.2f', pc)})")
+    end
+    if (rc = answers['root_cause'])
+      actions << Action.new('jev_root_cause',
+                            "jev: root_cause=#{rc['choice']} (P=#{format('%.2f', rc.dig('probabilities', rc['choice']).to_f)}, conf=#{format('%.2f', rc['confidence'].to_f)})")
+    end
+  end
+
+  escalate = answers ? ((answers.dig('bloqueia_merge', 'noul') || 0) > 0.8 && fail_count.positive?) : false
+  {
+    'schema' => 'itaruby-gate-triage/1',
+    'digest_result' => digest['result'],
+    'actions' => actions.map { |a| { 'id' => a.id, 'advice' => a.advice } },
+    'escalate' => escalate,
+    'recommended_next' => answers&.dig('proxima_acao', 'choice')
+  }
+end
+
+# ------------------------------------------------------------------ transport
+def jev_key
+  ENV['OPENROUTER_API_KEY'] || `omp token openrouter 2>/dev/null`.to_s.strip
+end
+
+def jev_decide(state)
+  key = jev_key
+  raise TransportError, 'no OPENROUTER_API_KEY and `omp token openrouter` produced nothing' if key.to_s.empty?
+
+  uri = URI.parse(ENV['GATE_TRIAGE_ENDPOINT'] || ENDPOINT)
+  req = Net::HTTP::Post.new(uri)
+  req['Authorization'] = "Bearer #{key}"
+  req['Content-Type'] = 'application/json'
+  req.body = JSON.generate('model' => MODEL, 'state' => state, 'questions' => QUESTIONS)
+  http = Net::HTTP.new(uri.host, uri.port)
+  http.use_ssl = uri.scheme == 'https'
+  http.open_timeout = 5
+  http.read_timeout = 30
+  res = http.start { |h| h.request(req) }
+  raise TransportError, "endpoint answered HTTP #{res.code}" unless res.code.to_i == 200
+
+  body = JSON.parse(res.body)
+  answers = body['answers']
+  raise TransportError, 'response carried no answers object' unless answers.is_a?(Hash)
+
+  answers
+rescue JSON::ParserError, SocketError, OpenSSL::SSL::SSLError, Errno::ECONNREFUSED,
+       Errno::EHOSTUNREACH, Errno::ETIMEDOUT, Net::OpenTimeout, Net::ReadTimeout,
+       IOError, SystemCallError => e
+  raise TransportError, e.message
+end
+
+# ----------------------------------------------------------------------- cli
+def load_digest(path)
+  raise ArgError, "cannot read digest at #{path}" unless path && File.file?(path)
+
+  JSON.parse(File.read(path))
+rescue JSON::ParserError
+  raise ArgError, "not valid JSON: #{path}"
+end
+
+def load_answers(path)
+  return nil unless path
+
+  ans = JSON.parse(File.read(path))
+  validate_answers!(ans)
+  ans
+rescue Errno::ENOENT, JSON::ParserError => e
+  raise ArgError, "answers file unusable: #{e.message}"
+end
+
+usage = 'usage: gate-triage state|classify|run --digest FILE [--answers FILE]'
+cmd = ARGV.shift
+digest_path = nil
+answers_path = nil
+rest = ARGV.dup
+until rest.empty?
+  flag = rest.shift
+  case flag
+  when '--digest'  then digest_path = rest.shift
+  when '--answers' then answers_path = rest.shift
+  when '-h', '--help' then puts usage; exit 0
+  else warn "gate-triage: unknown argument #{flag}"; warn usage; exit EXIT_ARGS
+  end
+end
+
+begin
+  case cmd
+  when 'state'
+    answers = load_answers(answers_path) # validated for free, never sent
+    puts JSON.generate(build_state(load_digest(digest_path), digest_path))
+  when 'classify'
+    answers = load_answers(answers_path)
+    puts JSON.generate(classify(load_digest(digest_path), answers))
+  when 'run'
+    answers = load_answers(answers_path)
+    digest = load_digest(digest_path)
+    state = build_state(digest, digest_path)
+    begin
+      live = jev_decide(state)
+      answers = answers ? answers.merge(live) : live
+    rescue TransportError => e
+      puts JSON.generate('schema' => 'itaruby-gate-triage/1', 'digest_result' => digest['result'],
+                         'actions' => [], 'escalate' => false, 'recommended_next' => nil,
+                         'unavailable' => e.message)
+      warn "gate-triage: triage unavailable (#{e.message}); the gauntlet verdict stands"
+      exit EXIT_TRANSPORT
+    end
+    puts JSON.generate(classify(digest, answers))
+  when '-h', '--help', nil
+    puts usage
+  else
+    warn "gate-triage: unknown subcommand #{cmd}"
+    warn usage
+    exit EXIT_ARGS
+  end
+rescue ArgError => e
+  warn "gate-triage: #{e.message}"
+  exit EXIT_ARGS
+end
+exit 0

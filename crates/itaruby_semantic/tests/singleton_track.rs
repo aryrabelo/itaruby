@@ -108,6 +108,23 @@ fn sclass_attr_reader_arity_is_checked() {
     assert_eq!(diags("sclass_attr_arity_accuses.rb"), vec!["9:8:E0102"]);
 }
 
+/// The INSTANCE side of the same fact, through the checker's own
+/// verdict: `class << self; attr_reader :x; end` defines `x` on the
+/// CLASS OBJECT and on nothing else, so a call on an instance is a
+/// certain `NoMethodError` (MRI raises on exactly this line of
+/// `sclass_attr_is_not_an_instance_method.rb`) and the instance track
+/// must keep accusing E0101 now that the name no longer sits there.
+/// Before the singleton track existed, this name was filed on the
+/// instance track and the call was silent — the silence of a checker
+/// blind to the track was mistaken for correctness.
+#[test]
+fn sclass_attr_called_on_an_instance_accuses() {
+    assert_eq!(
+        diags("sclass_attr_is_not_an_instance_method.rb"),
+        vec!["9:12:E0101"]
+    );
+}
+
 // ---------------------------------------------------------------------
 // family (b): `extend` copies a module's instance methods onto the
 // extender's singleton — including `extend self` and `module_function`
@@ -383,6 +400,9 @@ fn every_dynamic_def_shape_opens_its_class() {
         "ByClassEval",
         "ByInstanceEval",
         "ByModuleEval",
+        "ByInstanceExec",
+        "ByClassExec",
+        "ByModuleExec",
     ] {
         let (_i, _s, open) = facts(name, path);
         assert!(open, "{path} must be open");

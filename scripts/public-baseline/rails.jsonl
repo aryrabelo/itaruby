@@ -8,7 +8,6 @@
 {"code":"E0101","column":10,"line":21,"message":"undefined method `mountable?` for `Rails::PluginBuilder`","path":"rails/railties/lib/rails/generators/rails/plugin/plugin_generator.rb","severity":"error"}
 {"code":"E0101","column":10,"line":270,"message":"undefined method `devcontainer?` for `Rails::AppBuilder`","path":"rails/railties/lib/rails/generators/rails/app/app_generator.rb","severity":"error"}
 {"code":"E0101","column":10,"line":90,"message":"undefined method `engine?` for `Rails::PluginBuilder`","path":"rails/railties/lib/rails/generators/rails/plugin/plugin_generator.rb","severity":"error"}
-{"code":"E0101","column":105,"line":628,"message":"undefined method `_routes` for `ActionDispatch::Routing::RouteSet`","path":"rails/actionpack/lib/action_dispatch/routing/route_set.rb","severity":"error"}
 {"code":"E0101","column":11,"line":113,"message":"undefined method `empty_directory_with_keep_file` for `Rails::PluginBuilder`","path":"rails/railties/lib/rails/generators/rails/plugin/plugin_generator.rb","severity":"error"}
 {"code":"E0101","column":11,"line":157,"message":"undefined method `skip_action_cable?` for `Rails::AppBuilder`","path":"rails/railties/lib/rails/generators/rails/app/app_generator.rb","severity":"error"}
 {"code":"E0101","column":11,"line":161,"message":"undefined method `skip_active_storage?` for `Rails::AppBuilder`","path":"rails/railties/lib/rails/generators/rails/app/app_generator.rb","severity":"error"}

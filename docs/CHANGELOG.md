@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `scripts/gate-triage`: routes a finished gauntlet run to its next action,
+  reading `target/gauntlet/digest.json` only. Deterministic rules over digest
+  features carry the routing — perf red without a parent-revision measurement
+  (re-measure before believing), corpus revision drift (content vs detection
+  drift), corpus error drift (audit new diagnostics as true positives or
+  revert), artifact absence (absence is never agreement), public drift
+  (unaudited until the ledger has a verdict), loaded host (load1 > 8 marks
+  every ceiling suspect) — and four optional Jev judgments
+  (`typesafe/jev-1.13`, ~0.6 s and ~US$0.00005 per call, measured
+  2026-09-18) refine the route without ever creating, dismissing or blocking
+  one. The instrument is advisory only: it never gates, exits 4 fail-open on
+  transport trouble, and the state it sends to the model is a proven pure
+  function of the digest (the secrecy wall travels with the digest). Two-
+  sided proof in `scripts/gate-triage-selftest.sh`, wired as gate c2c:
+  eight fixture runs routed exactly (green routes nothing), ten cmp-guarded
+  mutants each accused by its named guard, unknown answer keys rejected with
+  exit 2, a byte ceiling on the green state (1723 B measured).
 - `scripts/gate-digest`: the gate suite's verdict as ONE compact JSON
   (`target/gauntlet/digest.json`, 1791 B all-green) instead of the ~115 MB
   `target/gauntlet/` holds — per-gate status, one-line reason and numbers
@@ -468,6 +485,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The singleton track files every method-defining form where it really
+  lands, and one rails false positive goes with it. Four defects, found
+  by review before the `Ty::Class` `NotFound` arm reports and each one a
+  guaranteed invariant #1 violation the moment it does: inside
+  `class << self`, `define_method` (block and argument spelling),
+  `alias_method` and the `alias` keyword were filed on the INSTANCE
+  track, where no singleton lookup ever looks and where they invent
+  instance methods MRI does not have; a literal definer inside a `def`
+  body registered NOTHING, so `def self.install;
+  define_singleton_method(:ready?) { true }; attr_accessor :mode; end`
+  left the class CLOSED without any of the names it installs
+  (discourse's `GlobalSetting`); `send(:define_method, ...)` was not
+  unwrapped in a def body although the core-pollution walker has
+  unwrapped it since `definer_sources_named` was split; and an
+  explicit-receiver literal (`Other.define_method(:x)`) produced no
+  reason at all, leaving that class closed without the name — the shape
+  behind rails' `ActionDispatch::Routing::RouteSet` E0101, a false
+  positive this repository's own audit ledger had already recorded as
+  one and which is now gone by correction (rails public baseline 1090 ->
+  1089 lines; mastodon and discourse byte-identical). Attribution is by
+  receiver and by whether `self` is provably the class: a `def self.x`
+  body files the names, an instance body opens the class instead
+  (`define_singleton_method` there lands on ONE object), a foreign
+  constant receiver opens THAT class and never touches the enclosing
+  one. Singleton residue re-measured with a probe built from this tree
+  against the same probe on the parent revision: rails 42 (193),
+  mastodon 0 (22), discourse 14 (605) — identical on both sides, so the
+  flip stays blocked for the same reasons and nothing regressed.
+  Two-sided: nine MRI-executed fixtures in `testdata/singleton_track/`,
+  nine mutants (MUT-H..MUT-P) in `scripts/singleton-mutants.sh`, and the
+  suite's MRI ground truth is now EXECUTED over all 39 fixtures instead
+  of narrated in doc comments.
 - E0108 no longer fires on a REFINED core operator — an invariant #1
   violation found by review and reproduced: `module IntPlus; refine
   Integer do def +(other) = "refined #{other}" end; end` + `using

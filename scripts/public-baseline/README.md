@@ -76,6 +76,29 @@ warnings only.
 |----|-----------|------:|-------:|---------:|---------:|
 | rails | `3df2cbea2027026a29edb92cbb7e336a63e35444` | 1090 | 167 | 923 | 1.4 s |
 
+### Regeneration 2026-09-18 (literal definers inside a `def` body)
+
+rails only, and only DOWNWARD: 1090 -> 1089 lines, the removed line the
+false positive this ledger already recorded as one —
+`E0101 undefined method \`_routes\` for \`ActionDispatch::Routing::RouteSet\``
+at `actionpack/lib/action_dispatch/routing/route_set.rb:628`. The receiver
+there is `helper_module`, the anonymous `Module.new` of `:550` captured at
+`:619`, not a RouteSet; the checker was resolving lexical `self`. It goes
+silent because `def generate_url_helpers` (`:547`) is an INSTANCE method
+whose body carries literal `define_method` calls: `self` is not provably
+the class there, so RouteSet now fails closed (open) instead of being
+judged against a surface the walker cannot attribute. Gone by correction,
+not by suppression.
+
+mastodon and discourse are byte-identical, and the 548f2b8 parent
+reproduces all three committed baselines exactly (0 new, 0 gone) — the
+measurement is a comparison between two builds in one window, not a
+reading of one.
+
+| id | pinned sha | lines | errors | warnings | ita wall |
+|----|-----------|------:|-------:|---------:|---------:|
+| rails | `3df2cbea2027026a29edb92cbb7e336a63e35444` | 1089 | 166 | 923 | (not timed — measured on a loaded machine) |
+
 ## Audit ledger (errors)
 
 Every error line is grouped by family — `code` and the receiver class taken
@@ -93,7 +116,7 @@ the existing 160 builder-FP and 3 bulk-import-TP verdicts are unchanged.
 | rails | E0101 `Rails::PluginBuilder` | 86 | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive** |
 | rails | E0101 `Rails::AppBuilder` | 74 | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive** |
 | rails | E0101 `LazyLoadHooksTest::FakeContext` | 3 | false positive / correct silence — `activesupport/test/lazy_load_hooks_test.rb:131-137` installs `first_wrestler` via the class hook; `:160-174` installs `second_wrestler` only on `context` (valid at `:174`, intentionally absent on the fresh instance inside `assert_raises NoMethodError` at `:168-170`); `activesupport/lib/active_support/lazy_load_hooks.rb:101-110` dispatches through `class_eval` / `instance_eval`. |
-| rails | E0101 `ActionDispatch::Routing::RouteSet` | 1 | false positive — `actionpack/lib/action_dispatch/routing/route_set.rb:628` calls `helper_module._routes`, not a RouteSet instance: `Module.new` at `:550`, `helper_module = self` at `:619`, singleton `_routes` at `:599`, and proxy reader at `:561-564` supply the method and return the captured route set. |
+| rails | E0101 `ActionDispatch::Routing::RouteSet` | 0 (was 1) | false positive, FIXED 2026-09-18 and removed from the baseline — `actionpack/lib/action_dispatch/routing/route_set.rb:628` calls `helper_module._routes`, not a RouteSet instance: `Module.new` at `:550`, `helper_module = self` at `:619`, singleton `_routes` at `:599`, and proxy reader at `:561-564` supply the method and return the captured route set. The enclosing `def generate_url_helpers` (`:547`) is an instance method carrying literal `define_method` calls, so RouteSet now fails closed instead of being judged. |
 | rails | E0101 `ActionDispatch::Routing::Endpoint` | 1 | false positive — `actionpack/lib/action_dispatch/routing/endpoint.rb:11-15` defaults `rack_app` to the endpoint, but `rack_app.is_a?(Class) && rack_app < Rails::Engine` short-circuits for that instance; the comparison is for a class-valued rack app, using inherited `Module#<`, not `Endpoint#<`. |
 | rails | E0101 `ActionDispatch::Routing::RouteSetTest::SimpleApp` | 1 | true positive (dormant test helper) — `actionpack/test/dispatch/routing/route_set_test.rb:12-20` defines an Object subclass with no mixins/accessor: initialization stores `@response` at `:14`, but `call` bare-sends `response` at `:18`; dispatching this Rack app would raise `NoMethodError`. Uses at `:26-34,55-72` register routes/check helpers rather than dispatching, so those assertions do not exercise the defect. |
 | rails | E0101 `Blog::Post` | 1 | false positive — the instance send at `activemodel/test/cases/naming_test.rb:328` is provided by `activemodel/test/models/blog_post.rb:8-9` extending `ActiveModel::Naming`; its `extended` hook at `activemodel/lib/active_model/naming.rb:263-266` delegates instance `model_name` to the class, whose method is at `:280`. |

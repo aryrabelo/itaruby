@@ -2008,6 +2008,21 @@ impl DefWalker<'_> {
                 let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
                 let span = span_of(node);
                 match name.as_str() {
+                    // `attr_reader`/`attr_writer`/`attr_accessor`. Inside
+                    // `class << self` the macro defines the methods on the
+                    // CLASS OBJECT, not on instances (bead singleton-track
+                    // family (a), measured 2026-09-17: the residue probe
+                    // found `RequireProfiler.stats`-shaped sites whose
+                    // reader the index had filed on the instance track, so
+                    // the singleton lookup walked a closed class and saw
+                    // nothing). Routing by `in_singleton` is additive on
+                    // both tracks at once: a name moves from a track where
+                    // nothing ever looked it up to the track that does, and
+                    // no lookup that used to be `Found` can stop being
+                    // found — an instance-track `attr_*` inside
+                    // `class << self` was never a real instance method in
+                    // MRI either (the fixture proves it: MRI raises on
+                    // `Config.new.stats`).
                     "attr_reader" | "attr_writer" | "attr_accessor" => {
                         let mut all_symbols = true;
                         if let Some(args) = call.arguments() {
@@ -2016,20 +2031,24 @@ impl DefWalker<'_> {
                                     let attr =
                                         String::from_utf8_lossy(sym.unescaped()).into_owned();
                                     let aspan = span_of(&arg);
+                                    let mut defs: Vec<MethodDef> = Vec::new();
                                     if name != "attr_writer" {
-                                        self.fragments[i].methods.push(MethodDef::synthetic(
-                                            attr.clone(),
-                                            0,
-                                            aspan,
-                                        ));
+                                        defs.push(MethodDef::synthetic(attr.clone(), 0, aspan));
                                     }
                                     if name != "attr_reader" {
-                                        self.fragments[i].methods.push(MethodDef::synthetic(
+                                        defs.push(MethodDef::synthetic(
                                             format!("{attr}="),
                                             1,
                                             aspan,
                                         ));
                                     }
+                                    let frag = &mut self.fragments[i];
+                                    let track = if in_singleton {
+                                        &mut frag.singleton_methods
+                                    } else {
+                                        &mut frag.methods
+                                    };
+                                    track.extend(defs);
                                 } else {
                                     all_symbols = false;
                                 }

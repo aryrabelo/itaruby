@@ -141,6 +141,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with `scripts/const-missing-mutants.sh`, which had shipped unwired —
   a probe nothing executes decays into narration.
 
+- Singleton-track index knowledge, step 1 of the program pinned in
+  `crates/itaruby_semantic/tests/singleton_lookup.rs`:
+  `attr_reader`/`attr_writer`/`attr_accessor` inside `class << self` are
+  now filed on the CLASS-OBJECT track instead of the instance track,
+  where no singleton lookup ever looked. MRI agrees on both halves —
+  `Config.endpoint` works and `Config.new.endpoint` raises
+  `NoMethodError` — so the move is a correction, not a widening. What it
+  makes observable is the arity that rides on a `Found` lookup:
+  `Config.endpoint("x")` on an `attr_accessor` reader is now
+  `error[E0102]`, and MRI raises `ArgumentError: wrong number of
+  arguments (given 1, expected 0)` on that same line. Openness is
+  untouched, so the residue this unlocks is knowledge banked for the
+  singleton `NotFound` report, not a new diagnostic family.
+  Step 0 of the same program measured that residue first, with an
+  instrumented build, per corpus and bucketed by why the method really
+  exists at runtime (histogram in `singleton_track.rs`'s header):
+  rails 888 sites (703 with an explicit receiver), mastodon 58 (36),
+  discourse 4803 (4109), corpus-c 1701 (2). `class << self` `attr_*`
+  itself contributes ZERO of them today, which is why this step ships as
+  banked knowledge plus its arity test rather than as a corpus delta.
+  Fixtures in `testdata/singleton_track/`, all MRI-executable, plus
+  `crates/itaruby_semantic/tests/singleton_track.rs`.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

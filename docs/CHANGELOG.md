@@ -192,6 +192,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   family went 0/0/4/0 to 0/0/0/0; totals 650/44/4572/1701 (explicit
   478/22/3894/2). Public and corpus-c error sets byte-identical.
 
+- Singleton-track step 3b: the `class_methods do ... end` spelling of a
+  concern's class methods. ActiveSupport::Concern `const_set`s a real
+  `ClassMethods` module from that block, so the block's `def`s are now
+  harvested onto a synthetic `<concern>::ClassMethods` fragment carrying
+  the same `extends` edge step 3 added for the written-out module — one
+  mechanism, both spellings. Openness is preserved (the block still opens
+  the concern), so this banks knowledge rather than closing anything.
+  It does fix two false positives on rails: `E0104 unresolved constant
+  ConcernTest::Baz::ClassMethods` at
+  `activesupport/test/concern_test.rb:81,87` is gone, because the
+  constant really exists at runtime — rails' own passing tests in that
+  file assert it is the module extended onto the includer. The rails
+  baseline is regenerated (1092 -> 1090 lines, 167 errors unchanged, 925
+  -> 923 warnings) with the audit recorded in
+  `scripts/public-baseline/README.md`; mastodon and discourse are
+  byte-identical.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

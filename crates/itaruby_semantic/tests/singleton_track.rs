@@ -202,3 +202,31 @@ fn the_concern_edge_is_only_added_when_class_methods_exists() {
         index.class(plain).extends
     );
 }
+
+/// The block spelling, `class_methods do ... end`: the names land on a
+/// synthetic `<concern>::ClassMethods` fragment with the same `extends`
+/// edge, so one mechanism serves both spellings. Openness is PRESERVED
+/// (the block still opens the concern, `mattr_accessor`'s measured
+/// lesson), so what this banks is knowledge — the fixture stays silent
+/// either way, and MRI runs it to completion.
+#[test]
+fn class_methods_block_is_harvested_as_the_class_methods_module() {
+    let name = "class_methods_block_resolves_silently.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (db, _f, _t) = fixture(name);
+    let index = project_index(&db);
+    let concern = *index.by_path.get("Countable").unwrap();
+    assert!(
+        index.class(concern).extends.contains(&"Countable::ClassMethods".to_string()),
+        "edge missing, got {:?}",
+        index.class(concern).extends
+    );
+    let cm = *index
+        .by_path
+        .get("Countable::ClassMethods")
+        .expect("the block must synthesize the ClassMethods module");
+    let mut names: Vec<String> = index.class(cm).methods.keys().cloned().collect();
+    names.sort();
+    assert_eq!(names, vec!["count_for"]);
+    assert!(index.class(concern).open, "the concern stays open, as before");
+}

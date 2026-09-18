@@ -55,6 +55,27 @@ errors, warnings unchanged.
 |----|-----------|-------:|---------:|---------:|
 | discourse | `dd4cc4f4cc5aa73d8eb8efc3c154f4e139ff6052` | 9 | 1890 | 8.3 s |
 
+### Regeneration 2026-09-17 (concern `class_methods do` defines `ClassMethods`)
+
+rails only, and only DOWNWARD: 1092 -> 1090 lines, both removed lines the
+same false positive —
+`E0104 unresolved constant ConcernTest::Baz::ClassMethods` at
+`activesupport/test/concern_test.rb:81` and `:87`. The constant really
+exists at runtime: `Baz` uses `class_methods do ... end`, and
+`ActiveSupport::Concern#class_methods` `const_set`s `ClassMethods` on the
+concern. Rails' own passing tests assert exactly that — the same file's
+`test_class_methods_are_extended` (`:78-82`) and
+`test_class_methods_are_extended_when_prepended` (`:84-88`) both compare
+`ConcernTest::Baz::ClassMethods` against the includer's singleton
+ancestors. Indexing the block spelling registers the constant, so the two
+warnings are gone by correction, not by suppression. mastodon and
+discourse are byte-identical. Errors unchanged on all three; this touches
+warnings only.
+
+| id | pinned sha | lines | errors | warnings | ita wall |
+|----|-----------|------:|-------:|---------:|---------:|
+| rails | `3df2cbea2027026a29edb92cbb7e336a63e35444` | 1090 | 167 | 923 | 1.4 s |
+
 ## Audit ledger (errors)
 
 Every error line is grouped by family — `code` and the receiver class taken

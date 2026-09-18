@@ -455,11 +455,9 @@
 {"code":"E0104","column":18,"line":7,"message":"unresolved constant `Rake::TaskLib`","path":"rails/tools/releaser/lib/releaser.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":79,"message":"unresolved constant `TestJob`","path":"rails/activejob/test/integration/queuing_test.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":8,"message":"unresolved constant `RDoc::Task`","path":"rails/railties/lib/rails/api/task.rb","severity":"warning"}
-{"code":"E0104","column":18,"line":81,"message":"unresolved constant `ConcernTest::Baz::ClassMethods`","path":"rails/activesupport/test/concern_test.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":86,"message":"unresolved constant `Ace::Gas::Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":864,"message":"unresolved constant `PG::Error`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":87,"message":"unresolved constant `Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
-{"code":"E0104","column":18,"line":87,"message":"unresolved constant `ConcernTest::Baz::ClassMethods`","path":"rails/activesupport/test/concern_test.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":88,"message":"unresolved constant `Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":955,"message":"unresolved constant `::Bukkits::MyMailer`","path":"rails/railties/test/railties/engine_test.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":10,"message":"unresolved constant `Concurrent::AtomicBoolean`","path":"rails/activerecord/lib/active_record/asynchronous_queries_tracker.rb","severity":"warning"}

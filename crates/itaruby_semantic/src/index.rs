@@ -1453,6 +1453,50 @@ impl DefWalker<'_> {
         }
     }
 
+    /// `class_methods do ... end` — the block spelling of a concern's
+    /// `ClassMethods` module (singleton-track family (c)). The block's
+    /// own top-level `def`s are recorded on a synthetic fragment for
+    /// `<concern>::ClassMethods`, and the concern gains the `extends`
+    /// edge to it, so this spelling resolves through exactly the
+    /// mechanism `apply_concern_class_methods` gives the written-out
+    /// module. Deliberately shallow, the same discipline
+    /// `harvest_block_consts` and `harvest_included_hook` follow: only
+    /// top-level `def`s, never a nested traversal.
+    fn harvest_class_methods_block(
+        &mut self,
+        i: usize,
+        scope: &str,
+        nesting: &[String],
+        call: &ruby_prism::CallNode,
+    ) {
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(stmts) = block.body().and_then(|b| b.as_statements_node()) else { return };
+        let path = format!("{scope}::ClassMethods");
+        let mut defs: Vec<MethodDef> = Vec::new();
+        for stmt in &stmts.body() {
+            let Some(def) = stmt.as_def_node() else { continue };
+            if def.receiver().is_some() {
+                continue;
+            }
+            defs.push(self.method_def(&def));
+        }
+        if defs.is_empty() {
+            return;
+        }
+        if !self.fragments[i].extends.contains(&path) {
+            self.fragments[i].extends.push(path.clone());
+        }
+        let mut child_nesting = nesting.to_vec();
+        child_nesting.push(path.clone());
+        let idx = if let Some(idx) = self.fragments.iter().position(|f| f.path == path) {
+            idx
+        } else {
+            self.fragments.push(ClassFragment::new(path, true, child_nesting));
+            self.fragments.len() - 1
+        };
+        self.fragments[idx].methods.extend(defs);
+    }
+
 
     /// Bead ita-1yw: the canonical hook shape `def self.included(base)`
     /// whose body calls `base.attr_accessor :x` / `base.define_method(:x)`
@@ -1903,6 +1947,29 @@ impl DefWalker<'_> {
                         if !sig_block_is_recognized(&call) {
                             self.open_class(i, OpenReason::ClassBodyBlock);
                         }
+                    } else if call.name().as_slice() == b"class_methods"
+                        && call.receiver().is_none()
+                        && !scope.is_empty()
+                    {
+                        // `class_methods do ... end` (singleton-track
+                        // family (c)): ActiveSupport::Concern's block
+                        // form of the `ClassMethods` module — the gem
+                        // literally defines `ClassMethods` from this
+                        // block. Harvested into a synthetic fragment for
+                        // that exact path plus the same `extends` edge
+                        // `apply_concern_class_methods` adds for the
+                        // written-out form, so both spellings resolve
+                        // through one mechanism.
+                        //
+                        // OPENNESS IS PRESERVED: the block still opens
+                        // the concern, exactly as before. Closing it
+                        // would unmask everything else the index cannot
+                        // see inside a concern body (mattr_accessor's
+                        // measured 28-false-positive lesson), so this
+                        // banks the names and changes nothing observable
+                        // today.
+                        self.harvest_class_methods_block(i, scope, nesting, &call);
+                        self.open_class(i, OpenReason::ClassBodyBlock);
                     } else {
                         if let Some(block) = call.block() {
                             self.harvest_block_consts(i, &block);

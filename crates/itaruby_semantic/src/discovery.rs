@@ -152,6 +152,7 @@ fn wire_gemfile_lock_namespaces(db: &Db, lock_path: &Path) {
     let namespaces: std::collections::HashSet<String> = parse_gemfile_lock_gem_names(&text)
         .iter()
         .filter_map(|gem| gem_namespace(gem))
+        .map(|ns| gem_namespace_key(&ns))
         .collect();
     if !namespaces.is_empty() {
         GemfileLockNamespaces::new(db, namespaces);
@@ -232,11 +233,27 @@ fn parse_gemfile_lock_gem_names(text: &str) -> Vec<String> {
 /// characters) returns `None` rather than guess: absent from the mapped
 /// set is the same safe default as "gem not in the lock at all".
 fn gem_namespace(gem: &str) -> Option<String> {
-    // Measured exceptions: a plain per-segment capitalize does not
-    // reconstruct these gems' own internal-capital spelling.
+    // Measured exceptions, and the ONLY kind that can still exist now
+    // that matching is case- and separator-insensitive
+    // (`gem_namespace_key`): a gem whose namespace differs in LETTERS,
+    // not merely in capitalization. The old `wikicloth`/`fastimage`
+    // entries were the capitalization kind and are gone with that
+    // change — `WikiCloth` and `FastImage` now key to the same
+    // `wikicloth`/`fastimage` their lock names do.
+    //
+    // Each entry below is read out of the gem's own source at the
+    // version a reference corpus locks, never inferred from a corpus
+    // reopening (that inference is what `gem_namespace_key`'s doc
+    // comment refuses, with the measurement):
+    //
+    // * `kt-paperclip` 8.0.0 (mastodon `Gemfile.lock:394`) defines
+    //   `module Paperclip` at `lib/paperclip.rb:82`.
+    // * `ruby-vips` 2.3.0 (mastodon `Gemfile.lock:802`) defines
+    //   `module Vips` at `lib/vips/image.rb:9` (and in every other
+    //   `lib/vips/*.rb`).
     match gem {
-        "wikicloth" => return Some("WikiCloth".to_string()),
-        "fastimage" => return Some("FastImage".to_string()),
+        "kt-paperclip" => return Some("Paperclip".to_string()),
+        "ruby-vips" => return Some("Vips".to_string()),
         _ => {}
     }
     if gem.is_empty() {
@@ -259,6 +276,39 @@ fn gem_namespace(gem: &str) -> Option<String> {
         }
     }
     Some(out)
+}
+
+/// The key both sides of `apply_gem_reopenings`' comparison are reduced
+/// to: ASCII-lowercase, separators dropped. A `Gemfile.lock` name and the
+/// constant it names agree on LETTERS and never on case or punctuation —
+/// `rspec` is `RSpec`, `connection_pool` is `ConnectionPool`,
+/// `message_bus` is `MessageBus`, `activesupport` is `ActiveSupport` —
+/// so comparing the camelize GUESS by exact string equality (what this
+/// mechanism did until 2026-09-17) missed every gem whose author placed a
+/// capital anywhere the segment boundaries do not predict. Measured on
+/// the reference corpora by reopening site: mastodon reopens
+/// `ConnectionPool::*` (2 sites) and discourse `MessageBus::*` (1 site)
+/// under namespaces their own locks declare, and both were invisible
+/// here.
+///
+/// Case-insensitivity cannot widen this mechanism past the gems a lock
+/// actually names: the key is still the WHOLE name, so it can only ever
+/// pair a lock entry with the constant spelling of that same entry.
+/// SEGMENT matching would be the unsafe generalization, and it is
+/// deliberately refused — measured on the same corpora, "some hyphen
+/// segment of some locked gem equals this namespace" would have blinded
+/// `Api` (145 reopening sites in mastodon, via `elasticsearch-api`),
+/// `Auth` (16 in discourse, via `auth-sanitizer`), `Scheduler`, `Form`,
+/// `Event` and `Web`: all of them the PROJECT's own namespaces, and every
+/// method on them would have stopped being checkable.
+pub fn gem_namespace_key(namespace: &str) -> String {
+    let mut out = String::with_capacity(namespace.len());
+    for c in namespace.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c.to_ascii_lowercase());
+        }
+    }
+    out
 }
 
 /// Same walk as `find_upward`/`find_upward_dir`, for a bare file name

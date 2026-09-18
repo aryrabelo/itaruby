@@ -49,19 +49,53 @@ fn mail_reopen_matching_lockfile_gem_stays_silent() {
     assert!(diags.is_empty(), "expected silence, got {diags:?}");
 }
 
-/// Same shape for a gem whose namespace needs the small override table
-/// (`wikicloth` -> `WikiCloth`, not the plain-camelize `Wikicloth`).
+/// Capitalization the segment boundaries do not predict: `rspec` in the
+/// lock, `RSpec` in the code. This is the defect `gem_namespace_key`
+/// fixed on 2026-09-17 — the camelize guess `Rspec` never equalled
+/// `RSpec`, so the reopening looked like a complete project definition
+/// and a typo on a REAL gem class method (`RSpec.descrybe`) was a
+/// candidate accusation. Measured on the reference corpora by reopening
+/// site before the fix: mastodon `ConnectionPool` (2), discourse
+/// `MessageBus` (1).
 #[test]
-fn wikicloth_reopen_matching_lockfile_gem_stays_silent() {
-    let diags = check_fixture("silent_wikicloth_reopen.rb");
+fn rspec_reopen_matching_lockfile_gem_case_insensitively_stays_silent() {
+    let diags = check_fixture("silent_rspec_reopen.rb");
     assert!(diags.is_empty(), "expected silence, got {diags:?}");
 }
 
-/// Same shape for `fastimage` -> `FastImage`.
+/// The only exception kind the key cannot absorb: a namespace differing
+/// in LETTERS. `kt-paperclip` 8.0.0 defines `module Paperclip`
+/// (`lib/paperclip.rb:82`, read in the gem's own source at the version
+/// mastodon locks).
 #[test]
-fn fastimage_reopen_matching_lockfile_gem_stays_silent() {
-    let diags = check_fixture("silent_fastimage_reopen.rb");
+fn kt_paperclip_reopen_needs_the_exception_table_and_stays_silent() {
+    let diags = check_fixture("silent_kt_paperclip_reopen.rb");
     assert!(diags.is_empty(), "expected silence, got {diags:?}");
+}
+
+/// The generalization this mechanism REFUSES, pinned: `elasticsearch-api`
+/// is in the lock and `api` is one of its hyphen segments, but `Api` is
+/// the project's own namespace and stays checked. Matching by segment
+/// would have blinded 145 reopening sites under `Api` in mastodon, 16
+/// under `Auth` in discourse (`auth-sanitizer`), plus `Scheduler`,
+/// `Form`, `Event` and `Web` (measured 2026-09-17).
+#[test]
+fn gem_name_segment_never_opens_a_project_namespace() {
+    let diags = check_fixture("control_gem_name_segment_still_warns.rb");
+    assert_eq!(diags.len(), 1, "expected exactly one diagnostic, got {diags:?}");
+    assert!(diags[0].starts_with("E0101"), "expected E0101, got {diags:?}");
+}
+
+/// `wikicloth` -> `WikiCloth` and `fastimage` -> `FastImage`: two entries
+/// that used to need the override table and now fall out of
+/// `gem_namespace_key` for free. Kept as tests because the BEHAVIOR is
+/// the contract, not the mechanism that delivers it.
+#[test]
+fn internal_capital_gems_stay_silent_without_an_override_entry() {
+    for name in ["silent_wikicloth_reopen.rb", "silent_fastimage_reopen.rb"] {
+        let diags = check_fixture(name);
+        assert!(diags.is_empty(), "expected silence for {name}, got {diags:?}");
+    }
 }
 
 /// G2 (negative control): a project-owned class unrelated to any gem in

@@ -3199,10 +3199,15 @@ fn merge_declared_fragment(index: &mut ProjectIndex, frag: &ClassFragment) {
 /// Bead ita-547: force open every class the project itself already
 /// interned (a real `class`/`module` node this project wrote — never a
 /// name invented here, unlike `merge_declared_fragment`) whose TOP-LEVEL
-/// path segment matches one of `namespaces` exactly. `namespaces` is
+/// path segment matches one of `namespaces`. `namespaces` is
 /// `GemfileLockNamespaces`'s guessed-namespace set (`discovery.rs`'s
-/// `gem_namespace`), read once by the caller — this function never
-/// touches the filesystem or re-derives the set per class.
+/// `gem_namespace`), already reduced to `gem_namespace_key` form — so
+/// the comparison here reduces the class path's top segment the same
+/// way, making it case- and separator-insensitive. See that function's
+/// doc comment for why exact-string equality was a defect and why the
+/// looser SEGMENT match it could be mistaken for is refused. Read once
+/// by the caller — this function never touches the filesystem or
+/// re-derives the set per class.
 ///
 /// Top-level match, not exact full-path match like
 /// `is_known_external_class_path`'s curated lists: we only know a gem's
@@ -3221,7 +3226,11 @@ fn apply_gem_reopenings(index: &mut ProjectIndex, namespaces: &std::collections:
     let ids: Vec<ClassId> = index
         .by_path
         .iter()
-        .filter(|(path, _)| namespaces.contains(path.split("::").next().unwrap_or(path.as_str())))
+        .filter(|(path, _)| {
+            namespaces.contains(&crate::discovery::gem_namespace_key(
+                path.split("::").next().unwrap_or(path.as_str()),
+            ))
+        })
         .map(|(_, &id)| id)
         .collect();
     for id in ids {

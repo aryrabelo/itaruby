@@ -4,12 +4,15 @@ GEM
     activesupport (7.1.3)
       concurrent-ruby (~> 1.0)
       i18n (>= 1.6, < 2)
+    elasticsearch-api (7.17.11)
     fastimage (2.3.1)
+    kt-paperclip (8.0.0)
     mail (2.8.1)
       mini_mime (>= 0.1.1)
       net-imap
       net-pop
       net-smtp
+    rspec (3.13.0)
     wikicloth (0.8.4)
       builder
       expression_parser
@@ -20,6 +23,9 @@ PLATFORMS
 
 DEPENDENCIES
   activesupport
+  elasticsearch-api
+  kt-paperclip
+  rspec
   fastimage
   mail
   wikicloth

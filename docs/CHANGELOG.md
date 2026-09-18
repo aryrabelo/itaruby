@@ -209,6 +209,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `scripts/public-baseline/README.md`; mastodon and discourse are
   byte-identical.
 
+- Fixed: a `Gemfile.lock` gem whose namespace carries a capital the
+  segment boundaries do not predict was invisible to
+  `apply_gem_reopenings`, which compared the camelize GUESS by exact
+  string equality (`rspec` -> `Rspec`, never `RSpec`). Both sides now
+  reduce to `discovery::gem_namespace_key` — ASCII-lowercase, separators
+  dropped — so `connection_pool`/`ConnectionPool`,
+  `message_bus`/`MessageBus` and `activesupport`/`ActiveSupport` pair up.
+  Measured by reopening site on the reference corpora before the fix:
+  mastodon `ConnectionPool` (2 sites), discourse `MessageBus` (1).
+  The `wikicloth`/`fastimage` override entries are deleted: the key
+  absorbs them. What remains in the table is only the kind the key
+  cannot derive — a namespace differing in LETTERS — and each entry is
+  read in the gem's own source at the locked version:
+  `kt-paperclip` 8.0.0 `lib/paperclip.rb:82` (`module Paperclip`) and
+  `ruby-vips` 2.3.0 `lib/vips/image.rb:9` (`module Vips`).
+  SEGMENT matching, the tempting generalization, is refused and pinned by
+  a control test: measured on the same corpora it would have blinded
+  `Api` (145 reopening sites in mastodon, via `elasticsearch-api`),
+  `Auth` (16 in discourse, via `auth-sanitizer`), plus `Scheduler`,
+  `Form`, `Event` and `Web` — all of them the project's own namespaces.
+  All four corpora unchanged in both directions: errors byte-identical,
+  warnings 923/986/1890 and corpus-c 179 unmoved, singleton residue
+  identical at 650/44/4572/1701.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

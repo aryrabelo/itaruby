@@ -2222,6 +2222,91 @@ impl DefWalker<'_> {
                     }
                     return;
                 }
+                // `singleton_class.attr_reader/attr_writer/attr_accessor
+                // :a, :b` — the RECEIVER spelling of `class << self`
+                // `attr_*` (singleton-track family (a), second spelling).
+                // The class-body call arm below only ever saw RECEIVERLESS
+                // calls (the early return just under swallows everything
+                // else), so this shape fell through every arm: nothing was
+                // filed, nothing opened. Measured 2026-09-18 at de28b40 —
+                // the residue probe's largest rails family:
+                // `ActiveSupport::Dependencies.interlock/autoload_paths/...`
+                // (`dependencies.rb:10,48`, ~45 explicit-receiver sites),
+                // `ActionDispatch::ExceptionWrapper.rescue_responses/...`
+                // (`exception_wrapper.rb:12`, ~27), `ActiveModel::
+                // Translation.raise_on_missing_translations`
+                // (`translation.rb:25`), activesupport's own
+                // `ClassAttributeTest::Prepending.read/write` — every one
+                // a `singleton_class.attr_accessor :name` whose names no
+                // lookup could find on a class the index believed CLOSED.
+                //
+                // `is_own_singleton_class` is the receiver test: a bare
+                // `singleton_class` (or `self.singleton_class`) means the
+                // ENCLOSING class object — the same target family (a)'s
+                // `class << self` spelling files on. A constant receiver
+                // (`X.singleton_class.attr_accessor`) is NOT taken here:
+                // from inside `class Y` that call usually still means Y's
+                // own class object at runtime, but taking it by NAME would
+                // need the declared-owner machinery
+                // (`apply_singleton_patches`), and no corpus site uses the
+                // shape — narrow until measured (invariant #1).
+                //
+                // OPENNESS IS PRESERVED at its pre-arm state: CLOSED. This
+                // spelling never opened the class before (the early return
+                // swallowed it silently), and filing names is strictly
+                // additive — `NotFound` becomes `Found`, never the
+                // reverse. Unlike the receiverless macros below (mattr_*,
+                // class_attribute), whose catch-all openness must be
+                // preserved OPEN because closing unmasks what the index
+                // cannot see (the measured 28-false-positive lesson), this
+                // shape has no catch-all history to preserve: the methods
+                // land on a closed class, and the re-measured residue plus
+                // the public gate are the instruments that police any
+                // name the class carries that this filing does not see.
+                // A non-symbol argument defines an unknowable method set:
+                // that alone OPENS (DynamicAttrArg), the same rule as the
+                // `class << self` spelling above.
+                if call.receiver().is_some_and(|r| is_own_singleton_class(&r)) {
+                    if matches!(
+                        call.name().as_slice(),
+                        b"attr_reader" | b"attr_writer" | b"attr_accessor"
+                    ) {
+                        if let Some(i) = frag_idx {
+                            let mut all_symbols = true;
+                            if let Some(args) = call.arguments() {
+                                for arg in &args.arguments() {
+                                    if let Some(sym) = arg.as_symbol_node() {
+                                        let attr = String::from_utf8_lossy(sym.unescaped())
+                                            .into_owned();
+                                        let aspan = span_of(&arg);
+                                        let mut defs: Vec<MethodDef> = Vec::new();
+                                        if call.name().as_slice() != b"attr_writer" {
+                                            defs.push(MethodDef::synthetic(
+                                                attr.clone(),
+                                                0,
+                                                aspan,
+                                            ));
+                                        }
+                                        if call.name().as_slice() != b"attr_reader" {
+                                            defs.push(MethodDef::synthetic(
+                                                format!("{attr}="),
+                                                1,
+                                                aspan,
+                                            ));
+                                        }
+                                        self.fragments[i].singleton_methods.extend(defs);
+                                    } else {
+                                        all_symbols = false;
+                                    }
+                                }
+                            }
+                            if !all_symbols {
+                                self.open_class(i, OpenReason::DynamicAttrArg);
+                            }
+                        }
+                    }
+                    return;
+                }
                 if call.receiver().is_some() {
                     return;
                 }
@@ -2300,8 +2385,24 @@ impl DefWalker<'_> {
                     // one each. Anything not understood (a dynamic name, a
                     // non-symbol option key) opens the class instead of
                     // guessing, exactly as the `attr_*` arm above does.
+                    // `thread_mattr_*`/`thread_cattr_*`
+                    // (`attribute_accessors_per_thread.rb`) is the same
+                    // macro family with a thread-local backing store: the
+                    // singleton reader/writer are ALWAYS defined, the
+                    // instance reader needs `instance_reader` AND
+                    // `instance_accessor`, the instance writer needs
+                    // `instance_writer` AND `instance_accessor` — the same
+                    // option shape this arm already parses, so they join
+                    // the same arm rather than forking a second one.
+                    // Measured 2026-09-18: zero residue sites carry these
+                    // names today, but any real ActiveSupport project can
+                    // call them, and the task of the track is that the
+                    // index never meets a class-body macro it does not
+                    // know (the mattr comment above is the precedent).
                     "mattr_accessor" | "mattr_reader" | "mattr_writer" | "cattr_accessor"
-                    | "cattr_reader" | "cattr_writer" => {
+                    | "cattr_reader" | "cattr_writer" | "thread_mattr_accessor"
+                    | "thread_mattr_reader" | "thread_mattr_writer" | "thread_cattr_accessor"
+                    | "thread_cattr_reader" | "thread_cattr_writer" => {
                         let wants_reader = !name.ends_with("_writer");
                         let wants_writer = !name.ends_with("_reader");
                         let mut instance_reader = wants_reader;
@@ -2396,6 +2497,129 @@ impl DefWalker<'_> {
                         // (invariant #1). The resolution gain is gated on
                         // class openness, which is a separate problem —
                         // see the mattr_accessor tests.
+                        self.open_class(i, OpenReason::UnknownClassBodyCall);
+                        if !all_known {
+                            self.open_class(i, OpenReason::DynamicAttrArg);
+                        }
+                    }
+                    // ActiveSupport's `class_attribute :a, :b` (read out of
+                    // the gem's own source at the version rails locks,
+                    // `core_ext/class/attribute.rb`): the SINGLETON track
+                    // always gets the reader and the writer, plus the
+                    // `a?` predicate unless `instance_predicate: false` —
+                    // the predicate class_eval defines `self.a?` (class
+                    // object) and, when `instance_reader` is on, `a?` on
+                    // instances. The instance reader/writer follow the
+                    // documented option chain: `instance_reader` and
+                    // `instance_writer` each DEFAULT to `instance_accessor`,
+                    // so `instance_accessor: false` suppresses both unless
+                    // the finer option re-enables it explicitly. A dynamic
+                    // option value (`instance_reader: flag`) is read
+                    // conservatively as "defines everything": inventing the
+                    // absence of a method that may exist is the one
+                    // direction this file never guesses in (invariant #1).
+                    //
+                    // OPENNESS IS PRESERVED, the same rule as the mattr arm
+                    // above: receiverless today, the macro falls through to
+                    // the `_` catch-all and opens the class
+                    // (`UnknownClassBodyCall`), and this arm keeps it
+                    // exactly that open. The filing's resolution gain is
+                    // therefore gated on class openness — banked knowledge,
+                    // observable once openness itself is solved, never a
+                    // diagnostic change (invariant #1).
+                    "class_attribute" => {
+                        let mut instance_accessor = Some(true);
+                        let mut instance_reader: Option<bool> = None;
+                        let mut instance_writer: Option<bool> = None;
+                        let mut instance_predicate = Some(true);
+                        let mut attrs: Vec<(String, (usize, usize))> = Vec::new();
+                        let mut all_known = true;
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                if let Some(sym) = arg.as_symbol_node() {
+                                    attrs.push((
+                                        String::from_utf8_lossy(sym.unescaped()).into_owned(),
+                                        span_of(&arg),
+                                    ));
+                                } else if let Some(kw) = arg.as_keyword_hash_node() {
+                                    for el in &kw.elements() {
+                                        let key = el
+                                            .as_assoc_node()
+                                            .map(|a| (a.key(), a.value()));
+                                        let Some((k, v)) = key else {
+                                            all_known = false;
+                                            continue;
+                                        };
+                                        let Some(ks) = k.as_symbol_node() else {
+                                            all_known = false;
+                                            continue;
+                                        };
+                                        // Only a LITERAL `false` suppresses.
+                                        // A dynamic value may define the
+                                        // method, so it reads as `true`.
+                                        let literal_false = v.as_false_node().is_some();
+                                        let literal_true = v.as_true_node().is_some();
+                                        let value = if literal_false {
+                                            Some(false)
+                                        } else if literal_true {
+                                            Some(true)
+                                        } else {
+                                            None
+                                        };
+                                        match String::from_utf8_lossy(ks.unescaped()).as_ref() {
+                                            "instance_accessor" => instance_accessor = value,
+                                            "instance_reader" => instance_reader = value,
+                                            "instance_writer" => instance_writer = value,
+                                            "instance_predicate" => instance_predicate = value,
+                                            // `default:` and friends create
+                                            // no method and need no opening.
+                                            _ => {}
+                                        }
+                                    }
+                                } else {
+                                    all_known = false;
+                                }
+                            }
+                        }
+                        // The documented default chain: each fine-grained
+                        // option falls back to `instance_accessor`, and a
+                        // DYNAMIC anything falls forward to "defined"
+                        // (conservative).
+                        let eff_accessor = instance_accessor.unwrap_or(true);
+                        let eff_reader = instance_reader.unwrap_or(eff_accessor);
+                        let eff_writer = instance_writer.unwrap_or(eff_accessor);
+                        let eff_predicate = instance_predicate
+                            .unwrap_or(true);
+                        for (attr, aspan) in attrs {
+                            self.fragments[i].singleton_methods.push(
+                                MethodDef::synthetic(attr.clone(), 0, aspan),
+                            );
+                            self.fragments[i]
+                                .singleton_methods
+                                .push(MethodDef::synthetic(format!("{attr}="), 1, aspan));
+                            if eff_predicate {
+                                self.fragments[i]
+                                    .singleton_methods
+                                    .push(MethodDef::synthetic(format!("{attr}?"), 0, aspan));
+                            }
+                            if eff_reader {
+                                self.fragments[i].methods.push(MethodDef::synthetic(
+                                    attr.clone(),
+                                    0,
+                                    aspan,
+                                ));
+                            }
+                            if eff_writer {
+                                self.fragments[i]
+                                    .methods
+                                    .push(MethodDef::synthetic(format!("{attr}="), 1, aspan));
+                            }
+                            if eff_predicate && eff_reader {
+                                self.fragments[i]
+                                    .methods
+                                    .push(MethodDef::synthetic(format!("{attr}?"), 0, aspan));
+                            }
+                        }
                         self.open_class(i, OpenReason::UnknownClassBodyCall);
                         if !all_known {
                             self.open_class(i, OpenReason::DynamicAttrArg);

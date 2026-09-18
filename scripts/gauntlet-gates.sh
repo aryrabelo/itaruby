@@ -128,7 +128,7 @@ fi
 # byte-identical with `cmp`, so they run after gate b's build and before any
 # other binary-consuming gate rebuilds.
 say 'gate c1 — per-fix source mutants (each decision accused by a named test)'
-for m in const-missing operand-types; do
+for m in const-missing operand-types singleton; do
   if "$ROOT/scripts/$m-mutants.sh" >"$ART/$m-mutants.txt" 2>&1; then
     ok "$m mutants (every mutant accused, source restored byte-identical)"
   else

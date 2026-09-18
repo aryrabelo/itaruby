@@ -400,3 +400,152 @@ fn the_stdlib_singleton_surface_is_silent() {
     let name = "stdlib_singleton_surface_silent.rb";
     assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
 }
+
+// ---------------------------------------------------------------------
+// family (a), second spelling: `singleton_class.attr_reader/attr_writer/
+// attr_accessor :a` — the RECEIVER form. The residue probe at de28b40
+// measured it as the largest rails family (~90 of the 121
+// explicit-receiver sites: ActiveSupport::Dependencies,
+// ActionDispatch::ExceptionWrapper, ActiveModel::Translation, the
+// ClassAttributeTest::Prepending fixture).
+// ---------------------------------------------------------------------
+
+/// The receiver form files on the class-object track, and on that track
+/// ONLY — `singleton_class.attr_accessor :endpoint` defines nothing on
+/// instances (MRI: `sclass_call_attr_typo_would_be_not_found.rb`'s
+/// sibling raises on `Config.new.endpoint`).
+#[test]
+fn sclass_call_attr_is_indexed_on_the_singleton_track() {
+    let (instance, singleton, open) = facts("sclass_call_attr_resolves_silently.rb", "Config");
+    assert_eq!(
+        singleton,
+        vec!["connect", "endpoint", "endpoint=", "region", "token="]
+    );
+    assert!(instance.is_empty(), "instance track must stay empty, got {instance:?}");
+    // OPENNESS IS PRESERVED at its pre-arm state: this spelling never
+    // opened the class (the receiver early-return swallowed it), and
+    // filing names must not start opening classes — opening only unmasks
+    // what the index cannot see.
+    assert!(!open, "the receiver spelling must not open the class");
+}
+
+/// The silence side: every call in the fixture is real and MRI runs the
+/// file to completion (`ruby sclass_call_attr_resolves_silently.rb`
+/// exits 0).
+#[test]
+fn sclass_call_attr_calls_resolve_silently() {
+    let d = diags("sclass_call_attr_resolves_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// The filing is a FOUND, not an openness blanket: the wrong-arity call
+/// rides the filed method into E0102. MRI raises
+/// `ArgumentError: wrong number of arguments (given 1, expected 0)` on
+/// exactly this line. This is also the mutant script's accusation for
+/// the whole arm (`singleton-mutants.sh` MUT-A removes the filing and
+/// this test must fail).
+#[test]
+fn sclass_call_attr_reader_arity_is_checked() {
+    assert_eq!(diags("sclass_call_attr_arity_accuses.rb"), vec!["7:8:E0102"]);
+}
+
+/// The ground-truth side of the typo: MRI raises NoMethodError on
+/// `Config.endpointt` (line 5). The checker stays silent — the
+/// singleton `NotFound` arm is characterized in
+/// `singleton_lookup.rs` — but the fixture pins WHY a filed name
+/// matters: without the filing this call site is indistinguishable
+/// from the typo by the index.
+#[test]
+fn sclass_call_attr_typo_stays_characterized_silent() {
+    let d = diags("sclass_call_attr_typo_would_be_not_found.rb");
+    assert!(d.is_empty(), "expected characterized silence, got {d:?}");
+}
+
+// ---------------------------------------------------------------------
+// `class_attribute :a` (ActiveSupport). Read out of the gem's own
+// source: singleton reader/writer always, `a?` predicate unless
+// `instance_predicate: false`, instance reader/writer behind the
+// documented option chain. OPENNESS PRESERVED like the mattr family:
+// receiverless today falls into the `_` catch-all, so the class was
+// and stays OPEN — the filing is banked knowledge, and its resolution
+// gain is gated on class openness, which is a separate problem.
+// ---------------------------------------------------------------------
+
+/// Reader, writer, and predicate land on the class-object track; the
+/// instance track carries reader, writer, and predicate; and the class
+/// is exactly as open as the catch-all left it.
+#[test]
+fn class_attribute_is_filed_on_both_tracks() {
+    let (instance, singleton, open) = facts("class_attribute_resolves_silently.rb", "Base");
+    assert_eq!(singleton, vec!["report", "setting", "setting=", "setting?"]);
+    assert_eq!(instance, vec!["setting", "setting=", "setting?"]);
+    assert!(open, "the catch-all's openness must be preserved");
+}
+
+/// Every call in the fixture is real under MRI (the inline
+/// implementation mirrors the gem's semantics; `ruby
+/// class_attribute_resolves_silently.rb` exits 0).
+#[test]
+fn class_attribute_calls_resolve_silently() {
+    let d = diags("class_attribute_resolves_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// `instance_predicate: false` (literal) removes the predicate from
+/// BOTH tracks — MRI raises NoMethodError on `Base.setting?` (line 28).
+/// This is also the mutant script's accusation for the predicate
+/// decision (`singleton-mutants.sh` MUT-B removes the predicate filing
+/// and this test must fail).
+#[test]
+fn class_attribute_instance_predicate_false_removes_the_predicate() {
+    let (instance, singleton, _open) =
+        facts("class_attribute_instance_predicate_false_raises.rb", "Base");
+    assert_eq!(singleton, vec!["setting", "setting="]);
+    assert_eq!(instance, vec!["setting", "setting="]);
+}
+
+/// `instance_reader: false` (literal) removes the instance reader and,
+/// with it, the instance predicate — the singleton track is untouched
+/// (the gem defines the class sides regardless of every instance_*
+/// option). MRI raises NoMethodError on `Base.new.setting` (line 28).
+#[test]
+fn class_attribute_instance_reader_false_removes_the_instance_reader() {
+    let (instance, singleton, _open) =
+        facts("class_attribute_instance_reader_false_raises.rb", "Base");
+    assert_eq!(singleton, vec!["setting", "setting=", "setting?"]);
+    assert_eq!(instance, vec!["setting="]);
+}
+
+/// A DYNAMIC option value is read conservatively: every side that may
+/// exist is filed. MRI runs the fixture both ways (`ruby ...` and
+/// `ruby ... off` both exit 0) because at runtime the flag decides.
+#[test]
+fn class_attribute_dynamic_option_defines_everything() {
+    let (instance, singleton, _open) =
+        facts("class_attribute_dynamic_option_defines_everything.rb", "Base");
+    assert_eq!(singleton, vec!["setting", "setting=", "setting?"]);
+    assert_eq!(instance, vec!["setting", "setting=", "setting?"]);
+    let d = diags("class_attribute_dynamic_option_defines_everything.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+// ---------------------------------------------------------------------
+// `thread_mattr_accessor` and friends — the same macro family as
+// `mattr_accessor` with a thread-local backing store, so they join the
+// mattr arm's option parsing.
+// ---------------------------------------------------------------------
+
+/// The thread variants file both tracks exactly like `mattr_accessor`:
+/// the singleton reader/writer always, the instance reader/writer
+/// behind `instance_reader`/`instance_writer` AND `instance_accessor`.
+/// MRI runs the fixture to completion.
+#[test]
+fn thread_mattr_accessor_is_indexed_on_both_tracks() {
+    let (instance, singleton, open) =
+        facts("thread_mattr_accessor_resolves_silently.rb", "Job");
+    assert_eq!(singleton, vec!["drain", "queue", "queue="]);
+    assert_eq!(instance, vec!["queue", "queue="]);
+    assert!(open, "the catch-all's openness must be preserved");
+    let d = diags("thread_mattr_accessor_resolves_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}

@@ -31,22 +31,44 @@
 //! (3) stdlib module-function inventories. Then the residue can be
 //! re-measured against all three private corpora plus the public ones.
 //!
-//! RESIDUE, AND WHAT THE NUMBER MEANS (re-measured 2026-09-17 after
-//! singleton-track steps 1-3b and the `gem_namespace_key` fix). The
-//! metric is the only one that can ever become a diagnostic: a lookup
-//! that reaches this arm has already passed `lookup_singleton` (which
-//! returns `Inconclusive` the moment ANY ancestor is open) and
-//! `soften_not_found` (kernel/object singleton surface, dynamic mixins,
-//! gem reopenings), so "residue" == `NotFound` AND the singleton surface
-//! provably closed AND unsoftened. Verified per site, not assumed: every
-//! one of the 1534 discourse sites reports `open=false` and
-//! `inconclusive_reason = None`.
+//! RESIDUE, AND WHAT THE NUMBER MEANS (re-measured 2026-09-18 at
+//! 588b5ed, after the singleton-track steps through the class-level
+//! attribute macros, the mocking-gem softening, and the concern-edge
+//! harvest gate). The metric is the only one that can ever become a
+//! diagnostic: a lookup that reaches this arm has already passed
+//! `lookup_singleton` (which returns `Inconclusive` the moment ANY
+//! ancestor is open) and `soften_not_found` (kernel/object singleton
+//! surface, stdlib inventory, mocking-gem population, dynamic mixins,
+//! gem reopenings), so "residue" == `NotFound` AND the singleton
+//! surface provably closed AND unsoftened. Probe built from the exact
+//! revision under test; total sites in parentheses:
 //!
-//!   corpus    | sites | explicit receiver
-//!   rails     |   299 | 130
-//!   mastodon  |    22 |   0
-//!   discourse |  1534 | 861
-//!   corpus-c  |  1701 |   2
+//!   corpus    | explicit receiver (total)
+//!   rails     |  42 (193)
+//!   mastodon  |   0 (22)
+//!   discourse |  14 (605)
+//!   corpus-c  |   2 (1665)
+//!
+//! Not zero — the flip stays blocked. The remaining explicit-receiver
+//! families, by what really supplies the name:
+//!
+//! * `ActiveSupport` core extensions on `Module`/`Class` objects (`descendants`,
+//!   `module_parent*`, `in?`): 19 of rails' 42 — a gem's own core-extension
+//!   surface, which no path-keyed inventory can see (the receiver is ANY
+//!   class), a distinct population from the stdlib module-function inventory.
+//! * `with`/railtie-DSL/Singleton-pattern sites (`Foo.config`,
+//!   `Subscriber.instance`): 10 on rails — defined through gem-internal
+//!   class-object machinery (hooks, `class << self` inside gem files the
+//!   project never opens).
+//! * corpus-c's 2: `self.node_type`/`self.edge_type` inside a
+//!   `Class.new(GraphQL::Types::Relay::BaseEdge) do ... end` block — the
+//!   runtime receiver is the ANONYMOUS class, while the checker resolves
+//!   lexical `self`; a rebindable-block-shaped fix of its own.
+//! * discourse's 14: project classes whose class methods are installed by
+//!   plugin/`add_to_class`-style machinery from other files, plus two gem
+//!   reopens (`DiscourseSubscriptions`).
+//! * rails' `RaisesNoMethodError.foobar_method_doesnt_exist`: 1 DELIBERATE
+//!   true positive — the fixture exists to raise `NoMethodError`.
 //!
 //! A number measured on a probe built from UNCOMMITTED-then-reverted
 //! source is not a measurement (learned the hard way the same day: the

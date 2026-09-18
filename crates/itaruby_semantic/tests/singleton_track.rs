@@ -469,7 +469,7 @@ fn sclass_call_attr_reader_arity_is_checked() {
     assert_eq!(diags("sclass_call_attr_arity_accuses.rb"), vec!["7:8:E0102"]);
 }
 
-/// The ground-truth side of the typo: MRI raises NoMethodError on
+/// The ground-truth side of the typo: MRI raises `NoMethodError` on
 /// `Config.endpointt` (line 5). The checker stays silent — the
 /// singleton `NotFound` arm is characterized in
 /// `singleton_lookup.rs` — but the fixture pins WHY a filed name
@@ -482,7 +482,7 @@ fn sclass_call_attr_typo_stays_characterized_silent() {
 }
 
 /// The concern edge is the gate: a module that calls `class_methods do`
-/// WITHOUT extending ActiveSupport::Concern must not have a
+/// WITHOUT extending `ActiveSupport::Concern` must not have a
 /// `ClassMethods` module invented for it — no fragment in `by_path`, no
 /// extends edge, no filed methods. An invented CLOSED surface is
 /// exactly what the flip could never be allowed to accuse against; the
@@ -545,7 +545,7 @@ fn class_attribute_calls_resolve_silently() {
 }
 
 /// `instance_predicate: false` (literal) removes the predicate from
-/// BOTH tracks — MRI raises NoMethodError on `Base.setting?` (line 28).
+/// BOTH tracks — MRI raises `NoMethodError` on `Base.setting?` (line 28).
 /// This is also the mutant script's accusation for the predicate
 /// decision (`singleton-mutants.sh` MUT-B removes the predicate filing
 /// and this test must fail).
@@ -560,7 +560,7 @@ fn class_attribute_instance_predicate_false_removes_the_predicate() {
 /// `instance_reader: false` (literal) removes the instance reader and,
 /// with it, the instance predicate — the singleton track is untouched
 /// (the gem defines the class sides regardless of every instance_*
-/// option). MRI raises NoMethodError on `Base.new.setting` (line 28).
+/// option). MRI raises `NoMethodError` on `Base.new.setting` (line 28).
 #[test]
 fn class_attribute_instance_reader_false_removes_the_instance_reader() {
     let (instance, singleton, _open) =

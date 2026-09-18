@@ -95,6 +95,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HTTParty::COMMON_NETWORK_ERRORS` (a VALUE constant; this file carries
   only namespaces) and five first-party private-gem sites, which ship in
   no public gem and so can never enter a public declaration file.
+- Singleton track, class-level attribute macros (probe at de28b40 →
+  588b5ed): the receiver spelling `singleton_class.attr_accessor :a`
+  files on the class-object track — the largest rails residue family
+  (ActiveSupport::Dependencies, ActionDispatch::ExceptionWrapper,
+  ActiveModel::Translation, ~90 of the 121 explicit-receiver sites);
+  `class_attribute` files reader/writer/`a?` (predicate unless a
+  literal `instance_predicate: false`, instance sides behind the
+  documented option chain, dynamic options read as "defines
+  everything"); `thread_mattr_*`/`thread_cattr_*` join the mattr arm.
+  Rails explicit-receiver residue 121 → 42.
+- Singleton track, mocking gems: `X.any_instance` softens to
+  `Inconclusive` while rspec-mocks or mocha is in the project's own
+  `Gemfile.lock` (name-keyed in `soften_not_found`, never blanket; no
+  curated declaration exists for either gem and declaring
+  `Module#any_instance` would have softened every singleton lookup
+  project-wide). Discourse explicit-receiver residue 160 → 14; rails,
+  mastodon and the private corpus have neither gem in their locks and
+  are untouched by construction.
+- `scripts/singleton-mutants.sh`, running as gate c1: seven mutants,
+  each removing exactly one load-bearing decision of the singleton
+  track (receiver-spelling filing, class_attribute predicate, thread
+  variants, the any_instance softening, the `_exec` prefilter family,
+  the concern-edge gate on the `class_methods do` harvest) plus the
+  `gem_namespace_key` camelize key, each accused by a NAMED test.
+- The `class_methods do` harvest is gated on the concern edge: a
+  non-concern module's block can no longer invent a closed
+  `M::ClassMethods` surface (measured: 123 of 125 corpus sites carry
+  `extend ActiveSupport::Concern` before the block in the same file).
+- BODY_DEF_NAMES covers the `_exec` rebind family
+  (`instance_exec`/`class_exec`/`module_exec`), and
+  `dynamic_def_prefilter_covers_every_reacting_name` pins prefilter and
+  `body_def_reason` name by name — the pin the doc comment had been
+  naming without shipping.
+
 - E0108, operator operand type mismatch: `price = 100; label = "R$
   #{price}"; price + label` is now an error, where the checker used to be
   silent (measured silent on build sha 7f289c1b). MRI raises

@@ -1,0 +1,2 @@
+PASS mutant absence_is_agreement accused by case absent (green case still green)
+RESULT: PASS (both sides proved)

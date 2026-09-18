@@ -1,0 +1,2 @@
+fixture/one.rb:1:1 error[E0101] synthetic
+fixture/two.rb:3:2 warning[E0106] synthetic

@@ -1,0 +1,4 @@
+# drift for public corpus rails — in the clear (public repo, no secrecy wall)
+## new (present now, not in baseline; 1 line(s)):
+{"path":"rails/activerecord/lib/arel/nodes/casted.rb","line":41,"code":"E0108","message":"no method `foo` on Arel::Nodes::Casted"}
+## gone (in baseline, not produced now; 0 line(s)):

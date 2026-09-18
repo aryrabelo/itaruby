@@ -1,0 +1,1 @@
+{"path":"rails/app/models/x.rb","code":"E0102"}

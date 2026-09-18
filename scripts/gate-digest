@@ -1,0 +1,369 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# gate-digest — the gate suite's verdict as ONE compact JSON object.
+#
+# Why this exists (measured 2026-09-18): one `./scripts/dev gates` run writes
+# ~115 MB under target/gauntlet/ — public-discourse.txt alone is 440 KB (~110k
+# tokens), tests.txt 60 KB, corpus-corpus-c.txt 47 KB. The gate's own stdout is
+# already cheap (~30 PASS/FAIL lines), but the moment something goes red a
+# worker pulls artifacts into an expensive model to learn what happened. That
+# transport cost is deterministic to remove: this script reads the transcript
+# plus the artifacts and prints per-gate {status, reason, numbers} with, for a
+# FAIL, the exact artifact path and the line numbers to open. Typical output is
+# under 2 KB.
+#
+# Two rules it must never break:
+#
+#   1. SECRECY WALL (AGENTS.md, binding). The private corpora are sacred: no
+#      path, class, method, table or column name of theirs may leave the
+#      machine. So an artifact whose basename starts with `corpus-` is PRIVATE:
+#      the digest emits counts, hashes and LINE NUMBERS for it, never one byte
+#      of its content. Public corpora (`public-*.txt`) carry public repo code,
+#      so their drift lines may be excerpted. `private_artifact?` is the single
+#      decision point, and `scripts/gate-digest-selftest.sh` mutates it.
+#   2. ABSENCE IS NEVER AGREEMENT (AGENTS.md, binding — the public-gate
+#      false-green). A gate the transcript calls PASS whose evidence file is
+#      missing or empty is reported FAIL "artifact absent: <path>", never PASS.
+#      A gate that reads evidence it never made is not a gate.
+#
+# Stdlib only, no network, no writes outside --out. Exit status is always 0
+# unless its own arguments are unusable (2): this is a reporter, and a reporter
+# that can fail a build turns a probabilistic reading into an exit code.
+#
+# Usage: scripts/gate-digest [--art DIR] [--transcript FILE] [--out FILE]
+
+require 'json'
+require 'digest'
+
+ROOT = File.expand_path('..', __dir__)
+art = File.join(ROOT, 'target', 'gauntlet')
+transcript = nil
+out = nil
+
+argv = ARGV.dup
+until argv.empty?
+  flag = argv.shift
+  case flag
+  when '--art'        then art = argv.shift
+  when '--transcript' then transcript = argv.shift
+  when '--out'        then out = argv.shift
+  when '-h', '--help'
+    puts 'usage: gate-digest [--art DIR] [--transcript FILE] [--out FILE]'
+    exit 0
+  else
+    warn "gate-digest: unknown argument #{flag}"
+    exit 2
+  end
+end
+if art.nil? || art.empty?
+  warn 'gate-digest: --art needs a directory'
+  exit 2
+end
+transcript ||= File.join(art, 'transcript.txt')
+out ||= File.join(art, 'digest.json')
+
+MAX_REASON = 140
+MAX_EXCERPT_LINES = 3
+MAX_EXCERPT_CHARS = 120
+MAX_LINE_REFS = 5
+
+def clip(str, max)
+  s = str.to_s.gsub(/\s+/, ' ').strip
+  s.length > max ? "#{s[0, max - 1]}…" : s
+end
+
+# The one secrecy decision. `corpus-<id>*.txt` is a PRIVATE corpus artifact:
+# counts, hashes and line numbers may leave, content may not.
+def private_artifact?(path)
+  File.basename(path).start_with?('corpus-')
+end
+
+def read_lines(path)
+  return [] unless path && File.file?(path)
+
+  File.readlines(path, chomp: true)
+rescue StandardError
+  []
+end
+
+def artifact_present?(path)
+  File.file?(path) && File.size(path) > 0
+end
+
+INTERESTING = /(\bFAIL\b|OVER CEILING|^error|error\[|error:|panicked|failures:|no estimate|assertion|cannot|missing)/i
+
+# path:line refs plus, for a PUBLIC artifact only, up to three clipped lines.
+def evidence(path, rel)
+  lines = read_lines(path)
+  hits = []
+  lines.each_with_index do |l, i|
+    next if l.strip.empty?
+    next unless l =~ INTERESTING
+
+    hits << [i + 1, l]
+    break if hits.length >= MAX_LINE_REFS
+  end
+  if hits.empty?
+    tail = []
+    lines.each_with_index { |l, i| tail << [i + 1, l] unless l.strip.empty? }
+    hits = tail.last(MAX_EXCERPT_LINES) || []
+  end
+  ev = { 'artifact' => rel, 'lines' => hits.map { |h| h[0] } }
+  if private_artifact?(path)
+    ev['excerpt_withheld'] = 'private corpus artifact — secrecy wall'
+  else
+    ev['excerpt'] = hits.first(MAX_EXCERPT_LINES).map { |h| clip(h[1], MAX_EXCERPT_CHARS) }
+  end
+  ev
+end
+
+# ---------------------------------------------------------------- transcript
+sections = []
+preamble = []
+read_lines(transcript).each do |raw|
+  l = raw.rstrip
+  if l.start_with?('=== ')
+    sections << { 'header' => l[4..-1].to_s, 'lines' => [] }
+  elsif sections.empty?
+    preamble << l
+  else
+    sections.last['lines'] << l
+  end
+end
+all_lines = preamble + sections.flat_map { |s| s['lines'] }
+
+result_line = all_lines.reverse.find { |l| l.start_with?('RESULT:') }
+proved = (all_lines.find { |l| l.start_with?('corpus gate proved:') } || '')
+         .sub('corpus gate proved:', '').split
+skipped_ids = (all_lines.find { |l| l.start_with?('corpus gate skipped') } || '')
+              .sub(/\Acorpus gate skipped[^:]*:/, '').split
+
+# ------------------------------------------------------------------- numbers
+def nums_tests(art)
+  ls = read_lines(File.join(art, 'tests.txt'))
+  passed = 0
+  failed = 0
+  suites = 0
+  ls.each do |l|
+    m = l.match(/test result: \w+\. (\d+) passed; (\d+) failed/)
+    next unless m
+
+    suites += 1
+    passed += m[1].to_i
+    failed += m[2].to_i
+  end
+  { 'suites' => suites, 'passed' => passed, 'failed' => failed }
+end
+
+def nums_build(art)
+  ls = read_lines(File.join(art, 'build.txt'))
+  { 'warnings' => ls.count { |l| l.start_with?('warning') } }
+end
+
+def nums_probe(art)
+  ls = read_lines(File.join(art, 'testdata.txt'))
+  { 'errors' => ls.count { |l| l =~ /error\[/ }, 'warnings' => ls.count { |l| l =~ /warning\[/ } }
+end
+
+# Mutant logs speak one dialect: `PASS <label> accused by <test>` per mutant.
+def nums_mutants(paths)
+  accused = 0
+  failing = 0
+  paths.each do |p|
+    read_lines(p).each do |l|
+      accused += 1 if l.start_with?('PASS ') && l.include?('accused')
+      failing += 1 if l.start_with?('FAIL ')
+    end
+  end
+  { 'accused' => accused, 'not_accused' => failing, 'total' => accused + failing }
+end
+
+def nums_perf(art)
+  rows = []
+  read_lines(File.join(art, 'perf.txt')).each do |l|
+    m = l.match(/^\s*(\S+): ([\d.]+) ms \(ceiling ([\d.]+) ms, (\d+)% of it\) (ok|OVER CEILING)/)
+    next unless m
+
+    rows << { 'id' => m[1], 'ms' => m[2].to_f, 'ceiling_ms' => m[3].to_f,
+              'pct' => m[4].to_i, 'over' => m[5] != 'ok' }
+  end
+  worst = rows.max_by { |r| r['pct'] }
+  n = { 'benches' => rows.length, 'over' => rows.count { |r| r['over'] } }
+  n['worst'] = { 'id' => worst['id'], 'ms' => worst['ms'], 'ceiling_ms' => worst['ceiling_ms'] } if worst
+  n['no_estimate'] = true if read_lines(File.join(art, 'perf.txt')).any? { |l| l.include?('produced no estimate') }
+  n
+end
+
+# Private corpora: counts and a hash, never a line. The fingerprint is the
+# SHA-256 of the *hash* file, so it identifies the error SET without carrying
+# any of it — the same trick scripts/corpus-baseline.txt uses.
+def nums_corpus(art, id, section_lines)
+  n = { 'id' => id }
+  new_f = File.join(art, "corpus-#{id}-new-hashes.txt")
+  gone_f = File.join(art, "corpus-#{id}-gone-hashes.txt")
+  n['new'] = read_lines(new_f).count { |l| !l.strip.empty? } if File.file?(new_f)
+  n['gone'] = read_lines(gone_f).count { |l| !l.strip.empty? } if File.file?(gone_f)
+  hashes = File.join(art, "corpus-#{id}-error-hashes.txt")
+  if File.file?(hashes)
+    body = File.read(hashes)
+    n['errors'] = body.lines.count { |l| !l.strip.empty? }
+    n['error_set_sha'] = Digest::SHA256.hexdigest(body)[0, 16]
+  end
+  section_lines.each do |l|
+    m = l.match(/warning ceiling \(#{Regexp.escape(id)}\): (\d+) ([<>]=?) (\d+)/)
+    if m
+      n['warnings'] = m[1].to_i
+      n['warn_ceiling'] = m[3].to_i
+    end
+    r = l.match(/\(#{Regexp.escape(id)}\).*\[rev (\S+), baseline pinned (\S+)\]/)
+    next unless r
+
+    n['rev'] = r[1]
+    n['pinned'] = r[2].sub(/\]\z/, '')
+  end
+  n
+end
+
+# Public corpora carry public repo code: path:line of NEW/GONE lines is fine.
+def nums_public(art, section_lines)
+  repos = []
+  ids = section_lines.flat_map { |l| l.scan(/public (?:errors|time ceiling)[^(]*\((\w[\w-]*)\)/) }.flatten.uniq
+  ids.each do |id|
+    r = { 'id' => id }
+    %w[new gone].each do |kind|
+      f = File.join(art, "public-#{id}-#{kind}.txt")
+      next unless File.file?(f)
+
+      lines = read_lines(f).each_with_index.reject { |l, _| l.strip.empty? }
+      r[kind] = lines.length
+      unless lines.empty?
+        r["#{kind}_at"] = lines.first(MAX_LINE_REFS).map { |_, i| "public-#{id}-#{kind}.txt:#{i + 1}" }
+      end
+    end
+    section_lines.each do |l|
+      m = l.match(/public time ceiling \(#{Regexp.escape(id)}\): ([\d.]+)s ([<>]=?) ([\d.]+)s/)
+      next unless m
+
+      r['seconds'] = m[1].to_f
+      r['ceiling_s'] = m[3].to_f
+    end
+    repos << r
+  end
+  repos
+end
+
+# Evidence a PASS must be able to show. Absence here is a FAIL, never a PASS.
+def required(name, art, proved)
+  case name
+  when '0'   then %w[sf.txt sf-changed.txt]
+  when 'a'   then %w[tests.txt]
+  when 'b'   then %w[build.txt]
+  when 'c'   then %w[testdata.txt]
+  when 'c1'  then %w[const-missing-mutants.txt operand-types-mutants.txt singleton-mutants.txt]
+  when 'c2'  then %w[unwrap.txt]
+  when 'c2b' then %w[instrument-mutants.txt gate-digest-selftest.txt]
+  when 'c3'  then %w[perf.txt]
+  when 'd'   then proved.flat_map { |id| ["corpus-#{id}.txt", "corpus-#{id}-error-hashes.txt"] }
+  when 'f'   then %w[public.txt]
+  when 'g'   then %w[inference-selftest.txt]
+  else []
+  end.map { |f| File.join(art, f) }
+end
+
+# ---------------------------------------------------------------------- gates
+gates = []
+sections.each do |sec|
+  header = sec['header']
+  next if header == 'summary'
+
+  m = header.match(/\Agate (\S+) — (.*)\z/)
+  name = m ? m[1] : header
+  label = m ? m[2] : header
+  lines = sec['lines']
+  fails = lines.select { |l| l.start_with?('FAIL ') }
+  skips = lines.select { |l| l.start_with?('SKIP ') }
+  passes = lines.select { |l| l.start_with?('PASS ') }
+
+  status = if !fails.empty? then 'FAIL'
+           elsif !passes.empty? then 'PASS'
+           elsif !skips.empty? then 'SKIP'
+           else 'UNKNOWN'
+           end
+  # Token economy: a PASS row's "reason" only ever restates its label, and the
+  # digest exists because bytes cost tokens. So the reason line is emitted for
+  # every verdict that is NOT a plain PASS — exactly the rows a reader acts on.
+  reason = clip((fails.first || skips.first || passes.first || 'no verdict line in transcript')
+                .sub(/\A(PASS|FAIL|SKIP) /, ''), MAX_REASON)
+
+  g = { 'name' => name, 'label' => clip(label, 56), 'status' => status }
+  g['reason'] = reason unless status == 'PASS'
+
+  numbers =
+    case name
+    when 'a'   then nums_tests(art)
+    when 'b'   then nums_build(art)
+    when 'c'   then nums_probe(art)
+    when 'c1'  then nums_mutants(required('c1', art, proved))
+    when 'c2b' then nums_mutants(required('c2b', art, proved))
+    when 'c3'  then nums_perf(art)
+    when 'd'   then { 'corpora' => proved.map { |id| nums_corpus(art, id, lines) }, 'skipped' => skipped_ids }
+    when 'f'   then { 'repos' => nums_public(art, lines) }
+    else nil
+    end
+  g['numbers'] = numbers if numbers && !numbers.empty?
+
+  # Absence is never agreement: a PASS with no evidence file is a FAIL.
+  if status == 'PASS' || status == 'UNKNOWN'
+    absent = required(name, art, proved).reject { |p| artifact_present?(p) }
+    unless absent.empty?
+      g['status'] = 'FAIL'
+      g['reason'] = clip("artifact absent: #{absent.map { |p| p.sub("#{art}/", '') }.join(', ')}", MAX_REASON)
+      g['evidence'] = { 'artifact' => absent.first.sub("#{art}/", ''), 'lines' => [], 'absent' => true }
+    end
+  end
+
+  if g['status'] == 'FAIL' && !g.key?('evidence')
+    named = fails.map { |l| l[%r{target/gauntlet/([^\s)]+)}, 1] }.compact.first
+    rel = named || required(name, art, proved).first&.sub("#{art}/", '')
+    if rel
+      p = File.join(art, rel)
+      g['evidence'] = if artifact_present?(p)
+                        evidence(p, rel)
+                      else
+                        { 'artifact' => rel, 'lines' => [], 'absent' => true }
+                      end
+    end
+  end
+  gates << g
+end
+
+# ------------------------------------------------------------------- machine
+machine = nil
+load_f = File.join(art, 'load.txt')
+if File.file?(load_f)
+  txt = File.read(load_f)
+  m = txt.match(/load averages?: *([\d.]+)[, ] *([\d.]+)[, ] *([\d.]+)/)
+  machine = { 'load1' => m[1].to_f, 'load5' => m[2].to_f, 'load15' => m[3].to_f, 'captured' => 'at gate start' } if m
+end
+
+digest = {
+  'schema' => 'itaruby-gate-digest/1',
+  'result' => result_line ? clip(result_line.sub(/\ARESULT: */, ''), 80) : 'UNKNOWN (no RESULT line)',
+  'counts' => {
+    'pass' => gates.count { |g| g['status'] == 'PASS' },
+    'fail' => gates.count { |g| g['status'] == 'FAIL' },
+    'skip' => gates.count { |g| g['status'] == 'SKIP' }
+  },
+  'corpus' => { 'proved' => proved, 'skipped' => skipped_ids },
+  'gates' => gates,
+  'transcript' => transcript.sub("#{ROOT}/", ''),
+  'artifacts' => art.sub("#{ROOT}/", '')
+}
+digest['machine'] = machine if machine
+digest['result'] = "FAIL (digest: #{digest['counts']['fail']} gate(s) red)" if digest['counts']['fail'] > 0 && !digest['result'].start_with?('FAIL')
+
+json = JSON.generate(digest)
+File.write(out, "#{json}\n")
+puts json
+exit 0

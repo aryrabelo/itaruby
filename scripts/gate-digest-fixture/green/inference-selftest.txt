@@ -1,0 +1,1 @@
+inference selftest: 18 cases, every planted defect accused

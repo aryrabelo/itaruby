@@ -1,0 +1,1 @@
+sf check --changed HEAD: the guardrail only tightened

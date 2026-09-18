@@ -1,0 +1,2 @@
+PASS stale-binary defect accused by build_failure_stops_gates
+PASS shipped scripts clean

@@ -1,0 +1,4 @@
+perf gate: column=dev run_bench=1
+  index_small: 4.10 ms (ceiling 8.00 ms, 51% of it) ok
+  check_small: 9.20 ms (ceiling 20.00 ms, 46% of it) ok
+perf gate: PASS

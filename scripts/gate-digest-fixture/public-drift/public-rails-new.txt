@@ -1,0 +1,1 @@
+{"path":"rails/activerecord/lib/arel/nodes/casted.rb","line":41,"code":"E0108","message":"no method `foo` on Arel::Nodes::Casted"}

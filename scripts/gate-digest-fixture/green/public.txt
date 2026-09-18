@@ -1,0 +1,2 @@
+PASS public errors match baseline exactly (rails)
+RESULT: PASS

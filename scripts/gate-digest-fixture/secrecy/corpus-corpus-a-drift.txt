@@ -1,0 +1,4 @@
+# drift for corpus corpus-a — in the clear, stays on this machine (gitignored)
+## new (present now, not in baseline) — needs a true-positive audit before it joins the baseline:
+corpus-a/SEKRIT_FIXTURE_TOKEN/model.rb:12:3 error[E0108] no method `sekrit_column` on SekritFixtureClass
+## missing (baseline expects these hashes, none produced now):

@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `scripts/gate-digest`: the gate suite's verdict as ONE compact JSON
+  (`target/gauntlet/digest.json`, 1791 B all-green) instead of the ~115 MB
+  `target/gauntlet/` holds — per-gate status, one-line reason and numbers
+  (test counts, warning ceiling `x <= y`, bench ms vs ceiling, mutants
+  accused/total, corpus new/gone counts and an error-set hash), the machine
+  load at gate start, and for a FAIL the exact artifact path plus the line
+  numbers to open. `gauntlet-gates.sh` now records its transcript to
+  `target/gauntlet/transcript.txt` and calls the digest on every exit path,
+  including the two early build failures; the digest is a reporter and can
+  never change the gate's exit code. Private corpus artifacts yield counts,
+  hashes and line numbers only — never content (secrecy wall); a PASS whose
+  evidence file is missing or empty is reported `FAIL "artifact absent"`,
+  never PASS. Two-sided proof in `scripts/gate-digest-selftest.sh`, wired as
+  gate c2b: four fixture gauntlet directories under
+  `scripts/gate-digest-fixture/` plus five cmp-guarded mutants, each accused
+  by its own named case with the green case proved still green.
 - E0108 asks whether the OPERATOR was polluted, not whether the class was
   touched. The blanket question ("did anything reach this core class?")
   is what the closed-world lookup needs and not what an operator check

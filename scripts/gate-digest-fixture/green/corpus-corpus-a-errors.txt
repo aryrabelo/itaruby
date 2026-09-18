@@ -1,0 +1,1 @@
+corpus-a/one.rb:1:1 error[E0101] synthetic

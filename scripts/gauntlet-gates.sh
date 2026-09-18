@@ -38,12 +38,36 @@ ART=${ART:-$ROOT/target/gauntlet}
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 mkdir -p "$ART"
 
+# The transcript is written, not just printed. Everything below prints to
+# stdout for the human AND appends to $ART/transcript.txt, because
+# scripts/gate-digest reads the verdicts from there: a digest that had to
+# re-derive each verdict from the artifacts would be a second opinion, not a
+# summary of THIS run.
+TRANSCRIPT=${TRANSCRIPT:-$ART/transcript.txt}
+: >"$TRANSCRIPT"
+
+# The load at gate start, captured once, because a timing gate read without it
+# is a number with no conditions attached (this machine routinely runs several
+# agent sessions while the gates run).
+uptime >"$ART/load.txt" 2>/dev/null || : >"$ART/load.txt"
+
 failed=0
 skipped=0
-say() { printf '\n=== %s\n' "$1"; }
-ok()   { printf 'PASS %s\n' "$1"; }
-bad()  { printf 'FAIL %s\n' "$1"; failed=1; }
-skip() { printf 'SKIP %s — %s\n' "$1" "$2"; skipped=1; }
+log()  { printf '%s\n' "$1" >>"$TRANSCRIPT"; }
+say()  { printf '\n=== %s\n' "$1"; log "=== $1"; }
+ok()   { printf 'PASS %s\n' "$1"; log "PASS $1"; }
+bad()  { printf 'FAIL %s\n' "$1"; failed=1; log "FAIL $1"; }
+skip() { printf 'SKIP %s — %s\n' "$1" "$2"; skipped=1; log "SKIP $1 — $2"; }
+out()  { printf '%s\n' "$1"; log "$1"; }
+
+# One compact JSON verdict at $ART/digest.json, always fresh, on every exit
+# path — including the early ones, which are exactly the runs a reader most
+# needs explained. It is a REPORTER: its own failure can never change this
+# script's exit code (AGENTS.md: a gate's verdict stays an exit code).
+digest() {
+  "$ROOT/scripts/gate-digest" --art "$ART" --transcript "$TRANSCRIPT" \
+    --out "$ART/digest.json" >/dev/null 2>"$ART/digest-stderr.txt" || true
+}
 
 # --- gate 0: software-factory. Tamper-proof by design; a rule that blocks you
 # is a finding about your change, never about the rule.
@@ -73,7 +97,8 @@ if cargo build --release --locked --target-dir "$ROOT/target" >"$ART/build.txt" 
   ok 'cargo build --release'
 else
   bad 'cargo build --release (see target/gauntlet/build.txt)'
-  echo 'RESULT: FAIL (build failed; no binary-consuming gates executed)'
+  out 'RESULT: FAIL (build failed; no binary-consuming gates executed)'
+  digest
   exit 1
 fi
 
@@ -141,7 +166,8 @@ done
 # and a stale one is the 2026-09-17 defect (AGENTS.md).
 if ! cargo build --release --locked --target-dir "$ROOT/target" >>"$ART/build.txt" 2>&1; then
   bad 'rebuild after the source mutants failed'
-  echo 'RESULT: FAIL (no trustworthy binary for the remaining gates)'
+  out 'RESULT: FAIL (no trustworthy binary for the remaining gates)'
+  digest
   exit 1
 fi
 
@@ -171,6 +197,17 @@ if INSTRUMENT_MUTANTS_LAB="$ART/instrument-mutants" \
   ok 'evidence instruments (each defect reproduces under mutation, shipped scripts clean)'
 else
   bad 'evidence instruments (see target/gauntlet/instrument-mutants.txt)'
+fi
+# Same family, one level up: scripts/gate-digest is what a reader (human or
+# model) now believes INSTEAD of the 115 MB of artifacts, so it is itself an
+# evidence producer and gets the same two-sided proof — four fixture
+# gauntlet directories it must report exactly, and five cmp-guarded mutants
+# each of which must be accused by its own named case.
+if GATE_DIGEST_LAB="$ART/gate-digest-selftest" \
+   "$ROOT/scripts/gate-digest-selftest.sh" >"$ART/gate-digest-selftest.txt" 2>&1; then
+  ok 'gate digest (each fixture reported exactly, every mutant accused by its case)'
+else
+  bad 'gate digest (see target/gauntlet/gate-digest-selftest.txt)'
 fi
 
 # --- gate c3: performance ceiling. The launch bar for this project is speed
@@ -364,8 +401,9 @@ else
 fi
 
 say 'summary'
-(( ${#corpus_proved[@]} )) && echo "corpus gate proved: ${corpus_proved[*]}"
-(( ${#corpus_skipped[@]} )) && echo "corpus gate skipped (not found on this machine): ${corpus_skipped[*]}"
-if (( failed )); then echo 'RESULT: FAIL'; exit 1; fi
-if (( skipped )); then echo "RESULT: PASS (incomplete — skipped: ${corpus_skipped[*]})"; exit 2; fi
-echo 'RESULT: PASS'
+(( ${#corpus_proved[@]} )) && out "corpus gate proved: ${corpus_proved[*]}"
+(( ${#corpus_skipped[@]} )) && out "corpus gate skipped (not found on this machine): ${corpus_skipped[*]}"
+if (( failed )); then out 'RESULT: FAIL'; digest; exit 1; fi
+if (( skipped )); then out "RESULT: PASS (incomplete — skipped: ${corpus_skipped[*]})"; digest; exit 2; fi
+out 'RESULT: PASS'
+digest

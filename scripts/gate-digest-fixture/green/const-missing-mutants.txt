@@ -1,0 +1,2 @@
+PASS M1 const_missing suppression accused by const_missing_suppressed
+PASS baseline green (fixture)

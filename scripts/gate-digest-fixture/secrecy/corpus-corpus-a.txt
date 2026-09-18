@@ -1,0 +1,1 @@
+fixture/SEKRIT_FIXTURE_TOKEN/model.rb:12:3 error[E0108] no method `sekrit_column` on SekritFixtureClass

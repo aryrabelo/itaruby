@@ -238,6 +238,93 @@ chmod +x "$td/release/ita"
   else bad "shipped script measured something else (witness: ${ship_w:-empty})"; fi
 fi
 
+# ---------- case 4: public-gate artifact dir ----------
+# Measured 2026-09-17: public-gate.sh never created $ART, so on a tree
+# with no target/gauntlet every `>"$ART/..."` redirection failed, `comm`
+# compared two files that do not exist, and the gate printed "public
+# errors match baseline exactly" for every repo in ~0.01s and exited
+# clean. The lab below is a miniature of the real gate: one one-commit
+# git clone declared as a corpus, a baseline holding exactly the line the
+# fake `ita` emits, and a ceiling nothing can exceed.
+say 'case public-gate-artifacts — a comparison against artifacts that were never written must FAIL'
+c4=$LAB/public-gate
+pg_clone=$c4/corpora/lab
+mkdir -p "$pg_clone"
+git_clean init -q "$pg_clone"
+git_clean -C "$pg_clone" config user.email probe@lab
+git_clean -C "$pg_clone" config user.name probe
+printf 'class L\n  def a\n    1\n  end\nend\n' >"$pg_clone/f.rb"
+git_clean -C "$pg_clone" add -A && git_clean -C "$pg_clone" commit -qm lab
+pg_sha=$(git_clean -C "$pg_clone" rev-parse HEAD)
+mk_public() { # DIR SCRIPT_SRC
+  mkdir -p "$1/scripts/baseline" "$1/target/release"
+  cp "$2" "$1/scripts/public-gate.sh"
+  chmod +x "$1/scripts/public-gate.sh"
+  printf 'lab file:///dev/null %s 999\n' "$pg_sha" >"$1/scripts/corpora.txt"
+  printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"lab/f.rb","severity":"error"}\n' \
+    >"$1/scripts/baseline/lab.jsonl"
+  # A fake `ita` that emits exactly one JSON diagnostic line, pathed
+  # inside the lab clone so the gate's own normalization rewrites it to
+  # `lab/f.rb` and the baseline above matches.
+  {
+    echo '#!/bin/sh'
+    echo "cat <<'JSON'"
+    printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"%s/f.rb","severity":"error"}\n' "$pg_clone"
+    echo 'JSON'
+  } >"$1/target/release/ita"
+  chmod +x "$1/target/release/ita"
+}
+run_public() { # DIR ART_DIR -> echoes the gate transcript
+  ( cd "$1" && PUBLIC_CORPORA_FILE="$1/scripts/corpora.txt" \
+      PUBLIC_BASELINE_DIR="$1/scripts/baseline" \
+      PUBLIC_CORPORA_ROOT="$c4/corpora" ART="$2" \
+      bash "$1/scripts/public-gate.sh" 2>&1 )
+}
+if ! mutate "$ROOT/scripts/public-gate.sh" "$LAB/public-gate-mutant.sh" \
+      'mkdir -p "$ART" || { printf ' \
+      ': || { printf '; then
+  bad 'public-gate-artifacts: mutation did not apply (INVALIDO-cmp)'
+else
+  # ... and neuter the freshness guard itself, not one of its three call
+  # sites: the historical gate had no guard at all, and a mutant that
+  # keeps two of the three assertions fails for the RIGHT reason and so
+  # proves nothing about the wrong one.
+  mutate "$LAB/public-gate-mutant.sh" "$LAB/public-gate-mutant.sh" \
+    $'fresh_artifact() {\n  local path=$1 what=$2' \
+    $'fresh_artifact() {\n  return 0 # mutant: freshness guard removed\n  local path=$1 what=$2' \
+    || bad 'public-gate-artifacts: second mutation did not apply (INVALIDO-cmp)'
+  bash -n "$LAB/public-gate-mutant.sh" || bad 'public-gate-artifacts: mutant does not parse (INVALIDO-parse)'
+  mk_public "$c4/shipped" "$ROOT/scripts/public-gate.sh"
+  mk_public "$c4/mutant" "$LAB/public-gate-mutant.sh"
+
+  # Leg 1 — the defect: artifact dir absent, so nothing can be written.
+  mut_out=$(run_public "$c4/mutant" "$c4/mutant/absent-art")
+  if [[ $mut_out == *'match baseline exactly'* && ! -f $c4/mutant/absent-art/public-lab-fresh.txt ]]; then
+    ok 'mutant reproduces the defect (agreement reported with no artifact on disk)'
+  else
+    bad 'mutant did NOT reproduce the defect — this case proves nothing'
+  fi
+
+  # Leg 2a — shipped, same condition: it creates the dir and really measures.
+  ship_out=$(run_public "$c4/shipped" "$c4/shipped/absent-art")
+  if [[ $ship_out == *'match baseline exactly'* && -s $c4/shipped/absent-art/public-lab-fresh.txt ]]; then
+    ok 'shipped script creates the artifact dir and compares a real set'
+  else
+    bad "shipped script did not produce its artifacts: $ship_out"
+  fi
+
+  # Leg 2b — shipped, dir present but unwritable: FAIL naming the artifact.
+  ro=$c4/shipped/readonly-art
+  mkdir -p "$ro" && chmod 500 "$ro"
+  ro_out=$(run_public "$c4/shipped" "$ro")
+  chmod 700 "$ro"
+  if [[ $ro_out == *'artifact never written'* && $ro_out == *'RESULT: FAIL'* ]]; then
+    ok 'shipped script FAILS loudly when an artifact cannot be written'
+  else
+    bad "shipped script did not fail on an unwritable artifact dir: $ro_out"
+  fi
+fi
+
 say 'summary'
 if (( failed )); then echo "RESULT: FAIL (lab kept at $LAB)"; exit 1; fi
 echo "RESULT: PASS (lab kept at $LAB)"

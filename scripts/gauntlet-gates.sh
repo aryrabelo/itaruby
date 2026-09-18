@@ -24,6 +24,18 @@ CORPORA_ROOT=${CORPORA_ROOT:-$HOME/Sites}
 BASELINE=$ROOT/scripts/corpus-baseline.txt
 CORPORA_MAP=$ROOT/scripts/corpora-local.txt
 ART=${ART:-$ROOT/target/gauntlet}
+
+# Pin the cargo target dir to THIS tree unless the caller already chose
+# one. Two worktrees of this repo share one `build.target-dir` on this
+# machine (AGENTS.md, binding, measured): with it shared, `cargo test`
+# here resolves the OTHER tree's `rmeta` and reports a red on code this
+# tree does not contain, and two identically named tests race for the
+# same `CARGO_TARGET_TMPDIR` subdirectory. This gate's own binary path
+# (`$ITA` = `$ROOT/target/release/ita`) already assumes this tree's
+# `target/`, so the two were inconsistent: the build wrote wherever the
+# shared config said, and every binary-consuming gate then read a path
+# that build never wrote.
+export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}
 mkdir -p "$ART"
 
 failed=0

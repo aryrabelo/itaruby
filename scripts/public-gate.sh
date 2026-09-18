@@ -46,6 +46,45 @@ CLONE_ROOT=${PUBLIC_CORPORA_ROOT:-$HOME/Sites/temp-files/public-corpora}
 ART=${ART:-$ROOT/target/gauntlet}
 SRB_TIMEOUT=600
 
+# The artifact directory MUST exist before anything writes into it. Until
+# 2026-09-17 it did not: on a fresh tree (or after `rm -rf target/`),
+# every `>"$ART/..."` redirection failed, `ita check`'s output went
+# nowhere, and the comparison that follows compared two EMPTY files — so
+# the gate printed "public errors match baseline exactly" for all three
+# repos in 0.02s while measuring nothing, and exited 0. Measured on this
+# gate, the same false-green shape AGENTS.md records for
+# `gauntlet-gates.sh` and `replay.sh`: a gate that reads evidence it
+# never made.
+mkdir -p "$ART" || { printf 'FAIL public corpus: cannot create %s\n' "$ART"; exit 1; }
+
+# "Written THIS run" is proved by deletion, not by a timestamp: each
+# iteration removes the artifacts it is about to write (`clear_artifacts`)
+# and then requires them to exist and be non-empty (`fresh_artifact`).
+# Timestamps were the first design and were rejected — `[[ f -nt g ]]`
+# compares whole seconds on this platform, so a gate that finishes inside
+# the same second as its own sentinel would fail for no reason. Deletion
+# has no clock in it.
+clear_artifacts() {
+  rm -f "$@"
+}
+
+# Exists and is non-empty, or a FAIL naming the artifact — never a silent
+# PASS. `ita check` on a real corpus always emits at least one diagnostic
+# line, so empty here means "the redirection went nowhere" or "the binary
+# produced nothing", both of which used to read as agreement.
+fresh_artifact() {
+  local path=$1 what=$2
+  if [[ ! -f $path ]]; then
+    bad "$what: artifact never written ($path)"
+    return 1
+  fi
+  if [[ ! -s $path ]]; then
+    bad "$what: artifact is empty ($path)"
+    return 1
+  fi
+  return 0
+}
+
 failed=0
 skipped=0
 public_skipped=()
@@ -116,6 +155,8 @@ while read -r id url sha ceiling; do
   fi
 
   out="$ART/public-$id.txt"
+  clear_artifacts "$out" "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" \
+    "$ART/public-$id-new.txt" "$ART/public-$id-gone.txt" "$ART/public-$id-drift.txt"
   start=$(python3 -c 'import time; print(time.time())')
   "$ITA" check "$clone" --format=json >"$out" 2>&1
   end=$(python3 -c 'import time; print(time.time())')
@@ -132,6 +173,14 @@ while read -r id url sha ceiling; do
   # private corpus baseline's set semantics.
   sed "s|\"path\":\"$clone/|\"path\":\"$id/|g" "$out" | grep -E '^\{' | sort -u >"$ART/public-$id-fresh.txt"
   grep -E '^\{' "$base" | sort -u >"$ART/public-$id-expected.txt"
+
+  # Both sides of the comparison must be real files this run produced.
+  # Before this check, a missing $ART made every redirection above fail and
+  # `comm` compared nothing against nothing — reported as an exact match.
+  fresh_artifact "$out" "public corpus ($id)" || continue
+  fresh_artifact "$ART/public-$id-fresh.txt" "public corpus ($id) fresh set" || continue
+  fresh_artifact "$ART/public-$id-expected.txt" "public corpus ($id) baseline set" || continue
+
   comm -23 "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" >"$ART/public-$id-new.txt"
   comm -13 "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" >"$ART/public-$id-gone.txt"
   new=$(wc -l <"$ART/public-$id-new.txt" | tr -d ' ')

@@ -233,6 +233,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   warnings 923/986/1890 and corpus-c 179 unmoved, singleton residue
   identical at 650/44/4572/1701.
 
+- Fixed: `scripts/public-gate.sh` reported "public errors match baseline
+  exactly" for all three repos, in ~0.01s each, while measuring nothing.
+  It never created `$ART`, so on a tree without `target/gauntlet` every
+  redirection failed and `comm` compared two files that do not exist —
+  agreement by absence. Reproduced against the committed script
+  (0.013s/0.009s/0.009s, exit 0). It now `mkdir -p`s the artifact
+  directory, deletes the per-repo artifacts it is about to write, and
+  asserts each one exists and is non-empty before comparing; a missing or
+  empty artifact is a FAIL that names the path, never a PASS. Wired as a
+  fourth case in `scripts/instrument-mutants.sh` (gate c2b): the mutant
+  with the guard removed reports agreement with no artifact on disk, the
+  shipped script both measures for real and fails loudly on an unwritable
+  artifact directory.
+- `scripts/gauntlet-gates.sh` now exports
+  `CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$ROOT/target}`. Two worktrees on
+  this machine share one `build.target-dir`, and the gate's own
+  `$ROOT/target/release/ita` already assumed otherwise: the build went to
+  the shared directory while every binary-consuming gate read a path that
+  build never wrote.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

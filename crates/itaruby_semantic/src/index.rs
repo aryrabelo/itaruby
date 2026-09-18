@@ -3203,6 +3203,14 @@ fn body_def_literals_named(name: &[u8], args: &[Node<'_>]) -> Vec<BodyDefLiteral
         }
         b"define_singleton_method" => first().map(|m| opaque_arity(m, true)).unwrap_or_default(),
         b"attr_reader" | b"attr_writer" | b"attr_accessor" => body_def_attr_literals(name, args),
+        // The same one-level unwrap `body_def_reason_named` does, so
+        // `send(:attr_accessor, :mode)` files the same two methods
+        // the bare call would.
+        b"send" | b"public_send" | b"__send__" => match args.first().and_then(literal_method_name)
+        {
+            Some(inner) => body_def_literals_named(inner.as_bytes(), &args[1..]),
+            None => Vec::new(),
+        },
         _ => Vec::new(),
     }
 }
@@ -3306,7 +3314,13 @@ fn body_def_reason(node: &ruby_prism::CallNode<'_>) -> Option<OpenReason> {
     let args: Vec<Node<'_>> =
         node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
     let name = node.name();
-    let name = name.as_slice();
+    body_def_reason_named(name.as_slice(), &args)
+}
+
+/// `body_def_reason` on an already-unwrapped `(name, args)` pair, so
+/// `send(:define_method, name)` reuses every rule exactly — the same
+/// split `definer_sources_named` uses for the core-pollution walker.
+fn body_def_reason_named(name: &[u8], args: &[Node<'_>]) -> Option<OpenReason> {
     if is_eval_name(name) {
         return Some(OpenReason::EvalOrSend);
     }
@@ -3321,6 +3335,20 @@ fn body_def_reason(node: &ruby_prism::CallNode<'_>) -> Option<OpenReason> {
             (!args.iter().all(|a| a.as_symbol_node().is_some()))
                 .then_some(OpenReason::DynamicAttrArg)
         }
+        // `send(:define_method, :x)` is a definition wearing a
+        // dispatch: unwrap one level and every rule above applies
+        // unchanged. A DYNAMIC first argument (`send(what, ...)`)
+        // stays `None` deliberately — reacting to it would mean
+        // opening a class for every `self.send` in a method body, a
+        // conclusiveness change that needs its own corpus measurement
+        // and its own prefilter entry (this literal form needs
+        // neither: the inner name is spelled in the body text, which
+        // is what `BODY_DEF_NAMES` scans —
+        // `the_send_form_passes_the_prefilter` pins that).
+        b"send" | b"public_send" | b"__send__" => args
+            .first()
+            .and_then(literal_method_name)
+            .and_then(|inner| body_def_reason_named(inner.as_bytes(), &args[1..])),
         _ => None,
     }
 }
@@ -7180,6 +7208,43 @@ mod dynamic_def_tests {
                 scan.seen_reason,
                 "`{call_src}` did not parse into a reachable call node"
             );
+        }
+    }
+
+    /// The `send`/`public_send`/`__send__` family reacts through the
+    /// one-level unwrap, and — unlike every name in the table above —
+    /// it deliberately has NO `BODY_DEF_NAMES` entry of its own. It
+    /// needs none: the literal form spells the inner definer in the
+    /// body text, which is exactly what the substring prefilter scans,
+    /// and giving `send` an entry would walk every method body that
+    /// dispatches dynamically for no finding. That argument is a
+    /// dependency between two mechanisms, so it is asserted here
+    /// instead of narrated: each unwrapped shape must both pass the
+    /// prefilter and really produce a reason.
+    #[test]
+    fn the_send_form_passes_the_prefilter() {
+        for send in ["send", "public_send", "__send__"] {
+            assert!(
+                !BODY_DEF_NAMES.contains(&send),
+                "`{send}` must stay out of the prefilter: the inner name carries it"
+            );
+            for definer in [
+                "define_method",
+                "define_singleton_method",
+                "alias_method",
+                "attr_accessor",
+            ] {
+                let call_src = format!("{send}(:{definer}, name)");
+                assert!(
+                    BODY_DEF_NAMES.iter().any(|n| call_src.contains(n)),
+                    "`{call_src}` must pass the substring prefilter through its inner name"
+                );
+                let src = format!("def __probe\n  {call_src}\nend");
+                let parse = ruby_prism::parse(src.as_bytes());
+                let mut scan = ReasonScan { name: send, seen_reason: false };
+                ruby_prism::Visit::visit(&mut scan, &parse.node());
+                assert!(scan.seen_reason, "`{call_src}` did not react");
+            }
         }
     }
 }

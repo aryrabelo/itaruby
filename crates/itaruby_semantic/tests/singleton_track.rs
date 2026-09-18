@@ -237,6 +237,43 @@ fn def_body_definer_in_an_instance_method_fails_closed() {
     assert!(d.is_empty(), "expected silence, got {d:?}");
 }
 
+/// The same four definitions reached through `send`/`public_send`/
+/// `__send__`, which is how a project reaches past a private definer.
+/// One level of unwrapping and every rule above applies unchanged —
+/// without it `body_def_reason` saw a plain unknown call, the class
+/// stayed CLOSED, and none of the names it installs existed.
+#[test]
+fn def_body_send_wrapped_definers_are_filed_on_the_right_track() {
+    let (instance, singleton, open) =
+        facts("def_body_send_definers_resolve_silently.rb", "Boot");
+    assert_eq!(instance, vec!["mode", "mode=", "tick", "tock"], "instance track");
+    assert_eq!(singleton, vec!["install", "ready?"], "class-object track");
+    assert!(!open, "the unwrapped call names what it defines");
+    let d = diags("def_body_send_definers_resolve_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// The observable: `send(:attr_accessor, :mode)` defines a
+/// zero-argument reader, and MRI raises `ArgumentError` on line 13.
+#[test]
+fn def_body_send_wrapped_attr_arity_is_checked() {
+    assert_eq!(diags("def_body_send_attr_arity_accuses.rb"), vec!["13:10:E0102"]);
+}
+
+/// The other half of the unwrap, and the one that must FAIL CLOSED:
+/// a dynamic name under the dispatch (`send(:define_method, key)`) is
+/// exactly as unknowable as the bare `define_method(key)`, so the
+/// class opens. Without the unwrap the call read as an ordinary
+/// unknown send and the class stayed CLOSED with a surface it cannot
+/// enumerate — the invariant #1 shape.
+#[test]
+fn def_body_send_wrapped_dynamic_name_opens_the_class() {
+    let (_instance, _singleton, open) = facts("def_body_send_dynamic_name_opens.rb", "Boot");
+    assert!(open, "a dynamic name under `send` must open the class");
+    let d = diags("def_body_send_dynamic_name_opens.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
 // ---------------------------------------------------------------------
 // family (b): `extend` copies a module's instance methods onto the
 // extender's singleton — including `extend self` and `module_function`
@@ -792,6 +829,9 @@ fn mri_ground_truth_is_executed() {
         ("def_body_foreign_literal_definer_resolves_silently.rb", Mri::Clean),
         ("def_body_instance_def_definer_resolves_silently.rb", Mri::Clean),
         ("def_body_literal_definers_resolve_silently.rb", Mri::Clean),
+        ("def_body_send_attr_arity_accuses.rb", Mri::Raises("ArgumentError", 13)),
+        ("def_body_send_definers_resolve_silently.rb", Mri::Clean),
+        ("def_body_send_dynamic_name_opens.rb", Mri::Clean),
         ("dynamic_def_in_body_only_opens_its_own_class.rb", Mri::Raises("ArgumentError", 11)),
         ("dynamic_def_shapes_all_open.rb", Mri::Clean),
         ("dynamic_singleton_def_in_body_opens.rb", Mri::Clean),

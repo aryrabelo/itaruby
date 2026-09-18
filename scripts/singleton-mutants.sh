@@ -55,6 +55,10 @@
 #   MUT-N  the receiver attribution is cut: a foreign literal definer
 #          registers onto the enclosing class
 #          -> def_body_foreign_literal_definer_stays_off_the_enclosing_class
+#   MUT-O  the `send` unwrap on the REASON side is cut
+#          -> def_body_send_wrapped_dynamic_name_opens_the_class
+#   MUT-P  the `send` unwrap on the LITERAL side is cut
+#          -> def_body_send_wrapped_attr_arity_is_checked
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -325,6 +329,25 @@ mutant MUT-N "$IDX" \
   '        let _ = (&target, nesting);' \
   def_body_foreign_literal_definer_stays_off_the_enclosing_class \
   'the receiver attribution is cut: `Other.define_method(:x)` registers onto the ENCLOSING class, the one shape this step must never do'
+
+mutant MUT-O "$IDX" \
+  '        b"send" | b"public_send" | b"__send__" => args
+            .first()
+            .and_then(literal_method_name)
+            .and_then(|inner| body_def_reason_named(inner.as_bytes(), &args[1..])),' \
+  '' \
+  def_body_send_wrapped_dynamic_name_opens_the_class \
+  'the send unwrap on the REASON side is cut: `send(:define_method, key)` reads as an ordinary unknown send and the class stays closed with a surface it cannot enumerate'
+
+mutant MUT-P "$IDX" \
+  '        b"send" | b"public_send" | b"__send__" => match args.first().and_then(literal_method_name)
+        {
+            Some(inner) => body_def_literals_named(inner.as_bytes(), &args[1..]),
+            None => Vec::new(),
+        },' \
+  '' \
+  def_body_send_wrapped_attr_arity_is_checked \
+  'the send unwrap on the LITERAL side is cut: `send(:attr_accessor, :mode)` files nothing and the arity E0102 disappears'
 
 echo '--- restore and prove the shipped source is byte-identical'
 restore

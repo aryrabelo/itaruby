@@ -5,6 +5,7 @@
     "crates/itaruby_semantic/declarations/core_inventory.txt": "fd41517f473f753b677a2a15d2296fcea15c2716ca34e9b7f93e4ffbbb73103c",
     "crates/itaruby_semantic/declarations/rbs_collection.rbi": "4eec43003daac19445250b68b6eeef099b00ba6bc78c40596099b1bd711dcd05",
     "crates/itaruby_semantic/declarations/stdlib_constants.txt": "c82b41d7d5c8ddbb3469905e4dd5351eb6088de1e55a586b0aeec8b01557e29c",
+    "crates/itaruby_semantic/declarations/stdlib_singletons.txt": "bff1e435777457c815b3c7bf1407e21e6a0afa399e8760f1b3d4b420d8e31b4a",
     "scripts/vscode/package-lock.json": "977d15123b719a50a40f0fda3b1f6ebb9aa8c33357bc1c2401f946c8c335867b"
   }
 }

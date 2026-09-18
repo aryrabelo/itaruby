@@ -331,6 +331,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   -> 121 explicit), mastodon 22 (0) unchanged, discourse 1312 -> 1023
   (639 -> 430 explicit), corpus-c 1701 (2) unchanged.
 
+- Singleton-track family (e): the stdlib's own class-object surface,
+  generated. `declarations/stdlib_singletons.txt` carries 7180 unique
+  `Namespace.method` pairs harvested from the Ruby runtime by
+  `scripts/gen-stdlib-singleton-inventory.rb` — one `--disable-gems`
+  subprocess per stdlib lib, exactly the shape
+  `gen-stdlib-inventory.rb`/`gen-core-inventory.rb` already use, plus a
+  base-process pass for the namespaces that exist before any `require`
+  (`Kernel`, `Math`, `Process`, ...). Hash-locked by
+  `L2.GENERATED_FILES_ARE_LOCKED`.
+  The harvest is `singleton_methods(true)` minus everything
+  `Module`/`Class` answer, not `singleton_methods(false)`: the first
+  version missed `SecureRandom.uuid` outright, because SecureRandom gets
+  its surface by extending `Random::Formatter` and defines nothing
+  directly. Consumed by `soften_not_found` on the singleton track only,
+  suppression only, and deliberately ungated on `require` — gating is
+  the only direction that could turn silence into a diagnostic on code
+  that runs.
+  The two exclusions the generator applies (the `Module`/`Class`
+  surface `core.rs` already models, and the ten core classes
+  `core_inventory.txt` owns) are asserted against the COMMITTED file by
+  `crates/itaruby_semantic/tests/stdlib_singletons.rs`, so a
+  regeneration that widens the inventory fails the build instead of
+  quietly doubling it. The consumer is pinned two-sided in the same
+  file: `FileUtils.mkdir_p`/`SecureRandom.uuid`/`Kernel.rand` known,
+  `FileUtils.mkdir_pp`/`SecureRandom.uuidd`/`Workspace.prepare` not.
+  Residue: rails 279 (121 explicit) unchanged, mastodon 22 (0)
+  unchanged, discourse 1023 -> 753 (430 -> 160 explicit), corpus-c 1701
+  (2) unchanged. Perf `check/project_index` 5.86 ms against the 7.04 ms
+  ceiling.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

@@ -5713,6 +5713,15 @@ impl ProjectIndex {
         if kernel_hit {
             return MethodLookup::Inconclusive;
         }
+        // Singleton-track family (e): the stdlib's own class-object
+        // surface. `FileUtils.mkdir_p`, `SecureRandom.uuid`,
+        // `Kernel.rand` are real methods living in no project index —
+        // 270 of discourse's explicit-receiver residue sites and the
+        // single largest family left. Mechanically harvested, never
+        // hand-listed (`declarations/stdlib_singletons.txt`).
+        if singleton && stdlib_singleton_method(&self.class(id).path, name) {
+            return MethodLookup::Inconclusive;
+        }
         let targets = if singleton {
             &self.dynamic_mixin_singleton_targets
         } else {
@@ -6416,6 +6425,61 @@ fn stdlib_const_libs() -> &'static HashMap<&'static str, Vec<&'static str>> {
         map
     });
     &MAP
+}
+
+/// Singleton-track family (e): every `<Namespace>.<method>` pair the
+/// stdlib really answers, parsed once per process from the mechanically
+/// harvested inventory embedded at compile time
+/// (`declarations/stdlib_singletons.txt`, generator versioned at
+/// `scripts/gen-stdlib-singleton-inventory.rb` — the anti-gaming rule's
+/// generated-content exception, same pattern as `core_inventory.txt`).
+///
+/// A SET of whole pairs, not a namespace->names map: the question asked
+/// of it is always "does this exact namespace answer this exact name?",
+/// and answering it with one hash of a borrowed line keeps the hot path
+/// allocation-free for every miss.
+fn stdlib_singleton_pairs() -> &'static std::collections::HashSet<&'static str> {
+    use std::sync::LazyLock;
+    static SET: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        const TXT: &str = include_str!("../declarations/stdlib_singletons.txt");
+        TXT.lines().filter(|l| !l.starts_with('#') && !l.is_empty()).collect()
+    });
+    &SET
+}
+
+/// Does the stdlib itself answer `path.name` on its CLASS OBJECT?
+///
+/// Suppression only, and deliberately ungated on `require`: a hit turns
+/// a would-be singleton `NotFound` into `Inconclusive`, so the worst it
+/// can do is stay silent about a real typo on a stdlib namespace the
+/// project never required. Gating it would be the only direction that
+/// could produce a diagnostic on code that runs (invariant #1).
+///
+/// `::` prefixes are trimmed so `::FileUtils.mkdir_p` and
+/// `FileUtils.mkdir_p` answer alike — the checker stores class paths
+/// both ways depending on how the source wrote them.
+pub fn stdlib_singleton_method(path: &str, name: &str) -> bool {
+    let path = path.trim_start_matches("::");
+    // One allocation per CANDIDATE, never per miss on an unrelated
+    // namespace: the namespace check short-circuits first.
+    if !stdlib_singleton_namespaces().contains(path) {
+        return false;
+    }
+    stdlib_singleton_pairs().contains(format!("{path}.{name}").as_str())
+}
+
+/// Every namespace `stdlib_singletons.txt` says anything about. Lets
+/// `stdlib_singleton_method` reject the overwhelming majority of
+/// receivers (a project's own classes) before formatting a lookup key.
+fn stdlib_singleton_namespaces() -> &'static std::collections::HashSet<&'static str> {
+    use std::sync::LazyLock;
+    static SET: LazyLock<std::collections::HashSet<&'static str>> = LazyLock::new(|| {
+        stdlib_singleton_pairs()
+            .iter()
+            .filter_map(|pair| pair.rsplit_once('.').map(|(ns, _)| ns))
+            .collect()
+    });
+    &SET
 }
 
 /// Every path `declarations/gems.rbi` declares (bead ita-3gs), as a

@@ -57,6 +57,7 @@ rules:
         - "crates/itaruby_semantic/declarations/core_inventory.txt"
         - "crates/itaruby_semantic/declarations/rbs_collection.rbi"
         - "crates/itaruby_semantic/declarations/stdlib_constants.txt"
+        - "crates/itaruby_semantic/declarations/stdlib_singletons.txt"
         - "scripts/vscode/package-lock.json"
   # L2 — Every frozen exception carries a future review date
   L2.NO_PERMANENT_EXCEPTION:

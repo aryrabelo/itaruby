@@ -388,3 +388,15 @@ fn every_dynamic_def_shape_opens_its_class() {
         assert!(open, "{path} must be open");
     }
 }
+
+/// Family (e): the stdlib class-object surface, end to end through the
+/// checker rather than through `stdlib_singleton_method` directly (that
+/// predicate is pinned two-sided in `stdlib_singletons.rs`). Every call
+/// in the fixture really runs under MRI, which is what makes silence
+/// here a correct answer rather than a convenient one — `FileUtils.*`
+/// alone was 270 of discourse's explicit-receiver residue sites.
+#[test]
+fn the_stdlib_singleton_surface_is_silent() {
+    let name = "stdlib_singleton_surface_silent.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+}

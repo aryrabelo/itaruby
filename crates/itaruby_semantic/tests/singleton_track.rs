@@ -230,3 +230,77 @@ fn class_methods_block_is_harvested_as_the_class_methods_module() {
     assert_eq!(names, vec!["count_for"]);
     assert!(index.class(concern).open, "the concern stays open, as before");
 }
+
+// ---------------------------------------------------------------------
+// step N+1, shape (1): the singleton reached by NAME rather than by
+// lexical position — `X.singleton_class.prepend M` and `class << X`.
+// ---------------------------------------------------------------------
+
+/// The discourse shape, in miniature: a module prepended to a class's
+/// SINGLETON class answers class-method calls. `FileScan` already saw
+/// this call and filed it as an INSTANCE-track dynamic mixin (true of a
+/// plain `prepend`, wrong through `singleton_class`), which is why 205
+/// `DiscourseEvent.track_events` sites sat in the residue.
+#[test]
+fn singleton_class_prepend_lands_on_the_class_object() {
+    let name = "singleton_class_prepend_resolves_silently.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (db, _f, _t) = fixture(name);
+    let index = project_index(&db);
+    let bus = *index.by_path.get("Bus").unwrap();
+    assert!(
+        index.class(bus).extends.contains(&"BusTestHelper".to_string()),
+        "expected the singleton edge, got {:?}",
+        index.class(bus).extends
+    );
+}
+
+/// And the other side: the name is now INDEXED, so a wrong-arity call to
+/// it is reported. E0102 is the observable today — E0101 on this track is
+/// still characterized as silent in `singleton_lookup.rs` — and MRI
+/// raises `ArgumentError` on this exact line.
+#[test]
+fn singleton_class_prepend_arity_is_checked() {
+    assert_eq!(diags("singleton_class_prepend_arity_accuses.rb"), vec!["18:5:E0102"]);
+}
+
+/// `class << X` with a constant expression defines on X's class object.
+/// Both spellings inside the body count: a plain `def` and an `attr_*`.
+#[test]
+fn sclass_of_a_constant_defines_on_that_constants_singleton() {
+    let name = "sclass_of_const_resolves_silently.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (db, _f, _t) = fixture(name);
+    let index = project_index(&db);
+    let meter = *index.by_path.get("Meter").unwrap();
+    let mut names: Vec<String> = index.class(meter).singleton_methods.keys().cloned().collect();
+    names.sort();
+    assert_eq!(names, vec!["calibrate", "unit", "unit="]);
+}
+
+/// Two-sided for that shape too.
+#[test]
+fn sclass_of_a_constant_arity_is_checked() {
+    assert_eq!(diags("sclass_of_const_arity_accuses.rb"), vec!["11:7:E0102"]);
+}
+
+/// The measured trap, pinned: a by-name patch on a class the project does
+/// NOT declare must invent nothing. The first version of
+/// `apply_singleton_patches` interned the path, and discourse's
+/// `TCPSocket.singleton_class.prepend` turned the stdlib class into a
+/// closed, method-less project class — one new
+/// E0101 "undefined method `close`" at
+/// `spec/support/nginx_test_proxy.rb:145`, on code that runs. Silence
+/// here is the whole point, and `by_path` must stay clean.
+#[test]
+fn a_patch_on_an_undeclared_class_invents_nothing() {
+    let name = "singleton_patch_on_undeclared_class_invents_nothing.rb";
+    assert!(diags(name).is_empty(), "expected silence, got {:?}", diags(name));
+    let (db, _f, _t) = fixture(name);
+    let index = project_index(&db);
+    assert!(
+        !index.by_path.contains_key("Time"),
+        "the patch must not intern `Time`; paths: {:?}",
+        index.by_path.keys().collect::<Vec<_>>()
+    );
+}

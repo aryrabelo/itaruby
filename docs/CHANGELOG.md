@@ -272,6 +272,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the shared directory while every binary-consuming gate read a path that
   build never wrote.
 
+- Singleton-track step N+1, shape (1): the singleton reached by NAME
+  rather than by lexical position. `X.singleton_class.include/prepend M`
+  now puts M on X's class-object track (the `extends` edge
+  `lookup_singleton` already walks), `.singleton_class.extend M` opens X
+  instead of guessing, and `class << X` with a constant expression walks
+  its body as X's singleton so `def`/`attr_*` land there and anything
+  else opens X. `FileScan` had seen the `prepend` call all along and
+  filed it as an INSTANCE-track dynamic mixin — true of a plain
+  `prepend`, wrong through `singleton_class` — which is why discourse's
+  205 `DiscourseEvent.track_events` sites sat in the residue.
+  A patch applies ONLY to a path the project really declares
+  (`apply_singleton_patches`, a resolve-last pass reading `by_path.get`,
+  never `intern`). The first version interned, and discourse's
+  `TCPSocket.singleton_class.prepend` invented a closed, method-less
+  `TCPSocket`: one new E0101 on `TCPSocket.new(...).close` at
+  `spec/support/nginx_test_proxy.rb:145`, code that runs. That trap is
+  now a test of its own.
+  Residue (probe rebuilt from this exact source): rails 299 (130
+  explicit) unchanged, mastodon 22 (0) unchanged, discourse
+  1534 -> 1312 (861 -> 639 explicit), corpus-c 1701 (2) unchanged.
+  `DiscourseEvent` drops from 224 sites to 2, both of them
+  `DiscourseEvent.raise` — a `raise` inside `def self.trigger`'s rescue,
+  i.e. Kernel, not a class method.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

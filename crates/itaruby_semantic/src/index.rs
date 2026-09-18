@@ -312,6 +312,22 @@ pub struct ClassFragment {
     pub open_reason: Option<OpenReason>,
     /// `self.table_name = ...` as written in this fragment, if any.
     pub table_name: Option<TableNameDecl>,
+    /// This fragment was NOT written by a `class`/`module` keyword: it
+    /// exists because some other file patched this path's singleton by
+    /// NAME (`X.singleton_class.prepend M`, `class << X`). Merging it
+    /// like an ordinary fragment would INVENT the class, and inventing
+    /// one is a measured false-positive source: discourse's
+    /// `lib/freedom_patches/final_destination_connect.rb` patches
+    /// `TCPSocket.singleton_class`, and a fragment for `TCPSocket` made
+    /// the stdlib class look like a closed project class with no methods
+    /// — one new E0101 "undefined method `close`" at
+    /// `spec/support/nginx_test_proxy.rb:145`, on code that runs.
+    ///
+    /// So these are held aside by `merge_file_fragments` and applied by
+    /// `apply_singleton_patches` ONLY to a path the project really
+    /// declares, after every file has merged (the same "resolve last"
+    /// discipline as `resolve_qualified_const_writes`).
+    pub declared_owner_required: bool,
 }
 
 impl ClassFragment {
@@ -331,6 +347,7 @@ impl ClassFragment {
             open_reason: None,
             table_name: None,
             mixes_in_class_methods: Vec::new(),
+            declared_owner_required: false,
         }
     }
 }
@@ -1497,6 +1514,33 @@ impl DefWalker<'_> {
         self.fragments[idx].methods.extend(defs);
     }
 
+    /// Find, or create, the fragment for a class/module path this walker
+    /// is not lexically inside — the shape
+    /// `X.singleton_class.prepend M` and `class << X` both need, since
+    /// each names its target by constant path from somewhere else
+    /// entirely (discourse's `spec/support/discourse_event_helper.rb`
+    /// patches `DiscourseEvent` from a file that never opens it).
+    ///
+    /// The fragment is created as a CLASS (`is_module: false`) only when
+    /// it does not exist: a real `class`/`module` keyword elsewhere in
+    /// the project merges into the same `by_path` entry and its own
+    /// `is_module` wins, because `merge_file_fragments` keeps the first
+    /// real declaration's shape. Nothing here invents a name the source
+    /// did not write.
+    fn fragment_idx_for(&mut self, path: &str, nesting: &[String]) -> usize {
+        if let Some(idx) = self.fragments.iter().position(|f| f.path == path) {
+            return idx;
+        }
+        let mut child_nesting = nesting.to_vec();
+        child_nesting.push(path.to_string());
+        let mut frag = ClassFragment::new(path.to_string(), false, child_nesting);
+        // Not written by a keyword here: only `apply_singleton_patches`
+        // may merge it, and only onto a path the project declares.
+        frag.declared_owner_required = true;
+        self.fragments.push(frag);
+        self.fragments.len() - 1
+    }
+
 
     /// Bead ita-1yw: the canonical hook shape `def self.included(base)`
     /// whose body calls `base.attr_accessor :x` / `base.define_method(:x)`
@@ -1753,15 +1797,36 @@ impl DefWalker<'_> {
             }
             Node::SingletonClassNode { .. } => {
                 let sc = node.as_singleton_class_node().unwrap();
-                // Only `class << self` is modeled. `class << self` does
-                // NOT push a `Module.nesting` entry in real Ruby, so
-                // `nesting` passes through unchanged.
+                // `class << self` does NOT push a `Module.nesting` entry
+                // in real Ruby, so `nesting` passes through unchanged.
                 if sc.expression().as_self_node().is_some() {
                     if let Some(body) = sc.body() {
                         self.walk_stmts(scope, nesting, frag_idx, true, &body);
                     }
-                } else if let Some(i) = frag_idx {
-                    self.open_class(i, OpenReason::SingletonClassExpr);
+                } else {
+                    // `class << X` where X is a literal constant path:
+                    // the body defines methods on X's CLASS OBJECT, and
+                    // the file saying so is usually not the file that
+                    // opens X. Walking it with `in_singleton` puts every
+                    // `def`/`attr_*` on X's singleton track and lets the
+                    // existing openness machinery open X for anything
+                    // else in that body (singleton-track step N+1).
+                    if let Some(owner) = const_path_str(&sc.expression()) {
+                        if let Some(body) = sc.body() {
+                            let oi = self.fragment_idx_for(&owner, nesting);
+                            let child = self.fragments[oi].nesting.clone();
+                            self.walk_stmts(&owner, &child, Some(oi), true, &body);
+                        }
+                    }
+                    // The ENCLOSING class stays open regardless, exactly
+                    // as before: additive only. A class whose body
+                    // reopens someone else's singleton was open here
+                    // since bead ita-o1n, and narrowing that in the same
+                    // step as modeling X would mix a silence change into
+                    // a knowledge change.
+                    if let Some(i) = frag_idx {
+                        self.open_class(i, OpenReason::SingletonClassExpr);
+                    }
                 }
             }
             Node::DefNode { .. } => {
@@ -2011,6 +2076,41 @@ impl DefWalker<'_> {
                 // constant path argument still closes ancestry normally,
                 // any other argument shape still opens it.
                 if matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend") {
+                    // `X.singleton_class.include/prepend M` — the mixin
+                    // lands on X's CLASS OBJECT, so it is exactly the
+                    // `extend` edge `lookup_singleton` already walks.
+                    // Runs before the fragment-less bailout below on
+                    // purpose: the shape's whole point is patching a
+                    // class from a file that never opens it.
+                    //
+                    // `.singleton_class.extend M` is a different animal
+                    // (M lands on the singleton's OWN singleton, i.e.
+                    // X's class methods' class methods): nothing here
+                    // models that, so it opens X rather than guessing.
+                    if let Some(owner) = singleton_class_owner(&call) {
+                        let oi = self.fragment_idx_for(&owner, nesting);
+                        if call.name().as_slice() == b"extend" {
+                            self.open_class(oi, OpenReason::SingletonClassExpr);
+                            return;
+                        }
+                        let mut all_literal = true;
+                        if let Some(args) = call.arguments() {
+                            for arg in &args.arguments() {
+                                match const_path_str(&arg) {
+                                    Some(path) => {
+                                        if !self.fragments[oi].extends.contains(&path) {
+                                            self.fragments[oi].extends.push(path);
+                                        }
+                                    }
+                                    None => all_literal = false,
+                                }
+                            }
+                        }
+                        if !all_literal {
+                            self.open_class(oi, OpenReason::DynamicMixinArg);
+                        }
+                        return;
+                    }
                     // Top-level (fragment-less) bare `include M` mixes
                     // into Object, so every core receiver can gain M's
                     // methods (bead ita-2ve condition (b)). Bare
@@ -2645,6 +2745,30 @@ fn join_remaining<'a>(target: &str, rest: impl Iterator<Item = &'a str>) -> Stri
     }
 }
 
+/// `X.singleton_class` as a RECEIVER: the constant path `X`, when the
+/// receiver of this call is exactly a no-argument `singleton_class` send
+/// to a literal constant path. Anything else — a dynamic base
+/// (`obj.singleton_class`), arguments, a chained
+/// `X.singleton_class.singleton_class` — is `None`, because this is the
+/// only shape whose target object is not in doubt.
+///
+/// Measured on discourse 2026-09-17: `spec/support/
+/// discourse_event_helper.rb` writes
+/// `DiscourseEvent.singleton_class.prepend DiscourseEvent::TestHelper`,
+/// which is how 205 explicit-receiver `DiscourseEvent.track_events`
+/// sites get a method the class itself never defines. `FileScan`'s
+/// `note_dynamic_mixin` DID see that call, but classified `prepend` as
+/// `MixinTrack::Instance` — true of a normal `prepend`, wrong through
+/// `singleton_class`, where include/prepend land on the CLASS OBJECT.
+fn singleton_class_owner(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    let recv = call.receiver()?;
+    let inner = recv.as_call_node()?;
+    if inner.name().as_slice() != b"singleton_class" || inner.arguments().is_some() {
+        return None;
+    }
+    const_path_str(&inner.receiver()?)
+}
+
 /// Literal constant path (`Foo`, `Foo::Bar`, `::Foo`) as a string; None for
 /// dynamic expressions.
 pub fn const_path_str(node: &Node<'_>) -> Option<String> {
@@ -2900,6 +3024,12 @@ pub struct ProjectIndex {
     /// Emptied (`std::mem::take`) by that pass; never read after
     /// `project_index` returns.
     dynamic_mixin_raw: Vec<(MixinTrack, String, Vec<String>)>,
+    /// Fragments produced by a BY-NAME singleton patch
+    /// (`X.singleton_class.prepend M`, `class << X`), held aside by
+    /// `merge_file_fragments` and drained by `apply_singleton_patches`
+    /// once every file has merged — see
+    /// `ClassFragment::declared_owner_required`. Never read afterwards.
+    singleton_patches: Vec<(SourceFile, ClassFragment)>,
     /// Bead ita-o8l.1: resolved, deduplicated modules the project mixes
     /// in through a dynamic (non-const, non-self) receiver, split by
     /// track (`MixinTrack`) exactly like `lookup_method`/
@@ -2965,6 +3095,11 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // owner name resolves against the full index rather than whatever
     // subset had been merged when its file was walked.
     resolve_qualified_const_writes(&mut index, qualified_writes);
+    // Singleton-track step N+1, shape (1): a patch that names its target
+    // (`X.singleton_class.prepend M`, `class << X`) lands only on a path
+    // the project really declares, so it runs after every fragment,
+    // curated declaration and gem reopening has merged.
+    apply_singleton_patches(&mut index);
     // Bead ita-o8l.1: resolve every raw dynamic-mixin target collected
     // above into a real `ClassId`, once, now that every project
     // fragment, curated declaration, and gem-reopening pass has already
@@ -3085,6 +3220,13 @@ fn merge_file_fragments(
             .or_insert_with(|| (write_nesting.clone(), target.clone()));
     }
     for frag in &defs.fragments {
+        // A by-name singleton patch never interns its own path: see
+        // `ClassFragment::declared_owner_required` for the TCPSocket
+        // measurement that made this a separate pass.
+        if frag.declared_owner_required {
+            index.singleton_patches.push((file, frag.clone()));
+            continue;
+        }
         let id = index.intern(&frag.path);
         let class = &mut index.classes[id.0 as usize];
         class.is_module |= frag.is_module;
@@ -3396,6 +3538,54 @@ fn resolve_dynamic_mixin_targets(index: &mut ProjectIndex) {
     index.dynamic_mixin_instance_targets.dedup();
     index.dynamic_mixin_singleton_targets.sort_unstable();
     index.dynamic_mixin_singleton_targets.dedup();
+}
+
+/// Singleton-track step N+1, shape (1): apply every held-aside by-name
+/// singleton patch (`X.singleton_class.prepend M`, `class << X`) to the
+/// class it names — and ONLY if the project already declares that class.
+///
+/// `by_path.get`, never `intern`: interning here is the whole defect
+/// this pass exists to avoid. Measured 2026-09-17 on discourse, with
+/// the naive version that interned: `TCPSocket.singleton_class.prepend`
+/// in `lib/freedom_patches/final_destination_connect.rb` invented a
+/// `TCPSocket` class, which then looked like a CLOSED project class
+/// with no methods at all, and `TCPSocket.new(...).close` in
+/// `spec/support/nginx_test_proxy.rb:145` became a new `E0101` on code
+/// that runs — invariant #1, from a pass whose only job was to add
+/// knowledge. A patch naming a stdlib or gem class is dropped: the
+/// checker cannot see that class's methods either way, so the
+/// false-negative direction is the correct cost.
+///
+/// What lands: the singleton `extends` edges, the singleton methods the
+/// `class << X` body defined, and any openness that body produced.
+/// Instance-track content cannot reach here — the walker only ever
+/// writes these fragments with `in_singleton` true or as an `extends`
+/// edge — so nothing about instance dispatch changes.
+fn apply_singleton_patches(index: &mut ProjectIndex) {
+    for (file, frag) in std::mem::take(&mut index.singleton_patches) {
+        let Some(&id) = index.by_path.get(&frag.path) else { continue };
+        let class = &mut index.classes[id.0 as usize];
+        for path in frag.extends {
+            if !class.extends.contains(&path) {
+                class.extends.push(path);
+            }
+        }
+        for md in &frag.singleton_methods {
+            class
+                .singleton_methods
+                .entry(md.name.clone())
+                .or_insert_with(|| method_sig(md, file));
+        }
+        if frag.open {
+            class.open = true;
+            if class.open_reason.is_none()
+                || (class.open_reason == Some(OpenReason::AbstractRaise)
+                    && frag.open_reason.is_some_and(|r| r != OpenReason::AbstractRaise))
+            {
+                class.open_reason = frag.open_reason;
+            }
+        }
+    }
 }
 
 /// Turn every raw refinement target (`ProjectIndex::refine_raw`) into the

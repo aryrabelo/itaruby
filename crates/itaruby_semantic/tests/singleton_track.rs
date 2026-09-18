@@ -107,3 +107,51 @@ fn sclass_attr_calls_resolve_silently() {
 fn sclass_attr_reader_arity_is_checked() {
     assert_eq!(diags("sclass_attr_arity_accuses.rb"), vec!["9:8:E0102"]);
 }
+
+// ---------------------------------------------------------------------
+// family (b): `extend` copies a module's instance methods onto the
+// extender's singleton — including `extend self` and `module_function`
+// ---------------------------------------------------------------------
+
+/// `extend self` is the one `extend` argument whose target is never in
+/// doubt, and it used to open the module instead of resolving
+/// (`OpenReason::DynamicMixinArg`). Now it is an `extend <own path>`
+/// edge, so the module's own instance methods answer on the module
+/// object — with their arity. MRI raises `ArgumentError: wrong number of
+/// arguments (given 2, expected 1)` on the accusing fixture's last line.
+#[test]
+fn extend_self_exposes_instance_methods_on_the_module_object() {
+    assert!(
+        diags("extend_self_resolves_silently.rb").is_empty(),
+        "expected silence, got {:?}",
+        diags("extend_self_resolves_silently.rb")
+    );
+    assert_eq!(diags("extend_self_arity_accuses.rb"), vec!["11:6:E0102"]);
+}
+
+/// `module_function`, both shapes: the bare form (`ActionCable.server`'s
+/// `module_function def server` and `Mastodon::Version.user_agent`'s bare
+/// modifier were 49 and 2 measured residue sites) now resolves on the
+/// module object. MRI raises on the accusing fixture's last line with the
+/// same `given 2, expected 1`.
+#[test]
+fn module_function_exposes_methods_on_the_module_object() {
+    assert!(
+        diags("module_function_resolves_silently.rb").is_empty(),
+        "expected silence, got {:?}",
+        diags("module_function_resolves_silently.rb")
+    );
+    assert_eq!(diags("module_function_arity_accuses.rb"), vec!["11:6:E0102"]);
+}
+
+/// The edge is recorded as an `extend` of the module's own path, which is
+/// what makes the existing `lookup_singleton` walk find the names with no
+/// new mechanism. Pinned because the shape, not just the outcome, is the
+/// contract the singleton walk depends on.
+#[test]
+fn the_self_extend_edge_names_the_modules_own_path() {
+    let (db, _f, _t) = fixture("extend_self_resolves_silently.rb");
+    let index = project_index(&db);
+    let id = *index.by_path.get("Util").expect("Util must be indexed");
+    assert_eq!(index.class(id).extends, vec!["Util".to_string()]);
+}

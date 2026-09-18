@@ -164,6 +164,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fixtures in `testdata/singleton_track/`, all MRI-executable, plus
   `crates/itaruby_semantic/tests/singleton_track.rs`.
 
+- Singleton-track step 2, family (b): `extend self` and
+  `module_function` now put a module's instance methods on the module
+  OBJECT, modeled as the `extend <own path>` edge `lookup_singleton`
+  already walks. `extend self` used to open the module instead
+  (`OpenReason::DynamicMixinArg`) — it is the one `extend` argument
+  whose target is never in doubt. `module_function` was treated as a
+  plain visibility modifier, which is why `ActionCable.server`
+  (`module_function def server`, 49 measured sites) and
+  `Mastodon::Version.user_agent` (bare modifier) were invisible.
+  Residue re-measured on the same four corpora: this family went from
+  68/14/196/0 sites to 0/0/0/0, and the totals from
+  888/58/4803/1701 to 650/44/4576/1701 (explicit-receiver
+  703/36/4109/2 to 478/22/3898/2). Every public error set and the
+  private corpus-c set stayed byte-identical, as required of an
+  index-only step.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

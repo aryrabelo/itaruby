@@ -1971,6 +1971,24 @@ impl DefWalker<'_> {
                                     "extend" => self.fragments[i].extends.push(path),
                                     _ => self.fragments[i].prepends.push(path),
                                 }
+                            } else if arg.as_self_node().is_some()
+                                && name == "extend"
+                                && !scope.is_empty()
+                            {
+                                // `extend self` (singleton-track family
+                                // (b)): the module's own instance methods
+                                // become its class-object methods. That is
+                                // exactly what an `extend <own path>` edge
+                                // already means to `lookup_singleton`,
+                                // which reads an extended module's
+                                // `methods` map onto the extender's
+                                // singleton — so the shape needs no new
+                                // mechanism, only the edge. It also stops
+                                // opening the class for a mixin argument
+                                // it now understands; `extend self` is
+                                // the one `extend` argument whose target
+                                // is never in doubt.
+                                self.fragments[i].extends.push(scope.to_string());
                             } else {
                                 // Dynamic mixin: can't know the ancestry.
                                 self.open_class(i, OpenReason::DynamicMixinArg);
@@ -2248,12 +2266,33 @@ impl DefWalker<'_> {
                     }
                     // Visibility modifiers: harmless, but `private def foo`
                     // wraps the def as an argument — index it.
+                    //
+                    // `module_function` is not harmless (singleton-track
+                    // family (b)): it ALSO copies the module's instance
+                    // methods onto the module object, which is how
+                    // `ActionCable.server` (`module_function def server`)
+                    // and `Mastodon::Version.user_agent` (bare
+                    // `module_function`, 49 and 2 residue sites measured
+                    // 2026-09-17) are real methods the index could not
+                    // see. Modeled as the same `extend <own path>` edge
+                    // `extend self` uses above, which is a deliberate
+                    // OVER-approximation in one direction only: the real
+                    // macro affects the defs that follow it (bare form) or
+                    // its arguments, and this edge exposes every instance
+                    // method of the module on its singleton. Wrong only
+                    // ever by resolving a name whose call site is already
+                    // a `NoMethodError` at runtime — never by hiding one,
+                    // and never by fabricating a diagnostic on working
+                    // code (invariant #1).
                     "private"
                     | "public"
                     | "protected"
                     | "module_function"
                     | "private_class_method"
                     | "public_class_method" => {
+                        if name == "module_function" && !scope.is_empty() {
+                            self.fragments[i].extends.push(scope.to_string());
+                        }
                         if let Some(args) = call.arguments() {
                             for arg in &args.arguments() {
                                 if arg.as_def_node().is_some() {

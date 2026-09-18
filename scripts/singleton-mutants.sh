@@ -48,6 +48,13 @@
 #          -> sclass_define_method_and_aliases_are_indexed_on_the_singleton_track
 #   MUT-K  the `alias foo bar` KEYWORD form, same revert
 #          -> sclass_define_method_and_aliases_are_indexed_on_the_singleton_track
+#   MUT-L  the literal def-body filing is cut
+#          -> def_body_attr_accessor_arity_is_checked must fail
+#   MUT-M  the fail-closed gate on an instance method body is cut
+#          -> def_body_definer_in_an_instance_method_fails_closed
+#   MUT-N  the receiver attribution is cut: a foreign literal definer
+#          registers onto the enclosing class
+#          -> def_body_foreign_literal_definer_stays_off_the_enclosing_class
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -287,6 +294,37 @@ mutant MUT-K "$IDX" \
             }' \
   sclass_define_method_and_aliases_are_indexed_on_the_singleton_track \
   'the `alias foo bar` KEYWORD form goes back to the instance track'
+
+mutant MUT-L "$IDX" \
+  '        let mut md = MethodDef::synthetic(lit.name, lit.required, span);
+        md.arity_unknown = lit.arity_unknown;
+        self.track(i, lit.singleton).push(md);' \
+  '        let mut md = MethodDef::synthetic(lit.name, lit.required, span);
+        md.arity_unknown = lit.arity_unknown;
+        let _ = (i, md);' \
+  def_body_attr_accessor_arity_is_checked \
+  'the literal def-body filing is cut: the class goes back to CLOSED with none of the names it installs, and the arity E0102 that rode on the filed reader disappears'
+
+mutant MUT-M "$IDX" \
+  '        if !self_is_the_class {
+            self.open_class(i, OpenReason::DynamicDefineMethod);
+            return;
+        }' \
+  '        let _ = self_is_the_class;' \
+  def_body_definer_in_an_instance_method_fails_closed \
+  'the fail-closed gate on an INSTANCE method body is cut: a name only one object answers to gets filed as the class surface'
+
+mutant MUT-N "$IDX" \
+  '        let DefTarget::Enclosing = target else {
+            if let DefTarget::Named(path) = target {
+                let oi = self.fragment_idx_for(&path, nesting);
+                self.open_class(oi, OpenReason::DynamicDefineMethod);
+            }
+            return;
+        };' \
+  '        let _ = (&target, nesting);' \
+  def_body_foreign_literal_definer_stays_off_the_enclosing_class \
+  'the receiver attribution is cut: `Other.define_method(:x)` registers onto the ENCLOSING class, the one shape this step must never do'
 
 echo '--- restore and prove the shipped source is byte-identical'
 restore

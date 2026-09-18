@@ -169,6 +169,75 @@ fn sclass_define_method_called_on_an_instance_accuses() {
 }
 
 // ---------------------------------------------------------------------
+// Literal definers inside a `def` BODY. `body_def_reason` returns None
+// for them — correctly, they are facts and not blankets — and until
+// 2026-09-18 nothing consumed the fact, so `def self.install;
+// define_singleton_method(:ready?) { true }; ... end` left the class
+// CLOSED with none of the names it really installs. A guaranteed
+// invariant #1 violation the moment the singleton `NotFound` arm
+// reports, and discourse's `GlobalSetting` is exactly this shape.
+// ---------------------------------------------------------------------
+
+/// In a `def self.x` body `self` IS the class, so each definer's names
+/// are filed on the track it really writes — and the class stays
+/// CLOSED, because a literal definer names what it defines. MRI runs
+/// the fixture to completion.
+#[test]
+fn def_body_literal_definers_are_filed_on_the_right_track() {
+    let (instance, singleton, open) =
+        facts("def_body_literal_definers_resolve_silently.rb", "Boot");
+    assert_eq!(instance, vec!["mode", "mode=", "tick", "tock"], "instance track");
+    assert_eq!(singleton, vec!["install", "ready?"], "class-object track");
+    assert!(!open, "every definer in the body names what it defines");
+    let d = diags("def_body_literal_definers_resolve_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// What the filing makes observable: `attr_accessor :mode` inside
+/// `def self.install` defines a zero-argument reader, and MRI raises
+/// `ArgumentError: wrong number of arguments (given 1, expected 0)` on
+/// line 14. Before the filing the name was absent and the call silent.
+#[test]
+fn def_body_attr_accessor_arity_is_checked() {
+    assert_eq!(diags("def_body_attr_accessor_arity_accuses.rb"), vec!["14:10:E0102"]);
+}
+
+/// An explicit constant receiver never registers onto the enclosing
+/// class: `Other.define_method(:x)` inside `Host.install` is evidence
+/// about Other, so Host learns nothing and Other — whose surface now
+/// depends on someone calling `Host.install` — opens. Silence either
+/// way; the failure mode this guards is a name landing on Host.
+#[test]
+fn def_body_foreign_literal_definer_stays_off_the_enclosing_class() {
+    let (instance, singleton, open) =
+        facts("def_body_foreign_literal_definer_resolves_silently.rb", "Host");
+    assert!(instance.is_empty(), "Host must learn nothing, got {instance:?}");
+    assert_eq!(singleton, vec!["install"]);
+    assert!(!open, "Host's own surface is untouched by a foreign definer");
+    let (other_instance, _other_singleton, other_open) =
+        facts("def_body_foreign_literal_definer_resolves_silently.rb", "Other");
+    assert!(other_instance.is_empty(), "the name is not filed onto Other either");
+    assert!(other_open, "Other's surface is unknowable: it must fail closed");
+    let d = diags("def_body_foreign_literal_definer_resolves_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// In an INSTANCE method body `self` is one object, not the class:
+/// `define_singleton_method(:zoom)` there lands on that object alone.
+/// The attribution is not provable, so the class fails CLOSED — open,
+/// never enriched with a name only one instance answers to.
+#[test]
+fn def_body_definer_in_an_instance_method_fails_closed() {
+    let (instance, singleton, open) =
+        facts("def_body_instance_def_definer_resolves_silently.rb", "Widget");
+    assert_eq!(instance, vec!["install"], "no dynamic name may be filed here");
+    assert!(singleton.is_empty());
+    assert!(open, "self is an instance: the class must open instead of collecting");
+    let d = diags("def_body_instance_def_definer_resolves_silently.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+// ---------------------------------------------------------------------
 // family (b): `extend` copies a module's instance methods onto the
 // extender's singleton — including `extend self` and `module_function`
 // ---------------------------------------------------------------------
@@ -719,6 +788,10 @@ fn mri_ground_truth_is_executed() {
         ("class_methods_block_resolves_silently.rb", Mri::Clean),
         ("concern_class_methods_arity_accuses.rb", Mri::Raises("ArgumentError", 16)),
         ("concern_class_methods_resolves_silently.rb", Mri::Clean),
+        ("def_body_attr_accessor_arity_accuses.rb", Mri::Raises("ArgumentError", 14)),
+        ("def_body_foreign_literal_definer_resolves_silently.rb", Mri::Clean),
+        ("def_body_instance_def_definer_resolves_silently.rb", Mri::Clean),
+        ("def_body_literal_definers_resolve_silently.rb", Mri::Clean),
         ("dynamic_def_in_body_only_opens_its_own_class.rb", Mri::Raises("ArgumentError", 11)),
         ("dynamic_def_shapes_all_open.rb", Mri::Clean),
         ("dynamic_singleton_def_in_body_opens.rb", Mri::Clean),

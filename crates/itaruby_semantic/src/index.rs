@@ -1443,6 +1443,55 @@ impl DefWalker<'_> {
         }
     }
 
+    /// File one literal definition found inside a `def` body, or fail
+    /// closed. Three cases, and the decision rule is whether `self` at
+    /// that point is PROVABLY the class:
+    ///
+    /// * enclosing target in a `def self.x` (or `class << self`) body —
+    ///   `self` IS the class, so the call really defines the class's
+    ///   methods: file them, `define_singleton_method` on the
+    ///   class-object track and the rest on the instance track. This is
+    ///   the case discourse's `GlobalSetting` is made of, and the
+    ///   fixture `def_body_literal_definers_resolve_silently.rb` is the
+    ///   MRI proof that all four spellings really land there.
+    /// * enclosing target in an INSTANCE method body — `self` is one
+    ///   object. `define_singleton_method` there widens that object's
+    ///   surface and says nothing about the class, and every other
+    ///   definer here is a `NoMethodError` on a non-Module receiver. The
+    ///   attribution is not provable, so the class OPENS rather than
+    ///   collecting names it may not have (invariant #1).
+    /// * a literal constant receiver (`Other.define_method(:x)`) — that
+    ///   class's surface changes whenever this `def` runs, and the
+    ///   enclosing class learns nothing. Open THAT fragment, exactly as
+    ///   the dynamic case already does, and never register onto the
+    ///   enclosing one. Filing onto a foreign fragment would have to go
+    ///   through `apply_singleton_patches`' declared-owner rule, which
+    ///   is a separate decision from this one.
+    fn apply_body_def(
+        &mut self,
+        i: usize,
+        nesting: &[String],
+        self_is_the_class: bool,
+        span: (usize, usize),
+        target: DefTarget,
+        lit: BodyDefLiteral,
+    ) {
+        let DefTarget::Enclosing = target else {
+            if let DefTarget::Named(path) = target {
+                let oi = self.fragment_idx_for(&path, nesting);
+                self.open_class(oi, OpenReason::DynamicDefineMethod);
+            }
+            return;
+        };
+        if !self_is_the_class {
+            self.open_class(i, OpenReason::DynamicDefineMethod);
+            return;
+        }
+        let mut md = MethodDef::synthetic(lit.name, lit.required, span);
+        md.arity_unknown = lit.arity_unknown;
+        self.track(i, lit.singleton).push(md);
+    }
+
     /// Defect A (bead ita-exc): literal constant writes directly inside a
     /// class-body call's block — `enums do; Alpha = new(...); end`, or
     /// the fixture's invented `constvis_enums do; ... end` (any method
@@ -1880,7 +1929,8 @@ impl DefWalker<'_> {
                     // is what decides anything.
                     let body_text = &self.text[md.def_span.0..md.def_span.1];
                     if BODY_DEF_NAMES.iter().any(|n| body_text.contains(n)) {
-                        for (target, reason) in dynamic_defs_in_body(&def) {
+                        let defs = dynamic_defs_in_body(&def);
+                        for (target, reason) in defs.opens {
                             match target {
                                 DefTarget::Enclosing => self.open_class(i, reason),
                                 DefTarget::Named(path) => {
@@ -1888,6 +1938,16 @@ impl DefWalker<'_> {
                                     self.open_class(oi, reason);
                                 }
                             }
+                        }
+                        for (target, lit) in defs.literals {
+                            self.apply_body_def(
+                                i,
+                                nesting,
+                                treated_as_singleton,
+                                md.def_span,
+                                target,
+                                lit,
+                            );
                         }
                     }
                     // ponytail: text scan, not AST — `raise NotImplementedError`
@@ -3044,17 +3104,18 @@ const BODY_DEF_NAMES: [&str; 12] = [
 ///
 /// A LITERAL `define_method(:name)`/`define_singleton_method(:name)`
 /// opens nothing: the name is knowable, and pretending otherwise trades
-/// a fact for a blanket. Registering those names is worth doing and is
-/// not this function's job (see `harvest_included_hook` for the same
-/// discipline on the hook shape).
-fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> Vec<(DefTarget, OpenReason)> {
+/// a fact for a blanket. Those names are REGISTERED instead — see
+/// `BodyDefs::literals` and `ClassWalk::apply_body_def`, where the
+/// receiver decides the fragment and the enclosing `def`'s own kind
+/// decides whether `self` is provably the class.
+fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> BodyDefs {
     struct Scan {
-        found: Vec<(DefTarget, OpenReason)>,
+        found: BodyDefs,
     }
     impl Scan {
         fn note(&mut self, target: DefTarget, reason: OpenReason) {
-            if !self.found.iter().any(|(t, _)| *t == target) {
-                self.found.push((target, reason));
+            if !self.found.opens.iter().any(|(t, _)| *t == target) {
+                self.found.opens.push((target, reason));
             }
         }
 
@@ -3065,11 +3126,21 @@ fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> Vec<(DefTarget, OpenRe
         /// `def`. Measured on rails: attributing that nested call to the
         /// enclosing class opened `ActionDispatch::Routing::RouteSet`
         /// and took a baseline E0101 with it.
+        ///
+        /// A call either makes its target unknowable (a reason) or names
+        /// exactly what it defines (literals) — never both, which is
+        /// what keeps a half-literal `attr_accessor :a, b` from filing
+        /// `a` while its own blanket is the honest answer.
         fn consume(&mut self, node: &ruby_prism::CallNode<'_>) -> bool {
             let Some(target) = body_def_target(node) else { return false };
             let names_its_target = matches!(target, DefTarget::Named(_));
-            if let Some(reason) = body_def_reason(node) {
-                self.note(target, reason);
+            match body_def_reason(node) {
+                Some(reason) => self.note(target, reason),
+                None => {
+                    for lit in body_def_literals(node) {
+                        self.found.literals.push((target.clone(), lit));
+                    }
+                }
             }
             names_its_target && is_eval_name(node.name().as_slice())
         }
@@ -3082,10 +3153,86 @@ fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> Vec<(DefTarget, OpenRe
             ruby_prism::visit_call_node(self, node);
         }
     }
-    let Some(body) = def.body() else { return Vec::new() };
-    let mut scan = Scan { found: Vec::new() };
+    let Some(body) = def.body() else { return BodyDefs::default() };
+    let mut scan = Scan { found: BodyDefs::default() };
     ruby_prism::Visit::visit(&mut scan, &body);
     scan.found
+}
+
+/// Everything a `def` body says about some class's surface: the targets
+/// whose surface it makes unknowable, and the exact methods it defines
+/// where the call names them.
+#[derive(Default)]
+struct BodyDefs {
+    opens: Vec<(DefTarget, OpenReason)>,
+    literals: Vec<(DefTarget, BodyDefLiteral)>,
+}
+
+/// One method a literal definer inside a `def` body installs.
+struct BodyDefLiteral {
+    /// `define_singleton_method` writes the CLASS-OBJECT track; every
+    /// other definer here writes the instance track.
+    singleton: bool,
+    name: String,
+    required: u32,
+    /// `define_method`/`alias_method` take their arity from a block or
+    /// from another method, so the index knows the name and nothing
+    /// else — arity checking must stand down (invariant #1).
+    arity_unknown: bool,
+}
+
+/// The methods a method-defining call inside a `def` body installs, when
+/// it names all of them. Empty for every call `body_def_reason` reacts
+/// to (those are blankets, not facts) and for every name this walker
+/// does not model.
+fn body_def_literals(node: &ruby_prism::CallNode<'_>) -> Vec<BodyDefLiteral> {
+    let args: Vec<Node<'_>> =
+        node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let name = node.name();
+    body_def_literals_named(name.as_slice(), &args)
+}
+
+fn body_def_literals_named(name: &[u8], args: &[Node<'_>]) -> Vec<BodyDefLiteral> {
+    let opaque_arity = |m: String, singleton: bool| {
+        vec![BodyDefLiteral { singleton, name: m, required: 0, arity_unknown: true }]
+    };
+    let first = || args.first().and_then(literal_method_name);
+    match name {
+        b"define_method" | b"alias_method" => {
+            first().map(|m| opaque_arity(m, false)).unwrap_or_default()
+        }
+        b"define_singleton_method" => first().map(|m| opaque_arity(m, true)).unwrap_or_default(),
+        b"attr_reader" | b"attr_writer" | b"attr_accessor" => body_def_attr_literals(name, args),
+        _ => Vec::new(),
+    }
+}
+
+/// `attr_accessor :a` in a `def self.x` body: reader and writer with
+/// their REAL arities, which is the whole observable gain — a
+/// wrong-arity call on one of these is an `ArgumentError` MRI really
+/// raises (`def_body_attr_accessor_arity_accuses.rb`).
+fn body_def_attr_literals(name: &[u8], args: &[Node<'_>]) -> Vec<BodyDefLiteral> {
+    let mut out = Vec::new();
+    for arg in args {
+        let Some(m) = literal_method_name(arg) else { return Vec::new() };
+        if name != b"attr_writer" {
+            out.push(BodyDefLiteral {
+                singleton: false,
+                name: m.clone(),
+                required: 0,
+                arity_unknown: false,
+            });
+        }
+        if name != b"attr_reader" {
+            out.push(BodyDefLiteral {
+                singleton: false,
+                name: format!("{m}="),
+                required: 1,
+                arity_unknown: false,
+            });
+        }
+    }
+    out
 }
 
 /// Whose surface a method-defining call inside a `def` body describes.

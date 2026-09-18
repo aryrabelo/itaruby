@@ -155,3 +155,50 @@ fn the_self_extend_edge_names_the_modules_own_path() {
     let id = *index.by_path.get("Util").expect("Util must be indexed");
     assert_eq!(index.class(id).extends, vec!["Util".to_string()]);
 }
+
+// ---------------------------------------------------------------------
+// family (c): `ActiveSupport::Concern`'s `ClassMethods`
+// ---------------------------------------------------------------------
+
+/// The Rails concern idiom: `extend ActiveSupport::Concern` plus a nested
+/// `ClassMethods` module puts those methods on every includer's
+/// singleton. Measured as 4 residue sites on discourse
+/// (`AdminDashboardIndexData.fetch_cached_stats` via
+/// `StatsCacheable::ClassMethods`), and it is the concern half of the gap
+/// characterized in `singleton_lookup.rs`.
+#[test]
+fn concern_class_methods_reach_the_includers_singleton() {
+    assert!(
+        diags("concern_class_methods_resolves_silently.rb").is_empty(),
+        "expected silence, got {:?}",
+        diags("concern_class_methods_resolves_silently.rb")
+    );
+    assert_eq!(
+        diags("concern_class_methods_arity_accuses.rb"),
+        vec!["26:11:E0102"]
+    );
+}
+
+/// The edge is attached to the CONCERN, which is why an ordinary include
+/// ancestor walk finds it with no new lookup mechanism. Pinned because
+/// the post-pass' shape is the contract: no nested `ClassMethods` in the
+/// index means no edge, never a guess.
+#[test]
+fn the_concern_edge_is_only_added_when_class_methods_exists() {
+    let (db, _f, _t) = fixture("concern_class_methods_resolves_silently.rb");
+    let index = project_index(&db);
+    let concern = *index.by_path.get("StatsCacheable").unwrap();
+    assert!(
+        index.class(concern).extends.contains(&"StatsCacheable::ClassMethods".to_string()),
+        "concern must carry the ClassMethods edge, got {:?}",
+        index.class(concern).extends
+    );
+    // `ActiveSupport::Concern` itself has no nested `ClassMethods` here,
+    // and gains no edge.
+    let plain = *index.by_path.get("ActiveSupport::Concern").unwrap();
+    assert!(
+        index.class(plain).extends.is_empty(),
+        "no ClassMethods, no edge, got {:?}",
+        index.class(plain).extends
+    );
+}

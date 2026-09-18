@@ -180,6 +180,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   private corpus-c set stayed byte-identical, as required of an
   index-only step.
 
+- Singleton-track step 3, family (c): a module that
+  `extend ActiveSupport::Concern` and defines a nested `ClassMethods`
+  module now carries an `extends` edge to it, so those methods answer on
+  every includer's class object — the idiom behind
+  `AdminDashboardIndexData.fetch_cached_stats`
+  (`StatsCacheable::ClassMethods`) and behind the concern half of the gap
+  characterized in `singleton_lookup.rs`. It keys on the literal
+  `ActiveSupport::Concern` edge and requires the nested path to exist in
+  the index: no `ClassMethods`, no edge, never a guess. Residue for this
+  family went 0/0/4/0 to 0/0/0/0; totals 650/44/4572/1701 (explicit
+  478/22/3894/2). Public and corpus-c error sets byte-identical.
+
 - An executable inference benchmark against Sorbet,
   `scripts/inference-bench.rb` (gate `scripts/inference-gate.sh`, guarded
   by `scripts/inference-bench-selftest.sh`, documented in

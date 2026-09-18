@@ -2880,6 +2880,13 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // open even when no `Gemfile.lock` gem's guessed name happens to
     // match. See `apply_undeclared_namespace_reopenings`'s doc comment.
     apply_undeclared_namespace_reopenings(&mut index);
+    // Singleton-track family (c): `extend ActiveSupport::Concern` plus a
+    // nested `ClassMethods` module — the idiom every Rails concern uses
+    // to put class methods on its includers. Resolved here, after every
+    // fragment is merged, because the nested module is commonly written
+    // below (or in another file than) the `extend` that gives it its
+    // meaning.
+    apply_concern_class_methods(&mut index);
     // bead ita-vto (client-project `sorbet/rbi`) is deliberately NOT
     // merged here: 2.3M lines across ~1900 files at the reference corpus
     // can never be parsed eagerly on every `project_index` recompute. It
@@ -3230,6 +3237,58 @@ fn apply_undeclared_namespace_reopenings(index: &mut ProjectIndex) {
         // (2026-09-03, same precedence as `open_class`).
         if class.open_reason.is_none_or(|r| r == OpenReason::AbstractRaise) {
             class.open_reason = Some(OpenReason::ReopenedExternal);
+        }
+    }
+}
+
+/// Singleton-track family (c): `ActiveSupport::Concern`'s `ClassMethods`
+/// convention. A module that `extend ActiveSupport::Concern` and defines
+/// a nested `ClassMethods` module has that module extended onto EVERY
+/// includer's singleton by the gem's own `append_features` — the shape
+/// behind `AdminDashboardIndexData.fetch_cached_stats` (discourse,
+/// `StatsCacheable::ClassMethods`, 4 measured residue sites) and behind
+/// the concern half of `singleton_lookup.rs`'s characterized gap.
+///
+/// Modeled as an `extend <own path>::ClassMethods` edge on the concern
+/// itself, which is all `lookup_singleton` needs: it already walks an
+/// ancestor's `extends` and reads the extended module's `methods` map
+/// onto the receiver's singleton, and a concern is an ordinary include
+/// ancestor of its includers. This runs as a post-pass, after every
+/// fragment is merged, because `module ClassMethods` is normally written
+/// below the `extend` that gives it its meaning — resolving it during
+/// the walk would depend on statement order.
+///
+/// Three deliberate limits. It requires the NESTED path to exist in the
+/// index (`{concern}::ClassMethods`): no `ClassMethods`, no edge, never
+/// a guess. It keys on the literal `ActiveSupport::Concern` edge
+/// (`::`-prefixed or not), never on "some name ending in Concern" — a
+/// project's own `Concern`-suffixed module is not this gem's protocol.
+/// And it over-approximates in exactly one direction: the concern module
+/// OBJECT itself gains the names too, though MRI only gives them to
+/// includers. That can only resolve a call whose runtime is already
+/// `NoMethodError`, never hide one and never fabricate a diagnostic
+/// (invariant #1).
+fn apply_concern_class_methods(index: &mut ProjectIndex) {
+    let edges: Vec<(ClassId, String)> = index
+        .classes
+        .iter()
+        .enumerate()
+        .filter(|(_, class)| {
+            class
+                .extends
+                .iter()
+                .any(|e| e.trim_start_matches("::") == "ActiveSupport::Concern")
+        })
+        .filter_map(|(i, class)| {
+            let nested = format!("{}::ClassMethods", class.path);
+            let id = ClassId(u32::try_from(i).ok()?);
+            index.by_path.contains_key(&nested).then_some((id, nested))
+        })
+        .collect();
+    for (id, nested) in edges {
+        let class = &mut index.classes[id.0 as usize];
+        if !class.extends.contains(&nested) {
+            class.extends.push(nested);
         }
     }
 }

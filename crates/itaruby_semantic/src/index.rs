@@ -338,6 +338,26 @@ pub struct ClassFragment {
     /// declares, after every file has merged (the same "resolve last"
     /// discipline as `resolve_qualified_const_writes`).
     pub declared_owner_required: bool,
+    /// Bead H of onda 2: the names this fragment's `def self.extended(
+    /// base)` hook installs on `base`'s INSTANCE surface, with the span
+    /// of the statement that installs each — `base.delegate :model_name,
+    /// to: :class` is the canonical one. `extend M` puts none of these on
+    /// the extender by itself (it reads `M.methods` onto the extender's
+    /// SINGLETON), so `apply_extended_hooks` copies them onto every class
+    /// that really `extend`s this module. See `harvest_extended_hook` for
+    /// the four shapes that count and the fail-closed rule.
+    pub hook_instance_installs: Vec<(String, (usize, usize))>,
+    /// The same hook's `def base.x` statements. Those install on the base
+    /// OBJECT's singleton, never on its instances: registering them as
+    /// instance methods would silence a real `NoMethodError` on
+    /// `Base.new.x`.
+    pub hook_singleton_installs: Vec<(String, (usize, usize))>,
+    /// The same hook performed an installation whose NAME SET no AST here
+    /// can read (`base.send(:define_method, ...)`, a string `class_eval`,
+    /// a non-literal `delegate`) — the extender's instance surface may
+    /// hold any name, so `apply_extended_hooks` opens it (fail-closed,
+    /// invariant #1: silence, never a fabricated accusation).
+    pub hook_installs_opaque: bool,
 }
 
 impl ClassFragment {
@@ -358,6 +378,9 @@ impl ClassFragment {
             table_name: None,
             mixes_in_class_methods: Vec::new(),
             declared_owner_required: false,
+            hook_instance_installs: Vec::new(),
+            hook_singleton_installs: Vec::new(),
+            hook_installs_opaque: false,
         }
     }
 }
@@ -2094,6 +2117,151 @@ impl DefWalker<'_> {
         Some(String::from_utf8_lossy(rp.name().as_slice()).into_owned())
     }
 
+    /// Bead H of onda 2: `def self.extended(base)` — what that hook
+    /// installs on `base` is what every `extend`er of this module really
+    /// answers to, and no fragment of this project holds it.
+    ///
+    /// The canonical shape is `ActiveModel::Naming`'s:
+    ///
+    /// ```ruby
+    /// def self.extended(base)
+    ///   base.silence_redefinition_of_method :model_name
+    ///   base.delegate :model_name, to: :class
+    /// end
+    /// ```
+    ///
+    /// `Blog::Post` does `extend ActiveModel::Naming`
+    /// (`activemodel/test/models/blog_post.rb:9`), and `delegate` installs
+    /// `model_name` as an INSTANCE method of `Blog::Post` — so
+    /// `Blog::Post.new.model_name`, code that runs, was one of rails'
+    /// baseline errors (`activemodel/test/cases/naming_test.rb:333`).
+    /// `extend M` on its own reads `M`'s own instance methods onto the
+    /// extender's SINGLETON track (`lookup_singleton`), which is exactly
+    /// why the install this hook performs on the extender's INSTANCE
+    /// surface was invisible here.
+    ///
+    /// Four install shapes are read, and only these (the same shallow,
+    /// literal-only discipline `harvest_included_hook` uses — no second
+    /// traversal, no block chasing):
+    /// * `base.delegate :a, :b, <keywords>` — the positional symbols.
+    /// * `base.define_method(:x)` / `base.define_method("x")`.
+    /// * `base.class_eval do ... end` with a LITERAL block: that block
+    ///   runs with `self` = base, so its bare `def`s and receiverless
+    ///   `define_method` calls are base's own instance methods.
+    /// * `def base.x` — filed on the extender's SINGLETON surface, where
+    ///   it really lands; `Base.new.x` must keep accusing.
+    ///
+    /// Every other statement contributes NOTHING (`base.tag_stack = ...`,
+    /// `base.instance_variable_set(...)`, `base.const_set(...)`, an
+    /// unknown macro): a documented false negative, exactly like the
+    /// `included` hook's own unmodeled shapes. The one exception is the
+    /// fail-closed arm — a call that provably INSTALLS but whose NAME SET
+    /// cannot be read marks the hook opaque, and `apply_extended_hooks`
+    /// opens the extender's instance surface (invariant #1 prefers silence
+    /// to a fabricated accusation).
+    fn harvest_extended_hook(&mut self, i: usize, def: &ruby_prism::DefNode) {
+        let Some(pname) = Self::hook_receiver_param_name(def) else { return };
+        let Some(body) = def.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        for stmt in &stmts.body() {
+            self.harvest_extended_stmt(i, &pname, &stmt);
+        }
+    }
+
+    /// One top-level statement of a `self.extended(base)` body — see
+    /// `harvest_extended_hook` for the shapes that count.
+    fn harvest_extended_stmt(&mut self, i: usize, pname: &str, stmt: &Node<'_>) {
+        if let Some(def) = stmt.as_def_node() {
+            // `def base.x` installs on the base OBJECT's singleton, never
+            // on its instances: filing it as an instance method would
+            // silence the real `NoMethodError` that `Base.new.x` raises.
+            if def.receiver().is_some_and(|r| hook_param_read(&r, pname)) {
+                let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+                self.fragments[i].hook_singleton_installs.push((name, span_of(stmt)));
+            }
+            return;
+        }
+        let Some(call) = stmt.as_call_node() else { return };
+        let Some(recv) = call.receiver() else { return };
+        if hook_param_read(&recv, pname) {
+            self.harvest_extended_call(i, &call);
+        }
+    }
+
+    /// The install shapes a `self.extended(base)` body can carry on the
+    /// base itself; the caller has already proved the receiver is the
+    /// hook's own parameter.
+    fn harvest_extended_call(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
+        let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        match name.as_str() {
+            "delegate" => match hook_delegate_names(call) {
+                Some(names) => {
+                    for (n, span) in names {
+                        self.fragments[i].hook_instance_installs.push((n, span));
+                    }
+                }
+                None => self.fragments[i].hook_installs_opaque = true,
+            },
+            "define_method" => match hook_define_method_name(call) {
+                Some(n) => {
+                    let loc = call.location();
+                    self.fragments[i]
+                        .hook_instance_installs
+                        .push((n, (loc.start_offset(), loc.end_offset())));
+                }
+                None => self.fragments[i].hook_installs_opaque = true,
+            },
+            "class_eval" | "module_eval" | "class_exec" | "module_exec" => {
+                self.harvest_extended_eval_block(i, call);
+            }
+            "send" | "public_send" | "__send__" | "instance_eval" | "instance_exec" => {
+                self.fragments[i].hook_installs_opaque = true;
+            }
+            _ => {}
+        }
+    }
+
+    /// `base.class_eval do ... end`: the block runs with `self` = base, so
+    /// the `def`s written directly in it are base's own instance methods.
+    /// Any argument at all (a string body, a `&proc`) is a body no AST
+    /// here can read; so is a nested installer whose names are unknowable
+    /// (`send`-family, a non-literal `define_method`).
+    fn harvest_extended_eval_block(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
+        if call.arguments().is_some() {
+            self.fragments[i].hook_installs_opaque = true;
+            return;
+        }
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(body) = block.body() else { return };
+        let Some(stmts) = body.as_statements_node() else { return };
+        for stmt in &stmts.body() {
+            self.harvest_extended_eval_stmt(i, &stmt);
+        }
+    }
+
+    /// One statement of a literal `base.class_eval do ... end` body, where
+    /// `self` is the base.
+    fn harvest_extended_eval_stmt(&mut self, i: usize, stmt: &Node<'_>) {
+        if let Some(def) = stmt.as_def_node() {
+            if def.receiver().is_none() {
+                let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+                self.fragments[i].hook_instance_installs.push((name, span_of(stmt)));
+            }
+            return;
+        }
+        let Some(call) = stmt.as_call_node() else { return };
+        match String::from_utf8_lossy(call.name().as_slice()).as_ref() {
+            "send" | "public_send" | "__send__" => {
+                self.fragments[i].hook_installs_opaque = true;
+            }
+            "define_method" => match hook_define_method_name(&call) {
+                Some(n) => self.fragments[i].hook_instance_installs.push((n, span_of(stmt))),
+                None => self.fragments[i].hook_installs_opaque = true,
+            },
+            _ => {}
+        }
+    }
+
     /// Walk every arm of a `begin/rescue/else/ensure` (bead ita-o8l.5):
     /// the primary body, every `rescue` clause in the chain (`subsequent()`
     /// links a second `rescue Foo` onto the first), the `else` clause (runs
@@ -2359,6 +2527,12 @@ impl DefWalker<'_> {
                         // literal shape (helper is a no-op otherwise).
                         if name == "included" {
                             self.harvest_included_hook(i, &def);
+                        }
+                        // Bead H of onda 2: `def self.extended(base)` is
+                        // the same hook for the `extend` direction — see
+                        // `harvest_extended_hook`.
+                        if name == "extended" {
+                            self.harvest_extended_hook(i, &def);
                         }
                     } else {
                         self.fragments[i].methods.push(md);
@@ -4155,6 +4329,15 @@ pub struct ClassDef {
     pub methods: FxHashMap<String, MethodSig>,
     pub singleton_methods: FxHashMap<String, MethodSig>,
     pub consts: Vec<String>,
+    /// Bead H of onda 2, merged from `ClassFragment`'s own three hook
+    /// fields with the file each install was written in (so
+    /// `apply_extended_hooks` can file a real `MethodSig`): the instance
+    /// installs a `def self.extended(base)` hook performs, the singleton
+    /// ones (`def base.x`), and whether that hook installed something
+    /// whose name set could not be read.
+    pub hook_instance_installs: Vec<(String, (usize, usize), SourceFile)>,
+    pub hook_singleton_installs: Vec<(String, (usize, usize), SourceFile)>,
+    pub hook_installs_opaque: bool,
     /// Table this class maps to, if it looks like an `ActiveRecord` model.
     pub table_name: Option<TableNameDecl>,
 }
@@ -4428,6 +4611,14 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // down for that class — silence this bead never asked for. It has
     // no business touching the pollution picture at all.
     apply_load_hook_openness(&mut index);
+    // Bead H of onda 2: what a module's own `self.extended(base)` hook
+    // installs on `base` lands on the EXTENDER, so this pass reads the
+    // merged `extends` edges and files those installs there — after every
+    // fragment, curated declaration and gem reopening has landed (the
+    // module is commonly written in another file than the `extend`, and
+    // `apply_concern_class_methods` above has already added its own
+    // `ClassMethods` edges to the same field this pass walks).
+    apply_extended_hooks(&mut index);
     build_subclass_map(&mut index);
     build_methods_by_name(&mut index);
     index
@@ -4635,7 +4826,26 @@ fn merge_file_fragments(
                 .singleton_methods
                 .insert(md.name.clone(), method_sig(md, file));
         }
+        merge_hook_installs(class, frag, file);
     }
+}
+
+/// Bead H of onda 2: carry one fragment's `def self.extended(base)`
+/// harvest into the merged class it belongs to, remembering the file each
+/// install was written in (a `MethodSig` needs it, and the install itself
+/// is filed into ANOTHER class later — the extender — by
+/// `apply_extended_hooks`). Shared by the two merge paths, because a
+/// fragment can reach its class through either: the ordinary
+/// `class`/`module` merge, and `apply_singleton_patches`' `class << X`
+/// form, which walks a body that can define `X.extended` too.
+fn merge_hook_installs(class: &mut ClassDef, frag: &ClassFragment, file: SourceFile) {
+    for (name, span) in &frag.hook_instance_installs {
+        class.hook_instance_installs.push((name.clone(), *span, file));
+    }
+    for (name, span) in &frag.hook_singleton_installs {
+        class.hook_singleton_installs.push((name.clone(), *span, file));
+    }
+    class.hook_installs_opaque |= frag.hook_installs_opaque;
 }
 
 /// Bead ita-exc defect B: resolve every constant PATH write (`A::B =
@@ -4936,6 +5146,152 @@ fn merge_open(index: &mut ProjectIndex, id: ClassId, reason: OpenReason) {
     }
 }
 
+/// Bead H of onda 2: apply every module's `def self.extended(base)`
+/// harvest to the classes that really `extend` it — the instance installs
+/// onto the extender's INSTANCE surface (where `base.delegate`'s methods
+/// run), the `def base.x` names onto its SINGLETON surface, and the
+/// fail-closed open when the hook body could not be read.
+///
+/// Merge-time, after every fragment (and every curated declaration and gem
+/// reopening) has landed: the module a class extends is commonly written
+/// in another file, and the extender is only knowable from the merged
+/// `extends` edges — the same two-phase shape
+/// `resolve_dynamic_mixin_targets` uses.
+///
+/// Additive and arity-inert only: every install is filed with
+/// `arity_unknown`, so this can turn an existing `NotFound` into `Found`
+/// (silence) and can never manufacture an E0102. An install never
+/// overwrites a method the extender's own body defines — the same
+/// first-wins rule every merge here uses.
+fn apply_extended_hooks(index: &mut ProjectIndex) {
+    let mut edges: Vec<(ClassId, ClassId)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        for ext in &class.extends {
+            if let Some(module) = index.resolve_const(&class.nesting, ext) {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "class-table index bounded by `self.classes.len()`, far below u32::MAX for any real Ruby project"
+                )]
+                edges.push((ClassId(i as u32), module));
+            }
+        }
+    }
+    for (extender, module) in edges {
+        apply_one_extended_hook(index, extender, module);
+    }
+}
+
+/// One `(extender, module)` edge of `apply_extended_hooks`: file what the
+/// module's hook installs on `base` — see that function's contract. Split
+/// out to stay under the complexity ceiling, and named for the single edge
+/// it resolves.
+fn apply_one_extended_hook(index: &mut ProjectIndex, extender: ClassId, module: ClassId) {
+    let (instance, singleton, opaque) = {
+        let m = index.class(module);
+        (
+            m.hook_instance_installs.clone(),
+            m.hook_singleton_installs.clone(),
+            m.hook_installs_opaque,
+        )
+    };
+    let class = &mut index.classes[extender.0 as usize];
+    for (name, span, file) in instance {
+        class
+            .methods
+            .entry(name)
+            .or_insert_with(|| hook_install_sig(span, file));
+    }
+    for (name, span, file) in singleton {
+        class
+            .singleton_methods
+            .entry(name)
+            .or_insert_with(|| hook_install_sig(span, file));
+    }
+    if opaque {
+        merge_open(index, extender, OpenReason::EvalOrSend);
+    }
+}
+
+/// A method a `def self.extended(base)` hook installed on its extender.
+/// Only its NAME and where it was written are known: `delegate`'s own
+/// `def name(*args, &block)` and a `define_method` body both take an
+/// arity this index never sees, so the sig is arity-inert
+/// (`arity_unknown` — the same skip `check_arity` applies to a `rest`
+/// method) and can never manufacture an E0102.
+fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
+    MethodSig {
+        required: 0,
+        optional: 0,
+        rest: false,
+        keywords: Vec::new(),
+        kwrest: false,
+        sig: None,
+        sorbet_ret: None,
+        arity_unknown: true,
+        abstract_stub: false,
+        file,
+        def_span: span,
+        name_span: span,
+        schema_col_type: None,
+    }
+}
+
+/// Is `node` a bare read of the `def self.extended(base)` hook's own
+/// parameter (`base`)? Only that name is the base: a read of any other
+/// local in the hook body names someone else, and filing its calls here
+/// would attribute another object's methods to the extender.
+fn hook_param_read(node: &Node<'_>, pname: &str) -> bool {
+    node.as_local_variable_read_node()
+        .is_some_and(|read| String::from_utf8_lossy(read.name().as_slice()) == pname)
+}
+
+/// The names `<base>.delegate` installs when it is called ON the base,
+/// read off the call's own argument list. `None` means the set is
+/// unreadable, and the caller must fail closed.
+fn hook_delegate_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<(String, (usize, usize))>> {
+    let mut out = Vec::new();
+    for arg in &call.arguments()?.arguments() {
+        if let Some(sym) = arg.as_symbol_node() {
+            out.push((
+                String::from_utf8_lossy(sym.unescaped()).into_owned(),
+                span_of(&arg),
+            ));
+            continue;
+        }
+        if delegate_arg_unreadable(&arg) {
+            return None;
+        }
+    }
+    Some(out)
+}
+
+/// Is this non-symbol `delegate` argument one that makes the installed
+/// NAME SET unreadable? `prefix:`/`suffix:` rewrite the names
+/// (`delegate :name, to: :class, prefix: true` installs `class_name`), and
+/// a splat, a variable, or any other expression names methods only at
+/// runtime. The keywords every other spelling takes (`to:`, `allow_nil:`,
+/// `private:`, `public:`) leave the name alone.
+fn delegate_arg_unreadable(arg: &Node<'_>) -> bool {
+    const NAME_KEEPING: [&str; 4] = ["to", "allow_nil", "private", "public"];
+    let Some(kw) = arg.as_keyword_hash_node() else { return true };
+    !kw.elements().iter().all(|el| {
+        el.as_assoc_node().is_some_and(|assoc| {
+            assoc.key().as_symbol_node().is_some_and(|k| {
+                NAME_KEEPING.contains(&String::from_utf8_lossy(k.unescaped()).as_ref())
+            })
+        })
+    })
+}
+
+/// The name a `define_method` call installs, when its first argument is a
+/// literal symbol or string; `None` (a dynamic name) is the caller's
+/// fail-closed signal.
+fn hook_define_method_name(call: &ruby_prism::CallNode<'_>) -> Option<String> {
+    call.arguments()
+        .and_then(|a| a.arguments().iter().next())
+        .and_then(|a| literal_method_name(&a))
+}
+
 /// Bead ita-o8l.1: resolve every `(track, name, nesting)` entry
 /// collected project-wide (`ProjectIndex::dynamic_mixin_raw`) into a
 /// `ClassId`, once, after every fragment — real project source, curated
@@ -5077,6 +5433,8 @@ fn apply_singleton_patches(index: &mut ProjectIndex) {
     for (file, frag) in std::mem::take(&mut index.singleton_patches) {
         let Some(&id) = index.by_path.get(&frag.path) else { continue };
         let class = &mut index.classes[id.0 as usize];
+        // Before the `extends` loop below moves `frag.extends` out.
+        merge_hook_installs(class, &frag, file);
         for path in frag.extends {
             if !class.extends.contains(&path) {
                 class.extends.push(path);
@@ -6345,6 +6703,9 @@ impl ProjectIndex {
             methods: FxHashMap::default(),
             singleton_methods: FxHashMap::default(),
             consts: Vec::new(),
+            hook_instance_installs: Vec::new(),
+            hook_singleton_installs: Vec::new(),
+            hook_installs_opaque: false,
             table_name: None,
         });
         self.by_path.insert(path.to_string(), id);

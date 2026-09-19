@@ -506,6 +506,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays open.
 
 ### Changed
+- Public-corpus baselines regenerated for the attributed-mixin family: rails
+  1100 → 940 lines (166 → 6 errors, **0 new**), mastodon and discourse
+  byte-identical — their files do not appear in the diff at all, which is the
+  measurement that the mechanism is receiver-keyed rather than a blanket
+  softening. The 160 removed lines are the two Thor builder false-positive
+  families the ledger had already recorded as such. The ledger carries the new
+  section with the pinned shas, the gate's own wall times and the new totals
+  (**13 = 8 FP + 4 TP + 1 inconclusive**); the ceilings are unchanged and the
+  reason is stated (a wall reading is machine load, not a criterion median).
+  `./scripts/public-gate.sh` matches all three baselines exactly.
 - Publishing hygiene for the public launch: workspace package metadata
   (license/repository/homepage) inherited by every crate, the project
   site linked from the README, local scratch paths reworded out of

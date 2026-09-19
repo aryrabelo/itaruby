@@ -357,7 +357,7 @@ green but at least one declared corpus could not be checked on this machine
 | `sf check` (software-factory, gate #0) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
@@ -633,6 +633,30 @@ Per-run artifacts land in `target/gauntlet/` (gitignored).
   second suite reported "expected X to fail" while X had never run. The
   harness was printing a real failure for the wrong reason, which is one
   step from printing a pass for the wrong reason.
+- A mutation harness that rewrites the source IN PLACE makes every
+  concurrent reader read a mutant (learned 2026-09-19, binding, measured):
+  while `scripts/mixin-attribution-mutants.sh` held this checkout, reading
+  `index.rs` showed the `method_missing` gate ABSENT — that was MUT-1a's own
+  replacement text (`let _ = index.class(mid);`), and the lead nearly filed
+  "the gate does not exist" about code that ships. `target/release/ita` is a
+  mutant binary for part of the same window, so a concurrent measurement
+  measures the mutant too. Read `git show HEAD:<path>` (or wait for the run),
+  and never commit while a mutation harness holds the tree.
+- A suppression that names one TRACK must not soften the other, and a
+  mechanism no fixture or mutant can distinguish does not ship (learned
+  2026-09-19, binding, measured): `X.include(M)` with `M` answering every
+  name opens X for INSTANCE lookups, while the index's `open` flag is read by
+  both lookups — so the attributed-mixin family attributes `include`/`prepend`
+  only, and drops the `extend` arm whose only effect was silencing instance
+  lookups `extend` never justifies (the three public corpora are byte-equal
+  with it gone; `singleton_track_stays_closed` plus MUT-1c hold it down). The
+  mirror direction — an instance-track openness softening a class-level call —
+  is left exactly as it was, because no verdict can see it: this checker emits
+  no singleton `NotFound` for a project class at all (probed 2026-09-19:
+  `class X; end; X.absent_name` reports nothing), so a per-track reason would
+  be machinery nothing could accuse. When a measurement cannot tell two
+  behaviours apart, the honest output is that measurement, never the
+  mechanism built on the guess.
 
 ## Closeout
 

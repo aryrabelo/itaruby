@@ -149,11 +149,14 @@ fi
 # by removing exactly one at a time and demanding a NAMED test fail. Both
 # scripts existed before this wiring and neither ran in any gate — a probe
 # nothing executes decays into narration (AGENTS.md: the probes proving each
-# side live next to the instrument). They edit source in place and restore it
+# side live next to the instrument). The `mixin-attribution` family (bead
+# ita-a8z) joined the same loop when it was written, for the same reason:
+# it is the only thing that would notice one of the three suppression
+# mechanisms being cut. They edit source in place and restore it
 # byte-identical with `cmp`, so they run after gate b's build and before any
 # other binary-consuming gate rebuilds.
 say 'gate c1 — per-fix source mutants (each decision accused by a named test)'
-for m in const-missing operand-types singleton; do
+for m in const-missing operand-types singleton mixin-attribution; do
   if "$ROOT/scripts/$m-mutants.sh" >"$ART/$m-mutants.txt" 2>&1; then
     ok "$m mutants (every mutant accused, source restored byte-identical)"
   else

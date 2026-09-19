@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Attributed-mixin family (bead ita-a8z, phase A): three suppression-only
+  mechanisms that close rails' 160-site `Rails::AppBuilder` E0101 cluster with
+  ZERO new diagnostics — rails 166 → 6 errors (`new=0`, `gone=160`), mastodon
+  and discourse byte-identical, measured on the pinned trees (2026-09-19).
+  Mechanism 1 opens the class a mixin call's RECEIVER names (`X.include(M)`
+  with a literal constant, or the value of a resolvable expression) when `M`
+  defines `method_missing`/`respond_to_missing?`; mechanism 2 reads a local
+  assigned from a project method whose body is a ternary of constant paths
+  (`builder_class = get_builder_class`); mechanism 3 files the names a literal
+  list crossed with an interpolated `class_eval` string defines
+  (`%w(a b).each { |m| class_eval <<-RUBY def #{m} ... }`). Keyed on the
+  RECEIVER, never on "some module answers every name" — the receiver-blind
+  form silenced 222/222 of rails' baseline E0101 (AGENTS.md). INSTANCE track
+  only: `X.extend(M)` is deliberately not attributed, because the index's
+  `open` flag is read by both lookups and the arm's only effect was silencing
+  INSTANCE lookups `extend` never justifies (the three public corpora are
+  byte-equal with it gone). Mechanism 3's marginal on those corpora is zero in
+  the configuration that ships — it is kept for the shape its own fixture
+  proves against MRI (a method-PARAMETER include receiver, where no
+  receiver-keyed mechanism can attribute anything), and its earlier "95 sites"
+  credit was it measured WITHOUT mechanism 2. The harvest files names only
+  where the eval body really runs: `Other.class_eval` inside `class Bar` no
+  longer invents a method on Bar. Two-sided proof in
+  `scripts/mixin-attribution-mutants.sh` (gate c1): nine mutants, one decision
+  each, every one accused by a NAMED test, source restored byte-identical with
+  `cmp`, `INVALIDO` when an anchor stops matching. Ten fixtures in
+  `testdata/mixin_attribution/`, every accusing one MRI-raised and every silent
+  one MRI-clean (the cross-file pair loaded together), plus a two-file test for
+  the cross-file resolution the phase-2 map exists for.
 - `scripts/gate-triage`: routes a finished gauntlet run to its next action,
   reading `target/gauntlet/digest.json` only. Deterministic rules over digest
   features carry the routing — perf red without a parent-revision measurement

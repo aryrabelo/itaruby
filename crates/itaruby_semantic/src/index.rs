@@ -36,7 +36,12 @@ pub enum TableNameDecl {
 pub enum OpenReason {
     /// Superclass expression is not a resolvable constant path (`< Struct.new(...)`).
     DynamicSuperclass,
-    /// Defines `method_missing` / `respond_to_missing?`.
+    /// Defines `method_missing` / `respond_to_missing?` — either in the
+    /// fragment's OWN body (`DefWalker`'s `DefNode` arm) or through a
+    /// mixin edge this index could attribute to it
+    /// (`apply_attributed_mixin_edges`, the receiver-keyed half of the
+    /// dynamic-mixin family). Both mean the same thing: this class
+    /// answers every name, so nothing about its surface is knowable.
     MethodMissing,
     /// The `raise NotImplementedError` abstract-class text-scan idiom.
     AbstractRaise,
@@ -448,6 +453,23 @@ pub struct FileDefs {
     /// may live in a different file than the dynamic `include` call) —
     /// see `resolve_dynamic_mixin_targets`.
     pub dynamic_mixin_targets: Vec<(MixinTrack, String, Vec<String>)>,
+    /// Every mixin call in this file whose RECEIVER could be named — see
+    /// `AttributedMixinEdge`. Collected by `FileScan`'s full-tree
+    /// traversal (the same one `dynamic_mixin_targets` rides), because
+    /// the canonical shape lives inside a `def` body
+    /// (`app_base.rb`'s `builder_class.include(ActionMethods)`), which
+    /// `DefWalker`'s contour-limited walk never visits.
+    pub attributed_mixin_edges: Vec<AttributedMixinEdge>,
+    /// `def f; <const path or ternary of const paths>; end`, as
+    /// `(method name, path as written, lexical nesting at the def)` —
+    /// the Rails `get_builder_class` shape
+    /// (`defined?(::AppBuilder) ? ::AppBuilder : Rails::AppBuilder`),
+    /// whose return value is a class the caller then mixes into. Only a
+    /// body that is EXACTLY that expression is recorded: a body with any
+    /// other statement, or any other expression, contributes nothing
+    /// (fail-closed — a wrong receiver attribution is exactly the
+    /// receiver-blind silence bead ita-a8z measured).
+    pub const_returning_methods: Vec<(String, String, Vec<String>)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -515,6 +537,9 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         eval_unknown: false,
         keyed_pollution: Vec::new(),
         nested: 0,
+        attributed_mixin_edges: Vec::new(),
+        const_returning_methods: Vec::new(),
+        def_locals: Vec::new(),
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -532,6 +557,8 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         qualified_writes: w.qualified_writes,
         const_aliases: w.const_aliases,
         dynamic_mixin_targets: scan.targets,
+        attributed_mixin_edges: scan.attributed_mixin_edges,
+        const_returning_methods: scan.const_returning_methods,
     }
 }
 
@@ -548,6 +575,76 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
 pub enum MixinTrack {
     Instance,
     Singleton,
+}
+
+/// Where the RECEIVER of an attributed mixin call gets its value from —
+/// the half `dynamic_mixin_targets` deliberately never collected, because
+/// bead ita-a8z measured both receiver-keyed candidates it tried
+/// (`Global`, `BuilderName`) silencing real errors project-wide.
+///
+/// This one is different in kind, not in degree: it is not a guess about
+/// which class a receiver IS, it is a reading of the value the receiver
+/// provably holds at that call site. `X.include(M)` names `X`; a local
+/// assigned a constant path holds that constant; a local assigned a
+/// receiverless project method holds that method's own return, and a
+/// ternary of constant paths holds ONE of exactly two constants. Every
+/// shape here is all-or-nothing — one unreadable element drops the whole
+/// call, never a partial guess — and a receiver that is neither of these
+/// collects nothing (fail-closed, invariant #1).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum MixinReceiver {
+    /// The receiver is a literal constant path (`X.include(M)`), or the
+    /// value a ternary of constant paths yields — resolved in `nesting`,
+    /// the lexical scope the path was WRITTEN in (the call site for a
+    /// literal receiver, the `def`'s own scope for a method's body).
+    Path { path: String, nesting: Vec<String> },
+    /// The receiver is a local (or a bare receiverless call) whose value
+    /// is a project method's return — resolved in phase 2 against
+    /// `ProjectIndex::const_returning_methods`, once every file is merged
+    /// (`get_builder_class` lives in another file than the
+    /// `builder_class.include(ActionMethods)` call site in rails).
+    Call { method: String },
+}
+
+/// One mixin call whose receiver this scan could NAME, held until every
+/// file is merged (`apply_attributed_mixin_edges`). Distinct from
+/// `FileDefs::dynamic_mixin_targets` on purpose: those feed the
+/// name-keyed, receiver-blind `dynamic_mixin_covers` softening, and
+/// widening THAT set would widen a project-wide suppression. These feed
+/// one receiver-keyed decision only — "this class is known to include a
+/// module that answers every name" — see `OpenReason::MethodMissing`.
+///
+/// INSTANCE TRACK ONLY (`include`/`prepend`), and that is a decision, not
+/// an omission. `X.extend(M)` lands `M` on X's SINGLETON, while the only
+/// openness this index has (`ClassDef::open`) is read by BOTH lookups
+/// (`lookup_own` and `lookup_singleton`) — so opening X for an `extend`
+/// edge would silence every INSTANCE lookup on X, which `extend` never
+/// justifies. Nothing measured asks for that widening: no fixture carries
+/// an `extend` edge, and the three public corpora are byte-equal with the
+/// arm gone. The receiver-blind `dynamic_mixin_singleton_targets` path
+/// keeps covering the singleton case exactly as it did before this scan
+/// existed; a singleton-keyed openness is roadmap, never a guess.
+///
+/// The MIRROR direction (`include` opening the class for singleton
+/// lookups too) is deliberately not narrowed, and that is a measurement
+/// rather than an oversight: this checker emits no singleton `NotFound`
+/// for a project class AT ALL (probed 2026-09-19: `class X; end;
+/// X.absent_name` reports nothing, because every project class's ancestry
+/// carries an ancestor this index cannot close). An instance-track
+/// openness therefore cannot mislead a singleton verdict today, and a
+/// per-track reason would be a mechanism no fixture and no mutant could
+/// distinguish. If singleton `NotFound` ever becomes reachable for
+/// project classes, splitting the reason per track comes FIRST — see
+/// `OpenReason::MethodMissing`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AttributedMixinEdge {
+    pub receiver: MixinReceiver,
+    /// The mixin's literal constant argument, as written.
+    pub module: String,
+    /// Lexical nesting at the mixin call site, which is what resolves
+    /// `module` (`ActionMethods` inside `module Rails` is
+    /// `Rails::ActionMethods`).
+    pub module_nesting: Vec<String>,
 }
 
 /// What ONE pollution source can add to the class it targets — the
@@ -640,6 +737,22 @@ struct FileScan {
     /// first unresolvable spec helper), which is exactly the strictness
     /// the blanket collector never had.
     nested: usize,
+    /// Mixin calls with a namable receiver — see `AttributedMixinEdge`.
+    attributed_mixin_edges: Vec<AttributedMixinEdge>,
+    /// `def f; <const path / ternary of const paths>; end` — see
+    /// `FileDefs::const_returning_methods`.
+    const_returning_methods: Vec<(String, String, Vec<String>)>,
+    /// One frame per `def` body currently being walked, mapping a local
+    /// variable's name to the receivers its last written value can be.
+    /// A local is what carries the value from `get_builder_class` to
+    /// `builder_class.include(...)`; without the frame the mixin call's
+    /// receiver is just "some unknown object" and the edge stays
+    /// unattributed (today's behavior, and the fail-closed default).
+    /// Only writes whose value is one of `MixinReceiver`'s readable
+    /// shapes are recorded, and a later unreadable write to the same
+    /// name OVERWRITES the entry with nothing — a local reassigned to
+    /// something else must not keep resolving to its old value.
+    def_locals: Vec<FxHashMap<String, Vec<MixinReceiver>>>,
 }
 
 impl FileScan {
@@ -695,8 +808,11 @@ impl<'pr> Visit<'pr> for FileScan {
                 ));
             }
         }
+        self.note_const_returning_body(node);
         self.nested += 1;
+        self.def_locals.push(FxHashMap::default());
         ruby_prism::visit_def_node(self, node);
+        self.def_locals.pop();
         self.nested -= 1;
     }
 
@@ -706,8 +822,27 @@ impl<'pr> Visit<'pr> for FileScan {
         self.nested -= 1;
     }
 
+    fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+        // The value a local holds is what decides whose class the mixin
+        // call below targets. `remove`, never `insert`: this write
+        // REPLACES whatever the name held, so an unreadable value must
+        // clear the entry rather than leave a stale one.
+        let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+        let value = node.value();
+        let candidates = self.value_receivers(&value);
+        if let Some(frame) = self.def_locals.last_mut() {
+            if candidates.is_empty() {
+                frame.remove(&name);
+            } else {
+                frame.insert(name, candidates);
+            }
+        }
+        ruby_prism::visit_local_variable_write_node(self, node);
+    }
+
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
         self.note_dynamic_mixin(node);
+        self.note_attributed_mixin(node);
         self.note_refinement(node);
         self.note_opaque_eval(node);
         self.note_injection(node);
@@ -720,11 +855,7 @@ impl FileScan {
     /// see this struct's doc comment for why the RECEIVER is never the
     /// key.
     fn note_dynamic_mixin(&mut self, node: &ruby_prism::CallNode<'_>) {
-        let track = match node.name().as_slice() {
-            b"include" | b"prepend" => MixinTrack::Instance,
-            b"extend" => MixinTrack::Singleton,
-            _ => return,
-        };
+        let Some(track) = mixin_track(node.name().as_slice()) else { return };
         let dynamic_receiver = node
             .receiver()
             .is_some_and(|recv| const_path_str(&recv).is_none() && recv.as_self_node().is_none());
@@ -736,6 +867,120 @@ impl FileScan {
             if let Some(name) = const_path_str(&arg) {
                 self.targets.push((track, name, self.nesting.clone()));
             }
+        }
+    }
+
+    /// `<namable receiver>.include/extend/prepend(<literal constant>)` —
+    /// see `AttributedMixinEdge`. Implicit-`self` receivers are
+    /// `DefWalker`'s own arm (the enclosing class's real ancestry edge),
+    /// and a receiver whose value this scan cannot read collects
+    /// nothing: the mixin still softens by method NAME project-wide
+    /// through `dynamic_mixin_covers`, exactly as before.
+    fn note_attributed_mixin(&mut self, node: &ruby_prism::CallNode<'_>) {
+        // `MixinTrack::Singleton` is deliberately not attributed — see
+        // `AttributedMixinEdge`'s doc comment: the openness it would set is
+        // read by both lookups, so an `extend` edge would silence instance
+        // lookups that `extend` does not justify.
+        match mixin_track(node.name().as_slice()) {
+            Some(MixinTrack::Instance) => {}
+            _ => return,
+        }
+        let Some(recv) = node.receiver() else { return };
+        if recv.as_self_node().is_some() {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let modules: Vec<String> = args.arguments().iter().filter_map(|a| const_path_str(&a)).collect();
+        // All-or-nothing: `include M, whatever` names a module set this
+        // scan cannot enumerate, so it attributes none of them.
+        if modules.is_empty() || modules.len() != args.arguments().len() {
+            return;
+        }
+        let receivers = self.receiver_of(&recv);
+        if receivers.is_empty() {
+            return;
+        }
+        for receiver in receivers {
+            for module in &modules {
+                self.attributed_mixin_edges.push(AttributedMixinEdge {
+                    receiver: receiver.clone(),
+                    module: module.clone(),
+                    module_nesting: self.nesting.clone(),
+                });
+            }
+        }
+    }
+
+    /// What class this receiver expression provably names, if any — the
+    /// three readable shapes `MixinReceiver` documents. Anything else
+    /// (a chained call, an ivar, a literal) yields nothing.
+    fn receiver_of(&self, recv: &Node<'_>) -> Vec<MixinReceiver> {
+        if let Some(read) = recv.as_local_variable_read_node() {
+            let name = String::from_utf8_lossy(read.name().as_slice()).into_owned();
+            return self
+                .def_locals
+                .last()
+                .and_then(|frame| frame.get(&name))
+                .cloned()
+                .unwrap_or_default();
+        }
+        self.value_receivers(recv)
+    }
+
+    /// What class the VALUE of `node` provably names. A constant path is
+    /// itself; a ternary whose two arms are constant paths is one of
+    /// exactly those two (the predicate is never consulted — whatever it
+    /// evaluates to, the value is one of the arms); a bare receiverless
+    /// project call is deferred to phase 2 (`MixinReceiver::Call`),
+    /// because its body lives in another file. A bare constant read is
+    /// `Call`-free here only when it is a `LocalVariableReadNode`, which
+    /// `receiver_of` handles — a `CallNode` with no receiver and no
+    /// arguments is a method call, and that is the `get_builder_class`
+    /// spelling.
+    fn value_receivers(&self, node: &Node<'_>) -> Vec<MixinReceiver> {
+        if let Some(path) = const_path_str(node) {
+            return vec![MixinReceiver::Path { path, nesting: self.nesting.clone() }];
+        }
+        if let Some(ternary) = ternary_const_paths(node) {
+            return ternary
+                .into_iter()
+                .map(|path| MixinReceiver::Path { path, nesting: self.nesting.clone() })
+                .collect();
+        }
+        if let Some(call) = node.as_call_node() {
+            if call.receiver().is_none()
+                && call.arguments().is_none()
+                && call.block().is_none()
+                && !call.name().as_slice().is_empty()
+            {
+                return vec![MixinReceiver::Call {
+                    method: String::from_utf8_lossy(call.name().as_slice()).into_owned(),
+                }];
+            }
+        }
+        Vec::new()
+    }
+
+    /// `def f; <a constant path, or a ternary of two constant paths>; end`
+    /// — recorded so a caller holding `f`'s return can name the receiver
+    /// of its mixin call. Only a body that IS that expression once,
+    /// alone, qualifies; any other statement or expression contributes
+    /// nothing (see `FileDefs::const_returning_methods`).
+    fn note_const_returning_body(&mut self, node: &ruby_prism::DefNode<'_>) {
+        if node.receiver().is_some() {
+            return;
+        }
+        let Some(body) = node.body() else { return };
+        let Some(only) = sole_statement(&body) else { return };
+        let paths = ternary_const_paths(&only)
+            .or_else(|| const_path_str(&only).map(|p| vec![p]))
+            .unwrap_or_default();
+        if paths.is_empty() {
+            return;
+        }
+        let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+        for path in paths {
+            self.const_returning_methods.push((name.clone(), path, self.nesting.clone()));
         }
     }
 
@@ -1492,6 +1737,89 @@ impl DefWalker<'_> {
         self.track(i, lit.singleton).push(md);
     }
 
+    /// `%w(template copy_file ...).each do |method| class_eval <<-RUBY
+    /// def #{method}(...); @generator.send(:#{method}, ...); end RUBY end`
+    /// — a literal list crossed with an interpolated string body defines
+    /// exactly those names, and nothing in this walker can see them
+    /// otherwise (`class_eval` is a call with a string argument, and a
+    /// `def` written inside a string is not an AST node at all).
+    ///
+    /// This is `rails/railties/lib/rails/generators/rails/app/
+    /// app_generator.rb`'s `Rails::ActionMethods`: nine forwarding
+    /// methods, invisible to any per-`def`-node scan.
+    ///
+    /// What it is worth, measured honestly (re-measured 2026-09-19): in
+    /// the configuration that ships, this harvest's MARGINAL contribution
+    /// to the three public corpora is ZERO — rails lands on the same 6
+    /// E0101 with it and without it, and mastodon and discourse are
+    /// byte-identical. The "95 sites" an earlier version of this comment
+    /// cited was this harvest measured WITHOUT the const-returning-ternary
+    /// arm, which is not a configuration that ships, so it was not
+    /// evidence for keeping it. It is kept for the shape its own fixture
+    /// proves against runtime ground truth — a method-PARAMETER include
+    /// receiver, where every receiver-keyed mechanism attributes nothing
+    /// and this is the only thing that sees the names at all — and the
+    /// cost it carries is named rather than hidden: the names land on the
+    /// module's own map, so they soften through the pre-existing
+    /// NAME-keyed, receiver-blind `dynamic_mixin_covers`, exactly like
+    /// every other name that module defines.
+    ///
+    /// Naming the abandonment, because it looks like a contradiction:
+    /// "parse the literal body of an eval" was BUILT and ABANDONED on
+    /// 2026-09-18 for the E0108 pollution mark, and the reason recorded
+    /// there was that no corpus observes a difference — every core-class
+    /// eval body in three public corpora defines names no operator
+    /// question ever asks about. That reason does NOT carry here: this
+    /// harvest is the ONLY way those nine names become visible at all,
+    /// and its own fixture is a runtime-proven false positive without it.
+    /// The abandoned decision stays abandoned for its own question.
+    ///
+    /// Deliberately shallow and all-or-nothing: one `each` whose
+    /// receiver is a literal array of strings/symbols, one block
+    /// parameter, an `eval`-family call whose first argument is an
+    /// interpolated string that interpolates THAT parameter and nothing
+    /// else, and a substituted body that parses with zero prism errors.
+    /// Any other shape contributes nothing (fail-closed).
+    fn harvest_interpolated_eval_defs(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
+        if call.name().as_slice() != b"each" {
+            return;
+        }
+        let Some(array) = call.receiver().and_then(|r| r.as_array_node()) else { return };
+        let Some(block) = call.block().and_then(|b| b.as_block_node()) else { return };
+        let Some(param) = sole_block_param(&block) else { return };
+        let elements = literal_string_elements(&array);
+        if elements.is_empty() {
+            return;
+        }
+        let Some(body) = block.body() else { return };
+        for template in eval_string_templates(&body, &param) {
+            // The body runs in the class the eval call NAMES, and the
+            // names belong there. A template naming ANOTHER class is
+            // skipped rather than filed on the enclosing one: filing it
+            // here would both invent a method this class never gains and
+            // leave the class that really gains it unfiled — and it would
+            // feed `dynamic_mixin_covers` a name the enclosing class's
+            // mixers do not have. Filing on the resolved target instead
+            // needs `fragment_idx_for` plus the declared-owner rule that
+            // `apply_body_def` documents as a separate decision, so it is
+            // roadmap here, never a guess (fail-closed, invariant #1).
+            if let Some(target) = &template.explicit_target {
+                if *target != self.fragments[i].path {
+                    continue;
+                }
+            }
+            let placeholder = format!("#{{{param}}}");
+            for element in &elements {
+                let source = template.text.replace(&placeholder, element);
+                for name in top_level_def_names(&source) {
+                    let mut md = MethodDef::synthetic(name, 0, template.span);
+                    md.arity_unknown = true;
+                    self.fragments[i].methods.push(md);
+                }
+            }
+        }
+    }
+
     /// Defect A (bead ita-exc): literal constant writes directly inside a
     /// class-body call's block — `enums do; Alpha = new(...); end`, or
     /// the fixture's invented `constvis_enums do; ... end` (any method
@@ -2175,6 +2503,7 @@ impl DefWalker<'_> {
                         if let Some(block) = call.block() {
                             self.harvest_block_consts(i, &block);
                         }
+                        self.harvest_interpolated_eval_defs(i, &call);
                         self.open_class(i, OpenReason::ClassBodyBlock);
                     }
                     return;
@@ -3471,6 +3800,186 @@ pub fn const_path_str(node: &Node<'_>) -> Option<String> {
     None
 }
 
+/// The method-lookup track a mixin call feeds, or `None` for a call that
+/// is not a mixin at all.
+fn mixin_track(name: &[u8]) -> Option<MixinTrack> {
+    match name {
+        b"include" | b"prepend" => Some(MixinTrack::Instance),
+        b"extend" => Some(MixinTrack::Singleton),
+        _ => None,
+    }
+}
+
+/// A `cond ? A : B` (or the keyword `if`/`else` spelling, which prism
+/// encodes identically) whose TWO arms are both constant paths — the
+/// Rails `defined?(::AppBuilder) ? ::AppBuilder : Rails::AppBuilder`
+/// shape. `None` for every other conditional: an `elsif` chain is an
+/// `IfNode` nested in `subsequent`, not an `ElseNode`, and any arm that
+/// is not a constant path (a call, `Y.new`, a literal) names nothing
+/// this scan may attribute a mixin edge to.
+///
+/// The predicate is deliberately NOT consulted. Whatever it evaluates
+/// to, the VALUE of the whole expression is one of exactly the two arms,
+/// so a mixin called on that value can only ever target one of those
+/// two classes — that is the whole argument, and it needs no knowledge
+/// of `defined?` at all.
+fn ternary_const_paths(node: &Node<'_>) -> Option<Vec<String>> {
+    let if_node = node.as_if_node()?;
+    let then_arm = if_node.statements()?.as_node();
+    let then_path = const_path_str(&sole_statement(&then_arm)?)?;
+    let else_node = if_node.subsequent()?.as_else_node()?;
+    let else_arm = else_node.statements()?.as_node();
+    let else_path = const_path_str(&sole_statement(&else_arm)?)?;
+    Some(vec![then_path, else_path])
+}
+
+/// The single expression of a one-statement block/arm, or `None` when the
+/// arm is empty or holds more than one statement (an arm whose value
+/// would then be its LAST statement — knowable, but not this scan's
+/// shape; fail closed).
+fn sole_statement<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
+    let stmts = node.as_statements_node()?;
+    let mut body = stmts.body().iter();
+    let only = body.next()?;
+    body.next().is_none().then_some(only)
+}
+
+/// The name of a block that takes exactly one required positional
+/// parameter (`do |method|`), or `None` for every other block shape —
+/// optionals, rest, keywords, destructuring and a missing parameter all
+/// mean the interpolation below is not a straight substitution of one
+/// literal list element.
+fn sole_block_param(block: &ruby_prism::BlockNode<'_>) -> Option<String> {
+    let params = block.parameters()?.as_block_parameters_node()?.parameters()?;
+    if !params.optionals().is_empty()
+        || params.rest().is_some()
+        || !params.posts().is_empty()
+        || !params.keywords().is_empty()
+        || params.keyword_rest().is_some()
+        || params.block().is_some()
+    {
+        return None;
+    }
+    let mut required = params.requireds().iter();
+    let only = required.next()?;
+    if required.next().is_some() {
+        return None;
+    }
+    let name = only.as_required_parameter_node()?;
+    Some(String::from_utf8_lossy(name.name().as_slice()).into_owned())
+}
+
+/// Every element of a literal array, as its string value — all-or-nothing:
+/// one non-literal element (`%w(a) + [x]`, a splat, an interpolation)
+/// yields nothing at all, never a partial list.
+fn literal_string_elements(array: &ruby_prism::ArrayNode<'_>) -> Vec<String> {
+    array
+        .elements()
+        .iter()
+        .map(|element| literal_method_name(&element))
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
+}
+
+/// One reconstructable eval template: the string as written, with the
+/// loop parameter left in place as `#{param}`, plus the span it was
+/// written at (the span every name harvested from it is filed with).
+struct EvalTemplate {
+    text: String,
+    span: (usize, usize),
+    /// The class the eval call names EXPLICITLY (`Other.class_eval`), as
+    /// written — `None` for a receiverless or `self` receiver, which runs
+    /// its body in the enclosing class (`eval_target`'s own rule). The
+    /// harvest files names only where the body really runs, so a template
+    /// naming another class is skipped rather than filed on the wrong one
+    /// (see `harvest_interpolated_eval_defs`).
+    explicit_target: Option<String>,
+}
+
+/// Every `class_eval`/`module_eval`/`instance_eval`/`eval`-family call in
+/// `body` whose first argument is an interpolated string literal, rebuilt
+/// as text so a literal list element can be substituted into it. A string
+/// that interpolates anything other than the loop parameter itself
+/// (`#{other}`, `#@ivar`, a method call) is skipped — this is a
+/// substitution, not an interpreter.
+fn eval_string_templates(body: &Node<'_>, param: &str) -> Vec<EvalTemplate> {
+    let mut scan = EvalTemplateScan { param, templates: Vec::new() };
+    scan.visit(body);
+    scan.templates
+}
+
+struct EvalTemplateScan<'a> {
+    param: &'a str,
+    templates: Vec<EvalTemplate>,
+}
+
+impl<'pr> Visit<'pr> for EvalTemplateScan<'_> {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if is_eval_name(node.name().as_slice()) {
+            let arg = node.arguments().and_then(|a| a.arguments().iter().next());
+            if let Some(interp) = arg.as_ref().and_then(Node::as_interpolated_string_node) {
+                // The receiver is read exactly as `eval_target` reads it
+                // for the pollution mark: a namable constant path is an
+                // explicit target, an implicit or `self` receiver is not
+                // (its body runs in the enclosing class).
+                let explicit_target = node
+                    .receiver()
+                    .filter(|r| r.as_self_node().is_none())
+                    .and_then(|r| const_path_str(&r));
+                if let Some(template) = self.template_of(&interp, explicit_target) {
+                    self.templates.push(template);
+                }
+            }
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+}
+
+impl EvalTemplateScan<'_> {
+    fn template_of(
+        &self,
+        node: &ruby_prism::InterpolatedStringNode<'_>,
+        explicit_target: Option<String>,
+    ) -> Option<EvalTemplate> {
+        let mut text = String::new();
+        for part in &node.parts() {
+            if let Some(s) = part.as_string_node() {
+                text.push_str(&String::from_utf8_lossy(s.unescaped()));
+            } else {
+                let embedded = part.as_embedded_statements_node()?;
+                let stmts = embedded.statements()?.as_node();
+                let read = sole_statement(&stmts)?.as_local_variable_read_node()?;
+                if String::from_utf8_lossy(read.name().as_slice()) != self.param {
+                    return None;
+                }
+                text.push_str("#{");
+                text.push_str(self.param);
+                text.push('}');
+            }
+        }
+        Some(EvalTemplate { text, span: span_of(&node.as_node()), explicit_target })
+    }
+}
+
+/// The names of every `def` written directly in `source` — a body
+/// substituted out of an eval template, parsed on its own. Zero names for
+/// anything prism reports an error on: a substitution that produces
+/// invalid Ruby defines nothing this checker may file (fail-closed).
+fn top_level_def_names(source: &str) -> Vec<String> {
+    let parse = ruby_prism::parse(source.as_bytes());
+    if parse.errors().next().is_some() {
+        return Vec::new();
+    }
+    let Some(program) = parse.node().as_program_node() else { return Vec::new() };
+    let Some(stmts) = program.statements().as_node().as_statements_node() else { return Vec::new() };
+    stmts
+        .body()
+        .iter()
+        .filter_map(|stmt| stmt.as_def_node())
+        .map(|def| String::from_utf8_lossy(def.name().as_slice()).into_owned())
+        .collect()
+}
+
 /// Is `recv.method_name` a method-injection call on a core class/mixin
 /// (bead ita-2ve)? `String.prepend(M)`, `Kernel.class_eval { def ... }`,
 /// `Hash.send(:define_method, :x)` — each can add instance methods to a
@@ -3724,6 +4233,21 @@ pub struct ProjectIndex {
     /// rejected `Global`/`BuilderName` candidates.
     pub dynamic_mixin_instance_targets: Vec<ClassId>,
     pub dynamic_mixin_singleton_targets: Vec<ClassId>,
+    /// Every merged file's `FileDefs::attributed_mixin_edges`, drained by
+    /// `apply_attributed_mixin_edges` — the receiver-keyed half of the
+    /// dynamic-mixin question, resolved once the full `by_path` exists.
+    /// Never read after `project_index` returns.
+    attributed_mixin_raw: Vec<AttributedMixinEdge>,
+    /// Method name -> every `(path, nesting)` a `def` of that name
+    /// provably returns (`FileDefs::const_returning_methods`), merged
+    /// across the project. Keyed by NAME because the call site and the
+    /// definition commonly live in different classes and different files
+    /// (`AppBase#builder` calls `get_builder_class`, which only
+    /// `AppGenerator` and `PluginGenerator` define) — a receiver-keyed
+    /// lookup would find nothing and the whole mechanism would be inert
+    /// on the very shape it exists for. Consulted only by
+    /// `apply_attributed_mixin_edges`.
+    const_returning_methods: FxHashMap<String, Vec<(String, Vec<String>)>>,
     /// Singleton-track, the mocking gems' class-object population:
     /// method names every class object's singleton answers to while a
     /// declared mocking gem is loaded — populated once at index build
@@ -3809,6 +4333,14 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // pass always runs and never opens a class, only ever feeding
     // `soften_not_found`'s NotFound->Inconclusive softening.
     resolve_dynamic_mixin_targets(&mut index);
+    // Mechanism 1+2 of the attributed-mixin family: every mixin call
+    // whose RECEIVER could be named, applied here — after every fragment
+    // AND after `resolve_dynamic_mixin_targets`, which it mirrors, and
+    // before the census/method maps below. It never resolves a method
+    // and never softens a lookup by name: it opens exactly the receiver
+    // classes that provably include a module answering every name (see
+    // `OpenReason::MethodMissing`).
+    apply_attributed_mixin_edges(&mut index);
     resolve_refined_core(&mut index);
     resolve_eval_polluted_core(&mut index);
     // Name-keyed pollution resolves LAST of the three: it is the only
@@ -3936,6 +4468,40 @@ fn build_methods_by_name(index: &mut ProjectIndex) {
     }
 }
 
+/// One file's accumulator contributions merged into the project-wide ones:
+/// the whole-index flags, the by-name raw buckets and the const-returning
+/// method table. Split out of `merge_file_fragments` to stay under the
+/// complexity ceiling, and named for what it is — the part of a file's
+/// `file_defs` that lands in a project-wide bucket rather than on a class,
+/// which is exactly the part a reader cannot check against a single class's
+/// semantics.
+fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
+    index.core_mixin |= defs.core_mixin;
+    index.refine_raw.extend(defs.refine_targets.iter().cloned());
+    index.refined_unknown |= defs.refined_unknown;
+    index.eval_raw.extend(defs.eval_targets.iter().cloned());
+    index.eval_polluted_unknown |= defs.eval_unknown;
+    index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
+    index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
+    index.attributed_mixin_raw.extend(defs.attributed_mixin_edges.iter().cloned());
+    for (method, path, nesting) in &defs.const_returning_methods {
+        index
+            .const_returning_methods
+            .entry(method.clone())
+            .or_default()
+            .push((path.clone(), nesting.clone()));
+    }
+    index.requires.extend(defs.requires.iter().cloned());
+    index.toplevel_consts.extend(defs.toplevel_consts.iter().cloned());
+    // Bead ita-54k: first write wins, mirroring `toplevel_consts`/`by_path`.
+    for (name, write_nesting, target) in &defs.const_aliases {
+        index
+            .const_aliases
+            .entry(name.clone())
+            .or_insert_with(|| (write_nesting.clone(), target.clone()));
+    }
+}
+
 /// One file's `file_defs` merged into the global class table. Split out of
 /// `project_index` to stay under the complexity ceiling (bead ita-3gs added
 fn merge_file_fragments(
@@ -3945,23 +4511,8 @@ fn merge_file_fragments(
     qualified_writes: &mut Vec<(String, String)>,
 ) {
     let defs = file_defs(db, file);
-    index.core_mixin |= defs.core_mixin;
-    index.refine_raw.extend(defs.refine_targets.iter().cloned());
-    index.refined_unknown |= defs.refined_unknown;
-    index.eval_raw.extend(defs.eval_targets.iter().cloned());
-    index.eval_polluted_unknown |= defs.eval_unknown;
-    index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
-    index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
-    index.requires.extend(defs.requires.iter().cloned());
-    index.toplevel_consts.extend(defs.toplevel_consts.iter().cloned());
+    merge_file_accumulators(index, &defs);
     qualified_writes.extend(defs.qualified_writes.iter().cloned());
-    // Bead ita-54k: first write wins, mirroring `toplevel_consts`/`by_path`.
-    for (name, write_nesting, target) in &defs.const_aliases {
-        index
-            .const_aliases
-            .entry(name.clone())
-            .or_insert_with(|| (write_nesting.clone(), target.clone()));
-    }
     for frag in &defs.fragments {
         // A by-name singleton patch never interns its own path: see
         // `ClassFragment::declared_owner_required` for the TCPSocket
@@ -4286,6 +4837,93 @@ fn resolve_dynamic_mixin_targets(index: &mut ProjectIndex) {
     index.dynamic_mixin_instance_targets.dedup();
     index.dynamic_mixin_singleton_targets.sort_unstable();
     index.dynamic_mixin_singleton_targets.dedup();
+}
+
+/// Mechanisms 1 and 2 of the attributed-mixin family: apply every mixin
+/// call whose RECEIVER could be named, by opening exactly that receiver
+/// when the module it provably includes defines `method_missing` /
+/// `respond_to_missing?`.
+///
+/// Why this and not a wider rule. Bead ita-a8z measured — twice, in
+/// `AGENTS.md` — that keying a dynamic-mixin softening on "some mixed
+/// module has `method_missing`" silences EVERY `NotFound` on that track
+/// project-wide: 222/222 of rails' baseline E0101 and 207/207 of a
+/// private corpus's, because a real project always contains some
+/// unrelated dynamically-mixed `method_missing` target. The fix is not a
+/// narrower predicate, it is a keyed one: the openness follows the
+/// RECEIVER. `builder_class.include(ActionMethods)` names no receiver at
+/// the call site, but its value is a class this index can prove
+/// (`MixinReceiver`), and once it is proven the rule is exactly the one
+/// `DefWalker` already applies to a class whose OWN body defines
+/// `method_missing` (`index.rs`'s `DefNode` arm): that class answers
+/// every name, so it is `open`.
+///
+/// Fail-closed at every step: a receiver that does not resolve, a module
+/// that does not resolve, and a module whose `methods` map has neither
+/// `method_missing` nor `respond_to_missing?` each contribute nothing.
+/// The module's OWN map only, never its ancestry — the same deliberate
+/// shallowness `dynamic_mixin_covers` documents, and for the same reason
+/// (a second unbounded chase through an arbitrary module's own mixins
+/// silences far more than any measurement here justifies).
+///
+/// ADDITIVE ONLY: a class already `open` for another reason keeps that
+/// reason (`AbstractRaise` excepted, exactly as `apply_singleton_patches`
+/// does — an abstract stub is the WEAKEST reason and a real
+/// `method_missing` must replace it).
+fn apply_attributed_mixin_edges(index: &mut ProjectIndex) {
+    let raw = std::mem::take(&mut index.attributed_mixin_raw);
+    for rid in attributed_mixin_receivers(index, raw) {
+        let class = &mut index.classes[rid.0 as usize];
+        class.open = true;
+        // `AbstractRaise` is the weakest reason (an abstract stub is
+        // treated as closed and only softens through the receiver's
+        // subtree) — a real `method_missing` must REPLACE it, exactly as
+        // `open_class` does.
+        if class.open_reason.is_none() || class.open_reason == Some(OpenReason::AbstractRaise) {
+            class.open_reason = Some(OpenReason::MethodMissing);
+        }
+    }
+}
+
+/// The receivers an attributed mixin edge PROVES: the classes each edge
+/// names, resolved, kept only where the module it mixes in really answers
+/// every name. Fail-closed at every step — a receiver that does not
+/// resolve, a module that does not resolve, and a module whose OWN map has
+/// neither `method_missing` nor `respond_to_missing?` each contribute
+/// nothing. Split out of `apply_attributed_mixin_edges` to stay under the
+/// complexity ceiling, and named for the half it is: which receivers the
+/// edges prove, before anything is opened.
+fn attributed_mixin_receivers(
+    index: &ProjectIndex,
+    raw: Vec<AttributedMixinEdge>,
+) -> Vec<ClassId> {
+    let mut receivers: Vec<ClassId> = Vec::new();
+    for edge in raw {
+        let candidate_paths: Vec<(String, Vec<String>)> = match &edge.receiver {
+            MixinReceiver::Path { path, nesting } => vec![(path.clone(), nesting.clone())],
+            MixinReceiver::Call { method } => {
+                index.const_returning_methods.get(method).cloned().unwrap_or_default()
+            }
+        };
+        if candidate_paths.is_empty() {
+            continue;
+        }
+        let Some(mid) = index.resolve_const(&edge.module_nesting, &edge.module) else { continue };
+        let module = index.class(mid);
+        if !module.methods.contains_key("method_missing")
+            && !module.methods.contains_key("respond_to_missing?")
+        {
+            continue;
+        }
+        for (path, nesting) in candidate_paths {
+            if let Some(rid) = index.resolve_const(&nesting, &path) {
+                receivers.push(rid);
+            }
+        }
+    }
+    receivers.sort_unstable();
+    receivers.dedup();
+    receivers
 }
 
 /// Singleton-track step N+1, shape (1): apply every held-aside by-name

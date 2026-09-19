@@ -355,9 +355,10 @@ green but at least one declared corpus could not be checked on this machine
 | Gate | Needs | Runs on |
 |---|---|---|
 | `sf check` (software-factory, gate #0) | only the repo | **any machine** |
+| Gate 0b — MRI interpreter (`ruby -v` ≥ 3.x; a missing ruby is fine, the MRI legs skip) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
@@ -493,7 +494,18 @@ installed (learned 2026-08-20, binding). The same trap one layer down, for
 resolves `ruby` to `/usr/bin/ruby` 2.6, which cannot parse an endless method
 definition, so gates a, c1 and g fail on the interpreter and not on the code —
 identical run with brew's ruby 4.0.6 turns all three green, every other verdict
-byte-identical.
+byte-identical. It is a PATH trap, not an ssh trap, and it fires locally too
+(learned 2026-09-19, binding, measured): a local `./scripts/dev gates` whose
+environment put `/usr/bin` before mise's shims ran gate a on ruby 2.6, and the
+red surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,
+unexpected '='` INSIDE a fixture — ~70 minutes into gate c1, with the two
+mutant families that run the operand-types suite aborting on `baseline is not
+green` (the harness's own guard, correct, against a baseline red for the wrong
+reason). Gate 0b now names the interpreter before anything runs it (`PASS
+ruby 3.x`, or a FAIL with the version and the path), so that verdict costs two
+seconds instead of a mutation pass. On `m5` the 3.x ruby is mise's shim under
+`~/.local/share/mise/shims`, and there is no brew ruby at
+`/opt/homebrew/opt/ruby/bin` to reach for.
 
 ## Bootstrap on a new machine
 
@@ -641,7 +653,12 @@ Per-run artifacts land in `target/gauntlet/` (gitignored).
   "the gate does not exist" about code that ships. `target/release/ita` is a
   mutant binary for part of the same window, so a concurrent measurement
   measures the mutant too. Read `git show HEAD:<path>` (or wait for the run),
-  and never commit while a mutation harness holds the tree.
+  and never commit while a mutation harness holds the tree. A KILLED harness
+  leaves its mutant in the tree (measured 2026-09-19: a gauntlet stopped by a
+  3600 s job deadline left `crates/itaruby_semantic/src/index.rs` carrying a
+  mutant, found by `git status` and restored from HEAD before anything else
+  ran) — after any interrupted run, check the tree and restore; never resume
+  on top of it, and never read a file the killed run was rewriting.
 - A suppression that names one TRACK must not soften the other, and a
   mechanism no fixture or mutant can distinguish does not ship (learned
   2026-09-19, binding, measured): `X.include(M)` with `M` answering every

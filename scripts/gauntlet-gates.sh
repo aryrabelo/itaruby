@@ -89,6 +89,28 @@ else
   fi
 fi
 
+# --- gate 0b: the MRI interpreter the operand-type fixtures run under.
+# Those fixtures use endless method definitions (`def m(x) = …`), so a `ruby`
+# older than 3.0 makes gate a fail INSIDE a fixture with a syntax error — a red
+# for the wrong reason, and one that is only understood after the whole
+# mutation pass has burned (measured 2026-09-19: ~70 minutes of gate c1 spent
+# on /usr/bin/ruby 2.6 while a 3.4.2 sat first on the interactive PATH, and
+# both mutant families that run the operand-types suite then aborted with
+# "baseline is not green"). A MISSING ruby is not a failure — the MRI legs
+# skip by design — but an old one is, and saying so here costs two seconds.
+say 'gate 0b — MRI interpreter precondition'
+if ruby_bin=$(command -v ruby 2>/dev/null); then
+  ruby_ver=$(ruby -v 2>&1 | sed -n '1p')
+  ruby_major=$(printf '%s' "$ruby_ver" | sed -n 's/^ruby \([0-9][0-9]*\)\..*/\1/p')
+  if [[ -n $ruby_major && $ruby_major -ge 3 ]]; then
+    ok "ruby $ruby_major.x ($ruby_bin)"
+  else
+    bad "ruby too old for the operand-type fixtures (need 3.x+: they use endless defs): '$ruby_ver' at $ruby_bin — put a 3.x ruby first on PATH"
+  fi
+else
+  ok 'no ruby on PATH (the MRI legs skip by design)'
+fi
+
 say 'gate a — cargo test --workspace'
 if cargo test --workspace >"$ART/tests.txt" 2>&1; then ok 'cargo test'; else bad 'cargo test (see target/gauntlet/tests.txt)'; fi
 
@@ -155,8 +177,15 @@ fi
 # mechanisms being cut. They edit source in place and restore it
 # byte-identical with `cmp`, so they run after gate b's build and before any
 # other binary-consuming gate rebuilds.
+# Fase A/onda 2 added five more families on the same terms: each defends one
+# fail-closed decision that nothing else would notice being cut — the
+# lazy-load base openness (bead B), the self.extended hook harvest (bead H),
+# the two predicate-guard shapes (bead C), the asserted-raise subject span
+# (bead E) and the rebindable-block guard moving above the lookup dispatch
+# (bead F). They are listed here or they are narration.
 say 'gate c1 — per-fix source mutants (each decision accused by a named test)'
-for m in const-missing operand-types singleton mixin-attribution; do
+for m in const-missing operand-types singleton mixin-attribution \
+         lazy-load extended-hook guard-narrowing asserted-raise rebindable-guard; do
   if "$ROOT/scripts/$m-mutants.sh" >"$ART/$m-mutants.txt" 2>&1; then
     ok "$m mutants (every mutant accused, source restored byte-identical)"
   else

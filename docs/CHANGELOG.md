@@ -8,6 +8,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Public baselines regenerated for wave 2 (commit `600bc36`): rails 6 → 1
+  error, discourse 7 → 3, mastodon unchanged — **0 new lines on every repo**,
+  and the seven audit rows this closes bring the public corpora to **0 false
+  positives** (4 errors, all true positives already recorded). Every removed
+  line is marked CLOSED in `scripts/public-baseline/README.md`, which also
+  records the finding that closes bead D by measurement rather than by argument:
+  `vbulletin3.rb:1339`, D's acceptance criterion, is among the lines its sibling
+  suppressions removed (`git log -S vbulletin3` shows it entered the baseline
+  only at `0e64c5e`), so D is dropped exactly as bead A was. The wall column is
+  a load reading, not a criterion median: the first pass measured rails 3.420 s
+  and discourse 24.046 s against ceilings of 3 s and 10 s on a machine at load
+  8.8–22, and a same-window A/B of five alternating runs per binary gave rails
+  **1.544 s (wave 2) vs 1.606 s (parent `a0492ad`) — 0.96x, no regression**. The
+  public gate's time verdict is therefore flaky under fleet load and must be
+  re-measured with the parent before it is believed; its ceilings are unchanged.
+- Two harness defects found and fixed by measurement, both the same family — a
+  red for the wrong reason. `scripts/operand-types-mutants.sh` M14 and M15 went
+  INVALIDO (`anchor matched 0 times`) because wave 2 put `note_load_hook_base`
+  between the recursion and its neighbour, and added `def_locals` to the def
+  frame; both anchors were re-derived and re-counted with the harness's own
+  `src.count(needle) == 1`, and a sweep over all 111 anchors across the nine
+  harnesses now reports zero broken. `scripts/inference-bench-selftest.sh`
+  aborted before its first case under `set -u` — `${extra[@]}` on an EMPTY array
+  is an unbound-variable error in bash < 4.4, which is macOS's `/bin/bash` — so
+  the bench had no guard at all while gate g reported FAIL for a reason that had
+  nothing to do with the bench; the `+` form fixes it and all thirteen mutants
+  now accuse.
+- Gate 0b — the MRI interpreter precondition (learned 2026-09-19, binding,
+  measured): a local gate run whose PATH put `/usr/bin` ahead of mise's shims
+  ran gate a on ruby 2.6 and failed INSIDE an operand-type fixture
+  (`refined_integer_plus_silent.rb … syntax error, unexpected '='`) — ~70
+  minutes of gate c1 spent before the two mutant families that run that suite
+  aborted on `baseline is not green`: a red for the wrong reason, and the guard
+  that caught it was the harness's own baseline check, working correctly. The
+  gauntlet now states the interpreter before anything runs it — `PASS ruby
+  3.x`, or a FAIL naming version and path — so that verdict costs two seconds.
+  Proved both sides: with `/usr/bin/ruby` 2.6 first it accuses, with mise's
+  3.4.2 first it stays silent. A MISSING ruby is still not a failure: the MRI
+  legs skip by design.
 - Attributed-mixin family (bead ita-a8z, phase A): three suppression-only
   mechanisms that close rails' 160-site `Rails::AppBuilder` E0101 cluster with
   ZERO new diagnostics — rails 166 → 6 errors (`new=0`, `gone=160`), mastodon
@@ -37,6 +76,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `testdata/mixin_attribution/`, every accusing one MRI-raised and every silent
   one MRI-clean (the cross-file pair loaded together), plus a two-file test for
   the cross-file resolution the phase-2 map exists for.
+- Fase A/onda 2 (beads B, H, C, E, F): five more fail-closed suppressions, each
+  closing a measured false positive on the public corpora, each proved
+  two-sided. `run_load_hooks(<literal symbol>, <literal base>)` opens the base's
+  INSTANCE surface as `EvalOrSend` — nobody showed this checker a `class_eval`
+  into it — taking rails' `activesupport/test/lazy_load_hooks_test.rb` from
+  three E0101 to zero (rails-head 6 → 3 errors, discourse byte-identical,
+  mastodon unchanged; `scripts/lazy-load-mutants.sh`, 6 mutants). A
+  `self.extended(base)` hook files what it installs on the extender's real
+  surface — `base.delegate` with positional literal symbols, `base.define_method`
+  with a literal, a literal `base.class_eval do ... end` body, `def base.x` on
+  the SINGLETON surface where it lands — and opens the extender when the install
+  is provably there but its name set is unreadable (send/instance_eval/string
+  `class_eval`/dynamic `define_method` or `delegate`/`prefix:`); rails-head 3 → 2
+  (`activemodel/test/cases/naming_test.rb:333`), the `route_set_test.rb:18` true
+  positive stays (`scripts/extended-hook-mutants.sh`, 19 mutants). `respond_to?(:m)`
+  / `(:m, true)` and `x.is_a?(Class|Module) && x < Base` suppress the call they
+  prove, in the branch where the predicate held and in the right operand only,
+  keyed on the resolved PATH rather than resolvability — rails legitimately
+  reopens the core `Class`, and a resolvability bail made the guard fire on the
+  file alone while missing in the merged project
+  (`scripts/guard-narrowing-mutants.sh`, 10 mutants). A call that is the direct
+  subject of `assert_raises`/`assert_raise` or of `expect { }.to raise_error`
+  enters the existing suppressed mode, span-keyed so a nested call keeps firing
+  (`scripts/asserted-raise-mutants.sh`, 6 mutants), and the rebindable-block
+  guard moved above the `lookup_method` dispatch so the Found/arity path
+  consults it too, its NotFound-arm copy deleted
+  (`scripts/rebindable-guard-mutants.sh`, 3 mutants). All five families wired
+  into gate c1. Bead A was DROPPED on re-measurement, not implemented: its two
+  discourse lines do not exist on the pinned corpus
+  (`migrations/tooling/scripts/benchmarks/` is absent at `eff62154`; the ledger
+  already records both as GONE), and the receiverless-versus-explicit-receiver
+  distinction it needs lives in `check.rs`, not in the index — its corpus
+  acceptance is empty and any index-only softening would break the control that
+  must keep accusing. The narrower fail-closed arm was kept over the brief's
+  wider one after measuring both: identical corpus counts, and the wider form
+  fabricates uncertainty from calls that install nothing.
 - `scripts/gate-triage`: routes a finished gauntlet run to its next action,
   reading `target/gauntlet/digest.json` only. Deterministic rules over digest
   features carry the routing — perf red without a parent-revision measurement

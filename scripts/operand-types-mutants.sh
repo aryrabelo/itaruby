@@ -212,19 +212,33 @@ mutant M13 "$IDX" \
 # `self.note_refinement(node);` was the first attempt and is NOT adjacent
 # to the recursion: `note_opaque_eval` and `note_injection` sit between
 # them, so that anchor matched zero times and the mutant was never
-# injected (measured 2026-09-18, sha 63749fc: `FAIL M14 INVALIDO`). Only
-# `note_injection`'s line touches the recursion, and it occurs once.
+# injected (measured 2026-09-18, sha 63749fc: `FAIL M14 INVALIDO`).
+#
+# Rewritten again by the same cause (measured 2026-09-19, wave 2's
+# load-hook family): `note_load_hook_base` joined the chain between
+# `note_injection` and the recursion, and `def_locals` became part of the
+# def frame — so BOTH anchors matched zero times and gate c1 reported
+# `FAIL operand-types mutants` with M14 and M15 INVALIDO, 26 minutes into
+# a family that had already run its other 45 mutants. The neighbour
+# statement is the fragile half of every anchor here: re-count it with the
+# harness's own `src.count(needle) == 1` before a run, never after a red.
 mutant M14 "$IDX" \
-  '        self.note_injection(node);
+  '        self.note_load_hook_base(node);
         ruby_prism::visit_call_node(self, node);' \
-  '        self.note_injection(node);
+  '        self.note_load_hook_base(node);
         let _ = &node;' \
   a_refinement_inside_a_module_new_block_is_silent \
   'recursion into call blocks: a refine inside `Module.new do ... end` is still a refine'
 
+# The needle is the whole def frame, not just the recursion, because that
+# is the mutant the control was proved against: with the frame gone,
+# `self.nested` stays 0 inside a def body, which is what the named test
+# distinguishes.
 mutant M15 "$IDX" \
   '        self.nested += 1;
+        self.def_locals.push(FxHashMap::default());
         ruby_prism::visit_def_node(self, node);
+        self.def_locals.pop();
         self.nested -= 1;' \
   '        let _ = node;' \
   a_refinement_inside_a_method_body_is_silent \

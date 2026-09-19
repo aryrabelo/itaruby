@@ -20,8 +20,9 @@ the ledger includes known false positives and an inconclusive external-gem
 call. The launch bar ("winning on true errors found") must **not** be claimed
 from the raw totals. A wrong diagnostic that enters a baseline stays green
 forever; recording a verdict here does not repair the checker or baseline.
-As of the **2026-09-19 attributed-mixin regeneration** the baseline holds
-**13 errors = 8 FP + 4 TP + 1 inconclusive** (rails 6, mastodon 0, discourse 7);
+As of the **2026-09-19 wave-2 regeneration** the baseline holds
+**4 errors = 0 FP + 4 TP** (rails 1, mastodon 0, discourse 3) — every false
+positive the ledger had recorded on the public corpora is now closed;
 the totals above are the 2026-09-02 history, and the regeneration sections
 record what moved — the 160 builder false positives are gone.
 
@@ -191,6 +192,50 @@ discourse 7). The ceilings are unchanged at the re-pin's wall ×1.5 (3 s / 2 s /
 wall time, and the wall column is a machine-load reading, not a criterion
 median — a tightening from it would be a fabricated measurement.
 
+### Regeneration 2026-09-19 (wave 2: five fail-closed suppressions, rails 6 → 1)
+
+All three baselines regenerated at commit `600bc36` (wave 2's five fail-closed
+suppressions: the load-hook installs read by name, the attributed-mixin
+receivers, and the three in `check.rs`) on m5 (Apple M5), release binary built
+from that commit (`cargo build --release`, exit 0, `CARGO_TARGET_DIR` pinned to
+the checkout). Same pinned revisions as the re-pin above, so this is a
+detection change measured against a fixed tree, not a re-pin.
+
+| id | pinned sha | lines | errors | warnings | ita wall |
+|----|-----------|------:|-------:|---------:|---------:|
+| rails | `6610cb45b39b6a2c1f260f90bbe920b5899f844b` | 935 | 1 | 934 | 1.4–2.2 s |
+| mastodon | `2c92a56e5d0fb490cc2e49a0dd9652499000fcb4` | 986 | 0 | 986 | 0.4–0.9 s |
+| discourse | `eff621544daf344ce70e470b7f54f27bc75b68d9` | 1932 | 3 | 1929 | 6.4–7.9 s |
+
+**Zero new lines on every repo** — the phase removed false positives without
+adding a single one, which is the property that matters. The 4 remaining errors
+are all true positives already recorded above (rails `route_set_test.rb:18`;
+discourse `vbulletin5.rb:77,91` and `base.rb:1510`), so the public corpora now
+hold **0 FP**, down from the 8 the ledger had accumulated. All seven audit rows
+whose lines this regeneration removes are marked CLOSED above.
+
+**Bead D closed by measurement, not by argument.** `vbulletin3.rb:1339` (E0102,
+`postprocess_post_raw`) was D's acceptance criterion — the arity-ambiguity rule.
+`git log -S vbulletin3 -- scripts/public-baseline/discourse.jsonl` shows it
+entered the baseline only at `0e64c5e` and leaves it here: the sibling
+suppressions (C/E/F) closed it, so D has no acceptance left on the pinned
+corpora and is dropped exactly as bead A was. The rule it carried stays unbuilt
+until a corpus shows the shape.
+
+**The wall numbers were taken twice, and the first pass was noise.** The run
+that produced this regeneration measured rails at 3.420 s and discourse at
+24.046 s — both over their ceilings — on a machine whose load average was 8.8
+and climbing past 22 (the fleet runs several agent sessions here). A same-window
+A/B of the two binaries, five alternating runs each, gave rails median
+**1.544 s (wave 2) vs 1.606 s (parent `a0492ad`) — 0.96x, no regression** — while
+the same binary ranged 1.39–3.67 s across five runs. This is AGENTS.md's rule
+("a perf ceiling measured on a loaded machine is not a measurement") demonstrated
+on this very gate: the ceilings are wall ×1.5 of a quiet measurement, and this
+machine's noise is ×2, so **the public gate's time verdict is flaky under fleet
+load** and its red must be re-measured with the parent in the same window before
+it is believed. The ceilings are unchanged: re-deriving them from a loaded run
+would be the fabricated measurement the re-pin section already refuses.
+
 ## Audit ledger (errors)
 
 Every error line is grouped by family — `code` and the receiver class taken
@@ -207,17 +252,17 @@ the existing 160 builder-FP and 3 bulk-import-TP verdicts are unchanged.
 |----|---------------------------|------:|---------|
 | rails | E0101 `Rails::PluginBuilder` | 0 (was 86) | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive**; CLOSED 2026-09-19 by the attributed-mixin family — the receiver the `include` names is opened, so the whole family is silent (0 new errors on the three corpora) |
 | rails | E0101 `Rails::AppBuilder` | 0 (was 74) | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive**; CLOSED 2026-09-19 by the attributed-mixin family, same mechanism as `Rails::PluginBuilder` above |
-| rails | E0101 `LazyLoadHooksTest::FakeContext` | 3 | false positive / correct silence — `activesupport/test/lazy_load_hooks_test.rb:131-137` installs `first_wrestler` via the class hook; `:160-174` installs `second_wrestler` only on `context` (valid at `:174`, intentionally absent on the fresh instance inside `assert_raises NoMethodError` at `:168-170`); `activesupport/lib/active_support/lazy_load_hooks.rb:101-110` dispatches through `class_eval` / `instance_eval`. |
+| rails | E0101 `LazyLoadHooksTest::FakeContext` | 0 (was 3) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — the load-hook installs are read by name, so the three sites are silent; false positive / correct silence — `activesupport/test/lazy_load_hooks_test.rb:131-137` installs `first_wrestler` via the class hook; `:160-174` installs `second_wrestler` only on `context` (valid at `:174`, intentionally absent on the fresh instance inside `assert_raises NoMethodError` at `:168-170`); `activesupport/lib/active_support/lazy_load_hooks.rb:101-110` dispatches through `class_eval` / `instance_eval`. |
 | rails | E0101 `ActionDispatch::Routing::RouteSet` | 0 (was 1) | false positive, FIXED 2026-09-18 and removed from the baseline — `actionpack/lib/action_dispatch/routing/route_set.rb:628` calls `helper_module._routes`, not a RouteSet instance: `Module.new` at `:550`, `helper_module = self` at `:619`, singleton `_routes` at `:599`, and proxy reader at `:561-564` supply the method and return the captured route set. The enclosing `def generate_url_helpers` (`:547`) is an instance method carrying literal `define_method` calls, so RouteSet now fails closed instead of being judged. |
-| rails | E0101 `ActionDispatch::Routing::Endpoint` | 1 | false positive — `actionpack/lib/action_dispatch/routing/endpoint.rb:11-15` defaults `rack_app` to the endpoint, but `rack_app.is_a?(Class) && rack_app < Rails::Engine` short-circuits for that instance; the comparison is for a class-valued rack app, using inherited `Module#<`, not `Endpoint#<`. |
+| rails | E0101 `ActionDispatch::Routing::Endpoint` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — false positive — `actionpack/lib/action_dispatch/routing/endpoint.rb:11-15` defaults `rack_app` to the endpoint, but `rack_app.is_a?(Class) && rack_app < Rails::Engine` short-circuits for that instance; the comparison is for a class-valued rack app, using inherited `Module#<`, not `Endpoint#<`. |
 | rails | E0101 `ActionDispatch::Routing::RouteSetTest::SimpleApp` | 1 | true positive (dormant test helper) — `actionpack/test/dispatch/routing/route_set_test.rb:12-20` defines an Object subclass with no mixins/accessor: initialization stores `@response` at `:14`, but `call` bare-sends `response` at `:18`; dispatching this Rack app would raise `NoMethodError`. Uses at `:26-34,55-72` register routes/check helpers rather than dispatching, so those assertions do not exercise the defect. |
-| rails | E0101 `Blog::Post` | 1 | false positive — the instance send at `activemodel/test/cases/naming_test.rb:328` is provided by `activemodel/test/models/blog_post.rb:8-9` extending `ActiveModel::Naming`; its `extended` hook at `activemodel/lib/active_model/naming.rb:263-266` delegates instance `model_name` to the class, whose method is at `:280`. |
+| rails | E0101 `Blog::Post` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — false positive — the instance send at `activemodel/test/cases/naming_test.rb:328` is provided by `activemodel/test/models/blog_post.rb:8-9` extending `ActiveModel::Naming`; its `extended` hook at `activemodel/lib/active_model/naming.rb:263-266` delegates instance `model_name` to the class, whose method is at `:280`. |
 | mastodon | (no errors) | 0 | — |
 | discourse | E0101 `ForkedMultiDbWriter` | 0 (was 1) | false positive, GONE from the 2026-09-19 baseline — no longer emitted at `eff62154` (the top-level `create_extralite_db(path, initialize: false)` at `migrations/tooling/scripts/benchmarks/write.rb:27-36` now resolves through Object's private instance methods for the `:107` subclass), so removed by correction, not suppression. |
-| discourse | E0101 `Migrations::Conversion::Base` | 1 | false positive / correct silence — `migrations/core/lib/migrations/conversion/base.rb:13-16` calls `setup` only inside `if respond_to?(:setup)`; the base has no setup and skips it, as does the concrete subclass at `migrations/converters/lib/migrations/converters/discourse/converter.rb:6-12`; this is an optional hook, not an unguarded missing-method call. |
+| discourse | E0101 `Migrations::Conversion::Base` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — false positive / correct silence — `migrations/core/lib/migrations/conversion/base.rb:13-16` calls `setup` only inside `if respond_to?(:setup)`; the base has no setup and skips it, as does the concrete subclass at `migrations/converters/lib/migrations/converters/discourse/converter.rb:6-12`; this is an optional hook, not an unguarded missing-method call. |
 | discourse | E0101 `SingleWriter` | 0 (was 1) | false positive, GONE from the 2026-09-19 baseline — no longer emitted at `eff62154` (same top-level-helper resolution as `ForkedMultiDbWriter`; the `:54` Object subclass reaches `:27-36` with no receiver), so removed by correction, not suppression. |
-| discourse | E0102 method `postprocess_post_raw` | 1 | false positive — `script/import_scripts/vbulletin3.rb:1339` supplies two arguments to its own two-argument definition at `:1563`; that script requires `base` at `:4` and defines `ImportScripts::VBulletin` at `:20`. The separate v4 entrypoint `script/import_scripts/vbulletin.rb:21,884` reuses the class name with a one-argument method, but is not loaded by the v3 entrypoint; merging their signatures invents the arity error. |
-| discourse | E0102 method `can_edit_tag?` | 1 | false positive / correct silence (intentional negative test) — `spec/lib/guardian/tag_guardian_spec.rb:98-100` deliberately omits the required tag inside `expect { ... }.to raise_error(ArgumentError)`; `lib/guardian.rb:34` includes `TagGuardian`, whose `lib/guardian/tag_guardian.rb:18` requires one argument. The exception is the asserted behavior, not a defect. |
-| discourse | E0102 method `body` | 1 | inconclusive (receiver-blind suppression candidate) — `lib/email/message_builder.rb:200-203` sends `body html` inside `Mail::Part.new`, while the enclosing builder's unrelated `body` at `:206` takes zero arguments. Missing evidence: the pinned mail gem's `Mail::Part`/`Mail::Message` constructor block-evaluation behavior and body setter arity; these dependency sources are not present in either audited clone, so source-only inspection cannot prove the DSL receiver/arity. |
+| discourse | E0102 method `postprocess_post_raw` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2 — this was bead D's acceptance criterion, closed by its sibling beads (C/E/F), which is why D is dropped by measurement rather than built** — false positive — `script/import_scripts/vbulletin3.rb:1339` supplies two arguments to its own two-argument definition at `:1563`; that script requires `base` at `:4` and defines `ImportScripts::VBulletin` at `:20`. The separate v4 entrypoint `script/import_scripts/vbulletin.rb:21,884` reuses the class name with a one-argument method, but is not loaded by the v3 entrypoint; merging their signatures invents the arity error. |
+| discourse | E0102 method `can_edit_tag?` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — false positive / correct silence (intentional negative test) — `spec/lib/guardian/tag_guardian_spec.rb:98-100` deliberately omits the required tag inside `expect { ... }.to raise_error(ArgumentError)`; `lib/guardian.rb:34` includes `TagGuardian`, whose `lib/guardian/tag_guardian.rb:18` requires one argument. The exception is the asserted behavior, not a defect. |
+| discourse | E0102 method `body` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — inconclusive (receiver-blind suppression candidate) — `lib/email/message_builder.rb:200-203` sends `body html` inside `Mail::Part.new`, while the enclosing builder's unrelated `body` at `:206` takes zero arguments. Missing evidence: the pinned mail gem's `Mail::Part`/`Mail::Message` constructor block-evaluation behavior and body setter arity; these dependency sources are not present in either audited clone, so source-only inspection cannot prove the DSL receiver/arity. |
 | discourse | E0101 `BulkImport::VBulletin5` | 2 | true positive — proven by reading `script/bulk_import/vbulletin5.rb:77,91`; receiver `BulkImport::VBulletin5` has no `import_user_account_id`, no `create_oauth_records` (ancestry checked: `BulkImport::Base` — abstract-raise stub at `base.rb:409`, no later stronger open reason — then Object; no `def`/`attr_*`/`alias`/literal `define_method`/`method_missing`/`delegate`/`Forwardable` for either name anywhere in the repo) |
 | discourse | E0101 `BulkImport::Base` | 1 | true positive — proven by reading `script/bulk_import/base.rb:1512`; `process_user_stat` bare-sends `user_email` with no local of that name in scope, and receiver `BulkImport::Base` has no `user_email` (ancestry checked: no written superclass → Object, no mixins; no `def`/`attr_*`/`alias`/literal `define_method`/`method_missing` repo-wide) |

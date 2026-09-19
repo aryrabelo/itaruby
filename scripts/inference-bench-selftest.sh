@@ -54,7 +54,15 @@ rebuild_lab() {
 run_lab() {
   local extra=()
   [[ ${1:-} == sorbet ]] && extra+=(--sorbet)
-  ruby "$LAB/scripts/inference-bench.rb" --ita "$ITA" "${extra[@]}" 2>&1
+  # `${extra[@]}` on an EMPTY array is an unbound-variable error under
+  # `set -u` in bash < 4.4 — which is macOS's /bin/bash 3.2, and that is
+  # what `#!/usr/bin/env bash` resolves to when the lab runs with a PATH
+  # that has no newer bash ahead of it. Measured 2026-09-19 on gate g:
+  # `line 57: extra[@]: unbound variable` aborted the selftest before its
+  # first case, so the bench had no guard at all while the gate reported
+  # FAIL for a reason that had nothing to do with the bench. The `+` form
+  # expands to nothing when the array is empty, on every bash.
+  ruby "$LAB/scripts/inference-bench.rb" --ita "$ITA" ${extra[@]+"${extra[@]}"} 2>&1
 }
 
 # G1 — the pristine control.

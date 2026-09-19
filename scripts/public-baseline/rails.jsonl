@@ -1,9 +1,4 @@
-{"code":"E0101","column":26,"line":169,"message":"undefined method `second_wrestler` for `LazyLoadHooksTest::FakeContext`","path":"rails/activesupport/test/lazy_load_hooks_test.rb","severity":"error"}
-{"code":"E0101","column":40,"line":174,"message":"undefined method `second_wrestler` for `LazyLoadHooksTest::FakeContext`","path":"rails/activesupport/test/lazy_load_hooks_test.rb","severity":"error"}
-{"code":"E0101","column":43,"line":15,"message":"undefined method `<` for `ActionDispatch::Routing::Endpoint`","path":"rails/actionpack/lib/action_dispatch/routing/endpoint.rb","severity":"error"}
-{"code":"E0101","column":50,"line":137,"message":"undefined method `first_wrestler` for `LazyLoadHooksTest::FakeContext`","path":"rails/activesupport/test/lazy_load_hooks_test.rb","severity":"error"}
 {"code":"E0101","column":55,"line":18,"message":"undefined method `response` for `ActionDispatch::Routing::RouteSetTest::SimpleApp`","path":"rails/actionpack/test/dispatch/routing/route_set_test.rb","severity":"error"}
-{"code":"E0101","column":56,"line":333,"message":"undefined method `model_name` for `Blog::Post`","path":"rails/activemodel/test/cases/naming_test.rb","severity":"error"}
 {"code":"E0104","column":1,"line":18,"message":"unresolved constant `SQLite3::ForkSafety`","path":"rails/activerecord/lib/active_record/connection_adapters/sqlite3_adapter.rb","severity":"warning"}
 {"code":"E0104","column":1,"line":35,"message":"unresolved constant `Zeitwerk::Loader`","path":"rails/actioncable/lib/action_cable.rb","severity":"warning"}
 {"code":"E0104","column":1,"line":4,"message":"unresolved constant `Resque`","path":"rails/activejob/test/adapters/resque.rb","severity":"warning"}

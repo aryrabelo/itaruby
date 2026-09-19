@@ -1,0 +1,2 @@
+{"code":"E0101","column":5,"line":12,"message":"undefined method `a` for `B`","path":"rails/a.rb","severity":"error"}
+{"code":"E0104","column":1,"line":30,"message":"unresolved constant `X`","path":"rails/b.rb","severity":"warning"}

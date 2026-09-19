@@ -12,12 +12,28 @@
 #      missing baseline, or a broken ita binary — the summary names which
 #
 # Repos are declared one per line in scripts/public-corpora.txt:
-#   <id> <git-url> <pinned-sha> <time_ceiling_s>
+#   <id> <git-url> <pinned-sha> <time_ceiling_s> [<clone-dir>]
 # (ids: rails, mastodon, discourse, gitlab-foss — public code, so no
 # secrecy wall here; the diagnostic baseline for each id is stored IN THE
 # CLEAR in scripts/public-baseline/<id>.jsonl, normalized by stripping each
 # repo's clone root and replacing it with `<id>/` so the baseline is
 # machine-independent).
+#
+# <clone-dir> is OPTIONAL and names the directory under
+# $PUBLIC_CORPORA_ROOT that holds the pinned revision; without it the
+# canonical `<id>` clone is used and the historical semantics stand (a
+# missing or wrong-HEAD clone is a SKIP, or a repair under
+# PUBLIC_GATE_CLONE=1). WITH it the declaration is a claim about which tree
+# is measured, and the gate is FAIL-CLOSED over that claim: the path must
+# exist and its HEAD must be the declared sha, else the repo FAILS — never
+# skipped, never measured. A gate that measures one revision while its
+# transcript talks about another is the false-green shape this repo already
+# paid for twice (AGENTS.md), and it is how a re-pin silently becomes a
+# measurement of the revision it meant to replace.
+#
+# Every judged repo prints `public revision (<id>): tree <path> at sha <sha>`
+# before anything is compared, so no number in the transcript (or in
+# scripts/gate-digest's read of it) can belong to an unnamed tree.
 #
 # Unlike the private corpora (which the project never writes), the public
 # corpora DO get cloned on demand — but never automatically. gitlab-foss
@@ -27,7 +43,11 @@
 # per-repo SKIP (exit 2), named in the transcript.
 #
 # Clones live at $PUBLIC_CORPORA_ROOT/<id> (default
-# $HOME/Sites/temp-files/public-corpora). Baselines live at
+# $HOME/Sites/temp-files/public-corpora), or at
+# $PUBLIC_CORPORA_ROOT/<clone-dir> when the declaration names one — a linked
+# `git worktree` of the canonical clone is the normal case for a re-pin,
+# because re-pointing the canonical clone would move the tree another
+# measurement may still be reading. Baselines live at
 # scripts/public-baseline/<id>.jsonl unless PUBLIC_BASELINE_DIR redirects
 # the directory (a test hook; the committed layout is authoritative).
 #
@@ -43,6 +63,7 @@ ITA=$ROOT/target/release/ita
 CORPORA_FILE=${PUBLIC_CORPORA_FILE:-$ROOT/scripts/public-corpora.txt}
 BASELINE_DIR=${PUBLIC_BASELINE_DIR:-$ROOT/scripts/public-baseline}
 CLONE_ROOT=${PUBLIC_CORPORA_ROOT:-$HOME/Sites/temp-files/public-corpora}
+ATTRIB=${PUBLIC_ATTRIB:-$ROOT/scripts/public-drift-attrib}
 ART=${ART:-$ROOT/target/gauntlet}
 SRB_TIMEOUT=600
 
@@ -103,14 +124,14 @@ if [[ ! -f $CORPORA_FILE ]]; then
   bad "public corpus: $CORPORA_FILE missing; a gate with no declared repos proves nothing"
 fi
 
-while read -r id url sha ceiling; do
+while read -r id url sha ceiling clone_dir; do
   [[ -z $id || $id == \#* ]] && continue
   if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
     bad "public corpus: malformed repo line (bad pinned sha) in $CORPORA_FILE: $id"
     continue
   fi
   base="$BASELINE_DIR/$id.jsonl"
-  clone="$CLONE_ROOT/$id"
+  clone="$CLONE_ROOT/${clone_dir:-$id}"
 
   # A repo with no baseline cannot be judged — that is a SKIP, not a
   # failure: baselines are generated once a machine actually holds a clone.
@@ -124,6 +145,16 @@ while read -r id url sha ceiling; do
   # by default: only PUBLIC_GATE_CLONE=1 creates a missing clone or repairs
   # a broken/pinned-mismatched one. Otherwise the repo is skipped, never
   # failed — a missing clone is a machine limitation, not a regression.
+  #
+  # An EXPLICIT <clone-dir> changes that: the declaration names the tree that
+  # will be measured, so a missing path or a wrong HEAD is a FAIL, not a
+  # SKIP, and PUBLIC_GATE_CLONE does not rescue it either — a "repair" that
+  # silently checks out the declared sha into a tree someone else may be
+  # reading is exactly the surprise this rule exists to prevent.
+  if [[ -n $clone_dir && ! -d $clone ]]; then
+    bad "public corpus ($id): declared clone $clone is missing — refusing to measure another tree (fail-closed)"
+    continue
+  fi
   if [[ ! -d $clone ]]; then
     if [[ ${PUBLIC_GATE_CLONE:-0} == 1 ]]; then
       mkdir -p "$CLONE_ROOT"
@@ -137,6 +168,10 @@ while read -r id url sha ceiling; do
     fi
   fi
   head=$(git -C "$clone" rev-parse HEAD 2>/dev/null || true)
+  if [[ -n $clone_dir && $head != "$sha" ]]; then
+    bad "public corpus ($id): declared clone $clone is at ${head:-<no HEAD>}, not the declared sha $sha — refusing to measure another revision (fail-closed)"
+    continue
+  fi
   if [[ $head != "$sha" ]]; then
     if [[ ${PUBLIC_GATE_CLONE:-0} == 1 ]]; then
       if ! git -C "$clone" fetch --quiet --depth 1 origin "$sha" >"$ART/public-$id.txt" 2>&1 &&
@@ -153,6 +188,9 @@ while read -r id url sha ceiling; do
       continue
     fi
   fi
+  # Name the measured tree before any number is printed. Every sha the gate
+  # utters from here on belongs to this path.
+  ok "public revision ($id): tree $clone at sha $head"
 
   out="$ART/public-$id.txt"
   clear_artifacts "$out" "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" \
@@ -185,19 +223,40 @@ while read -r id url sha ceiling; do
   comm -13 "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" >"$ART/public-$id-gone.txt"
   new=$(wc -l <"$ART/public-$id-new.txt" | tr -d ' ')
   gone=$(wc -l <"$ART/public-$id-gone.txt" | tr -d ' ')
+  lines=$(wc -l <"$ART/public-$id-fresh.txt" | tr -d ' ')
+  errs=$(grep -c '"severity":"error"' "$ART/public-$id-fresh.txt" || true)
+  warns=$(( lines - errs ))
+  base_lines=$(wc -l <"$ART/public-$id-expected.txt" | tr -d ' ')
+  base_errs=$(grep -c '"severity":"error"' "$ART/public-$id-expected.txt" || true)
+  base_warns=$(( base_lines - base_errs ))
 
   if (( new == 0 && gone == 0 )); then
-    ok "public errors match baseline exactly ($id)"
+    ok "public errors match baseline exactly ($id): $errs error(s) + $warns warning(s) = $lines line(s), tree $clone at sha $head"
   else
+    # The set changed, so the run is red either way; what this adds is WHICH
+    # KIND of change it is. Most of a re-pin's "drift" is files moving under
+    # the diagnostics — the same path+code+message with only `line` changed,
+    # which is not a detection change at all. Before
+    # scripts/public-drift-attrib that split was done by hand (2026-09-19:
+    # rails showed 180 new / 169 gone lines, of which 168 were pure shifts).
     drift="$ART/public-$id-drift.txt"
-    {
-      echo "# drift for public corpus $id — in the clear (public repo, no secrecy wall)"
-      echo "## new (present now, not in baseline; $new line(s)):"
-      cat "$ART/public-$id-new.txt"
-      echo "## gone (in baseline, not produced now; $gone line(s)):"
-      cat "$ART/public-$id-gone.txt"
-    } >"$drift"
-    bad "public errors drifted ($id): $new new, $gone gone (see target/gauntlet/public-$id-drift.txt)"
+    if [[ -x $ATTRIB ]] && attrib_json=$("$ATTRIB" --id "$id" \
+          --new "$ART/public-$id-new.txt" --gone "$ART/public-$id-gone.txt" \
+          --tree "$clone" --rev "$head" --report "$drift" --json \
+          2>"$ART/public-$id-attrib-stderr.txt"); then
+      moved=$(printf '%s' "$attrib_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["moved"])' 2>/dev/null || true)
+      bad "public errors drifted ($id): $new new, $gone gone — ${moved:-?} line(s) are pure line shifts, the rest is real drift ($errs error(s) now vs $base_errs in baseline; see target/gauntlet/public-$id-drift.txt)"
+    else
+      {
+        echo "# drift for public corpus $id — in the clear (public repo, no secrecy wall)"
+        echo "# measured tree $clone at $head"
+        echo "## new (present now, not in baseline; $new line(s)):"
+        cat "$ART/public-$id-new.txt"
+        echo "## gone (in baseline, not produced now; $gone line(s)):"
+        cat "$ART/public-$id-gone.txt"
+      } >"$drift"
+      bad "public errors drifted ($id): $new new, $gone gone — drift attribution UNAVAILABLE ($ATTRIB did not run; raw sets, unclassified, in target/gauntlet/public-$id-drift.txt)"
+    fi
   fi
 
   # Wall-time ceiling. Slack is debt (AGENTS.md, binding): the ceiling is a

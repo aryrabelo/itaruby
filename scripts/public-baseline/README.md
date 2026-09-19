@@ -20,6 +20,9 @@ the ledger includes known false positives and an inconclusive external-gem
 call. The launch bar ("winning on true errors found") must **not** be claimed
 from the raw totals. A wrong diagnostic that enters a baseline stays green
 forever; recording a verdict here does not repair the checker or baseline.
+As of the **2026-09-19 re-pin** the baseline holds **173 errors = 168 FP + 4
+TP + 1 inconclusive** (rails 166, mastodon 0, discourse 7); the totals above
+are the 2026-09-02 history, and the re-pin section records what moved.
 
 Warnings are a separate gap (the external-declaration gap, bead ita-10d);
 they are ceilings, not truth claims, and this ledger concerns **errors only**.
@@ -99,6 +102,64 @@ reading of one.
 |----|-----------|------:|-------:|---------:|---------:|
 | rails | `3df2cbea2027026a29edb92cbb7e336a63e35444` | 1089 | 166 | 923 | (not timed — measured on a loaded machine) |
 
+### Regeneration 2026-09-19 (re-pin ~2.5 weeks forward)
+
+All three corpora re-pinned to their default-branch HEAD of 2026-09-19 and
+every baseline regenerated against the new revision in this commit. Measured
+on m5 (Apple M5), release binary at commit `b4acee4` (`cargo build --release`,
+exit 0, `CARGO_TARGET_DIR` pinned to the worktree). The canonical clones were
+NOT moved — the re-pinned revisions were measured in linked `git worktree`s
+(`rails-head`/`mastodon-head`/`discourse-head`), and `scripts/public-gate.sh`
+now verifies each declared tree's HEAD against the pinned sha fail-closed, so
+a re-pin cannot silently measure the revision it meant to replace.
+
+| id | pinned sha | .rb files | lines | errors | warnings | ita wall |
+|----|-----------|----------:|------:|-------:|---------:|---------:|
+| rails | `6610cb45b39b6a2c1f260f90bbe920b5899f844b` | 3464 | 1100 | 166 | 934 | 1.5–1.7 s |
+| mastodon | `2c92a56e5d0fb490cc2e49a0dd9652499000fcb4` | 3266 | 986 | 0 | 986 | 0.4–0.7 s |
+| discourse | `eff621544daf344ce70e470b7f54f27bc75b68d9` | 12280 | 1936 | 7 | 1929 | 5.3–6.6 s |
+
+Ceilings tightened to wall x1.5: rails 3 s (was 3), mastodon 2 s (was 2),
+discourse **10 s (was 16)** — the corpus is measurably faster now than the
+2026-09-02 anchor, and slack is debt (AGENTS.md).
+
+**Drift vs the 2026-09-02 baselines, classified by `scripts/public-drift-attrib`**
+(moved = same `path`+`code`+`message`, only `line` changed — a file grew under
+the diagnostic, not a detection change; real = a diagnostic newly emitted or no
+longer emitted):
+
+| id | new | gone | moved (line shift) | real new | real gone |
+|----|----:|-----:|-------------------:|---------:|----------:|
+| rails | 180 | 169 | 168 | 12 | 1 |
+| mastodon | 2 | 2 | 2 | 0 | 0 |
+| discourse | 364 | 327 | 289 | 75 | 38 |
+
+The raw drift looks large (994 of 1231 total new/gone lines) but is almost all
+files moving under the diagnostics. At ERROR severity the real drift is tiny:
+**0 new errors, 2 gone errors**, both discourse false positives now silent —
+`create_extralite_db` on `ForkedMultiDbWriter` and on `SingleWriter` (the
+top-level-helper-through-Object resolution). Everything else in the real-drift
+columns is E0104 warnings (the external-declaration gap, ita-10d — ceilings,
+not truth claims). rails 166 → 166 errors, discourse 9 → 7, mastodon 0 → 0.
+
+New error totals: **173 = 168 FP + 4 TP + 1 inconclusive** (was 175 = 170 FP +
+4 TP + 1 inconclusive; the two removed lines were false positives). The
+per-family verdicts in the table below were audited on the 2026-09-02 pins and
+are unchanged in content on the new pins — the surviving families' lines only
+shifted, verified mechanically by the classifier — so their internal line-refs
+are as-of that audit and move a few lines on the re-pin (e.g. `Blog::Post`
+`naming_test.rb:328`→`:333`, `BulkImport::Base` `base.rb:1512`→`:1510`).
+
+**gitlab-foss cost (measured 2026-09-19, read-only, NOT adopted — the owner
+decides whether it enters):** a `git clone --depth 1` of today's master
+(`ec664686`) is ~1.2 GB on disk (working tree ~1.0 GB + `.git` 214 MB) with
+55,037 `.rb` files; `ita check` over it ran in **18.4 s** (→ ceiling ~28 s at
+x1.5) and emitted 17,545 diagnostics (59 errors, 17,486 warnings, all
+unaudited). A `--filter=blob:none` full-history clone was not run (no fresh
+clone taken this session); the depth-1 footprint above is the disk budget a
+judged gitlab-foss would need. The public declaration and the SKIP stay as
+they are.
+
 ## Audit ledger (errors)
 
 Every error line is grouped by family — `code` and the receiver class taken
@@ -121,9 +182,9 @@ the existing 160 builder-FP and 3 bulk-import-TP verdicts are unchanged.
 | rails | E0101 `ActionDispatch::Routing::RouteSetTest::SimpleApp` | 1 | true positive (dormant test helper) — `actionpack/test/dispatch/routing/route_set_test.rb:12-20` defines an Object subclass with no mixins/accessor: initialization stores `@response` at `:14`, but `call` bare-sends `response` at `:18`; dispatching this Rack app would raise `NoMethodError`. Uses at `:26-34,55-72` register routes/check helpers rather than dispatching, so those assertions do not exercise the defect. |
 | rails | E0101 `Blog::Post` | 1 | false positive — the instance send at `activemodel/test/cases/naming_test.rb:328` is provided by `activemodel/test/models/blog_post.rb:8-9` extending `ActiveModel::Naming`; its `extended` hook at `activemodel/lib/active_model/naming.rb:263-266` delegates instance `model_name` to the class, whose method is at `:280`. |
 | mastodon | (no errors) | 0 | — |
-| discourse | E0101 `ForkedMultiDbWriter` | 1 | false positive — `migrations/tooling/scripts/benchmarks/write.rb:114` is a bare call to the top-level `create_extralite_db(path, initialize: false)` defined at `:27-36`; the class at `:107` inherits Object, where Ruby installs top-level methods as private instance methods, so this call resolves. |
+| discourse | E0101 `ForkedMultiDbWriter` | 0 (was 1) | false positive, GONE from the 2026-09-19 baseline — no longer emitted at `eff62154` (the top-level `create_extralite_db(path, initialize: false)` at `migrations/tooling/scripts/benchmarks/write.rb:27-36` now resolves through Object's private instance methods for the `:107` subclass), so removed by correction, not suppression. |
 | discourse | E0101 `Migrations::Conversion::Base` | 1 | false positive / correct silence — `migrations/core/lib/migrations/conversion/base.rb:13-16` calls `setup` only inside `if respond_to?(:setup)`; the base has no setup and skips it, as does the concrete subclass at `migrations/converters/lib/migrations/converters/discourse/converter.rb:6-12`; this is an optional hook, not an unguarded missing-method call. |
-| discourse | E0101 `SingleWriter` | 1 | false positive — `migrations/tooling/scripts/benchmarks/write.rb:58` resolves the top-level helper at `:27-36` through Object's private instance methods; the Object subclass at `:54` needs no explicit include or receiver for the call. |
+| discourse | E0101 `SingleWriter` | 0 (was 1) | false positive, GONE from the 2026-09-19 baseline — no longer emitted at `eff62154` (same top-level-helper resolution as `ForkedMultiDbWriter`; the `:54` Object subclass reaches `:27-36` with no receiver), so removed by correction, not suppression. |
 | discourse | E0102 method `postprocess_post_raw` | 1 | false positive — `script/import_scripts/vbulletin3.rb:1339` supplies two arguments to its own two-argument definition at `:1563`; that script requires `base` at `:4` and defines `ImportScripts::VBulletin` at `:20`. The separate v4 entrypoint `script/import_scripts/vbulletin.rb:21,884` reuses the class name with a one-argument method, but is not loaded by the v3 entrypoint; merging their signatures invents the arity error. |
 | discourse | E0102 method `can_edit_tag?` | 1 | false positive / correct silence (intentional negative test) — `spec/lib/guardian/tag_guardian_spec.rb:98-100` deliberately omits the required tag inside `expect { ... }.to raise_error(ArgumentError)`; `lib/guardian.rb:34` includes `TagGuardian`, whose `lib/guardian/tag_guardian.rb:18` requires one argument. The exception is the asserted behavior, not a defect. |
 | discourse | E0102 method `body` | 1 | inconclusive (receiver-blind suppression candidate) — `lib/email/message_builder.rb:200-203` sends `body html` inside `Mail::Part.new`, while the enclosing builder's unrelated `body` at `:206` takes zero arguments. Missing evidence: the pinned mail gem's `Mail::Part`/`Mail::Message` constructor block-evaluation behavior and body setter arity; these dependency sources are not present in either audited clone, so source-only inspection cannot prove the DSL receiver/arity. |

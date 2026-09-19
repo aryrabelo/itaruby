@@ -464,8 +464,8 @@
 {"code":"E0104","column":27,"line":11,"message":"unresolved constant `ActiveModelSerializers::Model`","path":"mastodon/app/models/translation.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":14,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_cid.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":15,"message":"unresolved constant `WebAuthn::FakeClient`","path":"mastodon/spec/requests/auth/sessions/security_key_options_spec.rb","severity":"warning"}
-{"code":"E0104","column":27,"line":205,"message":"unresolved constant `Thor::RequiredArgumentMissingError`","path":"mastodon/spec/lib/mastodon/cli/accounts_spec.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":21,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
+{"code":"E0104","column":27,"line":219,"message":"unresolved constant `Thor::RequiredArgumentMissingError`","path":"mastodon/spec/lib/mastodon/cli/accounts_spec.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":29,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_security.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":3,"message":"unresolved constant `ActiveModelSerializers::Adapter::Attributes`","path":"mastodon/app/lib/node_info/adapter.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":3,"message":"unresolved constant `ActiveModelSerializers::Model`","path":"mastodon/app/models/notification_group.rb","severity":"warning"}
@@ -922,7 +922,7 @@
 {"code":"E0104","column":71,"line":30,"message":"unresolved constant `WebAuthn`","path":"mastodon/spec/system/admin/users/two_factor_authentications_spec.rb","severity":"warning"}
 {"code":"E0104","column":73,"line":160,"message":"unresolved constant `HTTP::ConnectionError`","path":"mastodon/spec/lib/activitypub/activity/create_spec.rb","severity":"warning"}
 {"code":"E0104","column":74,"line":88,"message":"unresolved constant `HTTP::TimeoutError`","path":"mastodon/spec/lib/paperclip/response_with_limit_adapter_spec.rb","severity":"warning"}
-{"code":"E0104","column":75,"line":1186,"message":"unresolved constant `HTTP::ConnectionError`","path":"mastodon/spec/lib/mastodon/cli/accounts_spec.rb","severity":"warning"}
+{"code":"E0104","column":75,"line":1200,"message":"unresolved constant `HTTP::ConnectionError`","path":"mastodon/spec/lib/mastodon/cli/accounts_spec.rb","severity":"warning"}
 {"code":"E0104","column":75,"line":20,"message":"unresolved constant `HTTPClient::KeepAliveDisconnected`","path":"mastodon/app/lib/admin/system_check/elasticsearch_check.rb","severity":"warning"}
 {"code":"E0104","column":75,"line":283,"message":"unresolved constant `ActionMailer::MailDeliveryJob`","path":"mastodon/spec/models/user_spec.rb","severity":"warning"}
 {"code":"E0104","column":75,"line":32,"message":"unresolved constant `OpenIDConnect::Discovery::Provider::Config`","path":"mastodon/app/lib/content_security_policy.rb","severity":"warning"}

@@ -1,0 +1,189 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+#
+# public-drift-attrib — split a public corpus's drift into its two kinds.
+#
+# The public gate (`scripts/public-gate.sh`) compares a fresh
+# `ita check <clone> --format=json` run against the committed baseline for an
+# id and FAILS on any line that is new or gone. Two very different things land
+# in those two files:
+#
+#   (a) a LINE SHIFT — the same diagnostic (`path`, `code`, `message` all
+#       identical, `column` too, since the raw line is what carries them) with
+#       only its `line` changed: the file grew or was reformatted above it.
+#       The SET changed; the DETECTION did not.
+#   (b) REAL DRIFT — a diagnostic the checker now emits and did not before, or
+#       one it no longer emits.
+#
+# Until 2026-09-19 that split was done by hand, per corpus. Measured that day
+# on the re-pinned revisions (rails 6610cb45, mastodon 2c92a56e, discourse
+# eff62154): rails showed 180 new / 169 gone lines while carrying 166 errors
+# in BOTH runs — the "drift" there was almost entirely files moving under the
+# diagnostics, which no reader can see from the raw comm sets.
+#
+# The rule it must never break: EVERY non-empty input line is accounted for
+# exactly once, and a line that cannot be attributed is reported as drift,
+# never dropped. A non-empty line that is not a JSON diagnostic object stops
+# the run (exit 2) instead of being skipped — a classifier that silently
+# discards what it cannot read reports a clean drift where there was an
+# unreadable one, which is the false-green shape this repo already paid for.
+#
+# Stdlib only, no network. Exit 0 report produced (even a drift-free one) ·
+# 2 unusable arguments or malformed input.
+#
+# Usage:
+#   scripts/public-drift-attrib --new FILE --gone FILE [--id ID]
+#                               [--tree PATH] [--rev SHA]
+#                               [--report FILE] [--json]
+#
+# `--new`/`--gone` are the gate's `public-<id>-new.txt`/`-gone.txt` (comm
+# output, one normalized JSON diagnostic per line, sorted and unique).
+
+require 'json'
+
+EXIT_ARGS = 2
+
+# The identity of a diagnostic for shift purposes. `path` is part of it: the
+# same message on a DIFFERENT file is not a moved line, it is a new finding.
+KEY_FIELDS = %w[code message path].freeze
+
+def die(message)
+  warn "public-drift-attrib: #{message}"
+  exit EXIT_ARGS
+end
+
+def clip(str, max)
+  s = str.to_s.gsub(/\s+/, ' ').strip
+  s.length > max ? "#{s[0, max - 1]}…" : s
+end
+
+# Every non-empty line must be a JSON object; anything else is a hard stop.
+def read_side(path, what)
+  die "#{what} set is missing: #{path.inspect}" unless path && File.file?(path)
+
+  entries = []
+  File.readlines(path, chomp: true).each_with_index do |raw, i|
+    line = raw.strip
+    next if line.empty?
+
+    obj = begin
+      JSON.parse(line)
+    rescue JSON::ParserError
+      nil
+    end
+    die "#{what} #{path}: line #{i + 1} is not a JSON diagnostic object: #{clip(line, 80)}" unless obj.is_a?(Hash)
+
+    entries << { 'raw' => line, 'key' => KEY_FIELDS.map { |f| obj[f].to_s }.freeze, 'line' => obj['line'] }
+  end
+  entries.uniq { |e| e['raw'] }
+end
+
+# Pair every key that appears on BOTH sides, in ascending line order; the
+# surplus on either side is real drift. Nothing is ever discarded.
+def attribute(new_entries, gone_entries)
+  new_by_key = new_entries.group_by { |e| e['key'] }
+  gone_by_key = gone_entries.group_by { |e| e['key'] }
+  shifts = []
+  real_new = []
+  real_gone = []
+  (new_by_key.keys | gone_by_key.keys).each do |key|
+    n = (new_by_key[key] || []).sort_by { |e| [e['line'].to_i, e['raw']] }
+    g = (gone_by_key[key] || []).sort_by { |e| [e['line'].to_i, e['raw']] }
+    pairs = [n.length, g.length].min
+    pairs.times do |i|
+      shifts << { 'key' => key, 'from' => g[i]['line'], 'to' => n[i]['line'], 'raw_from' => g[i]['raw'] }
+    end
+    real_new.concat(n[pairs..] || [])
+    real_gone.concat(g[pairs..] || [])
+  end
+  [shifts, real_new, real_gone]
+end
+
+def shift_line(shift)
+  code, message, path = shift['key']
+  format('%s -> %s  %s  %s  %s', shift['from'].inspect, shift['to'].inspect, code, path, clip(message, 90))
+end
+
+def report(id, tree, rev, new_entries, gone_entries, shifts, real_new, real_gone)
+  new_n = new_entries.length
+  gone_n = gone_entries.length
+  out = []
+  out << "# drift for public corpus #{id} — in the clear (public repo, no secrecy wall)"
+  out << "# measured tree #{tree} at #{rev}" if tree && rev
+  out << format('# attribution: %d new · %d gone · %d moved line(s) (same path+code+message, only `line` changed, NOT drift) · %d new real · %d gone real',
+                new_n, gone_n, shifts.length, real_new.length, real_gone.length)
+  out << "## moved (line shift only — NOT drift; #{shifts.length} line(s)):"
+  shifts.each { |s| out << shift_line(s) }
+  out << "## new (real drift — #{real_new.length} line(s)):"
+  real_new.each { |e| out << e['raw'] }
+  out << "## gone (real drift — #{real_gone.length} line(s)):"
+  real_gone.each { |e| out << e['raw'] }
+  "#{out.join("\n")}\n"
+end
+
+new_path = nil
+gone_path = nil
+report_path = nil
+id = nil
+tree = nil
+rev = nil
+as_json = false
+
+argv = ARGV.dup
+until argv.empty?
+  flag = argv.shift
+  case flag
+  when '--new'    then new_path = argv.shift
+  when '--gone'   then gone_path = argv.shift
+  when '--report' then report_path = argv.shift
+  when '--id'     then id = argv.shift
+  when '--tree'   then tree = argv.shift
+  when '--rev'    then rev = argv.shift
+  when '--json'   then as_json = true
+  when '-h', '--help'
+    puts 'usage: public-drift-attrib --new FILE --gone FILE [--id ID] [--tree PATH] [--rev SHA] [--report FILE] [--json]'
+    exit 0
+  else
+    die "unknown argument #{flag.inspect}"
+  end
+end
+
+die '--new is required' if new_path.nil?
+die '--gone is required' if gone_path.nil?
+
+new_entries = read_side(new_path, 'new')
+gone_entries = read_side(gone_path, 'gone')
+shifts, real_new, real_gone = attribute(new_entries, gone_entries)
+id ||= File.basename(new_path).sub(/\Apublic-/, '').sub(/-new\.txt\z/, '')
+
+# Every line is accounted for exactly once. This is the invariant the whole
+# split rests on, so it is asserted rather than assumed.
+if shifts.length + real_new.length != new_entries.length ||
+   shifts.length + real_gone.length != gone_entries.length
+  die "internal inconsistency: #{new_entries.length} new / #{gone_entries.length} gone lines did not add up"
+end
+
+text = report(id, tree, rev, new_entries, gone_entries, shifts, real_new, real_gone)
+File.write(report_path, text) if report_path
+
+summary = {
+  'schema' => 'itaruby-public-drift-attrib/1',
+  'id' => id,
+  'tree' => tree,
+  'rev' => rev,
+  'new' => new_entries.length,
+  'gone' => gone_entries.length,
+  'moved' => shifts.length,
+  'new_real' => real_new.length,
+  'gone_real' => real_gone.length,
+  'shifts' => shifts.map { |s| { 'path' => s['key'][2], 'code' => s['key'][0], 'message' => s['key'][1], 'from' => s['from'], 'to' => s['to'] } },
+  'new_real_lines' => real_new.map { |e| e['raw'] },
+  'gone_real_lines' => real_gone.map { |e| e['raw'] }
+}
+
+if as_json
+  puts JSON.generate(summary)
+elsif report_path.nil?
+  print text
+end
+exit 0

@@ -20,9 +20,10 @@ the ledger includes known false positives and an inconclusive external-gem
 call. The launch bar ("winning on true errors found") must **not** be claimed
 from the raw totals. A wrong diagnostic that enters a baseline stays green
 forever; recording a verdict here does not repair the checker or baseline.
-As of the **2026-09-19 re-pin** the baseline holds **173 errors = 168 FP + 4
-TP + 1 inconclusive** (rails 166, mastodon 0, discourse 7); the totals above
-are the 2026-09-02 history, and the re-pin section records what moved.
+As of the **2026-09-19 attributed-mixin regeneration** the baseline holds
+**13 errors = 8 FP + 4 TP + 1 inconclusive** (rails 6, mastodon 0, discourse 7);
+the totals above are the 2026-09-02 history, and the regeneration sections
+record what moved — the 160 builder false positives are gone.
 
 Warnings are a separate gap (the external-declaration gap, bead ita-10d);
 they are ceilings, not truth claims, and this ledger concerns **errors only**.
@@ -160,6 +161,36 @@ clone taken this session); the depth-1 footprint above is the disk budget a
 judged gitlab-foss would need. The public declaration and the SKIP stay as
 they are.
 
+### Regeneration 2026-09-19 (attributed-mixin family: rails 166 → 6)
+
+All three baselines regenerated at commit `bddae94` (the attributed-mixin
+family — the "key on the receiver, never on a name" rule in AGENTS.md) on m5
+(Apple M5), release binary built from that commit (`cargo build --release`,
+exit 0, `CARGO_TARGET_DIR` pinned to the checkout). Same pinned revisions as
+the re-pin above, so this is a detection change measured against a fixed tree,
+not a re-pin.
+
+| id | pinned sha | lines | errors | warnings | ita wall |
+|----|-----------|------:|-------:|---------:|---------:|
+| rails | `6610cb45b39b6a2c1f260f90bbe920b5899f844b` | 940 | 6 | 934 | 1.7 s |
+| mastodon | `2c92a56e5d0fb490cc2e49a0dd9652499000fcb4` | 986 | 0 | 986 | 0.7 s |
+| discourse | `eff621544daf344ce70e470b7f54f27bc75b68d9` | 1936 | 7 | 1929 | 6.8 s |
+
+rails only, and only DOWNWARD: 1100 → 940 lines, **160 errors gone, 0 new** —
+and 0 new on the other two as well, whose files are **byte-identical**, which
+is the measurement that the mechanism is keyed on the receiver rather than a
+blanket softening of every dynamically-mixed module. All 160 were already
+recorded in this ledger as false positives: the two Thor builder families,
+`Rails::PluginBuilder` (86) and `Rails::AppBuilder` (74), closed by opening the
+class the mixin call's receiver provably names. Both audit rows below are now
+marked closed; nothing else in the table moved.
+
+New error totals: **13 = 8 FP + 4 TP + 1 inconclusive** (rails 6, mastodon 0,
+discourse 7). The ceilings are unchanged at the re-pin's wall ×1.5 (3 s / 2 s /
+10 s): the times above are the gate's own run, the mechanism adds no measurable
+wall time, and the wall column is a machine-load reading, not a criterion
+median — a tightening from it would be a fabricated measurement.
+
 ## Audit ledger (errors)
 
 Every error line is grouped by family — `code` and the receiver class taken
@@ -174,8 +205,8 @@ the existing 160 builder-FP and 3 bulk-import-TP verdicts are unchanged.
 
 | id | family (code + receiver) | count | verdict |
 |----|---------------------------|------:|---------|
-| rails | E0101 `Rails::PluginBuilder` | 86 | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive** |
-| rails | E0101 `Rails::AppBuilder` | 74 | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive** |
+| rails | E0101 `Rails::PluginBuilder` | 0 (was 86) | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive**; CLOSED 2026-09-19 by the attributed-mixin family — the receiver the `include` names is opened, so the whole family is silent (0 new errors on the three corpora) |
+| rails | E0101 `Rails::AppBuilder` | 0 (was 74) | **known FP family — Thor builder `method_missing` (docs/engineering-history.md §H), not a true positive**; CLOSED 2026-09-19 by the attributed-mixin family, same mechanism as `Rails::PluginBuilder` above |
 | rails | E0101 `LazyLoadHooksTest::FakeContext` | 3 | false positive / correct silence — `activesupport/test/lazy_load_hooks_test.rb:131-137` installs `first_wrestler` via the class hook; `:160-174` installs `second_wrestler` only on `context` (valid at `:174`, intentionally absent on the fresh instance inside `assert_raises NoMethodError` at `:168-170`); `activesupport/lib/active_support/lazy_load_hooks.rb:101-110` dispatches through `class_eval` / `instance_eval`. |
 | rails | E0101 `ActionDispatch::Routing::RouteSet` | 0 (was 1) | false positive, FIXED 2026-09-18 and removed from the baseline — `actionpack/lib/action_dispatch/routing/route_set.rb:628` calls `helper_module._routes`, not a RouteSet instance: `Module.new` at `:550`, `helper_module = self` at `:619`, singleton `_routes` at `:599`, and proxy reader at `:561-564` supply the method and return the captured route set. The enclosing `def generate_url_helpers` (`:547`) is an instance method carrying literal `define_method` calls, so RouteSet now fails closed instead of being judged. |
 | rails | E0101 `ActionDispatch::Routing::Endpoint` | 1 | false positive — `actionpack/lib/action_dispatch/routing/endpoint.rb:11-15` defaults `rack_app` to the endpoint, but `rack_app.is_a?(Class) && rack_app < Rails::Engine` short-circuits for that instance; the comparison is for a class-valued rack app, using inherited `Module#<`, not `Endpoint#<`. |

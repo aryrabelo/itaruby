@@ -165,6 +165,9 @@ pub fn check_file(db: &dyn salsa::Database, file: SourceFile) -> Vec<Diagnostic>
         unknown_call_src: FxHashMap::default(),
         last_ret_cause: None,
         defined_guards: Vec::new(),
+        respond_to_guards: Vec::new(),
+        narrowed_names: Vec::new(),
+        asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
     };
     let mut env = Env::default();
@@ -489,6 +492,9 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         unknown_call_src: FxHashMap::default(),
         last_ret_cause: None,
         defined_guards: Vec::new(),
+        respond_to_guards: Vec::new(),
+        narrowed_names: Vec::new(),
+        asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
     };
     let mut env = Env::default();
@@ -551,6 +557,9 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         unknown_call_src: FxHashMap::default(),
         last_ret_cause: None,
         defined_guards: Vec::new(),
+        respond_to_guards: Vec::new(),
+        narrowed_names: Vec::new(),
+        asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
     };
     let mut env = Env::default();
@@ -641,6 +650,9 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         unknown_call_src: FxHashMap::default(),
         last_ret_cause: None,
         defined_guards: Vec::new(),
+        respond_to_guards: Vec::new(),
+        narrowed_names: Vec::new(),
+        asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
     };
     let mut env = Env::default();
@@ -711,6 +723,9 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         unknown_call_src: FxHashMap::default(),
         last_ret_cause: None,
         defined_guards: Vec::new(),
+        respond_to_guards: Vec::new(),
+        narrowed_names: Vec::new(),
+        asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
     };
     let mut env = Env::default();
@@ -966,6 +981,42 @@ struct Checker<'db> {
     /// measured sites (bead ita-r8k) never nest, but there is no reason
     /// this shape should silently misbehave if a corpus ever does.
     defined_guards: Vec<String>,
+    /// Bead ita-w2c: method names currently proven to exist by an
+    /// enclosing `respond_to?(:m)` / `respond_to?(:m, true)` guard —
+    /// pushed before walking the branch that only runs when the guard
+    /// held (`if`/ternary then-branch, `unless` else-clause; see
+    /// `respond_to_guard_name`), popped right after. Consulted only for
+    /// a RECEIVERLESS call of that exact name: `respond_to?` proves what
+    /// `self` answers, never what some other object does, so
+    /// `x.respond_to?(:m); x.m` stays conclusive. Suppression-only, the
+    /// same contract as `defined_guards` beside it (invariant #1).
+    respond_to_guards: Vec<String>,
+    /// Bead ita-w2c: names whose reads are `Ty::Unknown` for the
+    /// sub-expression currently being walked, because a `&&` operand to
+    /// the left proved something the checker cannot model — today only
+    /// `x.is_a?(Class) | x.is_a?(Module)`, which proves `x` is a class or
+    /// module OBJECT and so whose method table (the singleton one the
+    /// call really dispatches on) is unknowable. Narrowing to Unknown
+    /// (never to a concrete accusable type) is what keeps the whole
+    /// mechanism fail-closed. Keyed by NAME — a local variable read or a
+    /// receiverless, argument-less, block-less call — because the two
+    /// occurrences of `x` in `x.is_a?(Class) && x < Base` are distinct
+    /// call nodes with distinct spans. Pushed by the `AndNode` arm around
+    /// its right operand only and popped right after; see
+    /// `Checker::class_object_guard`.
+    narrowed_names: Vec<(String, Ty)>,
+    /// Bead ita-w2c: spans (`span_of_call`) of calls that are the DIRECT
+    /// subject of an asserted raise — minitest's `assert_raises(...) { X }`
+    /// block body, or the `expect { X }` block of RSpec's
+    /// `.to raise_error(...)`. A call at one of these spans raises on
+    /// purpose: its exception (arity included) is the ASSERTED behavior,
+    /// not a defect. Span-keyed, not depth-counted, because the owner's
+    /// form is deliberately narrow: a call nested any deeper inside the
+    /// block keeps firing, and a span identifies exactly the one call
+    /// node that is the assertion's subject (see
+    /// `Checker::asserted_raise_subjects`, which pushes these around the
+    /// sub-walk that contains the block). Suppression-only.
+    asserted_subject_spans: Vec<(usize, usize)>,
     /// E0108: the flow-INSENSITIVE literal proof for the local variables
     /// of the ONE Ruby scope currently being walked — a method body, a
     /// class/module body, or the toplevel. Rebuilt and restored by
@@ -1822,6 +1873,16 @@ impl Checker<'_> {
                 if let Some(path) = &defined_guard {
                     self.defined_guards.push(path.clone());
                 }
+                // Bead ita-w2c: `if respond_to?(:setup); setup; end` — the
+                // then-branch only runs when `self` really answers
+                // `setup`, which is exactly the proof the receiverless
+                // call inside it needs. Same branch scope as the
+                // `defined?` guard beside it, and symmetric for
+                // `unless` below.
+                let respond_to_guard = respond_to_guard_name(&n.predicate());
+                if let Some(m) = &respond_to_guard {
+                    self.respond_to_guards.push(m.clone());
+                }
                 let then_stmts = n.statements();
                 let then_diverges = then_stmts.as_ref().is_some_and(stmts_diverge);
                 let then_ty = match &then_stmts {
@@ -1830,6 +1891,9 @@ impl Checker<'_> {
                 };
                 if defined_guard.is_some() {
                     self.defined_guards.pop();
+                }
+                if respond_to_guard.is_some() {
+                    self.respond_to_guards.pop();
                 }
                 let mut else_env = env.clone();
                 if let Some(nw) = &narrow {
@@ -1880,6 +1944,13 @@ impl Checker<'_> {
                 if let Some(path) = &defined_guard {
                     self.defined_guards.push(path.clone());
                 }
+                // Bead ita-w2c, the `unless` mirror: `unless
+                // respond_to?(:setup); ...; else; setup; end` — the
+                // else-clause only runs when the predicate was TRUE.
+                let respond_to_guard = respond_to_guard_name(&n.predicate());
+                if let Some(m) = &respond_to_guard {
+                    self.respond_to_guards.push(m.clone());
+                }
                 let else_ty = match n.else_clause() {
                     Some(e) => match e.statements() {
                         Some(s) => self.infer_stmts(&s, &mut else_env, self_ty, scope),
@@ -1889,6 +1960,9 @@ impl Checker<'_> {
                 };
                 if defined_guard.is_some() {
                     self.defined_guards.pop();
+                }
+                if respond_to_guard.is_some() {
+                    self.respond_to_guards.pop();
                 }
                 // `unless x.is_a?(Foo); return; end` is deliberately
                 // EXCLUDED from the shortcut below (bead ita-w9i):
@@ -2015,7 +2089,25 @@ impl Checker<'_> {
             Node::AndNode { .. } => {
                 let n = node.as_and_node().unwrap();
                 let l = self.infer_expr(&n.left(), env, self_ty, scope);
+                // Bead ita-w2c: `x.is_a?(Class) && x < Base` — the right
+                // operand is only ever reached when the LEFT one held, so
+                // `x` there is a class/module OBJECT, not whatever the
+                // left operand's own read inferred. No `Ty` models a
+                // singleton (the method table such a call really
+                // dispatches on), and narrowing to the class's own
+                // instance type would be a lie the checker would then
+                // accuse against — so the narrowed reading is
+                // `Ty::Unknown`, the fail-closed choice. Scoped to the
+                // right operand alone: the left operand was already
+                // walked, and the fact dies with this `&&`.
+                let guarded = self.class_object_guard(&n.left(), scope);
+                if let Some(name) = &guarded {
+                    self.narrowed_names.push((name.clone(), Ty::Unknown));
+                }
                 let r = self.infer_expr(&n.right(), env, self_ty, scope);
+                if guarded.is_some() {
+                    self.narrowed_names.pop();
+                }
                 Ty::union(l, r)
             }
             Node::OrNode { .. } => {
@@ -2619,6 +2711,74 @@ impl Checker<'_> {
         None
     }
 
+    /// Bead ita-w2c: the type a `&&`'s LEFT operand proved for the
+    /// expression `node` (see `Checker::narrowed_names`), if any. Keyed
+    /// by NAME, not by span: the two `rack_app` occurrences in
+    /// `rack_app.is_a?(Class) && rack_app < Rails::Engine` are distinct
+    /// call nodes at distinct spans, but the same name. A local variable
+    /// read and a receiverless, argument-less, block-less call are the
+    /// only shapes the key can name — anything else is not an expression
+    /// identity this walker can track, and gets no fact.
+    fn narrowed_expr_ty(&self, node: &Node<'_>) -> Option<Ty> {
+        let name = expr_name(node)?;
+        self.narrowed_names
+            .iter()
+            .rev()
+            .find(|(k, _)| *k == name)
+            .map(|(_, t)| t.clone())
+    }
+
+    /// Bead ita-w2c: does `predicate` prove its SUBJECT is a class or
+    /// module object — `x.is_a?(Class)` / `x.is_a?(Module)`? Returns the
+    /// subject's name when `x` is an expression `narrowed_names` can key
+    /// on. Both spellings really are the language's own answer: `Class`
+    /// and `Module` objects are exactly the ones `is_a?` can prove for a
+    /// receiver whose singleton method table is not modelled.
+    ///
+    /// The resolved-constant precedence matches `narrow_of_when`'s: a
+    /// project that declares its own `Class`/`Module` constant shadows
+    /// the core one and the guard proves nothing about class objects, so
+    /// a resolvable project constant bails first. Deliberately NOT gated
+    /// on `closed_world()` — like the `.extend` widening beside
+    /// `check_call`'s receiver arm, a receiver read as `Unknown` can
+    /// never fabricate a diagnostic under any world-openness, and both
+    /// measured corpora run open-world.
+    ///
+    /// `kind_of?`/`instance_of?` and every combinator predicate
+    /// (`x.is_a?(Class) && y.is_a?(Class)` as a LEFT operand is fine —
+    /// it is the left operand itself that must be the `is_a?` call) stay
+    /// out: no measured site, no fact.
+    fn class_object_guard(&self, predicate: &Node<'_>, scope: &[String]) -> Option<String> {
+        let call = predicate.as_call_node()?;
+        if call.name().as_slice() != b"is_a?" {
+            return None;
+        }
+        let name = expr_name(&call.receiver()?)?;
+        let args = call.arguments()?;
+        let mut it = args.arguments().iter();
+        let arg = it.next()?;
+        if it.next().is_some() {
+            return None;
+        }
+        let path = const_path_str(&arg)?;
+        let core = path.trim_start_matches("::");
+        if !matches!(core, "Class" | "Module") {
+            return None;
+        }
+        // A lexical class literally named `Class`/`Module` shadows the
+        // core one, and then the guard proves nothing about class
+        // objects. A project REOPENING the core `Class`/`Module` (rails'
+        // `active_support/core_ext/module/*` does exactly that) is the
+        // core class itself — the index files it under that very path —
+        // so the path, not mere resolvability, is the test.
+        if let Some(id) = self.index.resolve_const(scope, &path) {
+            if self.index.class(id).path.trim_start_matches("::") != core {
+                return None;
+            }
+        }
+        Some(name)
+    }
+
     /// `case <subject>; when <this clause>` narrowing fact (bead ita-w9i,
     /// family b): sound only when EVERY condition in the clause is a
     /// resolvable project or (closed-world) core class constant —
@@ -2699,6 +2859,15 @@ impl Checker<'_> {
         self_ty: SelfTy,
         scope: &[String],
     ) -> Ty {
+        // Bead ita-w2c, the RSpec half of the asserted-raise softening:
+        // `expect { <subject> }.to raise_error(...)` — the subject lives
+        // inside the RECEIVER, so the arm has to be in place before the
+        // receiver is inferred below, and only for the span of this one
+        // walk (nothing about it may outlive the call that owns the
+        // block).
+        let rspec_subjects = rspec_raise_subject_spans(call);
+        let saved_subject_len = self.asserted_subject_spans.len();
+        self.asserted_subject_spans.extend(rspec_subjects);
         let recv_ty = match call.receiver() {
             Some(r) => {
                 let t = self.infer_expr(&r, env, self_ty, scope);
@@ -2757,7 +2926,20 @@ impl Checker<'_> {
             }
             None => self_ty.as_ty(),
         };
+        // Bead ita-w2c: the enclosing `&&`'s left operand may have
+        // proven this very expression is a class/module object, whose
+        // method table no `Ty` models — the narrowed reading replaces
+        // whatever the receiver's own inference produced (the walk above
+        // still happened, so diagnostics INSIDE the receiver are
+        // untouched).
+        let recv_ty = call
+            .receiver()
+            .and_then(|r| self.narrowed_expr_ty(&r))
+            .unwrap_or(recv_ty);
         let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
+        // The `expect` block has been walked: the RSpec arm ends here, so
+        // a sibling argument or the matcher call can never ride it.
+        self.asserted_subject_spans.truncate(saved_subject_len);
 
         // Arguments.
         let mut pos_args: Vec<(Ty, (usize, usize), Option<String>)> = Vec::new();
@@ -2808,9 +2990,21 @@ impl Checker<'_> {
                 add_block_params(&mut benv, b.parameters().as_ref(), sink);
                 let rebindable = !self.block_keeps_lexical_self(&recv_ty, &name);
                 self.rebindable_block_depth += usize::from(rebindable);
+                // Bead ita-w2c, the minitest half: `assert_raises(...)`
+                // (`assert_raise`) takes the raising code as its BLOCK —
+                // the direct statements are the subject, and their
+                // exception is the asserted behavior. Armed around this
+                // block walk only.
+                let minitest_subjects = (name == "assert_raises" || name == "assert_raise")
+                    .then(|| b.body().map(|body| direct_statement_call_spans(&body)))
+                    .flatten()
+                    .unwrap_or_default();
+                let saved_subject_len = self.asserted_subject_spans.len();
+                self.asserted_subject_spans.extend(minitest_subjects);
                 if let Some(body) = b.body() {
                     self.infer_expr(&body, &mut benv, self_ty, scope);
                 }
+                self.asserted_subject_spans.truncate(saved_subject_len);
                 self.rebindable_block_depth -= usize::from(rebindable);
                 self.block_params.truncate(saved_bp_len);
                 spill_block_writes(env, &benv);
@@ -2825,6 +3019,40 @@ impl Checker<'_> {
         // E0108 is decided from the operand NODES, independently of
         // which method table below resolves the operator.
         self.check_operand_types(call, &recv_ty, env);
+
+        // Bead ita-w2c: this call IS the direct subject of an asserted raise
+        // (`assert_raises { ... }` / `expect { ... }.to raise_error(...)`)
+        // — the exception it raises, arity included, is the ASSERTED
+        // behavior and not a defect. Span-keyed, so a call nested any
+        // deeper inside the block keeps firing.
+        if self
+            .asserted_subject_spans
+            .iter()
+            .any(|s| *s == span_of_call(call))
+        {
+            self.tally_inconclusive(None);
+            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
+            return Ty::Unknown;
+        }
+
+        // Self-send inside a block whose receiving call could rebind
+        // `self` (`instance_exec`-style): the receiver here may not be
+        // `self_ty` at runtime, so NOTHING the walk below resolves
+        // against `self_ty` is conclusive — not a missing method, and
+        // not the arity/sig of a method that happens to exist there
+        // either (bead ita-w2c). The guard therefore sits ABOVE the
+        // `lookup_method` dispatch, where the `Found`/arity/sig path
+        // consults it too; it used to live only in the `NotFound` arm,
+        // which let `body html` inside `Mail::Part.new { ... }` be
+        // accused of the ENCLOSING builder's own zero-argument `body`
+        // while the block's real `self` is the part being built. A block
+        // proven to keep lexical self never raised the count (bead
+        // ita-uye) — see `rebindable_block_depth`.
+        if call.receiver().is_none() && self.rebindable_block_depth > 0 {
+            self.tally_inconclusive(None);
+            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
+            return Ty::Unknown;
+        }
 
         match recv_ty {
             Ty::Instance(c) => match self.index.lookup_method_rbi(c, &name, self.rbi_map) {
@@ -2873,17 +3101,23 @@ impl Checker<'_> {
                     }
                     ret
                 } else {
-                    // Self-send inside a block whose receiving call
-                    // could rebind `self` (`instance_exec`-style): the
-                    // receiver here may not be `c` at runtime, so this
-                    // is never conclusive. A block proven to keep
-                    // lexical self never raised the count (bead
-                    // ita-uye) — see `rebindable_block_depth`.
-                    if call.receiver().is_none() && self.rebindable_block_depth > 0 {
+                    // Bead ita-w2c: `if respond_to?(:setup); setup; end`
+                    // — `self` was proven to answer exactly this name in
+                    // the branch being walked, so the receiverless call
+                    // cannot be a `NoMethodError`. Suppression-only: the
+                    // call types as `Unknown`, never as a resolved
+                    // signature inferred from the guard.
+                    if call.receiver().is_none()
+                        && self.respond_to_guards.iter().any(|g| g == &name)
+                    {
                         self.tally_inconclusive(None);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                         return Ty::Unknown;
                     }
+                    // Self-send inside a block whose receiving call
+                    // could rebind `self` is already handled ABOVE the
+                    // dispatch (bead ita-w2c moved it there so the
+                    // Found/arity/sig path consults it too).
                     self.tally(Bucket::Diagnosed);
                     self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                     let path = &self.index.class(c).path;
@@ -4504,6 +4738,106 @@ fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {
 fn defined_guard_const(predicate: &Node<'_>) -> Option<String> {
     let defined = predicate.as_defined_node()?;
     const_path_str(&defined.value())
+}
+
+/// Bead ita-w2c: the spans of the calls that are the DIRECT statements
+/// of a block body — the sole subject of a raise assertion, never a call
+/// nested inside one. `expect { [X] }.to raise_error` records nothing,
+/// so `X` keeps firing: that is the owner's narrow scope made
+/// mechanical, and the control that proves it.
+fn direct_statement_call_spans(body: &Node<'_>) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    if let Some(stmts) = body.as_statements_node() {
+        for s in &stmts.body() {
+            if let Some(c) = s.as_call_node() {
+                out.push(span_of_call(&c));
+            }
+        }
+    } else if let Some(c) = body.as_call_node() {
+        out.push(span_of_call(&c));
+    }
+    out
+}
+
+/// Bead ita-w2c, the RSpec half: `expect { <subject> }.to raise_error(...)`
+/// (and `.to_not`) — the subject is the `expect` call's block body, which
+/// this call's own receiver inference walks. `raise_error` must be the
+/// first argument of the `.to`; `expect` itself must be receiverless,
+/// the only spelling the measured corpus site and RSpec's DSL use.
+fn rspec_raise_subject_spans(call: &CallNode<'_>) -> Vec<(usize, usize)> {
+    let name = call.name();
+    if name.as_slice() != b"to" && name.as_slice() != b"to_not" {
+        return Vec::new();
+    }
+    let matcher = call
+        .arguments()
+        .and_then(|a| a.arguments().iter().next())
+        .and_then(|m| m.as_call_node());
+    let Some(matcher) = matcher else { return Vec::new() };
+    if matcher.name().as_slice() != b"raise_error" {
+        return Vec::new();
+    }
+    let Some(expect) = call.receiver().and_then(|r| r.as_call_node()) else {
+        return Vec::new();
+    };
+    if expect.receiver().is_some() || expect.name().as_slice() != b"expect" {
+        return Vec::new();
+    }
+    let Some(body) = expect.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) else {
+        return Vec::new();
+    };
+    direct_statement_call_spans(&body)
+}
+
+/// Bead ita-w2c: the name `Checker::narrowed_names` can key an
+/// expression on — a local variable read (`x`), or a receiverless,
+/// argument-less, block-less call (`rack_app`), which is how a
+/// predicate like `rack_app.is_a?(Class)` names something that is not a
+/// local at all. Everything else (an ivar, an explicit-receiver call, a
+/// literal, a call with arguments) has no identity a second occurrence
+/// could be matched against, so it gets no key and no fact.
+fn expr_name(node: &Node<'_>) -> Option<String> {
+    if let Some(local) = node.as_local_variable_read_node() {
+        return Some(String::from_utf8_lossy(local.name().as_slice()).into_owned());
+    }
+    let call = node.as_call_node()?;
+    (call.receiver().is_none() && call.arguments().is_none() && call.block().is_none())
+        .then(|| String::from_utf8_lossy(call.name().as_slice()).into_owned())
+}
+
+/// Bead ita-w2c: `respond_to?(:m)` / `respond_to?(:m, true)` (and the
+/// `false` mirror) as a bare predicate — the true branch only runs when
+/// the receiver really answers `m`, so a receiverless call to `m` inside
+/// it cannot be a `NoMethodError`. Returns `m`.
+///
+/// Only the DIRECT predicate shape counts, same reasoning (and the same
+/// measured-site argument) as `defined_guard_const` above: `respond_to?(:m)
+/// && y` is a combinator, not a bare `CallNode` predicate, so it returns
+/// `None` — a gap (no suppression), never a wrong one (invariant #1).
+///
+/// The receiver must be implicit: an explicit receiver would make the
+/// guard a statement about THAT object, while the diagnostic this feeds
+/// is a self-send. The second argument, when present, must be a literal
+/// boolean (`respond_to?(:m, true)` also counts private methods, which
+/// still answers "the method exists"); anything else is not the shape
+/// this guard has evidence for.
+fn respond_to_guard_name(predicate: &Node<'_>) -> Option<String> {
+    let call = predicate.as_call_node()?;
+    if call.receiver().is_some() || call.name().as_slice() != b"respond_to?" {
+        return None;
+    }
+    let args = call.arguments()?;
+    let mut it = args.arguments().iter();
+    let name = String::from_utf8_lossy(it.next()?.as_symbol_node()?.unescaped()).into_owned();
+    if let Some(second) = it.next() {
+        if it.next().is_some() {
+            return None;
+        }
+        if second.as_true_node().is_none() && second.as_false_node().is_none() {
+            return None;
+        }
+    }
+    Some(name)
 }
 
 /// Branch join: for every var present in any branch env, the merged value is

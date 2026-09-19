@@ -60,7 +60,12 @@ pub enum OpenReason {
     /// `alias_method` with a non-literal name.
     DynamicAliasMethod,
     /// `class_eval`/`module_eval`/`instance_eval`/`send`/`public_send`/
-    /// `__send__`/`delegate`/`define_singleton_method`.
+    /// `__send__`/`delegate`/`define_singleton_method` — plus, from the
+    /// onda-2 beads, two merge-time passes that reach the same shape
+    /// without an AST: `apply_load_hook_openness`
+    /// (`run_load_hooks(:sym, Base)` → `base.class_eval(&block)`) and
+    /// `apply_extended_hooks` (a `self.extended(base)` body whose
+    /// installs onto `base` cannot be enumerated).
     EvalOrSend,
     /// The catch-all `_ =>` arm: some class-body call we do not model.
     /// In a Rails app this is `validates` / `belongs_to` / `scope` /
@@ -470,6 +475,14 @@ pub struct FileDefs {
     /// (fail-closed — a wrong receiver attribution is exactly the
     /// receiver-blind silence bead ita-a8z measured).
     pub const_returning_methods: Vec<(String, String, Vec<String>)>,
+    /// Bead B of onda 2: every `<call>.run_load_hooks(<literal symbol>,
+    /// <literal constant path>)` in this file, as `(base path as written,
+    /// lexical nesting at the call site)` — the base whose INSTANCE
+    /// surface `apply_load_hook_openness` marks open. Collected by the
+    /// full-tree `FileScan` (not `DefWalker`, whose contour-limited walk
+    /// never visits a `def` body, which is where every rails call site
+    /// lives).
+    pub load_hook_bases: Vec<(String, Vec<String>)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -539,6 +552,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         nested: 0,
         attributed_mixin_edges: Vec::new(),
         const_returning_methods: Vec::new(),
+        load_hook_bases: Vec::new(),
         def_locals: Vec::new(),
     };
     scan.visit(&parse.node());
@@ -559,6 +573,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         dynamic_mixin_targets: scan.targets,
         attributed_mixin_edges: scan.attributed_mixin_edges,
         const_returning_methods: scan.const_returning_methods,
+        load_hook_bases: scan.load_hook_bases,
     }
 }
 
@@ -742,6 +757,10 @@ struct FileScan {
     /// `def f; <const path / ternary of const paths>; end` — see
     /// `FileDefs::const_returning_methods`.
     const_returning_methods: Vec<(String, String, Vec<String>)>,
+    /// `run_load_hooks(:sym, <literal base>)` bases, with the lexical
+    /// nesting at the call site — bead B of onda 2, see
+    /// `FileDefs::load_hook_bases` and `apply_load_hook_openness`.
+    load_hook_bases: Vec<(String, Vec<String>)>,
     /// One frame per `def` body currently being walked, mapping a local
     /// variable's name to the receivers its last written value can be.
     /// A local is what carries the value from `get_builder_class` to
@@ -846,6 +865,7 @@ impl<'pr> Visit<'pr> for FileScan {
         self.note_refinement(node);
         self.note_opaque_eval(node);
         self.note_injection(node);
+        self.note_load_hook_base(node);
         ruby_prism::visit_call_node(self, node);
     }
 }
@@ -1249,6 +1269,48 @@ impl FileScan {
             self.keyed_pollution
                 .push((target.map(ToString::to_string), nesting.clone(), src));
         }
+    }
+
+    /// `run_load_hooks(:sym, <literal base>)` — bead B of onda 2.
+    ///
+    /// `ActiveSupport.on_load(:sym) { ... }` registers a block, and
+    /// `run_load_hooks(:sym, Base)` hands `Base` to it; the library's own
+    /// `execute_hook` then runs `base.class_eval(&block)` when the base
+    /// is a Module (`activesupport/lib/active_support/lazy_load_hooks.rb:
+    /// 107`). The block and the base are decoupled by a SYMBOL and the
+    /// hook's receiver is a method PARAMETER, so no per-`def` attribution
+    /// can reach the installed methods: the base's real instance surface
+    /// is exactly `class_eval`'s output, which is not in any project
+    /// fragment. Marking the named base `open` is therefore the only
+    /// correct answer — `Inconclusive`, never `NotFound` (`NotFound` was
+    /// measured wrong on rails' `LazyLoadHooksTest::FakeContext`, whose
+    /// three E0101 lines are this shape; `testdata/lazy_load/`).
+    ///
+    /// Deliberately narrow, all-or-nothing:
+    /// * exactly TWO positional arguments, the first a LITERAL symbol and
+    ///   the second a literal constant path. `run_load_hooks(:x)` alone
+    ///   defaults its base to `Object` and would open every receiver in
+    ///   the project; a base that is `self`, a local, or a call is not a
+    ///   name this pass can resolve, and an unresolved name contributes
+    ///   nothing (`apply_load_hook_openness`).
+    /// * the receiver is unconstrained, exactly as `core_injection_call`'s
+    ///   family is: `ActiveSupport.run_load_hooks(...)`, a bare
+    ///   `run_load_hooks(...)` inside the library's own
+    ///   `extend LazyLoadHooks`, and a chained receiver all name the same
+    ///   public API, and a project callback named `run_load_hooks` that
+    ///   takes a literal symbol and a constant would mean the same thing
+    ///   anyway.
+    fn note_load_hook_base(&mut self, node: &ruby_prism::CallNode<'_>) {
+        if node.name().as_slice() != b"run_load_hooks" {
+            return;
+        }
+        let Some(args) = node.arguments() else { return };
+        let args = args.arguments();
+        if args.len() != 2 || args.iter().next().and_then(|a| a.as_symbol_node()).is_none() {
+            return;
+        }
+        let Some(base) = args.iter().nth(1).and_then(|a| const_path_str(&a)) else { return };
+        self.load_hook_bases.push((base, self.nesting.clone()));
     }
 
     /// `Integer.include M` / `String.define_method(:+) { }` /
@@ -4101,6 +4163,11 @@ pub struct ClassDef {
 pub struct ProjectIndex {
     pub classes: Vec<ClassDef>,
     pub by_path: FxHashMap<String, ClassId>,
+    /// Bead B of onda 2, staging: `run_load_hooks(:sym, Base)` bases as
+    /// `(path as written, nesting at the call site)`, resolved to real
+    /// `ClassId`s by `apply_load_hook_openness` once every fragment has
+    /// merged (the same two-phase shape `refine_raw`/`eval_raw` use).
+    load_hook_raw: Vec<(String, Vec<String>)>,
     /// Any checked file monkeypatched a core class without a fragment
     /// (bead ita-2ve): the closed-world conclusive core lookup stands
     /// down for the whole run. Absent/unset keeps v0 behavior.
@@ -4348,6 +4415,19 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // every fragment, declaration and gem-reopening pass must already
     // have landed.
     resolve_keyed_pollution(&mut index);
+    // Bead B of onda 2: `run_load_hooks(:sym, Base)` hands `Base` to a
+    // block registered under that symbol, and the library runs that
+    // block as `base.class_eval(&block)` — a body no fragment contains.
+    //
+    // Runs AFTER `resolve_keyed_pollution` deliberately.
+    // `pollution_is_unreadable` (inside that pass) reads a core
+    // fragment's `open_reason` to decide whether the project's own
+    // ADDITIONS to a core class are enumerable, and the reason this
+    // pass records is one it counts as unreadable. Opening the base
+    // FIRST would therefore also stand the E0108 closed-world question
+    // down for that class — silence this bead never asked for. It has
+    // no business touching the pollution picture at all.
+    apply_load_hook_openness(&mut index);
     build_subclass_map(&mut index);
     build_methods_by_name(&mut index);
     index
@@ -4484,6 +4564,7 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
     index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
     index.attributed_mixin_raw.extend(defs.attributed_mixin_edges.iter().cloned());
+    index.load_hook_raw.extend(defs.load_hook_bases.iter().cloned());
     for (method, path, nesting) in &defs.const_returning_methods {
         index
             .const_returning_methods
@@ -4807,6 +4888,51 @@ fn apply_concern_class_methods(index: &mut ProjectIndex) {
         if !class.extends.contains(&nested) {
             class.extends.push(nested);
         }
+    }
+}
+
+/// Bead B of onda 2: mark every `run_load_hooks(:sym, Base)` base `open`
+/// — its instance surface is whatever the block registered under
+/// `:sym` installs when the library calls `base.class_eval(&block)`
+/// (`activesupport/lib/active_support/lazy_load_hooks.rb:107`), and this
+/// index can reach that body through NO fragment: `on_load` stores the
+/// block under a symbol in a hash, `run_load_hooks` looks it up at
+/// runtime, and the hook's own receiver is a method parameter (`def
+/// run_load_hooks(name, base = Object)`), so neither the block nor the
+/// base is attributed to anything.
+///
+/// `Open` with `OpenReason::EvalOrSend` is the exact and only honest
+/// answer: this checker knows a body it never read was `class_eval`'d
+/// into that class, so every miss on it is `Inconclusive` (silence) and
+/// never `NotFound`. The reused reason is not a new variant because the
+/// census's `tally_ancestry` matches `OpenReason` exhaustively, and this
+/// shape IS the `EvalOrSend` family (`class_eval` of a body nobody
+/// showed the checker) — see that variant's own doc comment.
+///
+/// Two-phase, like `resolve_dynamic_mixin_targets`: the base is resolved
+/// against the FULL merged index, because `Base` commonly lives in
+/// another file than the `run_load_hooks` call site. A base that does
+/// not resolve contributes nothing — fail-closed (invariant #1), never a
+/// widened match.
+fn apply_load_hook_openness(index: &mut ProjectIndex) {
+    let raw = std::mem::take(&mut index.load_hook_raw);
+    for (base, nesting) in raw {
+        let Some(id) = index.resolve_const(&nesting, &base) else { continue };
+        merge_open(index, id, OpenReason::EvalOrSend);
+    }
+}
+
+/// Mark class `id` open for `reason` from a merge-time pass, with
+/// `merge_file_fragments`' own precedence: an existing reason is kept,
+/// except `AbstractRaise` — the WEAKEST of them (an abstract stub is
+/// treated as closed and only softens through the receiver's own
+/// subtree), which any later, stronger open must replace. Same rule
+/// `open_class` and `apply_attributed_mixin_edges` apply.
+fn merge_open(index: &mut ProjectIndex, id: ClassId, reason: OpenReason) {
+    let class = &mut index.classes[id.0 as usize];
+    class.open = true;
+    if class.open_reason.is_none() || class.open_reason == Some(OpenReason::AbstractRaise) {
+        class.open_reason = Some(reason);
     }
 }
 

@@ -26,3 +26,8 @@ scripts/bug-replay/results/
 
 # Paseo tool state — never versioned
 .paseo/
+
+# The gitlab-foss public-corpus clone lives in the fleet corpus dir, never
+# here: a stray copy at the repo root made `sf check` scan 55k unrelated .rb
+# files and blocked every commit in this repository (2026-09-19).
+/gitlab/

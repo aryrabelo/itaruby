@@ -222,6 +222,29 @@ if GATE_TRIAGE_LAB="$ART/gate-triage-selftest" \
 else
   bad 'gate triage (see target/gauntlet/gate-triage-selftest.txt)'
 fi
+# Same family again, now on the public-corpus side. `public-gate.sh` compares a
+# clone against a baseline, and since 2026-09-19 it also verifies the clone's
+# HEAD against the declared sha — a guard that can be inert (the wave-9 trap:
+# `PASS (incomplete)` while judging another revision) is exactly the defect
+# this selftest re-injects, in both halves (missing guard, wrong-rev guard).
+if PUBLIC_GATE_LAB="$ART/public-gate-selftest" \
+   "$ROOT/scripts/public-gate-selftest.sh" >"$ART/public-gate-selftest.txt" 2>&1; then
+  ok 'public gate guard (match / wrong-rev / missing / default-skip, each mutant accused)'
+else
+  bad 'public gate guard (see target/gauntlet/public-gate-selftest.txt)'
+fi
+# And the reader of that diff: `public-drift-attrib` decides whether a new
+# line is a real detection change or the same diagnostic that moved, which is
+# the difference between "the checker regressed" and "the corpus advanced".
+# A classifier that reports everything as drift, or drops an unparseable line
+# silently, makes gate e's verdict meaningless — so it gets the same
+# two-sided proof (7 fixtures + a comm oracle + a malformed hard-stop).
+if PUBLIC_DRIFT_LAB="$ART/public-drift-attrib-selftest" \
+   "$ROOT/scripts/public-drift-attrib-selftest.sh" >"$ART/public-drift-attrib-selftest.txt" 2>&1; then
+  ok 'drift attribution (line-shift vs real drift, malformed hard-stop, each mutant accused)'
+else
+  bad 'drift attribution (see target/gauntlet/public-drift-attrib-selftest.txt)'
+fi
 
 # --- gate c3: performance ceiling. The launch bar for this project is speed
 # against an established typechecker, and nothing used to notice a regression.

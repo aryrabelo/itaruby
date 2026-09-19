@@ -100,13 +100,21 @@ run_gauntlet() { # DIR -> echoes witness content
 }
 mkdir -p "$c1"
 mk_gauntlet "$c1/shipped" "$ROOT/scripts/gauntlet-gates.sh"
+# The two needles below are anchored on the build-failure branch of
+# `gauntlet-gates.sh` AS IT READS TODAY. That branch was refactored to the
+# `out` helper and grew a `digest` call, which silently drifted the old
+# `echo` needle and turned this case into INVALIDO-cmp — the guard doing its
+# job, but on a red gate nobody had re-run. Re-count both after ANY refactor
+# of that branch (rules of proof: a disambiguated anchor is a NEW anchor).
+# `digest` never exits (`|| true`), so removing the `exit 1` alone is what
+# lets the mutant walk on into the binary-consuming gates.
 if ! mutate "$ROOT/scripts/gauntlet-gates.sh" "$LAB/gauntlet-mutant.sh" \
-      "  echo 'RESULT: FAIL (build failed; no binary-consuming gates executed)'" \
+      "  out 'RESULT: FAIL (build failed; no binary-consuming gates executed)'" \
       "  : # mutant: fail-fast announcement removed"; then
   bad 'gauntlet-fail-fast: mutation did not apply (INVALIDO-cmp)'
 else
   mutate "$LAB/gauntlet-mutant.sh" "$LAB/gauntlet-mutant.sh" \
-    $'  : # mutant: fail-fast announcement removed\n  exit 1' \
+    $'  : # mutant: fail-fast announcement removed\n  digest\n  exit 1' \
     '  : # mutant: fail-fast removed entirely' \
     || bad 'gauntlet-fail-fast: second mutation did not apply (INVALIDO-cmp)'
   bash -n "$LAB/gauntlet-mutant.sh" || bad 'gauntlet-fail-fast: mutant does not parse (INVALIDO-parse)'

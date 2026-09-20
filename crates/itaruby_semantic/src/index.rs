@@ -4783,7 +4783,7 @@ fn merge_file_fragments(
     qualified_writes: &mut Vec<(String, String)>,
 ) {
     let defs = file_defs(db, file);
-    merge_file_accumulators(index, &defs);
+    merge_file_accumulators(index, defs);
     qualified_writes.extend(defs.qualified_writes.iter().cloned());
     for frag in &defs.fragments {
         // A by-name singleton patch never interns its own path: see

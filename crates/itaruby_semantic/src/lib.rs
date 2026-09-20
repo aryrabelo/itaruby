@@ -13,8 +13,8 @@ pub mod structure_sql;
 pub mod types;
 
 pub use check::{
-    call_stats, check_file, constraint_report, definition_at, hover_at, ty_name, CallStats,
-    ConstraintOutcome, DefSite, HoverInfo, MethodHover,
+    call_stats, check_file, check_file_dark, constraint_report, definition_at, hover_at, ty_name,
+    CallStats, ConstraintOutcome, DarkSingleton, DarkVerdict, DefSite, HoverInfo, MethodHover,
 };
 pub use discovery::{find_upward_dir, upward_start, wire_declaration_sources, DiscoveredSources};
 pub use index::{core_methods_of, file_defs, project_consts, project_index, rbi_core_methods, rbi_files_parsed_count, stdlib_singleton_method, Blocker, FileDefs, OpenReason, ProjectIndex};

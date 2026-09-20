@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Dark singleton census (`ita check --dark-singletons=<file>`): the class-object
+  `Ty::Class` arms record their lookup verdict into a JSONL side channel —
+  `closed_notfound` (the residue: exactly what a class-object E0101 would fire
+  on) vs `open(<blocker>)` (the census reason machinery). Changes no diagnostic,
+  proven byte-identical on rails/mastodon/discourse. First measured run
+  (2026-09-20): residue 319/153/4389, of which 79–97% is the missing
+  Kernel-private tail (`raise`, `block_given?`, `rand`, `caller`, `Array`,
+  `URI`, …) called from singleton bodies — one enumerable inventory bead away
+  from an auditable flip. `scripts/dark-singleton-summary` reads the JSONL.
+  The census also caught a latent span bug the diagnostic path never renders:
+  745 discourse residue spans (132k sites overall) land mid-character and are
+  recorded flagged (`on_char_boundary: false`, `byte` offset) — filed for its
+  own bead.
 - Known red, not wave 2's: gate c2b's two `replay.sh` cases fail on this
   machine — `case replay-run-isolation` reports "global file has 0 lines,
   expected 2" and `case replay-build-pin` an empty witness, i.e. the replay

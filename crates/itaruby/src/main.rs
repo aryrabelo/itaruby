@@ -3,9 +3,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use itaruby_semantic::{
-    call_stats, check_file, constraint_report, definition_at, find_upward_dir, hover_at,
-    wire_declaration_sources, CallStats, ConstraintCall, ConstraintOutcome, ConstraintProof, Db,
-    Diagnostic, DiscoveredSources, LineIndex, ProjectFiles, Severity, SourceFile,
+    call_stats, check_file, check_file_dark, constraint_report, definition_at, find_upward_dir,
+    hover_at, wire_declaration_sources, CallStats, ConstraintCall, ConstraintOutcome,
+    ConstraintProof, DarkSingleton, DarkVerdict, Db, Diagnostic, DiscoveredSources, LineIndex,
+    ProjectFiles, Severity, SourceFile,
 };
 
 // bead ita-ufi hotspot 1: the platform allocator (Apple's `libsystem_malloc`)
@@ -325,11 +326,15 @@ struct CheckFlags {
     stats: bool,
     format_agent: bool,
     format_json: bool,
+    /// Dark singleton census output path (`--dark-singletons=<file>`): a
+    /// measurement run that changes no diagnostic, only writes the JSONL.
+    dark: Option<String>,
 }
 
 fn parse_check_flags(args: &[String]) -> Option<CheckFlags> {
     let mut format_agent = false;
     let mut format_json = false;
+    let mut dark: Option<String> = None;
     for a in args {
         match a.strip_prefix("--format=") {
             Some("agent") => format_agent = true,
@@ -337,17 +342,101 @@ fn parse_check_flags(args: &[String]) -> Option<CheckFlags> {
             Some(_) => return None,
             None => {}
         }
+        if let Some(v) = a.strip_prefix("--dark-singletons=") {
+            dark = Some(v.to_string());
+        }
     }
     Some(CheckFlags {
         verbose: args.iter().any(|a| a == "--verbose" || a == "-v"),
         stats: args.iter().any(|a| a == "--stats"),
         format_agent,
         format_json,
+        dark,
     })
 }
 
+/// The run's closing lines, each opt-in: the `--format=agent` summary
+/// (critic gaps, verdict-constraints r1+r2: under `--format=agent` silence
+/// is ambiguous to an unattended agent — "checked and clean" and "silently
+/// skipped" look identical, and a run with findings says nothing about the
+/// clean files around them; one unconditional footer disambiguates both
+/// without per-file noise at corpus scale), the `--verbose` rbi note, and
+/// the `--stats` census.
+fn print_check_footer(
+    flags: &CheckFlags,
+    db: &Db,
+    sources: &[SourceFile],
+    discovered: &DiscoveredSources,
+    checked: usize,
+    agent_blocks: usize,
+) {
+    if flags.format_agent {
+        println!(
+            "_Checked {} file(s); {} constraint finding(s)._",
+            checked,
+            agent_blocks,
+        );
+    }
+
+    if flags.verbose {
+        eprintln!(
+            "itaruby check: rbi phase 2: parsed {} .rbi files (lazy)",
+            itaruby_semantic::rbi_files_parsed_count()
+        );
+    }
+    if flags.stats {
+        print_stats(db, sources, &discovered.declarations_only);
+    }
+}
+
+/// bead ita-76m.2: a root that does not exist is a usage error, not a
+/// clean run. `discover_rb_files` walks `read_dir`, so a missing path
+/// yields zero files, zero diagnostics and exit 0 — byte-identical to
+/// "your code is fine". In CI (a typo'd path, the wrong
+/// working-directory, a shallow checkout) that green means nothing was
+/// checked at all. An existing directory holding no `.rb` stays silent
+/// and exit 0 on purpose: checking a subtree that has no Ruby yet is
+/// legitimate, and the silence-when-empty contract is load-bearing.
+///
+/// `try_exists`, never `exists()`: the latter collapses "definitely not
+/// there" and "could not find out" into the same `false`. A root whose
+/// parent directory denies traversal, or a mount that is gone, is not a
+/// typo — telling the operator "path not found" would send them looking
+/// for the wrong bug. Both still fail: both mean this run would check
+/// nothing; only the message differs, and the message is the whole value.
+fn verify_roots(paths: &[String]) -> Result<(), String> {
+    for p in paths {
+        match Path::new(p).try_exists() {
+            Ok(true) => {}
+            Ok(false) => return Err(format!("itaruby: path not found: {p}")),
+            Err(e) => return Err(format!("itaruby: cannot read path: {p}: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Serialize the census and report `(sites, closed_notfound)` for the
+/// operator-facing summary line.
+fn write_dark_census(
+    path: &str,
+    dark_out: &[serde_json::Value],
+) -> std::io::Result<(usize, usize)> {
+    let mut text = String::new();
+    let mut closed = 0usize;
+    for v in dark_out {
+        if v["verdict"] == "closed_notfound" {
+            closed += 1;
+        }
+        text.push_str(&v.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text)?;
+    Ok((dark_out.len(), closed))
+}
+
 fn run_check(args: &[String]) -> ExitCode {
-    let usage = "usage: ita check [--verbose] [--stats] [--format=agent|json] <path>...";
+    let usage =
+        "usage: ita check [--verbose] [--stats] [--format=agent|json] [--dark-singletons=<file>] <path>...";
     let Some(flags) = parse_check_flags(args) else {
         eprintln!("{usage}");
         return ExitCode::from(2);
@@ -361,34 +450,9 @@ fn run_check(args: &[String]) -> ExitCode {
         eprintln!("{usage}");
         return ExitCode::from(2);
     }
-    // bead ita-76m.2: a root that does not exist is a usage error, not a
-    // clean run. `discover_rb_files` walks `read_dir`, so a missing path
-    // yields zero files, zero diagnostics and exit 0 — byte-identical to
-    // "your code is fine". In CI (a typo'd path, the wrong
-    // working-directory, a shallow checkout) that green means nothing was
-    // checked at all. An existing directory holding no `.rb` stays silent
-    // and exit 0 on purpose: checking a subtree that has no Ruby yet is
-    // legitimate, and the silence-when-empty contract is load-bearing.
-    //
-    // `try_exists`, never `exists()`: the latter collapses "definitely not
-    // there" and "could not find out" into the same `false`. A root whose
-    // parent directory denies traversal, or a mount that is gone, is not a
-    // typo — telling the operator "path not found" would send them looking
-    // for the wrong bug. Both still exit 2, because both mean this run
-    // checked nothing; only the message differs, and the message is the
-    // whole value.
-    for p in &paths {
-        match Path::new(p).try_exists() {
-            Ok(true) => {}
-            Ok(false) => {
-                eprintln!("itaruby: path not found: {p}");
-                return ExitCode::from(2);
-            }
-            Err(e) => {
-                eprintln!("itaruby: cannot read path: {p}: {e}");
-                return ExitCode::from(2);
-            }
-        }
+    if let Err(msg) = verify_roots(&paths) {
+        eprintln!("{msg}");
+        return ExitCode::from(2);
     }
 
     let (db, sources, discovered) = build_project(&paths);
@@ -409,6 +473,7 @@ fn run_check(args: &[String]) -> ExitCode {
 
     let format_agent = flags.format_agent;
     let format_json = flags.format_json;
+    let dark = flags.dark.is_some();
     let jobs = check_worker_count(to_check.len());
     let chunk_size = to_check.len().div_ceil(jobs).max(1);
     // bead ita-6dh: compute every file's diagnostics on a worker-thread
@@ -419,7 +484,7 @@ fn run_check(args: &[String]) -> ExitCode {
     // (ita-uo4) on this thread only. Parallelizes the COMPUTATION;
     // the PRINTED byte stream is exactly what the old sequential loop
     // produced, chunk boundaries are invisible to it.
-    let outputs: Vec<(bool, usize, String)> = std::thread::scope(|scope| {
+    let outputs: Vec<(bool, usize, String, Vec<serde_json::Value>)> = std::thread::scope(|scope| {
         let handles: Vec<_> = to_check
             .chunks(chunk_size)
             .map(|chunk| {
@@ -429,9 +494,9 @@ fn run_check(args: &[String]) -> ExitCode {
                         .iter()
                         .map(|file| {
                             let mut out = String::new();
-                            let (err, blocks) =
-                                check_and_print(&db, *file, format_agent, format_json, &mut out);
-                            (err, blocks, out)
+                            let (err, blocks, dark_lines) =
+                                check_and_print(&db, *file, format_agent, format_json, dark, &mut out);
+                            (err, blocks, out, dark_lines)
                         })
                         .collect::<Vec<_>>()
                 })
@@ -444,35 +509,32 @@ fn run_check(args: &[String]) -> ExitCode {
     });
     let mut had_error = false;
     let mut agent_blocks = 0usize;
-    for (err, blocks, out) in outputs {
+    let mut dark_out: Vec<serde_json::Value> = Vec::new();
+    for (err, blocks, out, dark_lines) in outputs {
         had_error |= err;
         agent_blocks += blocks;
         print!("{out}");
+        dark_out.extend(dark_lines);
     }
-    // Critic gaps (verdict-constraints r1+r2): under `--format=agent`,
-    // silence is ambiguous to an unattended agent — "checked and clean"
-    // and "silently skipped" look identical, and a run with findings says
-    // nothing about the clean files around them. One unconditional
-    // summary footer (file count + finding count) disambiguates both
-    // without per-file noise at corpus scale; the normal format keeps
-    // compiler-style silence on clean code.
-    if flags.format_agent {
-        println!(
-            "_Checked {} file(s); {} constraint finding(s)._",
-            to_check.len(),
-            agent_blocks,
-        );
+    if let Some(dark_path) = &flags.dark {
+        match write_dark_census(dark_path, &dark_out) {
+            Ok((total, closed)) => eprintln!(
+                "itaruby: dark singleton census: {total} site(s) bucketed, {closed} closed-notfound -> {dark_path}"
+            ),
+            Err(e) => {
+                eprintln!("itaruby: cannot write dark-singletons file: {dark_path}: {e}");
+                return ExitCode::from(2);
+            }
+        }
     }
-
-    if flags.verbose {
-        eprintln!(
-            "itaruby check: rbi phase 2: parsed {} .rbi files (lazy)",
-            itaruby_semantic::rbi_files_parsed_count()
-        );
-    }
-    if flags.stats {
-        print_stats(&db, &sources, &discovered.declarations_only);
-    }
+    print_check_footer(
+        &flags,
+        &db,
+        &sources,
+        &discovered,
+        to_check.len(),
+        agent_blocks,
+    );
 
     if had_error {
         ExitCode::from(1)
@@ -565,6 +627,60 @@ fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
     (db, sources, discovered)
 }
 
+/// One owned diagnostics vec whichever mode the run uses: the tracked
+/// `check_file` (LSP/CLI diagnostic path) or the dark census entrypoint.
+/// `check_file` is salsa tracked with `returns(ref)` — cloned to one owned
+/// vec so both branches have one type.
+fn fetch_diagnostics(db: &Db, file: SourceFile, dark: bool) -> (Vec<Diagnostic>, Vec<DarkSingleton>) {
+    if dark {
+        check_file_dark(db, file)
+    } else {
+        (check_file(db, file).clone(), Vec::new())
+    }
+}
+
+/// The census's rendering: one JSON object per bucketed site. The census also
+/// renders spans the diagnostic path never has to — some call-name spans land
+/// mid-character (found on discourse: a call whose name span ends inside a
+/// multi-byte char, where `LineIndex::line_col` panics). Keep the site, flag
+/// the position: dropping it would hide both the residue and the span bug.
+fn render_dark_records(
+    db: &Db,
+    file: SourceFile,
+    index: &LineIndex,
+    text: &str,
+    dark_recs: &[DarkSingleton],
+) -> Vec<serde_json::Value> {
+    let mut dark_lines = Vec::with_capacity(dark_recs.len());
+    for rec in dark_recs {
+        let (line, column, on_boundary) = if text.is_char_boundary(rec.start) {
+            let (l, c) = index.line_col(text, rec.start);
+            (l + 1, c + 1, true)
+        } else {
+            (0, 0, false)
+        };
+        let (verdict, reason) = match &rec.verdict {
+            DarkVerdict::ClosedNotFound => ("closed_notfound", None),
+            DarkVerdict::Open(r) => ("open", Some(r.as_str())),
+        };
+        let mut obj = serde_json::json!({
+            "file": file.path(db).display().to_string(),
+            "line": line,
+            "column": column,
+            "on_char_boundary": on_boundary,
+            "byte": rec.start,
+            "receiver": rec.receiver,
+            "method": rec.method,
+            "verdict": verdict,
+        });
+        if let Some(r) = reason {
+            obj["reason"] = serde_json::Value::String(r.to_string());
+        }
+        dark_lines.push(obj);
+    }
+    dark_lines
+}
+
 /// Check one file, print its diagnostics with excerpts; true when any
 /// Error was seen (`run_check`'s exit code depends on it). Severity is
 /// always computed for every diagnostic regardless of `format_agent`/
@@ -590,18 +706,24 @@ fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
 /// the normal render), no excerpt, no footer. `format_agent` wins if both
 /// flags are somehow set — mutually exclusive in practice since
 /// `--format=` only ever carries one value per invocation.
+///
+/// Under `dark`, the run uses the census entrypoint and additionally returns
+/// one JSON object per bucketed class-object site (see `render_dark_records`).
 fn check_and_print(
     db: &Db,
     file: SourceFile,
     format_agent: bool,
     format_json: bool,
+    dark: bool,
     out: &mut String,
-) -> (bool, usize) {
+) -> (bool, usize, Vec<serde_json::Value>) {
     let text = file.text(db);
     let index = LineIndex::new(text);
     let mut had_error = false;
     let mut blocks = 0usize;
-    for diag in check_file(db, file) {
+    let (diags, dark_recs) = fetch_diagnostics(db, file, dark);
+    let dark_lines = render_dark_records(db, file, &index, text, &dark_recs);
+    for diag in &diags {
         let level = match diag.severity {
             Severity::Error => {
                 had_error = true;
@@ -640,7 +762,7 @@ fn check_and_print(
             }
         }
     }
-    (had_error, blocks)
+    (had_error, blocks, dark_lines)
 }
 
 /// Contract 2's JSONL line for one diagnostic: `{path, line, column, code,

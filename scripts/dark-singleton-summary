@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Summarize `ita check --dark-singletons=<file>` census JSONL.
+
+One argument per file (or a glob of them): prints the residue (closed_notfound)
+split into the Kernel-private tail population (fixed, enumerable — one
+inventory bead closes it) and the remainder (the audit set), plus the open
+blocker histogram. Read-only; the JSONL is the evidence, this is the lens.
+
+    scripts/dark-singleton-summary target/dark-*.jsonl
+"""
+import collections
+import glob
+import json
+import sys
+
+# Kernel private_instance_methods (plus Kernel/Object module-functions) that
+# every class object answers. REPORTING ONLY: the checker does not read this
+# list; when the tail bead lands, its inventory must be generated from the
+# running Ruby (gen-stdlib-singleton-inventory.rb's pattern), not copied here.
+KERNEL_TAIL = {
+    "raise", "fail", "block_given?", "require", "require_relative", "autoload",
+    "rand", "caller", "puts", "print", "p", "pp", "sleep", "format", "sprintf",
+    "Array", "Integer", "Float", "String", "Rational", "Complex", "URI",
+    "loop", "catch", "throw", "proc", "lambda", "binding", "gets", "abort",
+    "at_exit", "exit", "exit!", "trap", "warn",
+}
+
+
+def main() -> int:
+    files = sorted(
+        f
+        for pattern in sys.argv[1:]
+        for f in (glob.glob(pattern) or [pattern])
+    )
+    if not files:
+        print(__doc__)
+        return 2
+    for path in files:
+        recs = [json.loads(line) for line in open(path) if line.strip()]
+        closed = [r for r in recs if r["verdict"] == "closed_notfound"]
+        tail = [r for r in closed if r["method"] in KERNEL_TAIL]
+        rest = [r for r in closed if r["method"] not in KERNEL_TAIL]
+        bad_span = sum(1 for r in recs if not r.get("on_char_boundary", True))
+        reasons = collections.Counter(
+            r.get("reason", "?") for r in recs if r["verdict"] == "open"
+        )
+        print(f"== {path}")
+        print(
+            f"   sites={len(recs)}  closed_notfound={len(closed)}"
+            f"  (kernel-tail={len(tail)}  audit-set={len(rest)})"
+            f"  open={recs and len(recs) - len(closed)}"
+            f"  non-boundary-spans={bad_span}"
+        )
+        print("   open blockers (top 6):")
+        for reason, n in reasons.most_common(6):
+            print(f"     {n:8d}  {reason}")
+        methods = collections.Counter(
+            (r["receiver"], r["method"]) for r in rest
+        )
+        print("   audit-set top 12 (receiver#method):")
+        for (rcv, m), n in methods.most_common(12):
+            print(f"     {n:5d}  {rcv}#{m}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

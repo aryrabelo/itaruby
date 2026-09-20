@@ -542,6 +542,14 @@ which gates this machine can run (see `scripts/dev` for the other verbs,
 whatever the remote happened to have on disk is a false green. It requires the
 commit to already be on a remote (exit 65 otherwise).
 
+`ita check --dark-singletons=<file> <path>` runs the dark singleton census: a
+measurement instrument (never a gate) whose JSONL records what the class-object
+track WOULD accuse (`closed_notfound` — the residue) against the blocker
+standing every other receiver down (`open(<reason>)`). It changes no
+diagnostic — proven byte-identical on rails/mastodon/discourse — and doubles
+as the net for span bugs the diagnostic path never renders
+(`on_char_boundary: false`). `scripts/dark-singleton-summary` reads the JSONL.
+
 Per-run artifacts land in `target/gauntlet/` (gitignored).
 
 ### Removed — do not reintroduce

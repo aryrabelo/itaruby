@@ -91,9 +91,56 @@ static AR_API_SINGLETON: std::sync::LazyLock<HashSet<&'static str>> = std::sync:
         .collect()
 });
 
+/// One class-object call-site verdict from the dark singleton census.
+/// Measurement only: this type never becomes a diagnostic, and the census
+/// reads nothing the walk does not already read, so `check_file_dark`'s
+/// diagnostic vec is byte-identical to `check_file`'s.
+#[derive(Debug, Clone)]
+pub struct DarkSingleton {
+    pub start: usize,
+    pub end: usize,
+    /// The receiver's index path (e.g. `Page`).
+    pub receiver: String,
+    pub method: String,
+    pub verdict: DarkVerdict,
+}
+
+#[derive(Debug, Clone)]
+pub enum DarkVerdict {
+    /// The singleton chain is provably closed (complete, no declared
+    /// external, no open ancestor) and the lookup is unsoftened, and the
+    /// name is absent — the residue: every site bucketed here is a
+    /// prospective E0101 if the class-object track ever arms.
+    ClosedNotFound,
+    /// A blocker stands the receiver down (`index::inconclusive_reason`'s
+    /// census reason, Debug-formatted) — silence is the correct verdict and
+    /// the reason names what an inventory bead would have to model.
+    Open(String),
+}
+
 /// All diagnostics for one file: parse errors, invalid sigs, body checks.
 #[salsa::tracked]
 pub fn check_file(db: &dyn salsa::Database, file: SourceFile) -> Vec<Diagnostic> {
+    check_file_inner(db, file, false).0
+}
+
+/// Dark singleton census (measurement instrument, never a gate): the exact
+/// walk `check_file` runs with the `Ty::Class` call arms recording their
+/// lookup verdict. Deliberately NOT salsa-tracked — a census is run-scoped,
+/// and caching a side channel would let one call order silently drop every
+/// record (the tracked wrapper above stays the LSP/CLI diagnostic path).
+pub fn check_file_dark(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+) -> (Vec<Diagnostic>, Vec<DarkSingleton>) {
+    check_file_inner(db, file, true)
+}
+
+fn check_file_inner(
+    db: &dyn salsa::Database,
+    file: SourceFile,
+    dark: bool,
+) -> (Vec<Diagnostic>, Vec<DarkSingleton>) {
     let text = file.text(db);
     let parse = ruby_prism::parse(text.as_bytes());
     let cast_comments = collect_cast_comments(
@@ -139,6 +186,8 @@ pub fn check_file(db: &dyn salsa::Database, file: SourceFile) -> Vec<Diagnostic>
         cast_comments,
         diags,
         silent: false,
+        dark: false,
+        dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
         return_cause_memo: FxHashMap::default(),
@@ -174,10 +223,12 @@ pub fn check_file(db: &dyn salsa::Database, file: SourceFile) -> Vec<Diagnostic>
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.dark = dark;
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
+    let dark_recs = std::mem::take(&mut checker.dark_recs);
     let mut out = checker.diags;
     out.sort_by_key(|d| (d.start, d.code));
-    out
+    (out, dark_recs)
 }
 
 /// A resolved call-site definition: which file, and the byte span of the
@@ -466,6 +517,8 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         cast_comments,
         diags: Vec::new(),
         silent: false,
+        dark: false,
+        dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
         return_cause_memo: FxHashMap::default(),
@@ -531,6 +584,8 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         cast_comments,
         diags: Vec::new(),
         silent: true,
+        dark: false,
+        dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
         return_cause_memo: FxHashMap::default(),
@@ -624,6 +679,8 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         cast_comments,
         diags: Vec::new(),
         silent: true,
+        dark: false,
+        dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
         return_cause_memo: FxHashMap::default(),
@@ -697,6 +754,8 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         cast_comments,
         diags: Vec::new(),
         silent: false,
+        dark: false,
+        dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
         return_cause_memo: FxHashMap::default(),
@@ -841,6 +900,11 @@ struct Checker<'db> {
     diags: Vec<Diagnostic>,
     /// Foreign-body return inference runs silent: no diagnostics emitted.
     silent: bool,
+    /// Dark singleton census: set only by `check_file_inner` when called
+    /// through `check_file_dark`. Records the `Ty::Class` arms' verdicts,
+    /// never a diagnostic.
+    dark: bool,
+    dark_recs: Vec<DarkSingleton>,
     /// Explicit `return` types of the method body currently being inferred.
     returns: Vec<Ty>,
     return_memo: FxHashMap<(ClassId, String, bool), Ty>,
@@ -1007,7 +1071,7 @@ struct Checker<'db> {
     narrowed_names: Vec<(String, Ty)>,
     /// Bead ita-w2c: spans (`span_of_call`) of calls that are the DIRECT
     /// subject of an asserted raise — minitest's `assert_raises(...) { X }`
-    /// block body, or the `expect { X }` block of RSpec's
+    /// block body, or the `expect { X }` block of `RSpec`'s
     /// `.to raise_error(...)`. A call at one of these spans raises on
     /// purpose: its exception (arity included) is the ASSERTED behavior,
     /// not a defect. Span-keyed, not depth-counted, because the owner's
@@ -2747,7 +2811,7 @@ impl Checker<'_> {
     /// `kind_of?`/`instance_of?` and every combinator predicate
     /// (`x.is_a?(Class) && y.is_a?(Class)` as a LEFT operand is fine —
     /// it is the left operand itself that must be the `is_a?` call) stay
-    /// out: no measured site, no fact.
+    ///   out: no measured site, no fact.
     fn class_object_guard(&self, predicate: &Node<'_>, scope: &[String]) -> Option<String> {
         let call = predicate.as_call_node()?;
         if call.name().as_slice() != b"is_a?" {
@@ -2777,6 +2841,27 @@ impl Checker<'_> {
             }
         }
         Some(name)
+    }
+
+    /// Dark census only: record this arm's verdict. A no-op unless the run
+    /// was started through `check_file_dark` — the normal diagnostic path
+    /// never pays for a push (the flag check folds away).
+    fn dark_record(
+        &mut self,
+        loc: (usize, usize),
+        receiver: &str,
+        method: &str,
+        verdict: DarkVerdict,
+    ) {
+        if self.dark {
+            self.dark_recs.push(DarkSingleton {
+                start: loc.0,
+                end: loc.1,
+                receiver: receiver.to_string(),
+                method: method.to_string(),
+                verdict,
+            });
+        }
     }
 
     /// `case <subject>; when <this clause>` narrowing fact (bead ita-w9i,
@@ -2859,7 +2944,7 @@ impl Checker<'_> {
         self_ty: SelfTy,
         scope: &[String],
     ) -> Ty {
-        // Bead ita-w2c, the RSpec half of the asserted-raise softening:
+        // Bead ita-w2c, the `RSpec` half of the asserted-raise softening:
         // `expect { <subject> }.to raise_error(...)` — the subject lives
         // inside the RECEIVER, so the arm has to be in place before the
         // receiver is inferred below, and only for the span of this one
@@ -3336,6 +3421,22 @@ impl Checker<'_> {
                         ty
                     } else {
                         let blocker = self.index.inconclusive_reason(c, true);
+                        let receiver = self.index.class(c).path.clone();
+                        self.dark_record(
+                            msg_loc,
+                            &receiver,
+                            &name,
+                            DarkVerdict::Open(
+                                blocker.map_or_else(
+                                    // Chain closed, lookup still Inconclusive: the
+                                    // missing Class/Module tail surface (`extend`,
+                                    // `include`, `name`, ...) — the census's own
+                                    // measurement of that inventory gap.
+                                    || "inconclusive_no_blocker".into(),
+                                    |b| format!("{b:?}"),
+                                ),
+                            ),
+                        );
                         self.tally_inconclusive(blocker);
                         self.tally_ar_base(blocker, c);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
@@ -3343,6 +3444,12 @@ impl Checker<'_> {
                     },
                     MethodLookup::NotFound => {
                         let blocker = self.index.inconclusive_reason(c, true);
+                        let receiver = self.index.class(c).path.clone();
+                        let verdict = match blocker {
+                            None => DarkVerdict::ClosedNotFound,
+                            Some(b) => DarkVerdict::Open(format!("{b:?}")),
+                        };
+                        self.dark_record(msg_loc, &receiver, &name, verdict);
                         self.tally_inconclusive(blocker);
                         self.tally_ar_base(blocker, c);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
@@ -4759,11 +4866,11 @@ fn direct_statement_call_spans(body: &Node<'_>) -> Vec<(usize, usize)> {
     out
 }
 
-/// Bead ita-w2c, the RSpec half: `expect { <subject> }.to raise_error(...)`
+/// Bead ita-w2c, the `RSpec` half: `expect { <subject> }.to raise_error(...)`
 /// (and `.to_not`) — the subject is the `expect` call's block body, which
 /// this call's own receiver inference walks. `raise_error` must be the
 /// first argument of the `.to`; `expect` itself must be receiverless,
-/// the only spelling the measured corpus site and RSpec's DSL use.
+/// the only spelling the measured corpus site and `RSpec`'s DSL use.
 fn rspec_raise_subject_spans(call: &CallNode<'_>) -> Vec<(usize, usize)> {
     let name = call.name();
     if name.as_slice() != b"to" && name.as_slice() != b"to_not" {

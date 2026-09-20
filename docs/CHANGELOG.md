@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Residue audit (2026-09-20): the tail-census remainder (56/4/44) audited
+  family by family — full table in `scripts/public-baseline/README.md`. 2
+  confirmed + 1 pending true positives, including a **real discourse bug**
+  (`lib/color_math.rb:62` `raise new RuntimeError("...")` → NoMethodError
+  instead of the intended message). 98 of 104 records are populated silence
+  across 9 named mechanisms (block-nested class/def stubs, AS core-ext,
+  extend-into-declared-external, `include Singleton`, sclass-include mixins,
+  eval-built surfaces, gem-namespace receivers, `extend self`, census
+  attribution noise); the class-object E0101 flip stays closed until they
+  are indexed — flipping now would fire ~98 false positives. Known census
+  instrument bug filed: duplicated records with wrong file/line/byte
+  triples; family-level verdicts reliable, site-level locations not.
 - Kernel bare-call tail inventory (bead ita-tail): `gen-core-inventory.rb`
   now harvests the PRIVATE instance surface of
   Kernel/BasicObject/Module/Class/Object into a `Class~method` section of

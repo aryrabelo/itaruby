@@ -558,6 +558,16 @@ diagnostic path never renders (`on_char_boundary: false`).
 `scripts/dark-singleton-summary` reads the JSONL and flags any residue site
 still carrying a tail name (a wiring gap). Post-tail residue: 56/4/44 on
 rails/mastodon/discourse (from 319/153/4389), the hand-auditable remainder.
+The 2026-09-20 audit of that remainder (full table in
+`scripts/public-baseline/README.md`) found 2 confirmed + 1 pending TRUE
+positives — including a real discourse bug (`lib/color_math.rb:62`
+`raise new RuntimeError(...)` raises NoMethodError instead of the intended
+message) — and 98 populated sites across 9 named mechanisms: **the
+class-object flip stays closed until those populations are indexed**, per
+the same rule as the singleton-track gaps below. The census instrument also
+has a known attribution bug (duplicated records with wrong file/line/byte
+triples; instance-context calls leaking into the class track) — family-level
+verdicts are reliable, site-level locations are not; instrument bead filed.
 
 Per-run artifacts land in `target/gauntlet/` (gitignored).
 

@@ -266,3 +266,43 @@ the existing 160 builder-FP and 3 bulk-import-TP verdicts are unchanged.
 | discourse | E0102 method `body` | 0 (was 1) | **CLOSED 2026-09-19 by wave 2's fail-closed suppressions** — inconclusive (receiver-blind suppression candidate) — `lib/email/message_builder.rb:200-203` sends `body html` inside `Mail::Part.new`, while the enclosing builder's unrelated `body` at `:206` takes zero arguments. Missing evidence: the pinned mail gem's `Mail::Part`/`Mail::Message` constructor block-evaluation behavior and body setter arity; these dependency sources are not present in either audited clone, so source-only inspection cannot prove the DSL receiver/arity. |
 | discourse | E0101 `BulkImport::VBulletin5` | 2 | true positive — proven by reading `script/bulk_import/vbulletin5.rb:77,91`; receiver `BulkImport::VBulletin5` has no `import_user_account_id`, no `create_oauth_records` (ancestry checked: `BulkImport::Base` — abstract-raise stub at `base.rb:409`, no later stronger open reason — then Object; no `def`/`attr_*`/`alias`/literal `define_method`/`method_missing`/`delegate`/`Forwardable` for either name anywhere in the repo) |
 | discourse | E0101 `BulkImport::Base` | 1 | true positive — proven by reading `script/bulk_import/base.rb:1512`; `process_user_stat` bare-sends `user_email` with no local of that name in scope, and receiver `BulkImport::Base` has no `user_email` (ancestry checked: no written superclass → Object, no mixins; no `def`/`attr_*`/`alias`/literal `define_method`/`method_missing` repo-wide) |
+## Dark-census residue audit — 2026-09-20 (bead ita-tail follow-up)
+
+The singleton census's post-tail residue (56/4/44 closed_notfound on
+rails/mastodon/discourse, commit `d9a95f5`) was audited family by family:
+51 families, 104 records, every representative site read at its byte
+offset. Verdicts:
+
+**True positives found in the wild (2 confirmed + 1 pending, ~6 sites):**
+
+| family | verdict | evidence |
+|---|---|---|
+| `ColorMath::Converters#RuntimeError` (discourse, 4) | **TRUE POSITIVE — real bug in discourse** | `lib/color_math.rb:62`: `raise new RuntimeError("Hex color must be 6 characters")` — parsed as `raise(new(RuntimeError("…")))`; `RuntimeError` is a constant, not a method, so the validation branch raises NoMethodError instead of the intended message. Author meant `RuntimeError.new(...)`. |
+| `RaisesNoMethodError#foobar_method_doesnt_exist` (rails, 1) | TRUE POSITIVE (by design) | `activesupport/test/autoloading_fixtures/raises_no_method_error.rb` — the fixture exists to raise NoMethodError. |
+| `DiscourseAi::Completions::Llm#models_by_provider` (discourse, 1) | census noise (instance-context call) | `llm.rb:79` is inside `def valid_provider_models` — an INSTANCE method; the census bucketed it on the class-object track. Instrument finding, not a flip site. |
+| `DiscourseAi::Utils::DiffUtils#apply_hunk` (discourse, 3) | census noise (instance-context call) | `ai_artifact.rb:72-74` calls `differ.apply_hunk(...)` on a LOCAL; no `apply_hunk` def exists anywhere in the tree (dead path), but this belongs to the instance track, not the class-object census. |
+| `DiscourseAi::Agents::General#id` (discourse, 1) | likely TRUE POSITIVE — re-verify at flip | `bot_controller.rb:136` `DiscourseAi::Agents::General.id`; no `def self.id` found tree-wide. Chain closed per census. |
+
+**Populated — every one must stay silent; each names its bead (98 sites):**
+
+| mechanism | families/sites | unlocking bead |
+|---|---|---|
+| class/def nested in method bodies/blocks: the walker stubs them WITHOUT their superclass (`class Foo < Rails::Railtie` inside a test method) — config/railtie_name/instance/attributes_for_inspect/model_name/fetch_data | ~20 | walker: process block-nested class/def defs (or mark their stubs open, fail-closed) |
+| ActiveSupport core-ext on Class/Module/Object/Kernel: `descendants`, `module_parent(s)`, `module_parent_name`, `in?`, `silence_warnings` | 23 | lock-gated AS core-ext name inventory (mock-gate pattern) |
+| `extend ActionView::Helpers::TextHelper` (declared-external module extended): `TextHelper#excerpt/truncate` | 12 | extend-into-declared-external ⇒ Inconclusive |
+| gem-internal singletons with unmodeled `.with`: ExceptionWrapper/ExecutionContext/JSON::Encoding/SchemaReflection | 9 | same extend/ancestor-external blocker once stubs are fixed |
+| `include Singleton` (+ ancestor `Rails::Railtie`): `Subscriber#instance`, `Foo#instance` | 7 | Singleton-instance softener, include-visible-gated |
+| sclass-include mixin: `class << self; include Redisable` ⇒ bare `redis` in class methods | 4 | sclass-include filing on the singleton track |
+| eval-built class surface: `AnonymousCache.__compiled_key_builder` built by `eval(method)` inside a method body | 5 | opaque-eval mark must fire for eval inside method bodies, not only class body |
+| gem-namespace receiver: `QC#default_conn_adapter(=)` (queue_classic) | 4 | gem-namespace receiver ⇒ Inconclusive |
+| `extend self` module surface: `Marshal70/71WithFallback#marshal_load` | 2 | extend-self filing |
+| census attribution noise (wrong file/line/byte on duplicated records; `define_method`/`Class.new` block bodies): `send_shortcut=`, `description=`, duplicate variants of every `ok` record | ~10 + dupes | instrument bead: dedupe records by (file, byte), fix span/triple corruption, exclude non-lexical-self block bodies from the class-object walk |
+
+**Verdict: the class-object E0101 flip is NOT shippable today.** 98 of 104
+records are populated silence; flipping now would fire ~98 false positives —
+the exact outcome the audit exists to prevent (invariant #1). The nine beads
+above are each small, mechanical, and two-sided-provable; after them the
+residue is the true-positive table above, and the flip converts the two
+confirmed discourse/rails sites into diagnostics while the bench's two gap
+rows (`extend_singleton_typo`, `included_hook_class_method_typo`) flip to
+hits.

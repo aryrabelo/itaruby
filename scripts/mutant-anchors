@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Every mutant anchor must match exactly once, checked BEFORE a gate run.
+
+Why this exists (AGENTS.md, binding, measured twice): a mutation harness
+rewrites source IN PLACE and restores it, and its only guard is that the
+needle must appear exactly once — `inject()` reports INVALIDO otherwise. That
+guard fires 20-30 minutes into a family, after the mutants before it have
+already run, and the failure it reports is a red for a reason that has nothing
+to do with the checker. Measured 2026-09-19: wave 2 inserted
+`note_load_hook_base` between the recursion and its neighbour and added
+`def_locals` to the def frame, so M14 and M15 in `operand-types-mutants.sh`
+matched zero times — discovered only when gate c1 failed, ~26 minutes into a
+family that had already run its other 45 mutants. The 2026-09-18 incident was
+the same shape with a different neighbour statement.
+
+Counting a candidate needle costs milliseconds. So: every needle in every
+harness is counted here, in one pass, against the WORKING TREE (which is what
+the harnesses mutate), and a single mismatch is named.
+
+  0  every anchor matches exactly once
+  1  at least one anchor does not (named on stdout)
+
+Usage: scripts/mutant-anchors [--tree <dir>]   (default: this repo's root)
+"""
+import argparse
+import os
+import re
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# `mutant LABEL "$VAR" \
+#    '<needle>' \
+#    '<repl>' \`
+MUTANT_RE = re.compile(
+    r'mutant\s+(\S+)\s+"(\$\w+)"\s*\\\n\s*\'(.*?)\'\s*\\\n\s*\'(.*?)\'\s*\\\n',
+    re.S,
+)
+# `<VAR>=crates/...` inside a harness
+ASSIGN_RE = re.compile(r'^(\w+)=(crates/\S+)$', re.M)
+
+
+def unescape(needle: str) -> str:
+    """Undo bash's two ways of embedding a single quote in a single-quoted string.
+
+    Getting this wrong is how this checker itself lied first: a truncated
+    needle counts zero and reports two healthy anchors (M37, MUT-K) as broken.
+    """
+    return needle.replace('\'"\'"\'', "'").replace("'\\''", "'")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--tree', default=ROOT, help='tree to check anchors against')
+    args = ap.parse_args()
+
+    # A harness rewrites source IN PLACE, so while one is running every
+    # measurement of this tree measures the mutant (AGENTS.md, binding,
+    # measured): the first version of this checker reported two healthy
+    # anchors as broken because the operand-types family happened to be
+    # mid-run, with its own mutant in check.rs.
+    if args.tree == ROOT:
+        held = subprocess.run(
+            ['pgrep', '-f', '--', '-mutants.sh'], capture_output=True, text=True
+        )
+        if held.returncode == 0:
+            print('REFUSED a mutation harness is running and holds the tree '
+                  f'(pids: {held.stdout.split()}) — its mutant is what this would measure')
+            return 1
+
+    harnesses = sorted(
+        os.path.join(ROOT, 'scripts', f)
+        for f in os.listdir(os.path.join(ROOT, 'scripts'))
+        if f.endswith('-mutants.sh')
+    )
+    if not harnesses:
+        print('FAIL no *-mutants.sh found under scripts/')
+        return 1
+
+    broken, unknown, total = [], [], 0
+    for path in harnesses:
+        name = os.path.basename(path)
+        text = open(path).read()
+        files = dict(ASSIGN_RE.findall(text))
+        sources = {}
+        for var, rel in files.items():
+            full = os.path.join(args.tree, rel)
+            # the mutant regex captures the reference WITH its `$`; the
+            # assignment regex captures the name without it.
+            sources['$' + var] = open(full).read() if os.path.exists(full) else None
+        for label, var, needle, _repl in MUTANT_RE.findall(text):
+            total += 1
+            src = sources.get(var)
+            if src is None:
+                unknown.append(f'{name} {label} (${var.lstrip("$")} not mapped or missing)')
+                continue
+            n = src.count(unescape(needle))
+            if n != 1:
+                first = unescape(needle).splitlines()[0].strip()
+                broken.append(f'{name} {label}: needle matches {n} times — {first[:70]}')
+
+    for line in unknown:
+        print(f'UNKNOWN {line}')
+    for line in broken:
+        print(f'BROKEN {line}')
+    print(f'{total} anchors checked in {len(harnesses)} harnesses against {args.tree}')
+    if broken or unknown:
+        print(f'FAIL {len(broken)} broken, {len(unknown)} unmapped — a mutant that cannot '
+              f'inject proves nothing, and the harness would report INVALIDO '
+              f'20-30 minutes into a family')
+        return 1
+    print('PASS every anchor matches exactly once')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

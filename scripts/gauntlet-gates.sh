@@ -184,6 +184,17 @@ fi
 # (bead E) and the rebindable-block guard moving above the lookup dispatch
 # (bead F). They are listed here or they are narration.
 say 'gate c1 — per-fix source mutants (each decision accused by a named test)'
+# Every anchor must match exactly once BEFORE the families run. The harness's
+# own guard fires 20-30 minutes in, after the mutants ahead of it have already
+# run, and what it reports is a red for a reason that has nothing to do with
+# the checker (measured 2026-09-19: wave 2's neighbour insertions killed M14 and
+# M15 in the operand-types family, and the failure surfaced as
+# `baseline is not green` on the two families that run that suite).
+if "$ROOT/scripts/mutant-anchors" >"$ART/anchors.txt" 2>&1; then
+  ok 'mutant anchors (every needle matches exactly once)'
+else
+  bad 'mutant anchors (see target/gauntlet/anchors.txt)'
+fi
 for m in const-missing operand-types singleton mixin-attribution \
          lazy-load extended-hook guard-narrowing asserted-raise rebindable-guard; do
   if "$ROOT/scripts/$m-mutants.sh" >"$ART/$m-mutants.txt" 2>&1; then

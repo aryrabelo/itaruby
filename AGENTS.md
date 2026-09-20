@@ -332,7 +332,13 @@ found, and the launch bar is winning on both.
   into gate c1, on the integration run. Counting a candidate needle with
   the harness's own semantics (`src.count(needle)`) costs three seconds:
   every anchor edit does it, and no anchor edit is believed until its leg
-  has been re-run once.
+  has been re-run once. Since 2026-09-19 that count is a script —
+  `scripts/mutant-anchors` counts every needle in every `scripts/*-mutants.sh`
+  against the working tree (111 anchors across ten harnesses), and gate c1 runs
+  it BEFORE the families, so a dead anchor costs two seconds instead of the 26
+  minutes of family it cost the day wave 2's neighbour insertions killed M14 and
+  M15. It refuses to run while a harness holds the tree, because a mutant is
+  what it would otherwise measure.
 
 ## Engineering History
 

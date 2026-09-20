@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Known red, not wave 2's: gate c2b's two `replay.sh` cases fail on this
+  machine — `case replay-run-isolation` reports "global file has 0 lines,
+  expected 2" and `case replay-build-pin` an empty witness, i.e. the replay
+  benchmark judges nothing here, in BOTH the shipped script and the mutant, which
+  is what the harness's own two-sided shape is designed to distinguish. The
+  `gauntlet-fail-fast` and `public-gate-artifacts` cases in the same run pass, so
+  the harness is alive and this is the replay's environment (it materializes
+  detached worktrees of the mined corpora and runs the release binary on both
+  revisions). Filed as its own finding: the replay needs a machine that holds
+  those clones, and until then gate c2b stays red for a reason unrelated to the
+  checker.
 - Public baselines regenerated for wave 2 (commit `600bc36`): rails 6 → 1
   error, discourse 7 → 3, mastodon unchanged — **0 new lines on every repo**,
   and the seven audit rows this closes bring the public corpora to **0 false

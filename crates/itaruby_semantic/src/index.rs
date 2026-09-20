@@ -7361,7 +7361,12 @@ impl ProjectIndex {
             return MethodLookup::Inconclusive;
         }
         let kernel_hit = if singleton {
-            core::kernel_object_singleton_method(name)
+            // bead ita-tail: the bare-call private tail (`raise`, `rand`,
+            // ...) — a class object really answers these; NotFound on one is
+            // a prospective FALSE E0101 (79-97% of the measured residue).
+            // Still NotFound-only: `lookup_singleton_own` already returned,
+            // so a project-defined `raise` won above.
+            core::kernel_object_singleton_method(name) || core::kernel_bare_call_method(name)
         } else {
             core::kernel_object_instance_method(name)
         };

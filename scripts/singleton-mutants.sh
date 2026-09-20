@@ -59,6 +59,15 @@
 #          -> def_body_send_wrapped_dynamic_name_opens_the_class
 #   MUT-P  the `send` unwrap on the LITERAL side is cut
 #          -> def_body_send_wrapped_attr_arity_is_checked
+#   MUT-Q  the bare-call tail consult in soften_not_found is cut (ita-tail)
+#          -> kernel_tail_raise_buckets_known_tail_and_still_silent must
+#             fail: the raise flips back to conclusive NotFound and lands
+#             in the residue bucket
+#   MUT-R  the census's KnownTail LABEL is cut (ita-tail): the name still
+#          softens, but the JSONL reads the unattributable
+#          open(inconclusive_no_blocker) again
+#          -> kernel_tail_raise_buckets_known_tail_and_still_silent must
+#             fail on the known_tail assertion
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -70,8 +79,10 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 IDX=crates/itaruby_semantic/src/index.rs
 DIS=crates/itaruby_semantic/src/discovery.rs
+CHK=crates/itaruby_semantic/src/check.rs
 BAK_IDX=$ROOT/target/singleton-index.rs.orig
 BAK_DIS=$ROOT/target/singleton-discovery.rs.orig
+BAK_CHK=$ROOT/target/singleton-check.rs.orig
 LOG=$ROOT/target/singleton-mutants-test.txt
 
 fail=0
@@ -81,7 +92,8 @@ bad() { printf 'FAIL %s\n' "$1"; fail=1; }
 mkdir -p "$ROOT/target"
 cp "$IDX" "$BAK_IDX"
 cp "$DIS" "$BAK_DIS"
-restore() { cp "$BAK_IDX" "$IDX"; cp "$BAK_DIS" "$DIS"; }
+cp "$CHK" "$BAK_CHK"
+restore() { cp "$BAK_IDX" "$IDX"; cp "$BAK_DIS" "$DIS"; cp "$BAK_CHK" "$CHK"; }
 trap restore EXIT
 
 # One test-binary run over every suite these mutants can be accused by.
@@ -97,7 +109,7 @@ run_suite() {
   # (the defect operand-types-mutants.sh hit as M15 in round 6).
   CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby_semantic --no-fail-fast \
     --test singleton_track --test gem_reopen_lockfile \
-    --test mock_singleton_surface >"$LOG" 2>&1
+    --test mock_singleton_surface --test dark_singleton >"$LOG" 2>&1
   if grep -q 'could not compile' "$LOG"; then compiles=0; else compiles=1; fi
   failing=$(grep -oE '^test [a-z0-9_]+ \.\.\. FAILED' "$LOG" | awk '{print $2}' | sort -u)
 }
@@ -349,10 +361,26 @@ mutant MUT-P "$IDX" \
   def_body_send_wrapped_attr_arity_is_checked \
   'the send unwrap on the LITERAL side is cut: `send(:attr_accessor, :mode)` files nothing and the arity E0102 disappears'
 
+mutant MUT-Q "$IDX" \
+  '            core::kernel_object_singleton_method(name) || core::kernel_bare_call_method(name)' \
+  '            core::kernel_object_singleton_method(name)' \
+  kernel_tail_raise_buckets_known_tail_and_still_silent \
+  'the bare-call tail consult is cut: the bare raise goes back to conclusive NotFound and lands in the residue bucket — a prospective FALSE E0101 the inventory existed to kill'
+
+mutant MUT-R "$CHK" \
+  '                        let verdict = if kernel_bare_call_method(&name) {
+                            DarkVerdict::KnownTail
+                        } else {' \
+  '                        let verdict = if false && kernel_bare_call_method(&name) {
+                            DarkVerdict::KnownTail
+                        } else {' \
+  kernel_tail_raise_buckets_known_tail_and_still_silent \
+  'the census KnownTail label is cut: the raise still softens (silence preserved) but the JSONL reads the unattributable open(inconclusive_no_blocker) — the audit trail is the thing that broke'
+
 echo '--- restore and prove the shipped source is byte-identical'
 restore
-cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" \
-  && ok 'index.rs and discovery.rs restored byte-identical' \
+cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" && cmp -s "$CHK" "$BAK_CHK" \
+  && ok 'index.rs, discovery.rs and check.rs restored byte-identical' \
   || bad 'source NOT restored'
 run_suite
 if (( ! compiles )); then bad 'rebuild of the shipped source failed'
@@ -362,7 +390,7 @@ else
   ok 'post-restore suite green again'
 fi
 trap - EXIT
-rm -f "$BAK_IDX" "$BAK_DIS"
+rm -f "$BAK_IDX" "$BAK_DIS" "$BAK_CHK"
 
 if (( fail )); then echo 'RESULT: FAIL (singleton mutants)'; exit 1; fi
 echo 'RESULT: PASS (singleton mutants)'

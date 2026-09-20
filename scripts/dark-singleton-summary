@@ -40,6 +40,7 @@ def main() -> int:
         closed = [r for r in recs if r["verdict"] == "closed_notfound"]
         tail = [r for r in closed if r["method"] in KERNEL_TAIL]
         rest = [r for r in closed if r["method"] not in KERNEL_TAIL]
+        known = [r for r in recs if r["verdict"] == "known_tail"]
         bad_span = sum(1 for r in recs if not r.get("on_char_boundary", True))
         reasons = collections.Counter(
             r.get("reason", "?") for r in recs if r["verdict"] == "open"
@@ -48,9 +49,18 @@ def main() -> int:
         print(
             f"   sites={len(recs)}  closed_notfound={len(closed)}"
             f"  (kernel-tail={len(tail)}  audit-set={len(rest)})"
-            f"  open={recs and len(recs) - len(closed)}"
+            f"  known_tail={len(known)}"
+            f"  open={recs and len(recs) - len(closed) - len(known)}"
             f"  non-boundary-spans={bad_span}"
         )
+        if tail:
+            methods = collections.Counter((r["receiver"], r["method"]) for r in tail)
+            print(
+                f"   WIRES MISSING? {len(tail)} residue sites carry a tail name —"
+                " the inventory should have silenced these:"
+            )
+            for (rcv, m), n in methods.most_common(6):
+                print(f"     {n:5d}  {rcv}#{m}")
         print("   open blockers (top 6):")
         for reason, n in reasons.most_common(6):
             print(f"     {n:8d}  {reason}")

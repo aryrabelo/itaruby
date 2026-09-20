@@ -662,6 +662,7 @@ fn render_dark_records(
         let (verdict, reason) = match &rec.verdict {
             DarkVerdict::ClosedNotFound => ("closed_notfound", None),
             DarkVerdict::Open(r) => ("open", Some(r.as_str())),
+            DarkVerdict::KnownTail => ("known_tail", None),
         };
         let mut obj = serde_json::json!({
             "file": file.path(db).display().to_string(),

@@ -11,7 +11,7 @@ use itaruby_syntax::SourceFile;
 use crate::core::{
     core_block_keeps_lexical_self, core_class_of, core_const_ty, core_inventory_has,
     core_inventory_names, core_method, core_pollution_names, is_known_core_constant,
-    arg_pollution_keys, core_own_names, CoreClass, CoreRet,
+    kernel_bare_call_method, arg_pollution_keys, core_own_names, CoreClass, CoreRet,
 };
 use crate::index::{
     const_path_str, file_defs, project_index, Blocker, MethodLookup, MethodSig, OpenReason,
@@ -116,6 +116,12 @@ pub enum DarkVerdict {
     /// census reason, Debug-formatted) — silence is the correct verdict and
     /// the reason names what an inventory bead would have to model.
     Open(String),
+    /// Bead ita-tail: silent because the NAME is the core bare-call tail
+    /// (`raise`, `rand`, ... — `core::kernel_bare_call_method`). Name-keyed
+    /// label, deterministic and auditable; it may overlap another core
+    /// softener (`extend` is both `Object#extend` and tail), and it never
+    /// becomes a diagnostic. The residue (`ClosedNotFound`) excludes these.
+    KnownTail,
 }
 
 /// All diagnostics for one file: parse errors, invalid sigs, body checks.
@@ -3422,21 +3428,24 @@ impl Checker<'_> {
                     } else {
                         let blocker = self.index.inconclusive_reason(c, true);
                         let receiver = self.index.class(c).path.clone();
-                        self.dark_record(
-                            msg_loc,
-                            &receiver,
-                            &name,
-                            DarkVerdict::Open(
-                                blocker.map_or_else(
-                                    // Chain closed, lookup still Inconclusive: the
-                                    // missing Class/Module tail surface (`extend`,
-                                    // `include`, `name`, ...) — the census's own
-                                    // measurement of that inventory gap.
-                                    || "inconclusive_no_blocker".into(),
-                                    |b| format!("{b:?}"),
-                                ),
-                            ),
-                        );
+                        // bead ita-tail: name-keyed label. When the name is
+                        // the core bare-call tail, the silence is INVENTORY
+                        // silence — record it as such instead of the
+                        // unattributable `inconclusive_no_blocker`, so the
+                        // JSONL self-describes why the site never accuses.
+                        let verdict = if kernel_bare_call_method(&name) {
+                            DarkVerdict::KnownTail
+                        } else {
+                            DarkVerdict::Open(blocker.map_or_else(
+                                // Chain closed, lookup still Inconclusive: the
+                                // missing Class/Module tail surface (`extend`,
+                                // `include`, `name`, ...) — the census's own
+                                // measurement of that inventory gap.
+                                || "inconclusive_no_blocker".into(),
+                                |b| format!("{b:?}"),
+                            ))
+                        };
+                        self.dark_record(msg_loc, &receiver, &name, verdict);
                         self.tally_inconclusive(blocker);
                         self.tally_ar_base(blocker, c);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);

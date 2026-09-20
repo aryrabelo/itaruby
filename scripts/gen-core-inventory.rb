@@ -83,6 +83,29 @@ CLASSES.each do |klass|
 end
 
 puts
+puts <<~TAIL_HEADER
+  # bare-call private tail (bead ita-tail): one `Class~method` line per
+  # PRIVATE instance method (`private_instance_methods(false)`) of the
+  # classes a Ruby class object answers through its own ancestry
+  # (`Class < Module < Object < Kernel < BasicObject`). A private method can
+  # never be an explicit-receiver call, so these lines are deliberately in a
+  # DISTINCT format from the `Class#method` section above — the receiver-call
+  # reader (`core_inventory_has`) never sees them, and the only consumer is
+  # core.rs's bare-call tail reader (`kernel_bare_call_method`), consulted
+  # from the class-object track's NotFound softening (index.rs
+  # `soften_not_found`). `initialize` is excluded (see
+  # KERNEL_PRIVATE_INSTANCE_METHODS' doc comment in core.rs: treating it as a
+  # blanket hit would turn every `.new` arity check into Inconclusive).
+TAIL_HEADER
+%w[Kernel BasicObject Module Class Object].each do |klass|
+  Kernel.const_get(klass).private_instance_methods(false).sort.each do |meth|
+    next if meth == :initialize
+
+    puts "#{klass}~#{meth}"
+  end
+end
+
+puts
 puts "# top-level constants (Object.constants under --disable-gems)"
 TOP_LEVEL_CONSTANTS.each do |const|
   puts "::#{const}"

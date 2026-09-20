@@ -40,6 +40,7 @@ fn dark_fixture(name: &str) -> (Vec<String>, Vec<String>) {
             let v = match r.verdict {
                 itaruby_semantic::DarkVerdict::ClosedNotFound => "closed_notfound".to_string(),
                 itaruby_semantic::DarkVerdict::Open(reason) => format!("open({reason})"),
+                itaruby_semantic::DarkVerdict::KnownTail => "known_tail".to_string(),
             };
             format!("{} {} {}", r.receiver, r.method, v)
         })
@@ -123,4 +124,103 @@ fn foreign_receiver_records_nothing() {
     let (diags, recs) = dark_fixture("stdlib_receiver.rb");
     assert!(diags.is_empty(), "{diags:?}");
     assert!(recs.is_empty(), "no class-object site, no record: {recs:?}");
+}
+
+/// Bead ita-tail: the headline tail call — a bare `raise` in a `def self.`
+/// body — is INVENTORY silence, bucketed `known_tail`, never residue. The
+/// census label is the two-sided guard: a mutant that drops `raise` (or any
+/// generated private) from the tail set flips this fixture to
+/// `closed_notfound` and fails here.
+#[test]
+fn kernel_tail_raise_buckets_known_tail_and_still_silent() {
+    let (diags, recs) = dark_fixture("kernel_tail_raise_silently.rb");
+    assert!(diags.is_empty(), "tail silence never diagnoses: {diags:?}");
+    assert!(
+        recs.iter().any(|r| r == "Importer raise known_tail"),
+        "the bare raise must bucket known_tail: {recs:?}"
+    );
+    assert!(
+        recs.iter().all(|r| !r.ends_with("closed_notfound")),
+        "a tail name never reaches the residue bucket: {recs:?}"
+    );
+}
+
+/// The rest of the measured tail family, same expectation, one assertion
+/// per name: rand/caller/Array/URI/puts/sleep/block_given?/require_relative
+/// all bucket known_tail (the exact names the census histogram carried).
+#[test]
+fn kernel_tail_family_buckets_known_tail() {
+    let (diags, recs) = dark_fixture("kernel_tail_bare_call_family_silent.rb");
+    assert!(diags.is_empty(), "tail silence never diagnoses: {diags:?}");
+    for m in [
+        "rand",
+        "caller",
+        "Array",
+        "URI",
+        "puts",
+        "sleep",
+        "block_given?",
+        "require_relative",
+    ] {
+        assert!(
+            recs.iter().any(|r| *r == format!("Probe {m} known_tail")),
+            "tail name {m} must bucket known_tail: {recs:?}"
+        );
+    }
+    assert!(
+        recs.iter().all(|r| !r.ends_with("closed_notfound")),
+        "no tail name reaches the residue bucket: {recs:?}"
+    );
+}
+
+/// A bare tail call at CLASS-BODY level runs with the class object as
+/// `self` too, and buckets known_tail the same way.
+#[test]
+fn class_body_kernel_tail_buckets_known_tail() {
+    let (diags, recs) = dark_fixture("class_body_kernel_tail_still_silent.rb");
+    assert!(diags.is_empty(), "tail silence never diagnoses: {diags:?}");
+    assert!(
+        recs.iter().any(|r| r == "Boot puts known_tail"),
+        "the class-body puts must bucket known_tail: {recs:?}"
+    );
+    assert!(
+        recs.iter().all(|r| !r.ends_with("closed_notfound")),
+        "no tail name reaches the residue bucket: {recs:?}"
+    );
+}
+
+/// PRECEDENCE: the project defines `raise` on the class object, so the call
+/// RESOLVES — the inventory is never consulted, and a resolved lookup
+/// records nothing at all. The mutant this fails: consulting the tail
+/// before the project's own method table (blanket suppression).
+#[test]
+fn project_defined_raise_resolves_and_records_nothing() {
+    let (diags, recs) = dark_fixture("project_defined_raise_wins_over_inventory.rb");
+    assert!(diags.is_empty(), "correct code stays silent: {diags:?}");
+    assert!(
+        recs.iter().all(|r| !r.starts_with("Uploader ")),
+        "a project-defined raise must resolve, never bucket (let alone known_tail): {recs:?}"
+    );
+    assert!(
+        recs.iter().all(|r| !r.ends_with("known_tail")),
+        "the tail label never lands on a resolved call: {recs:?}"
+    );
+}
+
+/// The accusation survives the tail: a TYPO inside a `def self.` body is
+/// not a tail name, stays silent today, and remains the residue — exactly
+/// what a class-object E0101 fires on once the track arms.
+#[test]
+fn singleton_tail_typo_stays_closed_notfound() {
+    let (diags, recs) = dark_fixture("singleton_tail_typo_still_closed.rb");
+    assert!(diags.is_empty(), "the track is still not armed: {diags:?}");
+    assert!(
+        recs.iter().any(|r| r == "Job performm closed_notfound"),
+        "a non-tail typo must stay in the residue bucket: {recs:?}"
+    );
+    assert_eq!(
+        recs.iter().filter(|r| r.ends_with("closed_notfound")).count(),
+        1,
+        "exactly one residue site: {recs:?}"
+    );
 }

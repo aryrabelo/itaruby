@@ -545,10 +545,19 @@ commit to already be on a remote (exit 65 otherwise).
 `ita check --dark-singletons=<file> <path>` runs the dark singleton census: a
 measurement instrument (never a gate) whose JSONL records what the class-object
 track WOULD accuse (`closed_notfound` — the residue) against the blocker
-standing every other receiver down (`open(<reason>)`). It changes no
-diagnostic — proven byte-identical on rails/mastodon/discourse — and doubles
-as the net for span bugs the diagnostic path never renders
-(`on_char_boundary: false`). `scripts/dark-singleton-summary` reads the JSONL.
+standing every other receiver down (`open(<reason>)`). Since the tail bead
+(2026-09-20) a third verdict exists: `known_tail` — silent because the NAME is
+the core bare-call tail (`core::kernel_bare_call_method`), generated into
+`declarations/core_inventory.txt`'s `Class~method` section by
+`scripts/gen-core-inventory.rb` (private harvest of
+Kernel/BasicObject/Module/Class/Object, `initialize` excluded; `URI`/`pp`
+hand-added as default-stdlib extensions invisible to `--disable-gems`, same
+precedent as `gem`). It changes no diagnostic — proven byte-identical on
+rails/mastodon/discourse — and doubles as the net for span bugs the
+diagnostic path never renders (`on_char_boundary: false`).
+`scripts/dark-singleton-summary` reads the JSONL and flags any residue site
+still carrying a tail name (a wiring gap). Post-tail residue: 56/4/44 on
+rails/mastodon/discourse (from 319/153/4389), the hand-auditable remainder.
 
 Per-run artifacts land in `target/gauntlet/` (gitignored).
 

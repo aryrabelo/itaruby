@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Kernel bare-call tail inventory (bead ita-tail): `gen-core-inventory.rb`
+  now harvests the PRIVATE instance surface of
+  Kernel/BasicObject/Module/Class/Object into a `Class~method` section of
+  `declarations/core_inventory.txt` (deliberately disjoint from the
+  `Class#method` public lines, so an explicit-receiver reader can never see a
+  private name; `initialize` excluded; `URI`/`pp` hand-added as
+  default-stdlib extensions invisible under `--disable-gems`, same precedent
+  as `gem`). The class-object track's `soften_not_found` consults it
+  NotFound-only — project definitions win — and the census labels the
+  silence `known_tail` so the JSONL self-describes why a site never accuses.
+  Residue: 319/153/4389 → **56/4/44** on rails/mastodon/discourse, zero tail
+  names left in the residue, diagnostics byte-identical everywhere.
+  Two-sided: 5 fixtures/tests (raise, the family, class body, the
+  project-defines-raise precedence guard, the surviving typo) and mutants
+  MUT-Q/MUT-R in `scripts/singleton-mutants.sh` — cutting the consult flips
+  the residue back, cutting only the label re-anonymizes the audit trail.
 - Dark singleton census (`ita check --dark-singletons=<file>`): the class-object
   `Ty::Class` arms record their lookup verdict into a JSONL side channel —
   `closed_notfound` (the residue: exactly what a class-object E0101 would fire

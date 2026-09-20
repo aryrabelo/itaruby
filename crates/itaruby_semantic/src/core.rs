@@ -475,6 +475,14 @@ const KERNEL_PRIVATE_INSTANCE_METHODS: &[&str] = &[
     "putc", "readline", "readlines", "respond_to_missing?", "select", "set_trace_func",
     "singleton_method_added", "singleton_method_removed", "singleton_method_undefined", "spawn", "syscall", "test",
     "trace_var", "trap", "untrace_var",
+    // bead ita-tail (2026-09-20, dark-census measurement): stdlib-EXT
+    // defaults, invisible to the generator's `--disable-gems` harvest for
+    // the same reason `gem` is, and measured as bare-call residue anyway —
+    // `URI(...)` 23 sites in rails' singleton residue, `pp` in the
+    // report-side tail set. Every real application requires these; the
+    // language-purity guarantee above is about not harvesting GEMS, and
+    // default-stdlib extensions are not gems.
+    "URI", "pp",
 ];
 
 /// Kernel/top-level DSL methods contributed by PUBLIC gems, never by app
@@ -618,6 +626,46 @@ const CLASS_MODULE_ONLY_METHODS: &[&str] = &[
 /// `Module`'s own surface (`CLASS_MODULE_ONLY_METHODS`).
 pub fn kernel_object_singleton_method(name: &str) -> bool {
     kernel_object_instance_method(name) || CLASS_MODULE_ONLY_METHODS.contains(&name)
+}
+
+/// Bead ita-tail (2026-09-20): the BARE-CALL tail — every name a Ruby class
+/// object answers by implicit receiver from its own core ancestry, both the
+/// generated private harvest (`Class~method` lines in CORE_INVENTORY —
+/// `Kernel.private_instance_methods` etc.: `raise`, `rand`, `caller`,
+/// `block_given?`, ...) and the hand-maintained core lists above. This is
+/// the population the dark census measured as the class-object residue's
+/// bulk: 79-97% of `closed_notfound` on rails/mastodon/discourse, a
+/// prospective FALSE E0101 on every site once the class-object track arms.
+///
+/// Line-shape discipline: the private section is `Class~method` with NO
+/// `#`, deliberately disjoint from the public section (`Class#method`) and
+/// from operator methods literally named `~` (`Integer#!~` carries `#`, so
+/// it never parses as a private line) — an explicit-receiver reader can
+/// never see a private name, preserving the public inventory's "private can
+/// never be a receiver call" invariant.
+///
+/// Silence-only, and only ever consulted (a) from the class-object track's
+/// `soften_not_found` NotFound path — project definitions win, because
+/// `lookup_singleton_own` has already returned by then — and (b) in
+/// check.rs's dark census to LABEL the silence `KnownTail`. Never consulted
+/// on the instance track (not measured there) and never from any path that
+/// produces a diagnostic (invariant #1: the inventory can only stand a
+/// would-be diagnostic down, never raise one).
+static BARE_CALL_TAIL: std::sync::LazyLock<std::collections::HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        CORE_INVENTORY
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.contains('#') && l.contains('~'))
+            .map(|l| &l[l.rfind('~').expect("filtered: has ~") + 1..])
+            .chain(KERNEL_PRIVATE_INSTANCE_METHODS.iter().copied())
+            .chain(CLASS_MODULE_ONLY_METHODS.iter().copied())
+            .collect()
+    });
+
+/// Is `name` part of the core bare-call tail a class object answers? See
+/// [`BARE_CALL_TAIL`] for the membership and the silence-only contract.
+pub fn kernel_bare_call_method(name: &str) -> bool {
+    BARE_CALL_TAIL.contains(name)
 }
 
 /// Inventory names for a core class — `Bool` is the only two-class case

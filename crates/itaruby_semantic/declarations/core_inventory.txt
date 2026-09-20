@@ -1109,6 +1109,110 @@ Object#to_enum
 Object#to_s
 Object#yield_self
 
+# bare-call private tail (bead ita-tail): one `Class~method` line per
+# PRIVATE instance method (`private_instance_methods(false)`) of the
+# classes a Ruby class object answers through its own ancestry
+# (`Class < Module < Object < Kernel < BasicObject`). A private method can
+# never be an explicit-receiver call, so these lines are deliberately in a
+# DISTINCT format from the `Class#method` section above — the receiver-call
+# reader (`core_inventory_has`) never sees them, and the only consumer is
+# core.rs's bare-call tail reader (`kernel_bare_call_method`), consulted
+# from the class-object track's NotFound softening (index.rs
+# `soften_not_found`). `initialize` is excluded (see
+# KERNEL_PRIVATE_INSTANCE_METHODS' doc comment in core.rs: treating it as a
+# blanket hit would turn every `.new` arity check into Inconclusive).
+Kernel~Array
+Kernel~Complex
+Kernel~Float
+Kernel~Hash
+Kernel~Integer
+Kernel~Rational
+Kernel~String
+Kernel~__callee__
+Kernel~__dir__
+Kernel~__method__
+Kernel~`
+Kernel~abort
+Kernel~at_exit
+Kernel~autoload
+Kernel~autoload?
+Kernel~binding
+Kernel~block_given?
+Kernel~caller
+Kernel~caller_locations
+Kernel~catch
+Kernel~eval
+Kernel~exec
+Kernel~exit
+Kernel~exit!
+Kernel~fail
+Kernel~fork
+Kernel~format
+Kernel~gets
+Kernel~global_variables
+Kernel~initialize_clone
+Kernel~initialize_copy
+Kernel~initialize_dup
+Kernel~iterator?
+Kernel~lambda
+Kernel~load
+Kernel~local_variables
+Kernel~loop
+Kernel~open
+Kernel~p
+Kernel~pp
+Kernel~print
+Kernel~printf
+Kernel~proc
+Kernel~putc
+Kernel~puts
+Kernel~raise
+Kernel~rand
+Kernel~readline
+Kernel~readlines
+Kernel~require
+Kernel~require_relative
+Kernel~respond_to_missing?
+Kernel~select
+Kernel~set_trace_func
+Kernel~sleep
+Kernel~spawn
+Kernel~sprintf
+Kernel~srand
+Kernel~syscall
+Kernel~system
+Kernel~test
+Kernel~throw
+Kernel~trace_var
+Kernel~trap
+Kernel~untrace_var
+Kernel~warn
+BasicObject~method_missing
+BasicObject~singleton_method_added
+BasicObject~singleton_method_removed
+BasicObject~singleton_method_undefined
+Module~append_features
+Module~const_added
+Module~extend_object
+Module~extended
+Module~included
+Module~initialize_clone
+Module~initialize_copy
+Module~method_added
+Module~method_removed
+Module~method_undefined
+Module~module_function
+Module~prepend_features
+Module~prepended
+Module~private
+Module~protected
+Module~public
+Module~refine
+Module~remove_const
+Module~ruby2_keywords
+Module~using
+Class~inherited
+
 # top-level constants (Object.constants under --disable-gems)
 ::ARGF
 ::ARGV

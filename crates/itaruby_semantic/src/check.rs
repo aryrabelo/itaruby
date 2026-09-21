@@ -4458,6 +4458,20 @@ impl Checker<'_> {
             // belong to `m.file`, not the file under the cursor, so
             // hover capture must stand down for the nested walk.
             let saved_hover = self.hover_target.take();
+            // Bead ita-census: the dark census must stand down here for
+            // the same reason. `dark_record` attributes every record to
+            // the file under the CURSOR, and this walk's call spans
+            // belong to `m.file` — without the stand-down a host file's
+            // census carries foreign-span records: measured on
+            // discourse, 132k of 319k rows rendered line 0 (the byte is
+            // not even a char boundary in the attributed file), real
+            // sites appeared as exact duplicates (the site's own walk
+            // plus every host that pulled the body), and ghost sites
+            // appeared in files that never call them. Family-level
+            // verdicts survived (same lookup, same verdict); site-level
+            // attribution — the residue audit's whole point — did not.
+            let saved_dark = self.dark;
+            self.dark = false;
             // Bead ita-qst: same file-mismatch guard — `cast_comments`
             // is keyed by BYTE OFFSETS, which are only meaningful
             // against the file they were collected from. Recompute
@@ -4486,6 +4500,7 @@ impl Checker<'_> {
             self.hover_target = saved_hover;
             self.cast_comments = saved_cast_comments;
             self.silent = was_silent;
+            self.dark = saved_dark;
             t
         } else {
             // ponytail: no def found at all — never ran a body walk,

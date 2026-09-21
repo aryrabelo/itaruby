@@ -579,10 +579,14 @@ positives — including a real discourse bug (`lib/color_math.rb:62`
 `raise new RuntimeError(...)` raises NoMethodError instead of the intended
 message) — and 98 populated sites across 9 named mechanisms: **the
 class-object flip stays closed until those populations are indexed**, per
-the same rule as the singleton-track gaps below. The census instrument also
-has a known attribution bug (duplicated records with wrong file/line/byte
-triples; instance-context calls leaking into the class track) — family-level
-verdicts are reliable, site-level locations are not; instrument bead filed.
+the same rule as the singleton-track gaps below. (2026-09-21, bead
+ita-census: those were census RECORDS, inflated by the foreign-span ghost
+emissions the instrument fix removed — the true distinct-site remainder
+is 50/1/20; the family-level audit table stands, now with trustworthy
+site-level attribution.) The census instrument's remaining known bug
+(the duplicated-record/instance-leak note above) was that same foreign-
+span emission and is FIXED by ita-census; the site-level audit can
+proceed.
 
 Per-run artifacts land in `target/gauntlet/` (gitignored).
 

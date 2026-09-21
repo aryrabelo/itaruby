@@ -8,6 +8,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Census instrument fix (bead ita-census, 2026-09-21): `method_return`'s
+  nested cross-file body walk no longer emits dark-census records. The
+  walk's byte offsets belong to `m.file` while `dark_record` attributes
+  to the file under the cursor — the same mismatch hover and
+  `cast_comments` already stand down for. Measured before the fix on
+  discourse: 132,455 of 319,494 rows rendered line 0 (the foreign byte
+  is not a char boundary in the attributed file), live sites appeared
+  as exact duplicates (own walk plus every host that pulled the body —
+  mastodon's 4-record residue was 4 ghosts of ONE
+  `DeliveryFailureTracker redis` site), and ghost sites appeared in
+  files that never call them. After: mastodon 4 records → 1 site,
+  discourse 42 records → 20 sites, **zero** closed records with
+  line 0 — site-level attribution is trustworthy for the first time,
+  which is what the residue audit and the eventual E0101 flip need.
+  Diagnostics byte-identical (census is a side channel). Two-sided:
+  `census_foreign_body_walk_records_nothing_in_the_host` (a host
+  fixture with no census-able site of its own — any record is a ghost)
+  and mutant MUT-T, which cuts the stand-down and is accused by it.
 - Nested `def` filing (bead ita-nst, 2026-09-21): a `def` KEYWORD nested
   anywhere in a method body is now filed on the track its `self` really
   writes — `def self.x` inside a plain-yield block inside `def self.y`

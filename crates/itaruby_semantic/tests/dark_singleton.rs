@@ -242,3 +242,42 @@ fn nested_def_self_in_block_resolves_and_records_nothing() {
         "fetch_data must not appear in any record: {recs:?}"
     );
 }
+
+/// Bead ita-census: `method_return`'s nested cross-file body walk must
+/// stand the census DOWN. Its byte offsets belong to `m.file`, while
+/// `dark_record` attributes every record to the file under the cursor —
+/// the same mismatch hover and `cast_comments` already stand down for.
+/// Measured on discourse before the fix: 132k of 319k rows rendered
+/// line 0 (the foreign byte is not a char boundary in the attributed
+/// file), live sites appeared as exact duplicates (own walk plus every
+/// host that pulled the body), and ghost sites appeared in files that
+/// never call them. The host fixture here has NO census-able site of
+/// its own, so any record at all in `a_recs` is a foreign-span ghost.
+#[test]
+fn census_foreign_body_walk_records_nothing_in_the_host() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/dark_singleton");
+    let b_path = format!("{dir}/census_host_b.rb");
+    let a_path = format!("{dir}/census_host_a.rb");
+    let b_text = std::fs::read_to_string(&b_path).unwrap();
+    let a_text = std::fs::read_to_string(&a_path).unwrap();
+    let db = Db::default();
+    let b = SourceFile::new(&db, b_path.into(), b_text);
+    let a = SourceFile::new(&db, a_path.into(), a_text);
+    ProjectFiles::new(&db, vec![a, b]);
+    let (a_diags, a_recs) = check_file_dark(&db, a);
+    let (b_diags, b_recs) = check_file_dark(&db, b);
+    assert!(a_diags.is_empty(), "calling into b stays silent: {a_diags:?}");
+    assert!(b_diags.is_empty(), "the residue stays silent: {b_diags:?}");
+    assert!(
+        a_recs.is_empty(),
+        "the host file must record nothing from the foreign body walk: {a_recs:?}"
+    );
+    assert_eq!(
+        b_recs
+            .iter()
+            .filter(|r| matches!(r.verdict, itaruby_semantic::DarkVerdict::ClosedNotFound))
+            .count(),
+        1,
+        "exactly one residue site, emitted by its own file's walk: {b_recs:?}"
+    );
+}

@@ -384,6 +384,13 @@ mutant MUT-S "$IDX" \
                                 self.fragments[i].singleton_methods.push(nd.md);' \
   nested_def_self_arity_is_checked \
   'the nested-def singleton filing is cut: the block-installed def self.fetch_data never lands on the class-object track, the arity E0102 disappears, and the shape goes back to reading as residue — a prospective FALSE E0101 the moment the track arms'
+mutant MUT-T "$CHK" \
+  '            let saved_dark = self.dark;
+            self.dark = false;' \
+  '            let saved_dark = self.dark;' \
+  census_foreign_body_walk_records_nothing_in_the_host \
+  'the census stand-down in the nested cross-file body walk is cut: method_return re-emits foreign-span records into the host file — the ghost/duplicate/line-0 corruption measured on discourse before ita-census'
+
 echo '--- restore and prove the shipped source is byte-identical'
 restore
 cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" && cmp -s "$CHK" "$BAK_CHK" \

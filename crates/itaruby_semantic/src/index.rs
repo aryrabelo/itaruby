@@ -7310,21 +7310,77 @@ impl ProjectIndex {
             if let Some(m) = class.singleton_methods.get(name) {
                 return MethodLookup::Found(m, a);
             }
-            for ext in &class.extends {
-                if let Some(mid) = self.resolve_const(&class.nesting, ext) {
-                    if let Some(m) = self.class(mid).methods.get(name) {
-                        return MethodLookup::Found(m, mid);
-                    }
-                } else {
-                    return MethodLookup::Inconclusive;
-                }
+            if let Some(lookup) = self.extended_module_surface(class, name) {
+                return lookup;
             }
+        }
+        // Bead ita-asx: a class object is an instance of `Class` (a module
+        // object, of `Module`, itself a `Class`), so after the singleton
+        // chain the lookup ends in `Class`'s INSTANCE surface. A project
+        // reopening (`class Class ... end` — the exact shape
+        // activesupport's own `core_ext/class/subclasses.rb`,
+        // `core_ext/module/introspection.rb` and friends ship) defines
+        // those methods in project source, exactly as readable as the
+        // `extend`ed module's instance side consulted above: measured on
+        // rails, 17 census residue sites (`Parent.descendants`,
+        // `module_parent*`, ...) were this shape reading as NotFound. The
+        // fragment's openness (`ReopenedExternal`) concerns the REST of
+        // the core surface — what the gem may add dynamically — not what
+        // the reopening's own text literally defines; this reads only
+        // that. Monotonically less diagnostic (NotFound -> Found),
+        // invariant #1.
+        if let Some(found) = self.core_object_instance_surface(id, name) {
+            return found;
         }
         if complete && !self.descendant_defines(id, name, true) {
             MethodLookup::NotFound
         } else {
             MethodLookup::Inconclusive
         }
+    }
+
+    /// An `extend M` puts M's instance methods on the class object's
+    /// dispatch: resolve the named module against the ancestor's own
+    /// nesting and read it. An unresolvable module name makes the whole
+    /// verdict inconclusive — the surface genuinely cannot be read
+    /// (`Some(Inconclusive)`), never silently skipped. Bead ita-asx named
+    /// this cluster when the `Class`/`Module` reopening consult
+    /// (`core_object_instance_surface`) joined it at the same call site.
+    fn extended_module_surface(&self, class: &ClassDef, name: &str) -> Option<MethodLookup<'_>> {
+        for ext in &class.extends {
+            if let Some(mid) = self.resolve_const(&class.nesting, ext) {
+                if let Some(m) = self.class(mid).methods.get(name) {
+                    return Some(MethodLookup::Found(m, mid));
+                }
+            } else {
+                return Some(MethodLookup::Inconclusive);
+            }
+        }
+        None
+    }
+
+    /// The instance surface every class object dispatches through after
+    /// its own singleton chain: `Class` for classes, `Module` then `Class`
+    /// for modules. Only PROJECT reopenings of those names are consulted —
+    /// a fragment exists there only when project source literally wrote
+    /// `class Class`/`class Module`, and its instance methods are exactly
+    /// as readable as an `extend`ed module's. A missing fragment changes
+    /// nothing: the builtin core surface is the inventory's business, not
+    /// this consult's (bead ita-asx).
+    fn core_object_instance_surface(&self, id: ClassId, name: &str) -> Option<MethodLookup<'_>> {
+        let object_class: &[&str] = if self.class(id).is_module {
+            &["Module", "Class"]
+        } else {
+            &["Class"]
+        };
+        for path in object_class {
+            if let Some(&cid) = self.by_path.get(*path) {
+                if let Some(m) = self.class(cid).methods.get(name) {
+                    return Some(MethodLookup::Found(m, cid));
+                }
+            }
+        }
+        None
     }
 
     /// Bead ita-6bq: does a class's OWN singleton `new` show up somewhere

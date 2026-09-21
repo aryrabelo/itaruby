@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Core-object reopening consult (bead ita-asx, 2026-09-21): the
+  class-object track's singleton lookup now ends in the `Class`/`Module`
+  INSTANCE surface — where a project reopening (`class Class ... end`,
+  the exact shape activesupport's own `core_ext/class/subclasses.rb` and
+  `core_ext/module/introspection.rb` ship) defines methods in project
+  source. Measured on rails: **17 census residue sites resolved**
+  (`ClassTest::Parent#descendants` and the `descendants` family,
+  `module_parent`/`module_parent_name`/`module_parents`), 50 → 33; the
+  reopening carries a real signature, so the resolution is checkable —
+  `core_ext_class_reopening_arity_accuses.rb` fires an E0102 MRI really
+  raises. Diagnostics byte-identical on all three public corpora (the
+  consult is monotonically less diagnostic: NotFound → Found,
+  invariant #1); mastodon/discourse residue untouched (no overreach).
+  `lookup_singleton`'s `extends` cluster extracted into
+  `extended_module_surface` (the complexity ceiling caught the inline
+  version). Two-sided: the resolution fixture (MRI Clean) + the arity
+  fixture (MRI Raises) + mutant MUT-U accused by the arity test.
 - Census instrument fix (bead ita-census, 2026-09-21): `method_return`'s
   nested cross-file body walk no longer emits dark-census records. The
   walk's byte offsets belong to `m.file` while `dark_record` attributes

@@ -391,6 +391,14 @@ mutant MUT-T "$CHK" \
   census_foreign_body_walk_records_nothing_in_the_host \
   'the census stand-down in the nested cross-file body walk is cut: method_return re-emits foreign-span records into the host file — the ghost/duplicate/line-0 corruption measured on discourse before ita-census'
 
+mutant MUT-U "$IDX" \
+  '        for path in object_class {
+            if let Some(&cid) = self.by_path.get(*path) {' \
+  '        for path in object_class {
+            if let Some(&cid) = self.by_path.get("__ita_asx_never__") {' \
+  core_ext_class_reopening_arity_is_checked \
+  'the core-object reopening consult is cut: a project `class Class ... end` no longer answers class-object lookups, the arity E0102 disappears, and the AS core-ext shape (14 measured rails sites) goes back to reading as residue — a prospective FALSE E0101 the moment the track arms'
+
 echo '--- restore and prove the shipped source is byte-identical'
 restore
 cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" && cmp -s "$CHK" "$BAK_CHK" \

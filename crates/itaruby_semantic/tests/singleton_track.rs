@@ -910,6 +910,8 @@ fn mri_ground_truth_is_executed() {
         ("singleton_patch_on_undeclared_class_invents_nothing.rb", Mri::Clean),
         ("stdlib_singleton_surface_silent.rb", Mri::Clean),
         ("nested_def_self_arity_accuses.rb", Mri::Raises("ArgumentError", 22)),
+        ("core_ext_class_reopening_resolves.rb", Mri::Clean),
+        ("core_ext_class_reopening_arity_accuses.rb", Mri::Raises("ArgumentError", 15)),
         ("nested_def_self_in_instance_body_opens.rb", Mri::Clean),
         ("nested_plain_def_files_instance_track.rb", Mri::Clean),
         ("thread_mattr_accessor_resolves_silently.rb", Mri::Clean),
@@ -924,6 +926,7 @@ fn mri_ground_truth_is_executed() {
         &["off"],
     );
     assert_eq!(code, 0, "the dynamic-option fixture must run clean with `off` too: {text}");
+
     // Every fixture on disk is in the table.
     let mut on_disk: Vec<String> = std::fs::read_dir(fixture_dir())
         .expect("fixture dir")
@@ -935,4 +938,35 @@ fn mri_ground_truth_is_executed() {
     let mut declared: Vec<String> = table.iter().map(|(n, _)| (*n).to_string()).collect();
     declared.sort();
     assert_eq!(on_disk, declared, "every fixture must declare its MRI outcome");
+}
+
+// ---------------------------------------------------------------------
+
+/// Bead ita-asx: a project reopening of `Class` defines an instance method
+/// of Class itself — every class object answers it (the exact shape
+/// activesupport's `core_ext/class/subclasses.rb` ships; 14 measured
+/// census residue sites on rails). The class-object track consults the
+/// reopening's instance surface after the singleton chain: the call
+/// resolves, silence holds.
+#[test]
+fn core_ext_class_reopening_resolves_on_the_class_object_track() {
+    let (instance, singleton, open) =
+        facts("core_ext_class_reopening_resolves.rb", "Plant");
+    assert!(instance.is_empty(), "nothing lands on Plant: {instance:?}");
+    assert!(singleton.is_empty(), "nothing lands on Plant's singleton: {singleton:?}");
+    assert!(!open, "the reopening defines a real method; Plant stays closed");
+    let d = diags("core_ext_class_reopening_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// The reopening carries a REAL signature: `descendants(need)` takes one
+/// argument, so the zero-argument call on the class object is an E0102
+/// MRI really raises (ArgumentError, given 0 expected 1). Resolution is
+/// checkable knowledge, not just silence.
+#[test]
+fn core_ext_class_reopening_arity_is_checked() {
+    assert_eq!(
+        diags("core_ext_class_reopening_arity_accuses.rb"),
+        vec!["15:7:E0102"]
+    );
 }

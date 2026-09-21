@@ -375,8 +375,15 @@ mutant MUT-R "$CHK" \
                             DarkVerdict::KnownTail
                         } else {' \
   kernel_tail_raise_buckets_known_tail_and_still_silent \
-  'the census KnownTail label is cut: the raise still softens (silence preserved) but the JSONL reads the unattributable open(inconclusive_no_blocker) — the audit trail is the thing that broke'
+  'the census KnownTail LABEL is cut: the raise still softens (silence preserved) but the JSONL reads the unattributable open(inconclusive_no_blocker) again — the audit trail is the thing that broke'
 
+mutant MUT-S "$IDX" \
+  '                            if treated_as_singleton {
+                                self.fragments[i].singleton_methods.push(nd.md);' \
+  '                            if false && treated_as_singleton {
+                                self.fragments[i].singleton_methods.push(nd.md);' \
+  nested_def_self_arity_is_checked \
+  'the nested-def singleton filing is cut: the block-installed def self.fetch_data never lands on the class-object track, the arity E0102 disappears, and the shape goes back to reading as residue — a prospective FALSE E0101 the moment the track arms'
 echo '--- restore and prove the shipped source is byte-identical'
 restore
 cmp -s "$IDX" "$BAK_IDX" && cmp -s "$DIS" "$BAK_DIS" && cmp -s "$CHK" "$BAK_CHK" \

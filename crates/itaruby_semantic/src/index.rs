@@ -100,6 +100,12 @@ pub enum OpenReason {
     /// as a visible non-zero in `anc_other` instead of silently leaving
     /// the ancestry census entirely.
     Unattributed,
+    /// Bead ita-nst: a `def self.x` KEYWORD nested inside an INSTANCE
+    /// method's body (usually in a block): at runtime `self` there is
+    /// one object, so the definition lands on that object's own singleton
+    /// — an owner no index position can name. The enclosing class OPENS
+    /// rather than collecting a name it may not have (invariant #1).
+    NestedDefOwner,
 }
 
 /// What actually blocks a `MethodLookup::Inconclusive` from concluding
@@ -2485,9 +2491,35 @@ impl DefWalker<'_> {
                     // The prefilter only ever SKIPS work: a body that
                     // mentions a name still goes through the AST, which
                     // is what decides anything.
-                    let body_text = &self.text[md.def_span.0..md.def_span.1];
-                    if BODY_DEF_NAMES.iter().any(|n| body_text.contains(n)) {
-                        let defs = dynamic_defs_in_body(&def);
+                    // Body-ONLY span (bead ita-nst fix): the def's whole
+                    // span starts with "def " by construction, so a
+                    // prefilter over it is tautological — every body
+                    // would pass, the perf ceiling the original prefilter
+                    // bought (10.71 ms vs 7.04, measured) would be gone,
+                    // and MUT-F's control (the `_exec` prefilter entry)
+                    // would read BLIND. The body node starts after the
+                    // header/params, which is exactly where a NESTED def
+                    // can first appear.
+                    let body_text = def.body().map_or("", |b| {
+                        let loc = b.location();
+                        &self.text[loc.start_offset()..md.def_span.1]
+                    });
+                    // The `def ` arms are bead ita-nst: a nested def
+                    // KEYWORD spells "def " in the BODY text, and
+                    // "define_method" does not (the 'd','e','f' are
+                    // followed by 'i'). False positives (a comment or
+                    // string saying "def ") only cost an AST walk.
+                    if BODY_DEF_NAMES.iter().any(|n| body_text.contains(n))
+                        || body_text.contains("def ")
+                        || body_text.contains("def\n")
+                        || body_text.contains("def\t")
+                    {
+                        let defs = dynamic_defs_in_body(
+                            &def,
+                            self.text,
+                            self.line_index,
+                            self.sig_comments,
+                        );
                         for (target, reason) in defs.opens {
                             match target {
                                 DefTarget::Enclosing => self.open_class(i, reason),
@@ -2506,6 +2538,40 @@ impl DefWalker<'_> {
                                 target,
                                 lit,
                             );
+                        }
+                        // Bead ita-nst: file every nested `def` KEYWORD.
+                        // The self-binding rules (MRI-verified, and the
+                        // fixtures carry the proofs):
+                        // * enclosing def is singleton-shaped (`def self.x`
+                        //   or `class << self`): self at block run time IS
+                        //   the class/module, so BOTH spellings define on
+                        //   its singleton track — `def y` on the class of
+                        //   self (= this module's singleton class) and
+                        //   `def self.y` directly on it.
+                        // * enclosing INSTANCE def with a plain-yield
+                        //   block: `def y` defines on the class of self —
+                        //   this very class — so the instance track; but
+                        //   `def self.y` defines on ONE object's own
+                        //   singleton, an owner no index position can
+                        //   name: open (invariant #1 — an optimistic
+                        //   filing here could silence a real typo by
+                        //   inventing a name the class never gets).
+                        // Measured shape: discourse's
+                        // `EmotionDashboardReport.fetch_data`, defined in
+                        // a plain-yield block inside `def self.register!`
+                        // this filing.
+                        for nd in defs.nested_defs {
+                            let nested_name = nd.md.name.clone();
+                            if nested_name == "method_missing" || nested_name == "respond_to_missing?" {
+                                self.open_class(i, OpenReason::MethodMissing);
+                            }
+                            if treated_as_singleton {
+                                self.fragments[i].singleton_methods.push(nd.md);
+                            } else if nd.receiver_self {
+                                self.open_class(i, OpenReason::NestedDefOwner);
+                            } else {
+                                self.fragments[i].methods.push(nd.md);
+                            }
                         }
                     }
                     // ponytail: text scan, not AST — `raise NotImplementedError`
@@ -3488,10 +3554,35 @@ impl DefWalker<'_> {
     }
 
     fn method_def(&mut self, def: &ruby_prism::DefNode<'_>) -> MethodDef {
-        let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
-        let name_loc = def.name_loc();
-        let def_loc = def.location();
+        build_method_def(
+            def,
+            self.text,
+            self.line_index,
+            self.sig_comments,
+            &mut self.sig_errors,
+            self.pending_sorbet_ret.take(),
+        )
+    }
+}
 
+/// `DefWalker::method_def` as a free function (bead ita-nst): the nested-
+/// def collector inside `dynamic_defs_in_body`'s scanner needs the exact
+/// same construction but holds no `DefWalker` — only the three references
+/// this function needs. The ONE deliberate difference: nested defs take
+/// no `pending_sorbet_ret` (`sig`/`def` adjacency across a block boundary
+/// is not a thing Tapioca or a human writes) and their `#:` sig-comment
+/// lookup still runs, same as any def.
+fn build_method_def(
+    def: &ruby_prism::DefNode<'_>,
+    text: &str,
+    line_index: &LineIndex,
+    sig_comments: &HashMap<u32, (usize, usize)>,
+    sig_errors: &mut Vec<(usize, usize, String)>,
+    pending_sorbet_ret: Option<String>,
+) -> MethodDef {
+    let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
+    let name_loc = def.name_loc();
+    let def_loc = def.location();
         let mut md = MethodDef {
             name,
             required: 0,
@@ -3501,7 +3592,7 @@ impl DefWalker<'_> {
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_ret: self.pending_sorbet_ret.take(),
+            sorbet_ret: pending_sorbet_ret,
             arity_unknown: false,
             abstract_stub: false,
             name_span: (name_loc.start_offset(), name_loc.end_offset()),
@@ -3509,57 +3600,61 @@ impl DefWalker<'_> {
         };
 
         if let Some(params) = def.parameters() {
-            #[expect(
-                clippy::cast_possible_truncation,
-                reason = "a single `def`'s parameter count is bounded by the source file it was parsed from, far below u32::MAX"
-            )]
-            {
-                md.required =
-                    (params.requireds().iter().count() + params.posts().iter().count()) as u32;
-                md.optional = params.optionals().iter().count() as u32;
-            }
-            md.rest = params.rest().is_some()
-                // `def foo(...)` (Ruby 3.0 forwarding, ita-7g9): prism
-                // parses `...` as the params' `keyword_rest` field holding
-                // a `ForwardingParameterNode`, not `rest`. Forwarding
-                // relays whatever positional/keyword/block args the
-                // caller passes, so it models the same "no cap" arity as
-                // a bare `*args` — treat it as rest for `check_arity`
-                // (crates/itaruby_semantic/src/check.rs), which already
-                // skips both the min and max check when `rest` is true.
-                || params
-                    .keyword_rest()
-                    .is_some_and(|kr| kr.as_forwarding_parameter_node().is_some());
-            for kw in &params.keywords() {
-                if let Some(k) = kw.as_required_keyword_parameter_node() {
-                    md.keywords.push((
-                        String::from_utf8_lossy(k.name().as_slice()).into_owned(),
-                        true,
-                    ));
-                } else if let Some(k) = kw.as_optional_keyword_parameter_node() {
-                    md.keywords.push((
-                        String::from_utf8_lossy(k.name().as_slice()).into_owned(),
-                        false,
-                    ));
-                }
-            }
-            md.kwrest = params.keyword_rest().is_some();
-            md.block = params.block().is_some();
+            fill_def_params(&mut md, &params);
         }
 
         // `#:` sig on the line right above the def.
-        let (def_line, _) = self.line_index.line_col(self.text, def_loc.start_offset());
+        let (def_line, _) = line_index.line_col(text, def_loc.start_offset());
         if def_line > 0 {
-            if let Some(&(cstart, cend)) = self.sig_comments.get(&(def_line - 1)) {
-                let body = self.text[cstart..cend].trim_start_matches("#:").trim();
+            if let Some(&(cstart, cend)) = sig_comments.get(&(def_line - 1)) {
+                let body = text[cstart..cend].trim_start_matches("#:").trim();
                 match parse_rbs_comment(body) {
                     Ok(sig) => md.sig = Some(sig),
-                    Err(e) => self.sig_errors.push((cstart, cend, e)),
+                    Err(e) => sig_errors.push((cstart, cend, e)),
                 }
             }
         }
         md
     }
+
+/// The parameters block of `build_method_def` (bead ita-nst split for the
+/// complexity ceiling): counts, rest/forwarding, keywords, block.
+fn fill_def_params(md: &mut MethodDef, params: &ruby_prism::ParametersNode<'_>) {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "a single `def`'s parameter count is bounded by the source file it was parsed from, far below u32::MAX"
+    )]
+    {
+        md.required = (params.requireds().iter().count() + params.posts().iter().count()) as u32;
+        md.optional = params.optionals().iter().count() as u32;
+    }
+    md.rest = params.rest().is_some()
+        // `def foo(...)` (Ruby 3.0 forwarding, ita-7g9): prism
+        // parses `...` as the params' `keyword_rest` field holding
+        // a `ForwardingParameterNode`, not `rest`. Forwarding
+        // relays whatever positional/keyword/block args the
+        // caller passes, so it models the same "no cap" arity as
+        // a bare `*args` — treat it as rest for `check_arity`
+        // (crates/itaruby_semantic/src/check.rs), which already
+        // skips both the min and max check when `rest` is true.
+        || params
+            .keyword_rest()
+            .is_some_and(|kr| kr.as_forwarding_parameter_node().is_some());
+    for kw in &params.keywords() {
+        if let Some(k) = kw.as_required_keyword_parameter_node() {
+            md.keywords.push((
+                String::from_utf8_lossy(k.name().as_slice()).into_owned(),
+                true,
+            ));
+        } else if let Some(k) = kw.as_optional_keyword_parameter_node() {
+            md.keywords.push((
+                String::from_utf8_lossy(k.name().as_slice()).into_owned(),
+                false,
+            ));
+        }
+    }
+    md.kwrest = params.keyword_rest().is_some();
+    md.block = params.block().is_some();
 }
 
 fn span_of(node: &Node<'_>) -> (usize, usize) {
@@ -3673,11 +3768,19 @@ const BODY_DEF_NAMES: [&str; 12] = [
 /// `BodyDefs::literals` and `ClassWalk::apply_body_def`, where the
 /// receiver decides the fragment and the enclosing `def`'s own kind
 /// decides whether `self` is provably the class.
-fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> BodyDefs {
-    struct Scan {
+fn dynamic_defs_in_body(
+    def: &ruby_prism::DefNode<'_>,
+    text: &str,
+    line_index: &LineIndex,
+    sig_comments: &HashMap<u32, (usize, usize)>,
+) -> BodyDefs {
+    struct Scan<'pr> {
         found: BodyDefs,
+        text: &'pr str,
+        line_index: &'pr LineIndex,
+        sig_comments: &'pr HashMap<u32, (usize, usize)>,
     }
-    impl Scan {
+    impl Scan<'_> {
         fn note(&mut self, target: DefTarget, reason: OpenReason) {
             if !self.found.opens.iter().any(|(t, _)| *t == target) {
                 self.found.opens.push((target, reason));
@@ -3710,16 +3813,46 @@ fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> BodyDefs {
             names_its_target && is_eval_name(node.name().as_slice())
         }
     }
-    impl<'pr> ruby_prism::Visit<'pr> for Scan {
+    impl<'pr> ruby_prism::Visit<'pr> for Scan<'pr> {
         fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
             if self.consume(node) {
                 return;
             }
             ruby_prism::visit_call_node(self, node);
         }
+
+        /// Bead ita-nst: a `def` KEYWORD nested anywhere in the body
+        /// (usually inside a plain-yield block — discourse's
+        /// `EmotionDashboardReport.register!` shape). The walk starts at
+        /// the ENCLOSING def's body, so every `DefNode` seen here is a
+        /// nested one. The `Visit` trait's reference lifetime cannot be
+        /// stored, so the OWNED `MethodDef` is built here and the arm's
+        /// filing rules only read `receiver_self` and the def itself's
+        /// data. Recursion continues — defs inside defs run under the
+        /// same self-binding rules.
+        fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+            let md = build_method_def(
+                node,
+                self.text,
+                self.line_index,
+                self.sig_comments,
+                &mut Vec::new(),
+                None,
+            );
+            self.found.nested_defs.push(NestedDef {
+                md,
+                receiver_self: node.receiver().is_some_and(|r| r.as_self_node().is_some()),
+            });
+            ruby_prism::visit_def_node(self, node);
+        }
     }
     let Some(body) = def.body() else { return BodyDefs::default() };
-    let mut scan = Scan { found: BodyDefs::default() };
+    let mut scan = Scan {
+        found: BodyDefs::default(),
+        text,
+        line_index,
+        sig_comments,
+    };
     ruby_prism::Visit::visit(&mut scan, &body);
     scan.found
 }
@@ -3731,6 +3864,18 @@ fn dynamic_defs_in_body(def: &ruby_prism::DefNode<'_>) -> BodyDefs {
 struct BodyDefs {
     opens: Vec<(DefTarget, OpenReason)>,
     literals: Vec<(DefTarget, BodyDefLiteral)>,
+    /// Bead ita-nst: every `def` KEYWORD nested in this body, in walk
+    /// order — the walker files them per the self-binding rules in
+    /// `walk_stmt`'s `Node::DefNode` arm.
+    nested_defs: Vec<NestedDef>,
+}
+
+/// One nested `def` keyword found by the body scanner (bead ita-nst).
+struct NestedDef {
+    md: MethodDef,
+    /// `def self.x` spelling — under an instance-method enclosure this is
+    /// the unattributable shape (`OpenReason::NestedDefOwner`).
+    receiver_self: bool,
 }
 
 /// One method a literal definer inside a `def` body installs.
@@ -5658,7 +5803,8 @@ fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
             | OpenReason::ClassBodyBlock
             | OpenReason::SingletonClassExpr
             | OpenReason::AbstractRaise
-            | OpenReason::Unattributed,
+            | OpenReason::Unattributed
+            | OpenReason::NestedDefOwner,
         ) => true,
         Some(
             OpenReason::ReopenedExternal

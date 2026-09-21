@@ -630,7 +630,7 @@ pub fn kernel_object_singleton_method(name: &str) -> bool {
 
 /// Bead ita-tail (2026-09-20): the BARE-CALL tail — every name a Ruby class
 /// object answers by implicit receiver from its own core ancestry, both the
-/// generated private harvest (`Class~method` lines in CORE_INVENTORY —
+/// generated private harvest (`Class~method` lines in `CORE_INVENTORY` —
 /// `Kernel.private_instance_methods` etc.: `raise`, `rand`, `caller`,
 /// `block_given?`, ...) and the hand-maintained core lists above. This is
 /// the population the dark census measured as the class-object residue's
@@ -645,7 +645,7 @@ pub fn kernel_object_singleton_method(name: &str) -> bool {
 /// never be a receiver call" invariant.
 ///
 /// Silence-only, and only ever consulted (a) from the class-object track's
-/// `soften_not_found` NotFound path — project definitions win, because
+/// `soften_not_found` `NotFound` path — project definitions win, because
 /// `lookup_singleton_own` has already returned by then — and (b) in
 /// check.rs's dark census to LABEL the silence `KnownTail`. Never consulted
 /// on the instance track (not measured there) and never from any path that

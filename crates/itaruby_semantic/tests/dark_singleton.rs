@@ -224,3 +224,21 @@ fn singleton_tail_typo_stays_closed_notfound() {
         "exactly one residue site: {recs:?}"
     );
 }
+
+/// Bead ita-nst: the nested `def self.fetch_data` now RESOLVES, so the
+/// census records nothing for it — before the filing this exact fixture
+/// bucketed `Report fetch_data closed_notfound` (the red that motivated
+/// the bead, measured on discourse's EmotionDashboardReport shape).
+#[test]
+fn nested_def_self_in_block_resolves_and_records_nothing() {
+    let (diags, recs) = dark_fixture("nested_def_self_in_block_resolves.rb");
+    assert!(diags.is_empty(), "resolution is silence: {diags:?}");
+    assert!(
+        recs.iter().all(|r| !r.ends_with("closed_notfound")),
+        "a resolved nested def is never residue: {recs:?}"
+    );
+    assert!(
+        recs.iter().all(|r| !r.contains(" fetch_data ")),
+        "fetch_data must not appear in any record: {recs:?}"
+    );
+}

@@ -248,6 +248,21 @@ found, and the launch bar is winning on both.
   observation whose producing tree cannot be reconstructed byte-for-byte
   is a hypothesis, not a measurement: record the sha and the diff of every
   scratch before reading its output.
+- A gate transcript read through a filter is not the gate's verdict (learned
+  2026-09-21, binding, measured twice in one night): two full
+  `singleton-mutants.sh` runs "ended" right after MUT-Q, and the matrix read
+  as complete-minus-two. The harness was right both times — my summary pipe
+  hid `line 137: $6: unbound variable`, because MUT-R's invocation had been
+  added with its rationale argument missing, and `set -u` aborts the script
+  there. Count the mutants in the raw log against the harness's declared
+  list before believing a transcript, and read the tail of the raw log, never
+  a grep of it. The same session's tautological-prefilter defect (a `def `
+  needle searched over a span that BEGINS with `def `, so every body passed)
+  was caught only because MUT-F went BLIND — the blind-mutant rule above
+  earning its keep.
+- A `mutant`-style invocation is code and gets checked like code: a missing
+  argument does not fail the mutant, it kills the run before the mutant
+  exists.
 - The instrument that PRODUCES the evidence gets the same two-sided
   treatment as the code it judges (learned 2026-09-17, binding, measured
   three times in one file pair): every rule above governs checks that read

@@ -3698,7 +3698,8 @@ impl Checker<'_> {
                 | OpenReason::DynamicDefineMethod
                 | OpenReason::DynamicAliasMethod
                 | OpenReason::EvalOrSend
-                | OpenReason::SingletonClassExpr,
+                | OpenReason::SingletonClassExpr
+                | OpenReason::NestedDefOwner
             )) => s.anc_meta += 1,
             Some(Blocker::Project(OpenReason::MethodMissing | OpenReason::AbstractRaise)) => {
                 s.anc_missing += 1;

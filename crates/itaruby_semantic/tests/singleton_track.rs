@@ -237,6 +237,59 @@ fn def_body_definer_in_an_instance_method_fails_closed() {
     assert!(d.is_empty(), "expected silence, got {d:?}");
 }
 
+// ---------------------------------------------------------------------
+
+/// Bead ita-nst: a `def self.x` KEYWORD inside a plain-yield block inside
+/// `def self.register!` (discourse's `EmotionDashboardReport` shape, 3
+/// census residue sites that read as typos before this filing) defines on
+/// the module's singleton at runtime — `self` at block-run time IS the
+/// module. The walker files it on the singleton track.
+#[test]
+fn nested_def_self_in_block_files_on_the_singleton_track() {
+    let (instance, singleton, open) =
+        facts("nested_def_self_arity_accuses.rb", "Report");
+    assert!(instance.is_empty(), "nothing on the instance track: {instance:?}");
+    assert!(
+        singleton.contains(&"fetch_data".to_string()),
+        "the nested def must be filed: {singleton:?}"
+    );
+    assert!(singleton.contains(&"register!".to_string()));
+    assert!(!open, "a literal nested def names what it defines");
+}
+
+/// The filing carries DATA, not just a name: the nested `def
+/// self.fetch_data(x)` has one required parameter, so the wrong-arity
+/// call on line 22 is an E0102 MRI really raises (ArgumentError, given 2
+/// expected 1). Before the bead the call was silent residue.
+#[test]
+fn nested_def_self_arity_is_checked() {
+    assert_eq!(diags("nested_def_self_arity_accuses.rb"), vec!["22:8:E0102"]);
+}
+
+/// A plain `def helper` inside an INSTANCE method's block defines on the
+/// class of `self` — this very class — so the instance track files it.
+#[test]
+fn nested_plain_def_files_on_the_instance_track() {
+    let (instance, singleton, open) =
+        facts("nested_plain_def_files_instance_track.rb", "Maker");
+    assert!(instance.contains(&"helper".to_string()), "instance track: {instance:?}");
+    assert!(!open);
+    let d = diags("nested_plain_def_files_instance_track.rb");
+    assert!(d.is_empty(), "expected silence, got {d:?}");
+}
+
+/// `def self.bolt` inside an INSTANCE method's block defines on ONE
+/// object's own singleton — an owner no index position can name. The
+/// class fails CLOSED: open (`NestedDefOwner`), never enriched.
+#[test]
+fn nested_def_self_in_instance_body_fails_closed() {
+    let (instance, singleton, open) =
+        facts("nested_def_self_in_instance_body_opens.rb", "Maker");
+    assert!(!instance.contains(&"bolt".to_string()), "no name may be filed: {instance:?}");
+    assert!(!singleton.contains(&"bolt".to_string()));
+    assert!(open, "the owner is unnameable: the class must open");
+}
+
 /// The same four definitions reached through `send`/`public_send`/
 /// `__send__`, which is how a project reaches past a private definer.
 /// One level of unwrapping and every rule above applies unchanged —
@@ -856,6 +909,9 @@ fn mri_ground_truth_is_executed() {
         ("singleton_method_missing_opens.rb", Mri::Clean),
         ("singleton_patch_on_undeclared_class_invents_nothing.rb", Mri::Clean),
         ("stdlib_singleton_surface_silent.rb", Mri::Clean),
+        ("nested_def_self_arity_accuses.rb", Mri::Raises("ArgumentError", 22)),
+        ("nested_def_self_in_instance_body_opens.rb", Mri::Clean),
+        ("nested_plain_def_files_instance_track.rb", Mri::Clean),
         ("thread_mattr_accessor_resolves_silently.rb", Mri::Clean),
     ];
     for (name, expected) in &table {

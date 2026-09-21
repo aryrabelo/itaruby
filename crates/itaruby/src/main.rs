@@ -371,11 +371,7 @@ fn print_check_footer(
     agent_blocks: usize,
 ) {
     if flags.format_agent {
-        println!(
-            "_Checked {} file(s); {} constraint finding(s)._",
-            checked,
-            agent_blocks,
-        );
+        println!("_Checked {checked} file(s); {agent_blocks} constraint finding(s)._");
     }
 
     if flags.verbose {

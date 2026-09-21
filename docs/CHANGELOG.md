@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Nested `def` filing (bead ita-nst, 2026-09-21): a `def` KEYWORD nested
+  anywhere in a method body is now filed on the track its `self` really
+  writes — `def self.x` inside a plain-yield block inside `def self.y`
+  (discourse's `EmotionDashboardReport.register!` shape, 3 census residue
+  sites) lands on the class-object track with its real arity, so a
+  wrong-arity call on it is a conclusive E0102; a plain nested `def`
+  inside an instance method files on the instance track; `def self.x`
+  inside an INSTANCE method's block defines on one object's own
+  singleton and the class fails CLOSED (open, never enriched). The
+  prefilter grew a body-ONLY `def ` arm — over the whole def span it
+  would be tautological (the span starts with `def `), which would both
+  lose the prefilter's perf win and read MUT-F BLIND (measured: the
+  matrix caught it). Two-sided: 4 fixtures in
+  `testdata/singleton_track/` (arity accuses, instance filing, both
+  fail-closed opens) each executed under MRI, plus a dark-census test
+  proving the resolved shape records nothing; mutant MUT-S cuts the
+  singleton filing and `nested_def_self_arity_is_checked` accuses.
+  Corpora: diagnostics byte-identical (924/986/1895 on
+  rails/mastodon/discourse) and the discourse census 44 → 42 — exactly the
+  two `DiscourseAi::Sentiment::EmotionDashboardReport fetch_data` records
+  (the census's duplicated-record bug counts that one site twice), zero new
+  residue.
 - Residue audit (2026-09-20): the tail-census remainder (56/4/44) audited
   family by family — full table in `scripts/public-baseline/README.md`. 2
   confirmed + 1 pending true positives, including a **real discourse bug**

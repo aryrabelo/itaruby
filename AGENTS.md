@@ -174,6 +174,13 @@ found, and the launch bar is winning on both.
   constant as falsely silenced when names are attributed through the key.
   Attribute by name with the column in the key, and count silenced sites
   from the message side, never from key survivors.
+- A surface-routing control must pin the blamed call site, not only the
+  diagnostic count, code and method name (learned 2026-09-22, binding).
+  `extended-hook-mutants.sh` MUT-E moves `def base.pi` from singleton to
+  instance. Once both tracks report E0101, a fixture calling both surfaces
+  can still report one E0101 for `pi`, but on the opposite call. The named
+  control must reject that relocation; do not weaken or replace the real
+  surface mutation to make a count-only assertion fail.
 - A blind mutant means the suite lacks a control, not that the code is safe
   (learned 2026-08-26, binding): add the fixture that would catch it, prove
   the mutant fails it, and only then count the mutant as covered.
@@ -390,7 +397,7 @@ green but at least one declared corpus could not be checked on this machine
 | Gate 0b — MRI interpreter (`ruby -v` ≥ 3.x; a missing ruby is fine, the MRI legs skip) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the twelve mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-R) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
@@ -424,9 +431,10 @@ code that runs clean, the ONLY licensed claim is "Sorbet cannot prove this
 without an annotation", and it is licensed only by the `with_annotations`
 leg — the same program, sha-checked, plus the sig/RBI a human or Tapioca
 would write, measured clean. Rows without that leg are reported, never
-claimed. Both directions are published: the two cases where Sorbet proves a
-bug itaruby misses (`extend_singleton_typo`,
-`included_hook_class_method_typo`) are rows in the ledger, and the one live
+claimed. Both directions are published: the two cases where Sorbet used to
+prove a bug itaruby missed (`extend_singleton_typo`,
+`included_hook_class_method_typo`) are rows in the ledger and both CLOSED
+on 2026-09-21 with the class-object flip — that column now reads 0 — and the one live
 invariant #1 violation the bench found (`const_missing_namespace`, E0104 on
 a namespace defining `self.const_missing`) was fixed in `check_const_ref`
 the day it was found — suppression-only, with the no-hook and
@@ -441,18 +449,83 @@ certain typo planted; MRI raises on all three and itaruby is silent on all
 three, so those rows license "does not false-positive here" and never
 "models this pattern". The bench prints that limitation itself.
 
-Reporting a singleton `NotFound` is NOT an additive low-risk change
-(measured 2026-09-17, binding, reverted): the two gaps above look like pure
+Reporting a singleton `NotFound` was NOT an additive low-risk change
+(measured 2026-09-17, binding): the two gaps above looked like pure
 silence-to-diagnostic wins, and an implementation of exactly that added
 703/36/4109 diagnostics to rails/mastodon/discourse — narrowed to explicit
 receivers plus a did-you-mean near miss, still 216/0/12, and every sample
 inspected was a real method (`SecureRandom.uuid`, `Kernel.rand`,
 `mattr_accessor` writers, `class << self` accessors). A class object's
-singleton surface comes from populations this index does not model at all
-(`mattr_accessor`/`cattr_accessor` appear zero times in `index.rs`), so
-absence from the index is not absence at runtime. Index those populations
-first; until then the gaps stay open and characterized in
-`crates/itaruby_semantic/tests/singleton_lookup.rs`.
+singleton surface comes from populations the index did not model, so
+absence from the index was not absence at runtime.
+
+**The flip shipped 2026-09-21, and the rule it shipped under is the
+contract (learned 2026-09-21, binding).** A class-object `NotFound`
+becomes E0101 after `lookup_singleton` proves closed, complete ancestry
+and `lookup_singleton_rbi` leaves the verdict unsoftened. That verdict is
+the dark census's `closed_notfound` bucket, so the flip was a MEASUREMENT:
+index the populations, watch the residue fall, read every survivor at
+its byte offset, then arm. Residue on the pinned
+public clones went **54 records -> 8** (rails 33/1/20 -> 1/0/7) across
+twelve beads, and the 8 survivors are the 8 diagnostics the flip emits,
+each proven by reading in `scripts/public-baseline/README.md`.
+
+What GATES the emission: a conclusive singleton lookup. Every mechanism
+this wave named is keyed on the RECEIVER's own chain or on the method
+NAME, never receiver-blind:
+
+* `extend M` walks M's own ancestry, and an OPEN ancestor there
+  (`declarations/gems.rbi`, a dynamic definer) makes the surface
+  unreadable rather than empty (`extended_module_surface`).
+* the class-object chain continues `Class -> Module -> Object -> Kernel
+  -> BasicObject`, so project reopenings of `Object`/`Kernel` — every
+  activesupport `core_ext` — are read (`core_object_instance_surface`).
+* `include Singleton` installs `instance`/`_load`/`clone`
+  (`includes_singleton_mixin`, doubly keyed).
+* a `class`/`module` KEYWORD inside a class-body block is registered at
+  its LEXICAL path and born open (`OpenReason::BlockNestedDefinition`) —
+  the bug it fixes is receiver IDENTITY, not surface.
+* a BARE STUB whose name the project also writes as `class X` inside a
+  string literal is opened (`OpenReason::StringSourceDefined`); the
+  conjunction with "bare stub" is what keeps it from being a blanket.
+* `class << self; include M` files M on the SINGLETON surface.
+* a bare `eval(<string>)` in a METHOD body opens its class, not only the
+  class-body spelling.
+* a `self.extended(base)` hook reads `base.define_singleton_method`, and
+  any read of `base` the shallow walk did NOT consume makes the hook
+  opaque — an install inside a nested block is unreadable, not absent.
+* an explicit `self` receiver inside a rebindable block is exactly as
+  unprovable as a receiverless one; a NAMED receiver is untouched.
+* gem namespaces (`queue_classic` -> `QC`) and bundled-gem Kernel
+  functions (`BigDecimal`) join the tables whose entry rule already
+  covers them.
+
+The emission's second `inconclusive_reason` guard was redundant (learned
+2026-09-22, binding): CO-R removed it and the suite stayed green because
+`lookup_singleton` returns `Inconclusive` at the first open ancestor and
+can return `NotFound` only on a complete chain. Its RBI wrapper only
+softens `NotFound`; it never manufactures one from `Inconclusive`.
+The redundant guard/second walk is removed, not counted as a safeguard.
+CO-R now removes the lookup's actual open-ancestor guard; the named
+`unrecognized_class_body_call_keeps_the_receiver_open` control must catch
+a false E0101 at `open_receiver_typo.rb:14:8`, not merely a census change.
+Its closed counterpart must still emit E0101 at `closed_receiver_typo.rb:9:8`.
+
+Two rules this wave paid for:
+
+* **A census record is not a call site until its file and byte agree**
+  (learned 2026-09-21, binding, measured): 13 of the 54 residue records
+  were instrument noise — byte-identical duplicates, and one record
+  attributed to `activesupport/test/executor_test.rb` carrying
+  `actionpack/test/dispatch/executor_test.rb`'s byte. Audit by (file,
+  byte), never by count.
+* **A name that resolves to the wrong class reads as a conclusive miss**
+  (learned 2026-09-21, binding, measured): four rails records blamed
+  `Foo` — an empty stub in another sub-gem's tests — for methods
+  `RailtiesTest::RailtieTest::Foo` really has. Before believing a
+  `NotFound`, ask which class the name resolved to, not only what that
+  class defines. Registering the block-nested definition also deleted
+  30 false `E0104 unresolved constant` lines from the rails baseline.
 
 Any claim quoted out of this bench carries its full scope or it is not made
 (binding, 2026-09-17): **12** fixtures, sigil **`# typed: true`**, **srb
@@ -618,16 +691,20 @@ The 2026-09-20 audit of that remainder (full table in
 `scripts/public-baseline/README.md`) found 2 confirmed + 1 pending TRUE
 positives — including a real discourse bug (`lib/color_math.rb:62`
 `raise new RuntimeError(...)` raises NoMethodError instead of the intended
-message) — and 98 populated sites across 9 named mechanisms: **the
-class-object flip stays closed until those populations are indexed**, per
+message) — and 98 populated sites across 9 named mechanisms: the
+class-object flip stayed closed until those populations were indexed, per
 the same rule as the singleton-track gaps below. (2026-09-21, bead
 ita-census: those were census RECORDS, inflated by the foreign-span ghost
 emissions the instrument fix removed — the true distinct-site remainder
 is 50/1/20; the family-level audit table stands, now with trustworthy
-site-level attribution.) The census instrument's remaining known bug
-(the duplicated-record/instance-leak note above) was that same foreign-
-span emission and is FIXED by ita-census; the site-level audit can
-proceed.
+site-level attribution.) **Closed 2026-09-21**: twelve beads named every
+populated mechanism, the residue on the pinned clones fell to
+rails 1 / mastodon 0 / discourse 7 (8 records, every one read at its byte
+offset and proven to raise), and the class-object track now emits E0101
+on exactly that bucket. The census stays on as the instrument that shows
+the next population arriving: a `closed_notfound` count above the audited
+set is a prospective false positive, not a new true one, until someone
+reads the site.
 
 Per-run artifacts land in `target/gauntlet/` (gitignored).
 

@@ -106,6 +106,34 @@ pub enum OpenReason {
     /// — an owner no index position can name. The enclosing class OPENS
     /// rather than collecting a name it may not have (invariant #1).
     NestedDefOwner,
+    /// Bead ita-blk: a `class X`/`module X` KEYWORD written inside a
+    /// class-body BLOCK (`test "..." do class Foo < Rails::Railtie ... end
+    /// end`). The `class` keyword's cref is lexical, so at runtime this
+    /// really defines `<enclosing nesting>::X` — but the walker never
+    /// descended into the block, so the name was absent from the index
+    /// and a later `X.some_method` resolved to an UNRELATED same-named
+    /// class somewhere else in the project (measured on rails: four
+    /// residue records where `Foo` inside `RailtiesTest::RailtieTest`
+    /// resolved to `activesupport/test/testing/constant_lookup_test.rb:5`
+    /// `class Foo; end`, an empty stub). Registering the fragment puts
+    /// the name back where Ruby puts it; marking it open says the body
+    /// this walk did not read is unknown. Monotonic both ways: a wrong
+    /// receiver stops being consulted, and the right one answers
+    /// `Inconclusive`.
+    BlockNestedDefinition,
+    /// Bead ita-src: the project writes Ruby source that defines a class
+    /// of this name inside a STRING literal — rails' isolation tests do
+    /// `app_file "app/models/foo.rb", <<-RUBY ... class Foo <
+    /// ApplicationRecord ... RUBY` and then load the generated app. The
+    /// parsed tree contains no such definition, so a later `Foo.x`
+    /// resolved to whatever unrelated same-named stub the project
+    /// happened to contain (`activesupport/test/testing/
+    /// constant_lookup_test.rb:5 class Foo; end`) and read as a
+    /// conclusive miss on code that runs. Gated on the resolved fragment
+    /// being a BARE STUB (no methods and no singleton methods of its
+    /// own): a real, fleshed-out class that merely appears in a
+    /// generator template keeps its whole surface checkable.
+    StringSourceDefined,
 }
 
 /// What actually blocks a `MethodLookup::Inconclusive` from concluding
@@ -437,6 +465,10 @@ pub struct FileDefs {
     /// measured different answer (`PollutionSource`,
     /// `resolve_keyed_pollution`, `Checker::core_ops_unpolluted`).
     pub keyed_pollution: Vec<(Option<String>, Vec<String>, PollutionSource)>,
+    /// Bead ita-src: names this file defines as a class/module inside a
+    /// STRING literal — generated Ruby source no parse of this file can
+    /// see. See `OpenReason::StringSourceDefined`.
+    pub string_source_consts: Vec<String>,
     /// Value constants assigned at class/module-body or toplevel level
     /// (w12 closure, E0104 did-you-mean): `(qualified name, span)` as
     /// written, e.g. `("Foo::Bar", span-of-BAR)` for `module Foo; Bar = 1`.
@@ -578,6 +610,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         eval_targets: Vec::new(),
         eval_unknown: false,
         keyed_pollution: Vec::new(),
+        string_source_consts: Vec::new(),
         nested: 0,
         attributed_mixin_edges: Vec::new(),
         const_returning_methods: Vec::new(),
@@ -594,6 +627,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         eval_targets: scan.eval_targets,
         eval_unknown: scan.eval_unknown,
         keyed_pollution: scan.keyed_pollution,
+        string_source_consts: scan.string_source_consts,
         consts: w.consts,
         requires: w.requires,
         toplevel_consts: w.toplevel_consts,
@@ -771,6 +805,10 @@ struct FileScan {
     /// project-wide stand-down, and with `Names` it is bounded to those
     /// names. See `FileDefs::keyed_pollution`.
     keyed_pollution: Vec<(Option<String>, Vec<String>, PollutionSource)>,
+    /// Bead ita-src: every `class X`/`module X` name written inside a
+    /// STRING literal in this file — Ruby source the project generates
+    /// at runtime and this parse never sees.
+    string_source_consts: Vec<String>,
     /// How many `def`/block bodies deep the walk currently is. Zero plus
     /// an empty `nesting` is TRUE file toplevel — the only place a bare
     /// `include M` really lands on `Object` and a bare `def` really
@@ -886,6 +924,14 @@ impl<'pr> Visit<'pr> for FileScan {
             }
         }
         ruby_prism::visit_local_variable_write_node(self, node);
+    }
+
+    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {
+        collect_string_source_consts(
+            &String::from_utf8_lossy(node.unescaped()),
+            &mut self.string_source_consts,
+        );
+        ruby_prism::visit_string_node(self, node);
     }
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -1953,6 +1999,50 @@ impl DefWalker<'_> {
         }
     }
 
+    /// Bead ita-blk: every `class X`/`module X` KEYWORD anywhere inside a
+    /// class-body block, registered at the path Ruby's LEXICAL cref gives
+    /// it and marked `OpenReason::BlockNestedDefinition`.
+    ///
+    /// A `class` keyword never takes its cref from the block's runtime
+    /// `self` — `Foo.class_eval { class Bar; end }` defines `Bar` in the
+    /// block's lexical scope, not under `Foo` — so the path computed here
+    /// is the one MRI uses, and the recursion keeps that true for a
+    /// definition nested inside another.
+    ///
+    /// FAIL-CLOSED, never a surface: the fragment carries no methods and
+    /// is born OPEN. The bug it fixes is receiver IDENTITY, not receiver
+    /// surface: without the fragment, `Foo.config` inside
+    /// `RailtiesTest::RailtieTest` resolved against whatever unrelated
+    /// top-level `Foo` the project happened to contain and read as a
+    /// conclusive `NotFound` (4 of rails' 33 residue records, all of them
+    /// code that runs). With it, the name resolves to the class the code
+    /// really defines, whose body this walk has not read — `Inconclusive`,
+    /// which is the truth.
+    fn harvest_block_nested_definitions(
+        &mut self,
+        scope: &str,
+        nesting: &[String],
+        block: &Node<'_>,
+    ) {
+        let Some(b) = block.as_block_node() else { return };
+        let Some(body) = b.body() else { return };
+        let mut out: Vec<(String, Vec<String>, bool)> = Vec::new();
+        {
+            let mut scan = NestedDefScan {
+                scope: vec![scope.to_string()],
+                nesting: nesting.to_vec(),
+                out: &mut out,
+            };
+            scan.visit(&body);
+        }
+        for (path, nest, is_module) in out {
+            let mut frag = ClassFragment::new(path, is_module, nest);
+            frag.open = true;
+            frag.open_reason = Some(OpenReason::BlockNestedDefinition);
+            self.fragments.push(frag);
+        }
+    }
+
     /// `class_methods do ... end` — the block spelling of a concern's
     /// `ClassMethods` module (singleton-track family (c)). The block's
     /// own top-level `def`s are recorded on a synthetic fragment for
@@ -2169,14 +2259,33 @@ impl DefWalker<'_> {
         let Some(pname) = Self::hook_receiver_param_name(def) else { return };
         let Some(body) = def.body() else { return };
         let Some(stmts) = body.as_statements_node() else { return };
+        let mut consumed = 0usize;
         for stmt in &stmts.body() {
-            self.harvest_extended_stmt(i, &pname, &stmt);
+            consumed += usize::from(self.harvest_extended_stmt(i, &pname, &stmt));
+        }
+        // Bead ita-esc, the fail-closed half of the shallow walk: every
+        // read of `base` the shallow pass did NOT consume is `base`
+        // escaping into code this harvest never reads, so the installs
+        // cannot be enumerated. discourse's `Migrations::Enum` is the
+        // measured shape — its `self.extended(base)` body is one
+        // statement, `TracePoint.new(:end) do |tp| ... end.enable`, and
+        // every `base.define_singleton_method(...)` lives INSIDE that
+        // block, where the top-level scan cannot see it. Before this,
+        // such a hook contributed nothing at all and the extender read
+        // as a complete, closed surface (4 of discourse's 20 residue
+        // records). Silence-only: `apply_extended_hooks` turns the flag
+        // into `OpenReason::EvalOrSend` on the extender.
+        if count_local_reads(&body, &pname) > consumed {
+            self.fragments[i].hook_installs_opaque = true;
         }
     }
 
     /// One top-level statement of a `self.extended(base)` body — see
-    /// `harvest_extended_hook` for the shapes that count.
-    fn harvest_extended_stmt(&mut self, i: usize, pname: &str, stmt: &Node<'_>) {
+    /// `harvest_extended_hook` for the shapes that count. Returns whether
+    /// this statement CONSUMED a read of the hook parameter as its own
+    /// receiver, which is how `harvest_extended_hook` tells a modelled
+    /// install from `base` escaping somewhere it cannot read.
+    fn harvest_extended_stmt(&mut self, i: usize, pname: &str, stmt: &Node<'_>) -> bool {
         if let Some(def) = stmt.as_def_node() {
             // `def base.x` installs on the base OBJECT's singleton, never
             // on its instances: filing it as an instance method would
@@ -2184,14 +2293,17 @@ impl DefWalker<'_> {
             if def.receiver().is_some_and(|r| hook_param_read(&r, pname)) {
                 let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
                 self.fragments[i].hook_singleton_installs.push((name, span_of(stmt)));
+                return true;
             }
-            return;
+            return false;
         }
-        let Some(call) = stmt.as_call_node() else { return };
-        let Some(recv) = call.receiver() else { return };
+        let Some(call) = stmt.as_call_node() else { return false };
+        let Some(recv) = call.receiver() else { return false };
         if hook_param_read(&recv, pname) {
             self.harvest_extended_call(i, &call);
+            return true;
         }
+        false
     }
 
     /// The install shapes a `self.extended(base)` body can carry on the
@@ -2200,23 +2312,15 @@ impl DefWalker<'_> {
     fn harvest_extended_call(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
         let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
         match name.as_str() {
-            "delegate" => match hook_delegate_names(call) {
-                Some(names) => {
-                    for (n, span) in names {
-                        self.fragments[i].hook_instance_installs.push((n, span));
-                    }
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },
-            "define_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_instance_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },
+            "delegate" => self.harvest_hook_delegate(i, call),
+            "define_method" => self.harvest_hook_define(i, call, false),
+            // Bead ita-dsm: the SINGLETON spelling of the same install —
+            // `base.define_singleton_method(:values) { ... }` puts the name
+            // on the extender's class object, the very track `extend`
+            // dispatches on. discourse's `Migrations::Enum` installs
+            // `valid?`/`values` this way (four census residue records were
+            // conclusive misses on them).
+            "define_singleton_method" => self.harvest_hook_define(i, call, true),
             "class_eval" | "module_eval" | "class_exec" | "module_exec" => {
                 self.harvest_extended_eval_block(i, call);
             }
@@ -2224,6 +2328,43 @@ impl DefWalker<'_> {
                 self.fragments[i].hook_installs_opaque = true;
             }
             _ => {}
+        }
+    }
+
+    /// `extend M`'s `delegate :a, :b, to: ...` files each named method on
+    /// the extender's instance surface; an unreadable form makes the whole
+    /// install opaque. Split from `harvest_extended_call` for the ceiling.
+    fn harvest_hook_delegate(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
+        match hook_delegate_names(call) {
+            Some(names) => {
+                for (n, span) in names {
+                    self.fragments[i].hook_instance_installs.push((n, span));
+                }
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
+        }
+    }
+
+    /// `define_method`/`define_singleton_method` in a hook body: a literal
+    /// name is filed (on the singleton surface when `singleton`, else the
+    /// instance surface); a non-literal name makes the install opaque.
+    fn harvest_hook_define(
+        &mut self,
+        i: usize,
+        call: &ruby_prism::CallNode<'_>,
+        singleton: bool,
+    ) {
+        match hook_define_method_name(call) {
+            Some(n) => {
+                let loc = call.location();
+                let span = (loc.start_offset(), loc.end_offset());
+                if singleton {
+                    self.fragments[i].hook_singleton_installs.push((n, span));
+                } else {
+                    self.fragments[i].hook_instance_installs.push((n, span));
+                }
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
         }
     }
 
@@ -2728,6 +2869,45 @@ impl DefWalker<'_> {
                 // call) still opens it — narrowing further would risk a
                 // false E0101 the way bead ita-d0j's dynamic-include gap
                 // did.
+                // Bead ita-sce (2026-09-21, found by the inference bench's
+                // own `singleton_class_eval` row the day the class-object
+                // track armed): `X.singleton_class.class_eval do
+                // define_method(:generate) { ... } end` installs a real
+                // CLASS METHOD on `X` through a body this walker does not
+                // read. `class << X` and `X.singleton_class.prepend M`
+                // were already held-aside singleton patches; the
+                // eval/send family on the same receiver was not, so `X`
+                // read as a complete, closed class object and
+                // `X.generate` became a false E0101 the moment the arm
+                // started emitting. Fail-closed: the patch carries no
+                // methods, only openness, and `declared_owner_required`
+                // makes `merge_file_fragments` drop it when the project
+                // never declares `X` (the TCPSocket rule — inventing the
+                // class is the defect this avoids).
+                if let Some(owner) = singleton_class_owner(&call) {
+                    if is_eval_name(call.name().as_slice())
+                        || matches!(
+                            call.name().as_slice(),
+                            b"send"
+                                | b"public_send"
+                                | b"__send__"
+                                | b"define_method"
+                                | b"define_singleton_method"
+                                | b"alias_method"
+                                | b"attr_reader"
+                                | b"attr_writer"
+                                | b"attr_accessor"
+                        )
+                    {
+                        let mut frag =
+                            ClassFragment::new(owner, false, nesting.to_vec());
+                        frag.declared_owner_required = true;
+                        frag.open = true;
+                        frag.open_reason = Some(OpenReason::EvalOrSend);
+                        self.fragments.push(frag);
+                        return;
+                    }
+                }
                 if call.block().is_some_and(|b| b.as_block_node().is_some()) {
                     let Some(i) = frag_idx else { return };
                     if call.name().as_slice() == b"define_method" && call.receiver().is_none() {
@@ -2812,6 +2992,7 @@ impl DefWalker<'_> {
                     } else {
                         if let Some(block) = call.block() {
                             self.harvest_block_consts(i, &block);
+                            self.harvest_block_nested_definitions(scope, nesting, &block);
                         }
                         self.harvest_interpolated_eval_defs(i, &call);
                         self.open_class(i, OpenReason::ClassBodyBlock);
@@ -2909,6 +3090,25 @@ impl DefWalker<'_> {
                         for arg in &args.arguments() {
                             if let Some(path) = const_path_str(&arg) {
                                 match name.as_str() {
+                                    // Bead ita-scl: inside `class << self`
+                                    // an `include`/`prepend` lands on the
+                                    // SINGLETON class's ancestry, which is
+                                    // the chain a class-object call
+                                    // dispatches through — the same place
+                                    // an `extend` on the class body puts a
+                                    // module. Filing it as an instance
+                                    // include both missed the singleton
+                                    // surface (mastodon's
+                                    // `class << self; include Redisable`
+                                    // in `app/lib/delivery_failure_tracker.rb:50`,
+                                    // leaving the bare `redis` at :71 a
+                                    // conclusive miss) and claimed an
+                                    // instance surface the code never gets.
+                                    "include" | "prepend" if in_singleton => {
+                                        if !self.fragments[i].extends.contains(&path) {
+                                            self.fragments[i].extends.push(path);
+                                        }
+                                    }
                                     "include" => self.fragments[i].includes.push(path),
                                     "extend" => self.fragments[i].extends.push(path),
                                     _ => self.fragments[i].prepends.push(path),
@@ -3720,7 +3920,8 @@ fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
 /// here is a missed finding" failure the sentence above describes.
 /// `dynamic_def_prefilter_covers_every_reacting_name` now pins the list
 /// against `body_def_reason`.
-const BODY_DEF_NAMES: [&str; 12] = [
+const BODY_DEF_NAMES: [&str; 13] = [
+    "eval",
     "define_method",
     "define_singleton_method",
     "alias_method",
@@ -4063,6 +4264,19 @@ fn body_def_reason_named(name: &[u8], args: &[Node<'_>]) -> Option<OpenReason> {
         // neither: the inner name is spelled in the body text, which
         // is what `BODY_DEF_NAMES` scans —
         // `the_send_form_passes_the_prefilter` pins that).
+        // Bead ita-evb: a bare `eval(<expr>)` inside a method body runs
+        // a string this index cannot read, in the enclosing class's own
+        // scope — `def self.compile_key_builder` in discourse's
+        // `lib/middleware/anonymous_cache.rb:33-43` builds
+        // `"def self.__compiled_key_builder(h) ... end"` and `eval`s it,
+        // which is the ONLY definition of that method in the tree. The
+        // class-body spelling already opened its class (`is_eval_name`
+        // above, and the class-body `_ =>` arm); the def-body spelling
+        // did not, so `AnonymousCache.__compiled_key_builder`
+        // (`anonymous_cache.rb:47`) read as a conclusive miss on code
+        // that runs. A zero-argument `eval` names nothing and is left
+        // alone, exactly like every other shape here.
+        b"eval" => (!args.is_empty()).then_some(OpenReason::EvalOrSend),
         b"send" | b"public_send" | b"__send__" => args
             .first()
             .and_then(literal_method_name)
@@ -4674,6 +4888,10 @@ pub struct ProjectIndex {
     /// project whose lock names neither gem keeps conclusive
     /// `NotFound` on every one of these names.
     pub mock_singleton_methods: Vec<String>,
+    /// Bead ita-src: every class/module name the project defines inside a
+    /// STRING literal, merged across files. Drained by
+    /// `apply_string_source_definitions`; never read afterwards.
+    string_source_consts: Vec<String>,
 }
 
 /// Merge all files' `file_defs` into the global class table.
@@ -4720,6 +4938,12 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // open even when no `Gemfile.lock` gem's guessed name happens to
     // match. See `apply_undeclared_namespace_reopenings`'s doc comment.
     apply_undeclared_namespace_reopenings(&mut index);
+    // Bead ita-src: a name the project only ever DEFINES inside generated
+    // Ruby source (`app_file "...", <<-RUBY class Foo ... RUBY`) cannot be
+    // judged from a same-named bare stub that happens to sit elsewhere in
+    // the tree. Runs here, after every fragment and every namespace pass,
+    // because it reads each candidate's final method maps.
+    apply_string_source_definitions(&mut index);
     // Singleton-track family (c): `extend ActiveSupport::Concern` plus a
     // nested `ClassMethods` module — the idiom every Rails concern uses
     // to put class methods on its includers. Resolved here, after every
@@ -4924,6 +5148,11 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
     index.attributed_mixin_raw.extend(defs.attributed_mixin_edges.iter().cloned());
     index.load_hook_raw.extend(defs.load_hook_bases.iter().cloned());
+    for name in &defs.string_source_consts {
+        if !index.string_source_consts.contains(name) {
+            index.string_source_consts.push(name.clone());
+        }
+    }
     for (method, path, nesting) in &defs.const_returning_methods {
         index
             .const_returning_methods
@@ -5485,6 +5714,104 @@ fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
     }
 }
 
+/// Bead ita-src: every `class X`/`module X` name written in `body`, a
+/// STRING literal's content. Deliberately a text scan and not a
+/// sub-parse: AGENTS.md already records that parsing literal eval bodies
+/// as sub-programs was measured and rejected, and the only question here
+/// is "does the project generate a definition of this NAME", which the
+/// keyword plus the first constant segment answers.
+fn collect_string_source_consts(body: &str, out: &mut Vec<String>) {
+    for line in body.lines() {
+        let line = line.trim_start();
+        let Some(rest) = line
+            .strip_prefix("class ")
+            .or_else(|| line.strip_prefix("module "))
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
+        if name.starts_with(|c: char| c.is_ascii_uppercase()) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+}
+
+/// Bead ita-esc: how many times the local named `name` is READ anywhere
+/// inside `node`. `harvest_extended_hook` compares this with the reads
+/// its shallow walk consumed: a surplus means the hook's `base` reached
+/// code that walk never modelled.
+fn count_local_reads(node: &Node<'_>, name: &str) -> usize {
+    struct Counter<'a> {
+        name: &'a str,
+        n: usize,
+    }
+    impl<'pr> Visit<'pr> for Counter<'_> {
+        fn visit_local_variable_read_node(
+            &mut self,
+            node: &ruby_prism::LocalVariableReadNode<'pr>,
+        ) {
+            if String::from_utf8_lossy(node.name().as_slice()) == self.name {
+                self.n += 1;
+            }
+        }
+    }
+    let mut c = Counter { name, n: 0 };
+    c.visit(node);
+    c.n
+}
+
+/// Bead ita-blk: collects every `class X`/`module X` keyword reachable
+/// from a class-body block, carrying the LEXICAL scope Ruby gives it.
+/// A `class` keyword's cref is lexical, never the block's runtime `self`,
+/// so the path this builds is the one MRI defines; recursing through the
+/// definition's own body keeps that true for nested spellings.
+struct NestedDefScan<'a> {
+    /// Innermost-last lexical scope; index 0 is the enclosing class body
+    /// the block was written in.
+    scope: Vec<String>,
+    /// `Module.nesting` of that enclosing class body, extended as the
+    /// scan descends.
+    nesting: Vec<String>,
+    /// `(full path, nesting, is_module)` per definition found.
+    out: &'a mut Vec<(String, Vec<String>, bool)>,
+}
+
+impl NestedDefScan<'_> {
+    fn enter(&mut self, path: Option<String>, is_module: bool) -> bool {
+        let Some(path) = path else { return false };
+        let full = join_path(self.scope.last().map_or("", String::as_str), &path);
+        self.nesting.push(full.clone());
+        self.out.push((full.clone(), self.nesting.clone(), is_module));
+        self.scope.push(full);
+        true
+    }
+
+    fn leave(&mut self, entered: bool) {
+        if entered {
+            self.scope.pop();
+            self.nesting.pop();
+        }
+    }
+}
+
+impl<'pr> Visit<'pr> for NestedDefScan<'_> {
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        let entered = self.enter(const_path_str(&node.constant_path()), false);
+        ruby_prism::visit_class_node(self, node);
+        self.leave(entered);
+    }
+
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        let entered = self.enter(const_path_str(&node.constant_path()), true);
+        ruby_prism::visit_module_node(self, node);
+        self.leave(entered);
+    }
+}
+
 /// Is `node` a bare read of the `def self.extended(base)` hook's own
 /// parameter (`base`)? Only that name is the base: a read of any other
 /// local in the hook body names someone else, and filing its calls here
@@ -5655,6 +5982,46 @@ fn attributed_mixin_receivers(
     receivers.sort_unstable();
     receivers.dedup();
     receivers
+}
+
+/// Bead ita-src: open every BARE STUB whose name the project also writes
+/// as a `class X`/`module X` inside a string literal.
+///
+/// Two conditions, both required, and the conjunction is what keeps this
+/// from being a blanket. (1) NAME: some file generates Ruby source
+/// defining that name, so the parsed tree is not where the real
+/// definition lives. (2) SHAPE: the fragment this project does parse has
+/// no methods and no singleton methods of its own — a placeholder, never
+/// a class whose surface anybody could check. rails'
+/// `RaisesNoMethodError` fixture passes (2) and fails (1): no string
+/// literal in the tree defines that name, so its deliberate
+/// `NoMethodError` stays conclusive. The `Foo` this closes fails neither
+/// (`railties/test/application/configuration_test.rb:5352` writes
+/// `class Foo < ApplicationRecord` into a generated model file, and the
+/// only parsed top-level `Foo` is an empty stub in another sub-gem's
+/// tests).
+fn apply_string_source_definitions(index: &mut ProjectIndex) {
+    let names = std::mem::take(&mut index.string_source_consts);
+    if names.is_empty() {
+        return;
+    }
+    let mut targets: Vec<ClassId> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        if !class.methods.is_empty() || !class.singleton_methods.is_empty() {
+            continue;
+        }
+        let last = class.path.rsplit("::").next().unwrap_or(&class.path);
+        if names.iter().any(|n| n == last) {
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "class-table index bounded by `self.classes.len()`, far below u32::MAX for any real Ruby project"
+            )]
+            targets.push(ClassId(i as u32));
+        }
+    }
+    for id in targets {
+        merge_open(index, id, OpenReason::StringSourceDefined);
+    }
 }
 
 /// Singleton-track step N+1, shape (1): apply every held-aside by-name
@@ -5908,7 +6275,9 @@ fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
             | OpenReason::SingletonClassExpr
             | OpenReason::AbstractRaise
             | OpenReason::Unattributed
-            | OpenReason::NestedDefOwner,
+            | OpenReason::NestedDefOwner
+            | OpenReason::BlockNestedDefinition
+            | OpenReason::StringSourceDefined,
         ) => true,
         Some(
             OpenReason::ReopenedExternal
@@ -7482,20 +7851,48 @@ impl ProjectIndex {
         }
     }
 
-    /// An `extend M` puts M's instance methods on the class object's
-    /// dispatch: resolve the named module against the ancestor's own
-    /// nesting and read it. An unresolvable module name makes the whole
+    /// An `extend M` puts the instance methods of M **and of M's own
+    /// ancestry** on the class object's dispatch: resolve the named
+    /// module against the ancestor's own nesting and read its whole
+    /// linearized chain. An unresolvable module name makes the whole
     /// verdict inconclusive — the surface genuinely cannot be read
     /// (`Some(Inconclusive)`), never silently skipped. Bead ita-asx named
     /// this cluster when the `Class`/`Module` reopening consult
     /// (`core_object_instance_surface`) joined it at the same call site.
+    ///
+    /// Bead ita-xta (2026-09-21, measured on rails and discourse): reading
+    /// only `M`'s OWN `methods` map made `extend ActiveModel::Translation`
+    /// — whose whole body is `include ActiveModel::Naming` — read as a
+    /// class object with NO `model_name`, a prospective false E0101 on
+    /// `Person::Gender.model_name` (`activemodel/test/models/person.rb:18`,
+    /// `activemodel/test/cases/translation_test.rb:94`). `extend` is
+    /// ordinary Ruby ancestry: the extended module's includes and prepends
+    /// dispatch exactly like its own methods. The same walk carries the
+    /// fail-closed half — an OPEN ancestor of the extended module (a
+    /// `declarations/gems.rbi` entry such as
+    /// `ActionView::Helpers::TextHelper`, which discourse's
+    /// `Search::GroupedSearchResults::TextHelper` extends, or a project
+    /// module this index could not enumerate) makes the surface
+    /// unreadable rather than absent, and an incomplete chain does the
+    /// same. Monotonic: every verdict this widening changes is
+    /// `NotFound` -> `Found`/`Inconclusive`, never the reverse
+    /// (invariant #1).
     fn extended_module_surface(&self, class: &ClassDef, name: &str) -> Option<MethodLookup<'_>> {
         for ext in &class.extends {
-            if let Some(mid) = self.resolve_const(&class.nesting, ext) {
-                if let Some(m) = self.class(mid).methods.get(name) {
-                    return Some(MethodLookup::Found(m, mid));
+            let Some(mid) = self.resolve_const(&class.nesting, ext) else {
+                return Some(MethodLookup::Inconclusive);
+            };
+            let (chain, complete) = self.ancestors(mid);
+            for &a in &chain {
+                let m = self.class(a);
+                if m.open {
+                    return Some(MethodLookup::Inconclusive);
                 }
-            } else {
+                if let Some(sig) = m.methods.get(name) {
+                    return Some(MethodLookup::Found(sig, a));
+                }
+            }
+            if !complete {
                 return Some(MethodLookup::Inconclusive);
             }
         }
@@ -7503,13 +7900,27 @@ impl ProjectIndex {
     }
 
     /// The instance surface every class object dispatches through after
-    /// its own singleton chain: `Class` for classes, `Module` then `Class`
-    /// for modules. Only PROJECT reopenings of those names are consulted —
-    /// a fragment exists there only when project source literally wrote
-    /// `class Class`/`class Module`, and its instance methods are exactly
-    /// as readable as an `extend`ed module's. A missing fragment changes
-    /// nothing: the builtin core surface is the inventory's business, not
-    /// this consult's (bead ita-asx).
+    /// its own singleton chain. A class object is an instance of `Class`,
+    /// so its dispatch continues `Class` -> `Module` -> `Object` ->
+    /// `Kernel` -> `BasicObject`; a module object starts one link later.
+    /// Only PROJECT reopenings of those names are consulted — a fragment
+    /// exists there only when project source literally wrote
+    /// `class Class`/`class Object`/`module Kernel`, and its instance
+    /// methods are exactly as readable as an `extend`ed module's. A
+    /// missing fragment changes nothing: the builtin core surface is the
+    /// inventory's business, not this consult's (bead ita-asx).
+    ///
+    /// Bead ita-obx (2026-09-21, measured on rails): the chain used to
+    /// stop at `Class`/`Module`, so every `ActiveSupport` core extension
+    /// written as `class Object; def in?(...)` or
+    /// `class Object; def with(...)` — project source, inside the very
+    /// project being checked — read as absent on a class-object receiver.
+    /// 10 of rails' 33 residue records were exactly that: `A.in?(B)`
+    /// (`activesupport/test/core_ext/object/inclusion_test.rb:51-54`
+    /// against that directory's `inclusion.rb:2`) and `X.with(...)` on
+    /// four different receivers (against `with.rb:31`). Same monotonic
+    /// direction as the `extend` consult above: `NotFound` -> `Found`
+    /// only.
     fn core_object_instance_surface(&self, id: ClassId, name: &str) -> Option<MethodLookup<'_>> {
         // An unknown superclass may override this fallback. All proven
         // nearer singleton surfaces have already been searched by the caller.
@@ -7517,9 +7928,9 @@ impl ProjectIndex {
             return Some(MethodLookup::Inconclusive);
         }
         let object_class: &[&str] = if self.class(id).is_module {
-            &["Module", "Class"]
+            &["Module", "Object", "Kernel", "BasicObject"]
         } else {
-            &["Class"]
+            &["Class", "Module", "Object", "Kernel", "BasicObject"]
         };
         for path in object_class {
             if let Some(&cid) = self.by_path.get(*path) {
@@ -7717,34 +8128,69 @@ impl ProjectIndex {
         if kernel_hit {
             return MethodLookup::Inconclusive;
         }
-        // Singleton-track family (e): the stdlib's own class-object
-        // surface. `FileUtils.mkdir_p`, `SecureRandom.uuid`,
-        // `Kernel.rand` are real methods living in no project index —
-        // 270 of discourse's explicit-receiver residue sites and the
-        // single largest family left. Mechanically harvested, never
-        // hand-listed (`declarations/stdlib_singletons.txt`).
-        if singleton && stdlib_singleton_method(&self.class(id).path, name) {
-            return MethodLookup::Inconclusive;
-        }
-        // The mocking gems' class-object surface (`X.any_instance`):
-        // name-keyed, lock-gated — see `apply_mock_singleton_surface`'s
-        // doc comment for the measurement and the mechanism choice.
-        // Receiver-blind by construction (every class object gets the
-        // name from the gem), so ONLY the name may carry the proof, and
-        // only while this project's own lock declares a gem that really
-        // installs it.
-        if singleton && self.mock_singleton_methods.iter().any(|m| m == name) {
-            return MethodLookup::Inconclusive;
-        }
-        let targets = if singleton {
-            &self.dynamic_mixin_singleton_targets
+        let softened = if singleton {
+            self.singleton_surface_softens(id, name)
         } else {
-            &self.dynamic_mixin_instance_targets
+            // The instance-side dynamic mixin: a module mixed into
+            // instances by a runtime `include`/`prepend` the walker could
+            // not resolve, keyed on the method name.
+            self.dynamic_mixin_covers(&self.dynamic_mixin_instance_targets, name)
         };
-        if self.dynamic_mixin_covers(targets, name) {
+        if softened {
             return MethodLookup::Inconclusive;
         }
         MethodLookup::NotFound
+    }
+
+    /// The class-object-only softenings, split from `soften_not_found` so
+    /// the parent stays under the complexity ceiling. Order and
+    /// short-circuit are identical to the inline sequence they replaced;
+    /// each arm keeps the measurement that justifies it. Softening only —
+    /// never a signature, so no arity is manufactured from a method this
+    /// index never read.
+    fn singleton_surface_softens(&self, id: ClassId, name: &str) -> bool {
+        // Singleton-track family (e): the stdlib's own class-object
+        // surface. `FileUtils.mkdir_p`, `SecureRandom.uuid`, `Kernel.rand`
+        // are real methods living in no project index — 270 of discourse's
+        // explicit-receiver residue sites and the single largest family
+        // left. Mechanically harvested (`declarations/stdlib_singletons.txt`).
+        if stdlib_singleton_method(&self.class(id).path, name) {
+            return true;
+        }
+        // Bead ita-sgl: the stdlib `Singleton` mixin. `include Singleton`
+        // runs `Singleton.included(klass)`, whose body does
+        // `klass.extend SingletonClassMethods` — so the includer's CLASS
+        // OBJECT gains exactly `instance`, `_load` and `clone`. DOUBLY
+        // KEYED, never blanket: the receiver's own resolved ancestry must
+        // contain the constant `Singleton`, AND the name must be one of the
+        // three that mixin really installs.
+        if matches!(name, "instance" | "_load" | "clone") && self.includes_singleton_mixin(id) {
+            return true;
+        }
+        // The mocking gems' class-object surface (`X.any_instance`):
+        // name-keyed, lock-gated (see `apply_mock_singleton_surface`).
+        // Receiver-blind by construction, so ONLY the name may carry the
+        // proof, and only while this project's lock declares a gem that
+        // really installs it.
+        if self.mock_singleton_methods.iter().any(|m| m == name) {
+            return true;
+        }
+        // The dynamic singleton mixin: a module extended onto the class
+        // object by a runtime call the walker could not resolve, keyed on
+        // the method name.
+        self.dynamic_mixin_covers(&self.dynamic_mixin_singleton_targets, name)
+    }
+
+    /// Bead ita-sgl: does `id`'s resolved ancestry include the constant
+    /// `Singleton`? Exact top-level path equality on a RESOLVED ancestor,
+    /// never a text match on the `includes` list: a module actually named
+    /// `Singleton` is what `Singleton.included`'s hook hangs off, and an
+    /// ancestor name that never resolved already makes the chain
+    /// incomplete (`lookup_singleton` returns `Inconclusive` before this
+    /// is ever reached).
+    fn includes_singleton_mixin(&self, id: ClassId) -> bool {
+        let (chain, _complete) = self.ancestors(id);
+        chain.iter().any(|&a| self.class(a).path == "Singleton")
     }
 
     /// Bead ita-o8l.1: does an about-to-be-`NotFound` lookup for `name`

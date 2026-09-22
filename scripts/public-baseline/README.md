@@ -279,8 +279,8 @@ offset. Verdicts:
 |---|---|---|
 | `ColorMath::Converters#RuntimeError` (discourse, 4) | **TRUE POSITIVE — real bug in discourse** | `lib/color_math.rb:62`: `raise new RuntimeError("Hex color must be 6 characters")` — parsed as `raise(new(RuntimeError("…")))`; `RuntimeError` is a constant, not a method, so the validation branch raises NoMethodError instead of the intended message. Author meant `RuntimeError.new(...)`. |
 | `RaisesNoMethodError#foobar_method_doesnt_exist` (rails, 1) | TRUE POSITIVE (by design) | `activesupport/test/autoloading_fixtures/raises_no_method_error.rb` — the fixture exists to raise NoMethodError. |
-| `DiscourseAi::Completions::Llm#models_by_provider` (discourse, 1) | census noise (instance-context call) | `llm.rb:79` is inside `def valid_provider_models` — an INSTANCE method; the census bucketed it on the class-object track. Instrument finding, not a flip site. |
-| `DiscourseAi::Utils::DiffUtils#apply_hunk` (discourse, 3) | census noise (instance-context call) | `ai_artifact.rb:72-74` calls `differ.apply_hunk(...)` on a LOCAL; no `apply_hunk` def exists anywhere in the tree (dead path), but this belongs to the instance track, not the class-object census. |
+| `DiscourseAi::Completions::Llm#models_by_provider` (discourse, 1) | **SUPERSEDED — re-audited 2026-09-21 at the flip.** Previously classified as "census noise (instance-context call)" but re-examined as true positive: `llm.rb:79` sits inside `def valid_provider_models`, a SINGLETON method (class `<< self` block spans lines 20-150), so the bare call is on the class object. No `def self.models_by_provider` exists tree-wide; this is a real dead singleton method. |
+| `DiscourseAi::Utils::DiffUtils#apply_hunk` (discourse, 3) | **SUPERSEDED — re-audited 2026-09-21 at the flip.** Previously classified as "census noise (instance-context call)" but re-examined as true positive: `ai_artifact.rb:72-74` receives a LOCAL `differ = DiscourseAi::Utils::DiffUtils` (a module object), so the call is on the class-object track and conclusive. No `def self.apply_hunk` on the module; this is dead code. |
 | `DiscourseAi::Agents::General#id` (discourse, 1) | likely TRUE POSITIVE — re-verify at flip | `bot_controller.rb:136` `DiscourseAi::Agents::General.id`; no `def self.id` found tree-wide. Chain closed per census. |
 
 **Populated — every one must stay silent; each names its bead (98 sites):**
@@ -306,3 +306,86 @@ residue is the true-positive table above, and the flip converts the two
 confirmed discourse/rails sites into diagnostics while the bench's two gap
 rows (`extend_singleton_typo`, `included_hook_class_method_typo`) flip to
 hits.
+
+## Regeneration 2026-09-21 — the class-object E0101 flip
+
+The class-object track's conclusive `MethodLookup::NotFound` became a
+diagnostic (`crates/itaruby_semantic/src/check.rs`, the `Ty::Class` arm),
+gated on `inconclusive_reason(c, true) == None` — the exact predicate the
+dark census had been bucketing as `closed_notfound` while the arm was
+silent. Twelve mechanisms landed first, each a NAMED open reason or an
+indexed surface keyed on the receiver's own chain, and the census residue
+| bead | mechanism | records closed (rails/mastodon/discourse) |
+|---|---|---|
+| ita-xta | `extend M` walks M's OWN ANCESTRY (`include`/`prepend`), and an OPEN ancestor there makes the surface unreadable rather than empty | 1 / 0 / 2 |
+
+### NEW lines — 8 total; 7 true positives, 1 by-design fixture
+
+**Rails:** 1 error (the `RaisesNoMethodError#foobar_method_doesnt_exist` fixture at `activesupport/test/autoloading_fixtures/raises_no_method_error.rb:4`, designed to raise `NoMethodError` — not a discovered defect).
+
+**Discourse:** 7 errors — every one a true positive, read at its byte offset and proven to raise.
+
+Tree-wide greps below are over the pinned `-head` clone, `--include=*.rb`,
+for `def <name>` / `def self.<name>` / `attr_*` / `alias` / `alias_method`
+/ `define_method(:<name>` / `define_singleton_method(:<name>` / `delegate`
+/ `method_missing` on the receiver and every ancestor of its chain.
+
+Per-mechanism, measured on the pinned `-head` clones:
+
+| bead | mechanism | records closed (rails/mastodon/discourse) |
+|---|---|---|
+| ita-xta | `extend M` walks M's OWN ANCESTRY (`include`/`prepend`), and an OPEN ancestor there makes the surface unreadable rather than empty | 1 / 0 / 2 |
+| ita-obx | the class-object chain continues `Class -> Module -> Object -> Kernel -> BasicObject`, so project reopenings of `Object`/`Kernel` (activesupport's `core_ext`) are read | 10 / 0 / 0 |
+| ita-sgl | `include Singleton` installs `instance`/`_load`/`clone` on the includer's class object (receiver-keyed on the resolved ancestor `Singleton`, name-keyed on the three) | 5 / 0 / 0 |
+| ita-blk | a `class`/`module` KEYWORD inside a class-body block is registered at its LEXICAL path, born open | 4 / 0 / 0 |
+| ita-src | a BARE STUB whose name the project also writes as `class X` inside a string literal is opened | 1 / 0 / 0 |
+| ita-qcn | `queue_classic` -> `QC` in `gem_namespace`'s override table (read out of the gem archive at 4.0.0) | 4 / 0 / 0 |
+| ita-bgd | `BigDecimal` joins the bundled-gem Kernel table (`--disable-gems` cannot harvest it) | 4 / 0 / 0 |
+| ita-dsm | `base.define_singleton_method(:x)` in a `self.extended(base)` hook installs on the extender's class object | 0 / 0 / 4 |
+| ita-esc | a `self.extended(base)` hook whose `base` escapes the shallow walk (a nested block) is OPAQUE | 0 / 0 / (same 4) |
+| ita-evb | a bare `eval(<string>)` in a METHOD body opens the enclosing class | 0 / 0 / 1 |
+| ita-slf | an explicit `self` receiver inside a rebindable block is as unprovable as a receiverless one | 0 / 0 / 2 |
+| ita-scl | `class << self; include M` files M on the SINGLETON surface | 0 / 1 / 0 |
+
+### NEW lines — 8, every one a true positive proven by reading
+
+Tree-wide greps below are over the pinned `-head` clone, `--include=*.rb`,
+for `def <name>` / `def self.<name>` / `attr_*` / `alias` / `alias_method`
+/ `define_method(:<name>` / `define_singleton_method(:<name>` / `delegate`
+/ `method_missing` on the receiver and every ancestor of its chain.
+
+| id | line | proof |
+|---|---|---|
+| rails | `activesupport/test/autoloading_fixtures/raises_no_method_error.rb:4` `undefined method \`foobar_method_doesnt_exist\` for class \`RaisesNoMethodError\`` | TRUE POSITIVE BY DESIGN — `class RaisesNoMethodError` (:3) has no superclass and no mixins; the fixture exists to raise `NoMethodError` when autoloaded. Tree-wide `foobar_method_doesnt_exist` -> only this line. |
+| discourse | `lib/color_math.rb:62` `undefined method \`RuntimeError\` for class \`ColorMath::Converters\`` | TRUE POSITIVE, real bug — `raise new RuntimeError("Hex color must be 6 characters")` parses as `raise(new(RuntimeError("…")))`; arguments evaluate first, so `RuntimeError(...)` raises `NoMethodError` and the intended message never appears. `module ColorMath::Converters` (:35) is a single definition with no `extend`/`include`/`method_missing`; tree-wide `def (self\.)?RuntimeError` -> 0 hits. Author meant `RuntimeError.new(...)`. |
+| discourse | `plugins/discourse-ai/app/controllers/discourse_ai/ai_bot/bot_controller.rb:137` `undefined method \`id\` for class \`DiscourseAi::Agents::General\`` | TRUE POSITIVE — `class General < Agent` (`lib/agents/general.rb:5`) defines only instance methods; `class Agent`'s `class << self` block spans `lib/agents/agent.rb:8-292` and contains NO `id`; the only `def id` is at :294, OUTSIDE the sclass, i.e. an instance method. No `extend`/`include`/`prepend`/`method_missing`/`alias` in `agent.rb` and no reopening of `Agent`/`General` anywhere; tree-wide `def self\.id\b\|define_singleton_method(:id\|define_method(:id` -> 0 hits. Reached on the fallback path when the post/topic carries no agent id or name. |
+| discourse | `plugins/discourse-ai/app/models/ai_artifact.rb:72` `undefined method \`apply_hunk\` for class \`DiscourseAi::Utils::DiffUtils\`` | TRUE POSITIVE, dead code — `differ = DiscourseAi::Utils::DiffUtils` then `differ.apply_hunk(...)`; the receiver is a module object held in a local, so the class-object track is the right track. `module DiffUtils` is a pure namespace opened in three files (`lib/utils/diff_utils/{hunk_diff,simple_diff,safety_checker}.rb`) containing only the classes `HunkDiff`, `SimpleDiff`, `SafetyChecker`; no `def` on the module itself, no `extend`/`include`/`method_missing`/`define_method`/`delegate`. Tree-wide `apply_hunk` -> only these three calls plus a spec `describe ".apply_hunk"` whose subject calls `described_class.apply`. The real API is `DiffUtils::HunkDiff.apply` (`hunk_diff.rb:85`); `apply_diff` itself has zero callers. |
+| discourse | `plugins/discourse-ai/app/models/ai_artifact.rb:73` (same) | same |
+| discourse | `plugins/discourse-ai/app/models/ai_artifact.rb:74` (same) | same |
+| discourse | `plugins/discourse-ai/lib/completions/llm.rb:79` `undefined method \`models_by_provider\` for class \`DiscourseAi::Completions::Llm\`` | TRUE POSITIVE, dead singleton method — `def valid_provider_models` (:75) sits inside `class << self` (:20-150), so the bare `models_by_provider` is a class-object call. Tree-wide `models_by_provider` -> only this line, no definition anywhere; no `extend`/`include`/`method_missing` in `llm.rb`. `valid_provider_models` has zero callers. |
+| discourse | `plugins/discourse-subscriptions/app/serializers/discourse_subscriptions/payment_serializer.rb:33` `undefined method \`find\` for class \`DiscourseSubscriptions::User\`` | TRUE POSITIVE, masked by `rescue` — inside `module DiscourseSubscriptions`, `User` resolves lexically to `DiscourseSubscriptions::User`, a NAMESPACE MODULE (`app/controllers/discourse_subscriptions/user/{payments,subscriptions}_controller.rb:4 module User`), not `::User`. The plugin is a Rails Engine, so Zeitwerk sets that autoload and `Module#find` does not exist. Tree-wide: no `def self.find`, no `extend`, no `include`, no `method_missing` on it. MRI really raises; the `rescue StandardError -> nil` two lines down swallows it, which is why `PaymentSerializer#username` is always nil. |
+
+### GONE lines — 30, every one a FALSE POSITIVE the wave repaired
+
+All 30 are rails `E0104 unresolved constant` and all 30 are bead **ita-blk**:
+the constant was defined by a `class`/`module` KEYWORD inside a class-body
+block (`test "..." do class CallMeMaybe ... end end`), which the walker never
+descended into, so the reference to it resolved to nothing. Registering the
+definition at its lexical path makes the reference resolve. Representative
+sites, one per file:
+
+| file:line | constant |
+|---|---|
+| `actioncable/test/server/socket_test.rb:137` | `CallMeMaybe` |
+| `actionmailer/test/base_test.rb:315,327,339,349,368,896,911,926,941,972,989` | `LateAttachmentMailer`, `LateInlineAttachmentMailer`, `LateInlineAttachmentAccessorMailer`, `LateInlineAttachmentMailer`, `LateAttachmentAccessorMailer`, `BeforeActionMailer`, `AfterActionMailer`, `DefaultInlineAttachmentMailer`, `FooMailer`, `DefaultFromMailer`, `MailerWithCallback` |
+| `activejob/test/cases/serializers_test.rb:92,93` | `DummySerializerAlt` |
+| `activerecord/lib/active_record/signed_id.rb:29` | `DeprecateSignedIdVerifierSecret` |
+| `activesupport/test/autoloading_fixtures/raises_name_error.rb:4` | `FooBarBaz` |
+| `activesupport/test/core_ext/module/concerning_test.rb:104,115` | `Foo::ClassMethods` |
+| `railties/test/application/configuration_test.rb:3549` | `DummyDestroyAssociationAsyncJob` |
+| `railties/test/application/url_generation_test.rb:37` | `MyApp` |
+| `railties/test/command/base_test.rb:27,40,48,55,71,76,94,110,113` | `Rails::Command::{Hidden,Helpful,Nesting::Nested,CustomBin,LastSubcommand}Command` |
+| `railties/test/railties/railtie_test.rb:37` | `FooBarBaz` |
+
+No GONE line is a detection this wave lost: every one is a reference the
+checker could not resolve because the walker had not read the definition.

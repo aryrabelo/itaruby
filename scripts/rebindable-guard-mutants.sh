@@ -106,7 +106,9 @@ fi
 ok 'baseline green (every accusing fixture fires, every silent fixture quiet)'
 
 mutant M1 "$CHK" \
-  '        if call.receiver().is_none() && self.rebindable_block_depth > 0 {
+  '        if self.rebindable_block_depth > 0
+            && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+        {
             self.tally_inconclusive(None);
             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
             return Ty::Unknown;
@@ -116,10 +118,18 @@ mutant M1 "$CHK" \
   'the Found/arity path stops consulting the guard: `body html` accuses again'
 
 mutant M2 "$CHK" \
-  '        if call.receiver().is_none() && self.rebindable_block_depth > 0 {' \
+  '        if self.rebindable_block_depth > 0
+            && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+        {' \
   '        if self.rebindable_block_depth > 0 {' \
   explicit_receiver_in_a_rebindable_block_still_accuses \
-  'explicit-receiver calls ride the softening: a receiver `instance_eval` cannot change is silenced'
+  'the receiver clause is dropped: every call in a rebindable block is silenced, so an explicit `Helper` receiver `instance_eval` cannot change is wrongly softened'
+
+mutant M4 "$CHK" \
+  '            && call.receiver().is_none_or(|r| r.as_self_node().is_some())' \
+  '            && call.receiver().is_none()' \
+  self_receiver_in_a_rebindable_block_is_never_accused \
+  'the ita-slf self-arm is cut: an explicit `self` receiver in a rebindable block accuses again, though `self` IS the rebound object'
 
 mutant M3 "$CHK" \
   '                let rebindable = !self.block_keeps_lexical_self(&recv_ty, &name);' \
@@ -138,4 +148,4 @@ trap - EXIT
 rm -f "$BAK_CHK"
 
 if (( fail )); then echo 'RESULT: FAIL (rebindable guard mutants)'; exit 1; fi
-echo 'RESULT: PASS (rebindable guard mutants - 3 mutants, each accused by a named control)'
+echo 'RESULT: PASS (rebindable guard mutants - 4 mutants, each accused by a named control)'

@@ -271,17 +271,16 @@ end
     );
 }
 
-/// Cost/status-quo proof: the SAME reopening shape, but with no
-/// `sorbet/rbi` ever discovered (`rbi_map` is `None`) — `gem_reopens`
-/// exits on the `Option` check before touching any map, so this must
-/// behave byte-for-byte like before this bead: closed class, no gem
-/// knowledge at all, genuinely unknown method still diagnoses.
+/// With no discovered `sorbet/rbi`, `gem_reopens` exits before touching
+/// any map: the genuinely unknown instance method must still diagnose.
+/// The class-object flip also diagnoses this fixture's bare `sig`: no
+/// `extend T::Sig`, superclass, mixin, or project definition supplies it.
+/// Pin both blamed names, not just a count, so neither diagnostic can
+/// replace the other. The RBI-present counterpart above stays silent.
 #[test]
 fn project_without_rbi_keeps_reopening_diagnosing_status_quo() {
     let db = Db::default();
-    let file = wire_project(
-        &db,
-        "\
+    let text = "\
 class LkupGapExtNoRbi
   sig { void }
   def known_method
@@ -291,13 +290,17 @@ class LkupGapExtNoRbi
     totally_unknown_gap_method_no_rbi
   end
 end
-",
-    );
-    let diags = diag_codes(&db, file);
+";
+    let file = wire_project(&db, text);
+    let diags = check_file(&db, file);
+    let mut blamed: Vec<_> = diags
+        .iter()
+        .map(|d| format!("{}:{}", d.code, &text[d.start..d.end]))
+        .collect();
+    blamed.sort_unstable();
     assert_eq!(
-        diags,
-        vec!["E0101".to_string()],
-        "without a discovered sorbet/rbi, a closed class with a real unknown method must \
-         still diagnose exactly as before this bead: {diags:?}"
+        blamed,
+        vec!["E0101:sig", "E0101:totally_unknown_gap_method_no_rbi"],
+        "without an RBI map, both absent methods on this closed class must diagnose: {diags:?}"
     );
 }

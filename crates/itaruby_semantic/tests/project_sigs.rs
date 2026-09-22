@@ -6,6 +6,14 @@
 //! diagnostics, and every fixture here is deliberately built to raise one).
 //! Globally-unique class name prefix `ProjSig` per test, one inline
 //! `SourceFile` per `Db`.
+//!
+//! Recognized-sig fixtures extend `T::Sig`, the external provider of the
+//! class-body DSL. Without that provider the class-object flip correctly
+//! diagnoses the bare `sig` call, independently of return inference.
+//! Keep every return-type and precedence assertion unchanged; unresolved
+//! extension ancestry must not hide the owner's directly defined methods.
+//! The unrecognized-block control deliberately keeps no extension so its
+//! silence still depends on that block opening the class, not on a mixin.
 
 use itaruby_semantic::{check_file, Db, ProjectFiles, SourceFile};
 
@@ -33,6 +41,8 @@ class ProjSigWidgetA
 end
 
 class ProjSigOwnerA
+  extend T::Sig
+
   sig { returns(ProjSigWidgetA) }
   def make(x)
     x.whatever_unknown_method
@@ -67,6 +77,8 @@ class ProjSigWidgetB
 end
 
 class ProjSigOwnerB
+  extend T::Sig
+
   sig { returns(ProjSigWidgetB) }
   def make
     "just a string"
@@ -98,6 +110,8 @@ fn unresolvable_sig_name_stays_unknown_and_silent() {
     let diags = check_src(
         r"
 class ProjSigOwnerC
+  extend T::Sig
+
   sig { returns(ProjSigNotARealClassC) }
   def make(x)
     x.whatever_unknown_method
@@ -125,6 +139,8 @@ class ProjSigWidgetD
 end
 
 class ProjSigOwnerD
+  extend T::Sig
+
   sig { returns(ProjSigWidgetD) }
   def self.make(x)
     x.whatever_unknown_method
@@ -164,6 +180,8 @@ class ProjSigOtherSorbetF
 end
 
 class ProjSigOwnerF
+  extend T::Sig
+
   sig { returns(ProjSigOtherSorbetF) }
   #: () -> ProjSigWidgetF
   def make

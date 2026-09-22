@@ -1,3 +1,6 @@
+
+![itaruby — Ruby type checker, inference-first, zero annotations: write normal Ruby, run `ita check`, get a proven diagnostic](docs/assets/itaruby-how-it-works.webp)
+
 # itaruby
 
 *itá* means "stone" in Tupi — itaruby looks at the stone and says whether it
@@ -41,6 +44,20 @@ Alpha, pre-1.0. The core contract already holds — see "Invariant #1" below —
 but the checker doesn't yet handle autoload, refinements, or block
 parameter types, and the launch bar (below) hasn't been cleared yet.
 
+The class-object track armed on 2026-09-21: a call on a project class
+object (`Page.find_by_slog`) is now checked the same way a call on an
+instance is, gated on the receiver's whole singleton ancestry being
+closed. It shipped as a measurement — the dark-singleton census bucketed
+every would-be accusation on the three public corpora until the residue
+was 8 records across rails/mastodon/discourse, each read and proven to
+raise under MRI.
+
+This alpha is not a replacement for Sorbet in annotated projects. Support
+for existing Sorbet `sig`s and RBI files is partial, including extraction
+of some return types. Full contract checking of parameters and returns,
+and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
+alongside itaruby to preserve your existing Sorbet checks.
+
 ## Quick start
 
 ```sh
@@ -65,7 +82,7 @@ fine, a wrong answer is not.
 
 | code | severity | what |
 |---|---|---|
-| E0101 | Error | `undefined method` on an instance of a project class (closed ancestor chain) |
+| E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
 | E0103 | Error | argument type incompatible with an inline RBS sig |
 | E0104 | Warning | unresolved constant |
@@ -111,25 +128,27 @@ infers first and only speaks when it's sure (Invariant #1), so it finds
 bugs in code that has never seen a sig.
 
 The annotation-free bench (`scripts/inference-bench.jsonl`, judged by
-`scripts/inference-gate.sh`) asks a different question from the corpus
-rounds: on twelve self-contained, gem-free fixtures, does itaruby find
-real bugs with **zero annotations**, and does it stay silent on dynamic
-code that is correct at runtime? MRI is the judge — every accusation must
-really raise on the blamed line, every silence must really exit 0 — and
-the ledger publishes both directions. **Sorbet wins two rows**,
-`extend_singleton_typo` and `included_hook_class_method_typo`: singleton
-and hook shapes where the annotated leg proves a certain `NoMethodError`
-and itaruby stays silent. They sit in the ledger as first-class rows,
-next to the measured reason a blanket fix was reverted (216/0/12 false
-positives on rails/mastodon/discourse) and the named populations that
-must be indexed first (`mattr_accessor`/`cattr_accessor`,
-`class << self` `attr_*`, stdlib module functions). Conversely, on the
-three rows where Sorbet needs an annotation, the only claim is the
-narrow one — itaruby does not false-positive there; each such silence
-carries a positive control with a certain typo planted, so silence is
-never claimed as understanding. The bench also caught a live Invariant
-#1 violation once — `const_missing_namespace`, an E0104 on a namespace
-defining `self.const_missing` — fixed the day it was found.
+`scripts/inference-gate.sh`, described in `scripts/inference-bench-README.md`)
+asks a different question from the corpus rounds: on twelve self-contained,
+gem-free fixtures, does itaruby find real bugs with **zero annotations**,
+and does it stay silent on dynamic code that is correct at runtime? MRI is
+the judge — every accusation must really raise on the blamed line, every
+silence must really exit 0 — and the ledger publishes both directions.
+Until 2026-09-21 **Sorbet won two rows**, `extend_singleton_typo` and
+`included_hook_class_method_typo`: singleton and hook shapes where the
+annotated leg proves a certain `NoMethodError` and itaruby stayed silent.
+A blanket fix had been reverted for a measured reason (216/0/12 false
+positives on rails/mastodon/discourse); the populations that had to be
+indexed first (`mattr_accessor`/`cattr_accessor`, `class << self`
+`attr_*`, stdlib module functions, and the rest of the twelve named
+mechanisms) were indexed, and the class-object flip closed both rows.
+That column now reads zero. Conversely, on the three rows where Sorbet
+needs an annotation, the only claim is the narrow one — itaruby does not
+false-positive there; each such silence carries a positive control with a
+certain typo planted, so silence is never claimed as understanding. The
+bench also caught a live Invariant #1 violation once —
+`const_missing_namespace`, an E0104 on a namespace defining
+`self.const_missing` — fixed the day it was found.
 
 ## Ruby LSP addon
 

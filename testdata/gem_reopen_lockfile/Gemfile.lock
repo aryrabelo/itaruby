@@ -12,6 +12,7 @@ GEM
       net-imap
       net-pop
       net-smtp
+    queue_classic (4.0.0)
     rspec (3.13.0)
     wikicloth (0.8.4)
       builder
@@ -28,6 +29,7 @@ DEPENDENCIES
   rspec
   fastimage
   mail
+  queue_classic
   wikicloth
 
 BUNDLED WITH

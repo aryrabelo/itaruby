@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Class-object flip regression fixtures now distinguish the missing `sig`
+  provider from the missing instance method in the no-RBI lookup control.
+  Existing return-inference fixtures declare `extend T::Sig` without
+  relaxing their diagnostic or precedence assertions. Production lookup,
+  `Unknown` handling, and corpus baselines are unchanged.
+- Corrected Rust documentation markup for the strict clippy gate and
+  retained the nested plain-definition test's singleton-track control.
+- Retargeted the blind CO-R mutant to singleton lookup's effective
+  open-ancestor guard. Removed the redundant emission-side blocker walk:
+  open/incomplete ancestry already returns `Inconclusive`, and the RBI
+  wrapper only softens verdicts. The named control now pairs the open
+  receiver's diagnostic silence with the same typo on a closed receiver.
+
 ### Added
 - Reconcile conflicting superclass headers after project indexing instead of
   selecting the first filesystem entry. Inherited methods and constants
@@ -24,6 +38,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corpora are not cloned, drift-attribution selftests join CI, and the
   replay disk stub accepts trailing-slash lab roots without accepting
   sibling prefixes. Two-sided controls accompany these decisions.
+- **The class-object E0101 flip (2026-09-21).** A conclusive
+  `MethodLookup::NotFound` on the class-object track is now a diagnostic:
+  singleton lookup has already proved closed, complete ancestry, and its
+  RBI wrapper leaves the verdict unsoftened. That verdict is the dark
+  census's own `closed_notfound` bucket, so the flip is a measurement
+  rather than an argument: twelve mechanisms landed first and
+  the public-corpus residue fell **54 records → 8** (rails 33 → 1,
+  mastodon 1 → 0, discourse 20 → 7). The 8 survivors are the 8
+  diagnostics the flip emits, every one read at its byte offset and
+  proven to raise (ledger in `scripts/public-baseline/README.md`):
+  rails' `RaisesNoMethodError` fixture (by design), discourse's
+  `raise new RuntimeError(...)` (`lib/color_math.rb:62`, a real bug —
+  the validation raises `NoMethodError` instead of the intended
+  message), `DiscourseAi::Agents::General.id`, three dead
+  `DiffUtils.apply_hunk` calls, a dead `models_by_provider`, and a
+  Zeitwerk-shadowed `DiscourseSubscriptions::User.find` masked by
+  `rescue StandardError`. The bench's two open-debt rows
+  (`extend_singleton_typo`, `included_hook_class_method_typo`) flip from
+  miss to hit, so "Sorbet proves and itaruby does not" is now 0.
+  Mutants CO-A..CO-R in `scripts/class-object-flip-mutants.sh`,
+  registered in gate c1.
+- Transitive `extend` ancestry (bead ita-xta): `extend M` lifts the
+  instance methods of M AND of M's own `include`/`prepend` chain onto the
+  class object, and an OPEN ancestor there makes the surface unreadable
+  rather than empty. Closes rails' `Person::Gender.model_name` (via
+  `ActiveModel::Translation`'s `include ActiveModel::Naming`) and
+  discourse's `extend ActionView::Helpers::TextHelper`.
+- The `Object`/`Kernel` link of the class-object chain (bead ita-obx):
+  `Class < Module < Object < Kernel < BasicObject`, so a project
+  reopening of `Object` — every activesupport `core_ext` — is on every
+  class object's dispatch. 10 rails residue records (`A.in?(B)`,
+  `X.with(...)`).
+- `include Singleton` (bead ita-sgl): the mixin's `included` hook extends
+  the includer's class object with `SingletonClassMethods`, so
+  `instance`/`_load`/`clone` are real class methods. Doubly keyed —
+  the receiver's resolved ancestry must contain `Singleton`, and the
+  name must be one of the three.
+- Block-nested class/module definitions (bead ita-blk): a `class`
+  KEYWORD inside a class-body block takes its cref from the LEXICAL
+  scope, so it is now registered at that path and born open
+  (`OpenReason::BlockNestedDefinition`). The bug it fixes is receiver
+  IDENTITY: `Foo.config` inside `RailtiesTest::RailtieTest` used to
+  resolve to an empty `class Foo; end` stub in another sub-gem's tests.
+  Side effect, measured: **30 false `E0104 unresolved constant` lines
+  leave the rails baseline** — constants defined inside `test "..." do`
+  blocks now resolve.
+- `class << self; include M` files M on the SINGLETON surface (bead
+  ita-scl) — mastodon's `DeliveryFailureTracker`.
+- A bare `eval(<string>)` inside a METHOD body opens its class (bead
+  ita-evb) — discourse's `AnonymousCache.__compiled_key_builder`, built
+  by `eval` inside `def self.compile_key_builder`.
+- `base.define_singleton_method(:x)` is read as an extended-hook install
+  (bead ita-dsm), and any read of `base` the shallow hook walk did not
+  consume makes the hook OPAQUE (bead ita-esc) — discourse's
+  `Migrations::Enum` installs `valid?`/`values` inside
+  `TracePoint.new(:end) do ... end.enable`.
+- An explicit `self` receiver inside a rebindable block is as unprovable
+  as a receiverless one (bead ita-slf): `self.x = v` inside
+  `base.define_method(...) { }` and `Class.new(Cmd) do self.y = z end`
+  name the rebound object. A NAMED receiver is untouched.
+- A BARE STUB whose name the project also writes as `class X` inside a
+  string literal is opened (bead ita-src) — rails'
+  `app_file "...", <<-RUBY class Foo < ApplicationRecord ... RUBY`.
+- `queue_classic` -> `QC` in `gem_namespace`'s override table (bead
+  ita-qcn, read out of the gem archive at 4.0.0), and `BigDecimal` in
+  the bundled-gem Kernel table (bead ita-bgd, invisible to
+  `gen-core-inventory.rb`'s `--disable-gems` harvest for the same reason
+  `gem` and `URI` are).
 - Core-object reopening consult (bead ita-asx, 2026-09-21): the
   class-object track's singleton lookup now ends in the `Class`/`Module`
   INSTANCE surface — where a project reopening (`class Class ... end`,

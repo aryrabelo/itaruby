@@ -196,7 +196,8 @@ else
   bad 'mutant anchors (see target/gauntlet/anchors.txt)'
 fi
 for m in const-missing operand-types singleton mixin-attribution \
-         lazy-load extended-hook guard-narrowing asserted-raise rebindable-guard; do
+         lazy-load extended-hook guard-narrowing asserted-raise rebindable-guard \
+         class-object-flip; do
   if "$ROOT/scripts/$m-mutants.sh" >"$ART/$m-mutants.txt" 2>&1; then
     ok "$m mutants (every mutant accused, source restored byte-identical)"
   else

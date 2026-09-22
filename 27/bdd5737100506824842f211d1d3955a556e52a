@@ -1,0 +1,18 @@
+AGENTS.md
+  h_b156936c57c455 135-143,450,452-453,455-456,459-465,468-473
+scripts/corpus-baseline.txt
+  h_b156936c57c455 36-42,113-118,131-133,156-160
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 196-206,223,237,241,243
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "27bdd5737100506824842f211d1d3955a556e52a",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

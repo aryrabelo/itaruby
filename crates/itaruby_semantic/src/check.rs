@@ -5265,27 +5265,37 @@ fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
     }
 }
 
-/// Sorbet contract conformance (E0103/E0109) under invariant #1. Nil
-/// membership is a FLOW fact this checker cannot prove: a `T.nilable`
+/// Sorbet contract conformance (E0103/E0109) under invariant #1.
+///
+/// A union `actual` is the set of values the flow MIGHT hold, and this
+/// checker does not narrow through `case`/`when`, `is_a?`/`kind_of?`/
+/// `instance_of?`, `===`, a guard `return`/`raise`/`or return`, nor
+/// through a block, loop or rescue that rewrote a local; a mixed array
+/// literal's element and `s && s.empty?` are unions of the same kind. So
+/// ONE mismatched member is never proof: a union is accused only when NO
+/// member can be the expected type. A single (non-union) type answers for
+/// itself as before.
+///
+/// Nil membership is a FLOW fact this checker cannot prove: a `T.nilable`
 /// param seeds `T | nil` into the body and nothing strips nil through
 /// `x || d`, `x ||= d` or guards such as `return if x.blank?`, and a bare
 /// `nil` read back from a local, an ivar or a call may have been replaced
-/// by a write it never saw (an attribute writer, reflection). So every
-/// `nil` inside `actual` counts as Unknown — the rest of a union still
-/// answers for itself — unless the caller proved the value is a `nil`
-/// written right there (`literal_nil`), which keeps a top-level `Nil`.
+/// by a write it never saw (an attribute writer, reflection). So a `nil`
+/// member is neither proof nor alibi — it is dropped, and the rest of the
+/// union answers for itself — unless the caller proved the value is a
+/// `nil` written right there (`literal_nil`), which keeps a top-level
+/// `Nil`. Nils nested in a collection go with its erased type arguments.
 fn contract_accuses(actual: &Ty, expected: &Ty, literal_nil: bool, index: &ProjectIndex) -> bool {
-    fn unprove_nil(t: &Ty) -> Ty {
-        match t {
-            Ty::Nil => Ty::Unknown,
-            Ty::Union(parts) => Ty::Union(parts.iter().map(unprove_nil).collect()),
-            Ty::Array(e) => Ty::Array(Box::new(unprove_nil(e))),
-            Ty::Hash(k, v) => Ty::Hash(Box::new(unprove_nil(k)), Box::new(unprove_nil(v))),
-            other => other.clone(),
-        }
+    if literal_nil && *actual == Ty::Nil {
+        return !compatible(&Ty::Nil, expected, index);
     }
-    let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil } else { unprove_nil(actual) };
-    !compatible(&erase_type_arguments(&proven), expected, index)
+    // `Ty::union` flattens, so a union's members are never unions.
+    let members = match actual {
+        Ty::Union(parts) => parts.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let judged: Vec<Ty> = members.iter().filter(|m| **m != Ty::Nil).map(erase_type_arguments).collect();
+    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index))
 }
 
 /// Sorbet's generics are erased at runtime: sorbet-runtime checks that a

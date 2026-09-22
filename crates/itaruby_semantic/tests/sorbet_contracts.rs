@@ -113,6 +113,10 @@ end
     assert_eq!(&source[diags[0].start..diags[0].end], "amount");
 }
 
+/// Each explicit `return` is judged on its own; the implicit branches fold
+/// into one union, which accuses only when no member fits (see
+/// `union_with_one_compatible_member_stays_silent`) — so the implicit
+/// control mismatches in BOTH branches.
 #[test]
 fn explicit_returns_and_implicit_branches_are_checked() {
     let diags = check("branches", r#"
@@ -131,7 +135,7 @@ class ContractBranches
     if flag
       "wrong"
     else
-      1
+      :wrong
     end
   end
 end
@@ -815,7 +819,8 @@ end
 
 /// Controls that keep the nil rule a contract and not a blind spot: a
 /// literal `nil` in return or argument position still accuses, and so
-/// does a union whose non-nil member is itself a mismatch.
+/// does a union whose non-nil member is itself a mismatch — the unproven
+/// `nil` is dropped from the union, never read as an alibi for it.
 #[test]
 fn literal_nil_and_mismatched_union_members_still_accuse() {
     let source = r#"
@@ -1753,3 +1758,155 @@ ContractKeywordTaker.new.take(sym: NoSuchConstS)
     }
     assert_eq!(diags.len(), 5, "{diags:?}");
 }
+
+/// A flow-derived union is the set of values the body MIGHT hold, and this
+/// checker does not narrow through `case`/`when`, `is_a?`, `===`, a guard
+/// return or a `raise`, nor through a block, loop or rescue that rewrote a
+/// local. So one member that mismatches is not proof; every method below
+/// runs under sorbet-runtime. A union is accused only when NO member can be
+/// the declared type — see the control test that follows.
+#[test]
+fn union_with_one_compatible_member_stays_silent() {
+    let source = r#"
+class ContractUnionShape; end
+class ContractUnionOther; end
+class ContractUnionMembers
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def take(label)
+    label
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def case_when(k)
+    case k
+    when Integer then k.to_s
+    else k
+    end
+  end
+  sig { params(k: T.any(Integer, String)).returns(Integer) }
+  def guard_return(k)
+    return k.size unless k.is_a?(Integer)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def guard_raise(k)
+    raise ArgumentError unless k.is_a?(String)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(Integer) }
+  def or_return(k)
+    k.is_a?(Integer) or return 0
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def case_equality(k)
+    return k.to_s unless String === k
+    k
+  end
+  sig { params(k: T.any(ContractUnionShape, ContractUnionOther)).returns(ContractUnionShape) }
+  def project_kind_of(k)
+    return ContractUnionShape.new unless k.kind_of?(ContractUnionShape)
+    k
+  end
+  sig { params(k: T.any(ContractUnionShape, ContractUnionOther)).returns(ContractUnionShape) }
+  def project_instance_of(k)
+    return ContractUnionShape.new unless k.instance_of?(ContractUnionShape)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def guarded_argument(k)
+    return take(k) if k.is_a?(String) && k.size > 0
+    "none"
+  end
+  sig { params(name: String, n: Integer).returns(String) }
+  def mixed_first(name, n)
+    [name, n].first
+  end
+  sig { params(name: String, n: Integer).returns(Integer) }
+  def mixed_last(name, n)
+    [name, n].last
+  end
+  sig { params(items: T::Array[Integer]).returns(String) }
+  def block_widened(items)
+    x = 1
+    items.each { |i| x = "s#{i}" }
+    take(x)
+  end
+  sig { params(n: Integer).returns(String) }
+  def while_widened(n)
+    x = 1
+    while n > 0
+      x = "s"
+      n -= 1
+    end
+    take(x)
+  end
+  sig { params(items: T::Array[Integer]).returns(String) }
+  def for_widened(items)
+    x = 1
+    for i in items
+      x = "s#{i}"
+    end
+    take(x)
+  end
+  sig { returns(String) }
+  def rescue_widened
+    x = 1
+    begin
+      x = Integer("s").to_s
+    rescue StandardError
+      x = "t"
+    end
+    take(x)
+  end
+  sig { params(s: String).returns(T::Boolean) }
+  def and_predicate(s)
+    s && s.empty?
+  end
+  sig { params(k: T.any(Integer, String), flag: T.untyped).returns(String) }
+  def explicit_union_return(k, flag)
+    return k if flag
+    "none"
+  end
+end
+ContractUnionMembers.new.take([1, "a"].first)
+"#;
+    let diags = check("union-members", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The controls that keep the union rule a contract: a union whose EVERY
+/// member mismatches still accuses — in a tail, an explicit `return` and an
+/// argument — and so does a single mismatched type.
+#[test]
+fn union_with_no_compatible_member_still_accuses() {
+    let source = r#"
+class ContractUnionMismatch
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def take(label)
+    label
+  end
+  sig { params(k: T.any(Integer, Float)).returns(String) }
+  def tail_union(k)
+    k
+  end
+  sig { params(k: T.any(Integer, Float), flag: T.untyped).returns(String) }
+  def explicit_union(k, flag)
+    return k if flag
+    "ok"
+  end
+  sig { params(k: T.any(Integer, Float)).returns(String) }
+  def argument_union(k)
+    take(k)
+  end
+  sig { params(k: Integer).returns(String) }
+  def single(k)
+    k
+  end
+end
+"#;
+    let diags = check("union-mismatch", source, None);
+    assert_eq!(contract_names(source, &diags), ["tail_union", "explicit_union", "k", "single"], "{diags:?}");
+}
+

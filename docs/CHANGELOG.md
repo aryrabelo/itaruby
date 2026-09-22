@@ -56,7 +56,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return types the consumer. The body is checked against that declaration
   on its own, with no call site needed. A proven return that contradicts it
   is **E0109** (new code, Error), reported at the method name. Explicit
-  `return`s and implicit branch values are both checked. `void`,
+  `return`s and implicit branch values are both checked, each `return` on
+  its own. A union value is accused only when NO member fits the declared
+  type: the checker does not narrow through `case`/`when`, `is_a?`,
+  `kind_of?`, `instance_of?`, `===`, a guard `return`/`raise`/`or return`,
+  or a block, loop or rescue that rewrote a local, so `Integer | String`
+  under `returns(String)` runs and is not accused, while `Integer | Float`
+  there still is. The trade-off is a false negative: implicit branches
+  where one value is wrong and another is right (`flag ? "x" : 1` under
+  `returns(Integer)`) no longer accuse. An unproven `nil` member is
+  dropped from the union, neither proof nor alibi. `void`,
   `abstract`, `T.untyped` or Unknown bodies, an `ensure` that overrides the
   value, code after a `return`, and an `if false` branch never accuse.
   Declared params bind the body's locals. A call argument that contradicts

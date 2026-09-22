@@ -122,19 +122,27 @@ MUTATIONS = [
      "            sorbet_annotated: matches!(pending_sorbet_sig, Some(PendingSig::Parsed(_))),",
      "unusable_inline_sig_still_blocks_the_rbi_contract"),
     # -- nil is proven only where it is written (invariant #1)
-    ("nil in a union counts as proven", CHECK,
-     "            Ty::Union(parts) => Ty::Union(parts.iter().map(unprove_nil).collect()),",
-     "            Ty::Union(parts) => Ty::Union(parts.clone()),",
-     ("nilable_return_through_defaults_and_guards_stays_silent",
-      "nilable_argument_through_defaults_and_guards_stays_silent")),
+    # A union is accused only when NO member fits, so a nil member counted as
+    # PROVEN can no longer change a verdict (the other members already decide
+    # it): that old mutant is equivalent now. The live nil-in-a-union decision
+    # is the other direction — a dropped nil must not become an alibi either.
+    ("union member nil excuses the union", CHECK,
+     "members.iter().filter(|m| **m != Ty::Nil).map(erase_type_arguments)",
+     "members.iter().map(|m| if *m == Ty::Nil { &Ty::Unknown } else { m }).map(erase_type_arguments)",
+     "literal_nil_and_mismatched_union_members_still_accuse"),
     ("nil read from a variable counts as proven", CHECK,
-     "    let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil }",
-     "    let proven = if *actual == Ty::Nil { Ty::Nil }",
+     "    if literal_nil && *actual == Ty::Nil {\n        return !compatible(",
+     "    if *actual == Ty::Nil {\n        return !compatible(",
      "nil_read_from_a_variable_is_not_proof"),
     ("literal nil never accused", CHECK,
-     "    let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil }",
-     "    let proven = if false && literal_nil && *actual == Ty::Nil { Ty::Nil }",
+     "    if literal_nil && *actual == Ty::Nil {\n        return !compatible(",
+     "    if false && literal_nil && *actual == Ty::Nil {\n        return !compatible(",
      "literal_nil_and_mismatched_union_members_still_accuse"),
+    # -- a flow-derived union is what the body MIGHT hold: one member is no proof
+    ("union member mismatch accuses the union", CHECK,
+     "    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index))",
+     "    !judged.is_empty() && judged.iter().any(|m| !compatible(m, expected, index))",
+     "union_with_one_compatible_member_stays_silent"),
     # -- sig names: a core name stays core, an inherited name never falls to the top level
     ("reopened core name becomes a project instance", SIG,
      "    if crate::core::is_known_core_constant(path) {\n        return Ty::Unknown;\n    }\n",
@@ -275,8 +283,8 @@ MUTATIONS = [
      "module_self_is_never_proof_against_an_includer"),
     # -- collection type arguments are erased at runtime; only the category binds
     ("type arguments held as a contract", CHECK,
-     "    !compatible(&erase_type_arguments(&proven), expected, index)",
-     "    !compatible(&proven, expected, index)",
+     ".filter(|m| **m != Ty::Nil).map(erase_type_arguments).collect();",
+     ".filter(|m| **m != Ty::Nil).cloned().collect();",
      "collection_type_arguments_are_erased_but_the_category_still_accuses"),
     # -- the keyword loop still WALKS what it cannot bind by name
     ("non-symbol keyword pair left unwalked", CHECK,

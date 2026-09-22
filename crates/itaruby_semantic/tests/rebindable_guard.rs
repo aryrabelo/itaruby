@@ -14,7 +14,7 @@
 //! Fixtures live in `testdata/rebindable_guard/`: the silent one is MRI-
 //! executable and exits 0 (`Part#initialize` really `instance_eval`s the
 //! block, exactly like the mail gem), the control really raises
-//! NoMethodError on its diagnosed line (verified with ruby 3.4.2).
+//! `NoMethodError` on its diagnosed line (verified with ruby 3.4.2).
 
 fn check_fixture(name: &str) -> Vec<String> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/rebindable_guard");
@@ -58,7 +58,7 @@ fn self_send_inside_a_rebindable_block_is_silent() {
 
 /// ACCUSED (line 21): only SELF-sends are softened — an explicit-receiver
 /// call inside the same rebindable block still names a receiver that
-/// `instance_eval` cannot change. MRI raises NoMethodError at line 21.
+/// `instance_eval` cannot change. MRI raises `NoMethodError` at line 21.
 #[test]
 fn explicit_receiver_in_a_rebindable_block_still_accuses() {
     let d = only("explicit_receiver_in_rebindable_block_accuses.rb");
@@ -69,7 +69,7 @@ fn explicit_receiver_in_a_rebindable_block_still_accuses() {
 
 /// ACCUSED (line 11): a self-send inside a block whose receiving call IS
 /// proven lexical — `[1, 2].each`, a core iterator that merely yields —
-/// stays conclusive. MRI raises NoMethodError at line 11.
+/// stays conclusive. MRI raises `NoMethodError` at line 11.
 #[test]
 fn self_send_inside_a_lexical_block_still_accuses() {
     let d = only("lexical_block_self_send_accuses.rb");

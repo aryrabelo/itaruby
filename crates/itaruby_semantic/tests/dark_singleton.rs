@@ -1,21 +1,19 @@
 //! The dark singleton census: what the class-object track WOULD accuse.
 //!
 //! Since 2026-09-21 the `Ty::Class` `MethodLookup::NotFound` arm EMITS
-//! E0101 whenever `inconclusive_reason(c, true)` is `None` — the census
-//! is what proved that gate empty of populated silence, and it stays on
+//! E0101. Singleton lookup already excludes open/incomplete ancestry;
+//! the RBI wrapper only softens that verdict. The census stays on
 //! as the instrument that would show the next population arriving. This
 //! suite pins both sides:
 //!
-//! * the two gap fixtures must bucket `closed_notfound` — the residue, i.e.
-//!   exactly what a class-object E0101 fires on if the track ever arms;
-//! * a receiver stood down by a dynamic-definer mark must bucket `open` —
-//!   the test a bucketing mutant fails (one that ignores the blocker and
-//!   labels every `NotFound` closed would flip `open_receiver_typo.rb`);
+//! * the two gap fixtures must bucket `closed_notfound` and emit E0101;
+//! * a receiver stood down by a dynamic-definer mark stays silent and
+//!   buckets `open`; removing the singleton lookup's open-ancestor guard
+//!   must produce a false E0101, not merely change a census label;
 //! * resolved calls and non-project receivers record nothing at all.
 //!
-//! The census reads nothing the walk does not already read, so every
-//! assertion here doubles as the zero-diagnostic-change proof for these
-//! fixtures: `diags` is asserted empty alongside the buckets.
+//! Diagnostics are checked alongside the census labels: an open receiver
+//! must stay silent, while a closed receiver with the same typo must accuse.
 
 use itaruby_semantic::{check_file_dark, Db, LineIndex, ProjectFiles, SourceFile};
 
@@ -97,9 +95,10 @@ fn included_hook_typo_accuses_on_the_class_object_track() {
     );
 }
 
-/// THE bucketing guard: an unrecognized class-body call stands the receiver
-/// down, so the typo buckets `open`, never `closed_notfound`. A mutant that
-/// ignores the blocker labels every NotFound closed and fails here.
+/// CO-R: the unknown class-body call makes singleton lookup Inconclusive
+/// before emission. Removing that lookup guard must fail the diagnostic
+/// assertion, not just the census labels. The same typo without the DSL
+/// must still accuse, so blanket singleton silence cannot pass.
 #[test]
 fn unrecognized_class_body_call_keeps_the_receiver_open() {
     let (diags, recs) = dark_fixture("open_receiver_typo.rb");
@@ -114,6 +113,13 @@ fn unrecognized_class_body_call_keeps_the_receiver_open() {
         recs.iter().all(|r| !r.ends_with("closed_notfound")),
         "an open receiver never reaches the residue bucket: {recs:?}"
     );
+    let (closed_diags, closed_recs) = dark_fixture("closed_receiver_typo.rb");
+    assert_eq!(
+        closed_diags,
+        vec!["9:8:E0101 undefined method `load_nmae` for class `Widget`".to_string()],
+        "without the unknown DSL, the same typo must accuse"
+    );
+    assert_eq!(closed_recs, vec!["Widget load_nmae closed_notfound"]);
 }
 
 /// Resolved calls never enter the residue bucket. (`Page.extend` itself
@@ -158,8 +164,9 @@ fn kernel_tail_raise_buckets_known_tail_and_still_silent() {
 }
 
 /// The rest of the measured tail family, same expectation, one assertion
-/// per name: rand/caller/Array/URI/puts/sleep/block_given?/require_relative
-/// all bucket known_tail (the exact names the census histogram carried).
+/// per name: `rand`/`caller`/`Array`/`URI`/`puts`/`sleep`/`block_given?`/
+/// `require_relative` all bucket `known_tail` (the exact names the census
+/// histogram carried).
 #[test]
 fn kernel_tail_family_buckets_known_tail() {
     let (diags, recs) = dark_fixture("kernel_tail_bare_call_family_silent.rb");
@@ -186,7 +193,7 @@ fn kernel_tail_family_buckets_known_tail() {
 }
 
 /// A bare tail call at CLASS-BODY level runs with the class object as
-/// `self` too, and buckets known_tail the same way.
+/// `self` too, and buckets `known_tail` the same way.
 #[test]
 fn class_body_kernel_tail_buckets_known_tail() {
     let (diags, recs) = dark_fixture("class_body_kernel_tail_still_silent.rb");
@@ -244,7 +251,7 @@ fn singleton_tail_typo_stays_closed_notfound() {
 /// Bead ita-nst: the nested `def self.fetch_data` now RESOLVES, so the
 /// census records nothing for it — before the filing this exact fixture
 /// bucketed `Report fetch_data closed_notfound` (the red that motivated
-/// the bead, measured on discourse's EmotionDashboardReport shape).
+/// the bead, measured on discourse's `EmotionDashboardReport` shape).
 #[test]
 fn nested_def_self_in_block_resolves_and_records_nothing() {
     let (diags, recs) = dark_fixture("nested_def_self_in_block_resolves.rb");

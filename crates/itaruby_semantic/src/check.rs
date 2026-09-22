@@ -3506,14 +3506,15 @@ impl Checker<'_> {
                     // ancestry, project reopenings of
                     // `Class`/`Module`/`Object`/`Kernel`, the core
                     // bare-call tail, the stdlib singleton inventory, the
-                    // lock-gated mocking-gem names) and `blocker` is the
-                    // proof that nothing in that ancestry is open.
+                    // lock-gated mocking-gem names). `lookup_singleton`
+                    // returns Inconclusive at any open ancestor, and can
+                    // return NotFound only after a complete chain misses.
+                    // `lookup_singleton_rbi` can only soften that verdict.
+                    // Rechecking the census blocker here was redundant:
+                    // an open receiver never reaches this arm (CO-R).
                     //
-                    // The gate is `inconclusive_reason(c, true) == None`,
-                    // exactly the predicate the dark census bucketed as
-                    // `ClosedNotFound` while this arm was silent — which
-                    // is why the flip is a MEASUREMENT, not a guess. At
-                    // the flip commit the public-corpus residue was
+                    // This is the dark census's `ClosedNotFound` residue.
+                    // At the flip commit the public-corpus residue was
                     // rails 1 / mastodon 0 / discourse 7, every one of
                     // them read at its byte offset and proven to raise
                     // (`scripts/public-baseline/README.md`); the
@@ -3527,36 +3528,25 @@ impl Checker<'_> {
                     // each has a mutant in
                     // `scripts/class-object-flip-mutants.sh`.
                     MethodLookup::NotFound => {
-                        let blocker = self.index.inconclusive_reason(c, true);
                         let receiver = self.index.class(c).path.clone();
-                        let verdict = match blocker {
-                            None => DarkVerdict::ClosedNotFound,
-                            Some(b) => DarkVerdict::Open(format!("{b:?}")),
-                        };
-                        self.dark_record(msg_loc, &receiver, &name, verdict);
-                        if blocker.is_none() {
-                            self.tally(Bucket::Diagnosed);
-                            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
-                            let message =
-                                format!("undefined method `{name}` for class `{receiver}`");
-                            let suggestion = if self.silent {
-                                None
-                            } else {
-                                self.singleton_method_suggestion(c, &name)
-                            };
-                            self.emit_with(
-                                msg_loc.0,
-                                msg_loc.1,
-                                E0101_UNKNOWN_METHOD,
-                                Severity::Error,
-                                message,
-                                suggestion,
-                            );
-                            return Ty::Unknown;
-                        }
-                        self.tally_inconclusive(blocker);
-                        self.tally_ar_base(blocker, c);
+                        self.dark_record(msg_loc, &receiver, &name, DarkVerdict::ClosedNotFound);
+                        self.tally(Bucket::Diagnosed);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
+                        let message =
+                            format!("undefined method `{name}` for class `{receiver}`");
+                        let suggestion = if self.silent {
+                            None
+                        } else {
+                            self.singleton_method_suggestion(c, &name)
+                        };
+                        self.emit_with(
+                            msg_loc.0,
+                            msg_loc.1,
+                            E0101_UNKNOWN_METHOD,
+                            Severity::Error,
+                            message,
+                            suggestion,
+                        );
                         Ty::Unknown
                     }
                 }

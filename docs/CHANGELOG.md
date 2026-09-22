@@ -7,13 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Class-object flip regression fixtures now distinguish the missing `sig`
+  provider from the missing instance method in the no-RBI lookup control.
+  Existing return-inference fixtures declare `extend T::Sig` without
+  relaxing their diagnostic or precedence assertions. Production lookup,
+  `Unknown` handling, and corpus baselines are unchanged.
+- Corrected Rust documentation markup for the strict clippy gate and
+  retained the nested plain-definition test's singleton-track control.
+- Retargeted the blind CO-R mutant to singleton lookup's effective
+  open-ancestor guard. Removed the redundant emission-side blocker walk:
+  open/incomplete ancestry already returns `Inconclusive`, and the RBI
+  wrapper only softens verdicts. The named control now pairs the open
+  receiver's diagnostic silence with the same typo on a closed receiver.
+
 ### Added
 - **The class-object E0101 flip (2026-09-21).** A conclusive
-  `MethodLookup::NotFound` on the class-object track is now a diagnostic
-  when — and only when — `inconclusive_reason(c, true)` is `None`, i.e.
-  the receiver's whole singleton ancestry is closed. That predicate is
-  the dark census's own `closed_notfound` bucket, so the flip is a
-  measurement rather than an argument: twelve mechanisms landed first and
+  `MethodLookup::NotFound` on the class-object track is now a diagnostic:
+  singleton lookup has already proved closed, complete ancestry, and its
+  RBI wrapper leaves the verdict unsoftened. That verdict is the dark
+  census's own `closed_notfound` bucket, so the flip is a measurement
+  rather than an argument: twelve mechanisms landed first and
   the public-corpus residue fell **54 records -> 8** (rails 33 -> 1,
   mastodon 1 -> 0, discourse 20 -> 7). The 8 survivors are the 8
   diagnostics the flip emits, every one read at its byte offset and

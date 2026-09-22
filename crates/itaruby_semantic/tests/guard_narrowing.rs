@@ -61,7 +61,7 @@ fn respond_to_true_branch_is_silent() {
 }
 
 /// SILENT: the same guard written `respond_to?(:setup, true)` — the
-/// second argument widens which methods respond_to? counts, never what
+/// second argument widens which methods `respond_to?` counts, never what
 /// the predicate proves.
 #[test]
 fn respond_to_second_argument_form_is_silent() {
@@ -70,7 +70,7 @@ fn respond_to_second_argument_form_is_silent() {
 
 /// ACCUSED (line 14): the guard holds in the then-branch only, so the
 /// same call in the ELSE-branch — which runs exactly when the method does
-/// not exist — is a real missing method. MRI raises NameError at line 14.
+/// not exist — is a real missing method. MRI raises `NameError` at line 14.
 #[test]
 fn respond_to_else_branch_still_accuses() {
     let d = only("respond_to_else_branch_accuses.rb");
@@ -84,7 +84,7 @@ fn respond_to_else_branch_still_accuses() {
 
 /// ACCUSED (line 11): the guard is keyed on the exact name it names —
 /// answering `w2c_present_step` proves nothing about `w2c_absent_step`.
-/// MRI raises NameError at line 11.
+/// MRI raises `NameError` at line 11.
 #[test]
 fn respond_to_other_name_still_accuses() {
     let d = only("respond_to_wrong_name_accuses.rb");
@@ -97,7 +97,7 @@ fn respond_to_other_name_still_accuses() {
 }
 
 /// ACCUSED (line 8): the same absent self-send with no guard at all.
-/// MRI raises NameError at line 8.
+/// MRI raises `NameError` at line 8.
 #[test]
 fn respond_to_unguarded_self_send_still_accuses() {
     let d = only("respond_to_unguarded_accuses.rb");
@@ -123,7 +123,7 @@ fn class_object_guard_on_a_local_is_silent() {
 }
 
 /// ACCUSED (line 20): `rack_app < Base` with no `is_a?(Class)` in front
-/// of it proves nothing. MRI raises NoMethodError at line 20.
+/// of it proves nothing. MRI raises `NoMethodError` at line 20.
 #[test]
 fn class_object_unguarded_comparison_still_accuses() {
     let d = only("class_object_unguarded_accuses.rb");
@@ -134,7 +134,7 @@ fn class_object_unguarded_comparison_still_accuses() {
 
 /// ACCUSED (line 22): the fact attaches to the SUBJECT of the left
 /// operand, never to the `&&` as a whole — a different receiver in the
-/// right operand keeps its own type. MRI raises NoMethodError at line 22.
+/// right operand keeps its own type. MRI raises `NoMethodError` at line 22.
 #[test]
 fn class_object_guard_does_not_cover_another_subject() {
     let d = only("class_object_other_subject_accuses.rb");
@@ -163,7 +163,7 @@ fn class_object_guard_on_is_a_module_is_silent() {
 
 /// ACCUSED (line 16): a project constant named `Class` shadows the core
 /// one lexically, so the guard's evidence is gone and the comparison is
-/// checked normally. MRI raises NoMethodError at line 16.
+/// checked normally. MRI raises `NoMethodError` at line 16.
 #[test]
 fn class_object_guard_bails_on_a_shadowed_class_constant() {
     let d = only("class_object_shadowed_const_accuses.rb");
@@ -174,7 +174,7 @@ fn class_object_guard_bails_on_a_shadowed_class_constant() {
 
 /// ACCUSED (line 14): the guard speaks only about class/module OBJECTS.
 /// `thing.is_a?(Base)` — an ordinary project class the checker models
-/// fully — must not silence anything. MRI raises NoMethodError at line 14.
+/// fully — must not silence anything. MRI raises `NoMethodError` at line 14.
 #[test]
 fn class_object_guard_does_not_fire_on_a_project_class() {
     let d = only("class_object_project_class_accuses.rb");

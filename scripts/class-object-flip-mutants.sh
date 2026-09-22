@@ -6,13 +6,13 @@
 # message.
 #
 # The flip turned a conclusive `MethodLookup::NotFound` on the
-# class-object track into a diagnostic, gated on
-# `inconclusive_reason(c, true) == None`. Every mutant below removes
-# exactly ONE load-bearing decision — either one of the mechanisms that
-# emptied the public-corpus residue, or the flip's own emission/gate —
-# and must be ACCUSED by a NAMED test in crates/itaruby_semantic/tests/.
-# A mutant that compiles with the suite green is a missing control, not a
-# safe change (AGENTS.md): add the fixture, then count the mutant.
+# class-object track into a diagnostic. `lookup_singleton` owns the
+# open-ancestor guard; `lookup_singleton_rbi` only softens its verdict.
+# Every mutant below removes exactly ONE load-bearing decision — either
+# one of the mechanisms that emptied the public-corpus residue, or the
+# flip's emission/lookup guard — and must be ACCUSED by a NAMED test.
+# A green mutant needs a missing control or a structural redundancy
+# proof, never a waived mutant (AGENTS.md).
 #
 #   CO-A  `extended_module_surface` reverts to reading only the extended
 #         module's OWN method map (the pre-ita-xta shallow read)
@@ -72,11 +72,18 @@
 #         -> string_source_definition_opens_a_bare_stub must fail
 #   CO-Q  THE FLIP: the class-object E0101 emission is cut
 #         -> extend_typo_accuses_on_the_class_object_track must fail
-#   CO-R  THE FLIP'S GATE: the emission ignores the blocker and fires on
-#         every NotFound
+#   CO-R  THE LOOKUP GATE: singleton lookup ignores an open ancestor
 #         -> unrecognized_class_body_call_keeps_the_receiver_open must
-#            fail: an open receiver is exactly what may never accuse
-#            (invariant #1)
+#            fail its diagnostic assertion: Widget.load_nmae gets E0101.
+#         The shipped test also requires E0101 for the same typo on a
+#         closed receiver, so blanket silence cannot pass.
+#
+# CO-R's former emission-blocker mutation was BLIND: Widget's unknown
+# class-body call sets `open`, so lookup_singleton returns Inconclusive
+# before the NotFound emission arm. The second ancestry walk there added
+# no protection. It is removed; CO-R now mutates the effective guard.
+# This is not a census-only probe: the named test checks diagnostics
+# before labels, and must fail because the mutant emits a false E0101.
 #
 # Builds/tests go to $ROOT/target: measuring what another target-dir
 # produced is the 2026-09-17 stale-binary defect (AGENTS.md), and on a
@@ -315,22 +322,28 @@ mutant CO-P "$IDX" \
   'the string-source pass never runs'
 
 mutant CO-Q "$CHK" \
-  '                        if blocker.is_none() {
-                            self.tally(Bucket::Diagnosed);' \
-  '                        if false {
-                            self.tally(Bucket::Diagnosed);' \
+  '                        self.emit_with(
+                            msg_loc.0,
+                            msg_loc.1,
+                            E0101_UNKNOWN_METHOD,
+                            Severity::Error,
+                            message,
+                            suggestion,
+                        );
+                        Ty::Unknown' \
+  '                        let _ = (message, suggestion);
+                        Ty::Unknown' \
   extend_typo_accuses_on_the_class_object_track \
   'THE FLIP: the class-object E0101 emission is cut'
 
-mutant CO-R "$CHK" \
-  '                        if blocker.is_none() {
-                            self.tally(Bucket::Diagnosed);
-                            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);' \
-  '                        if true {
-                            self.tally(Bucket::Diagnosed);
-                            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);' \
+mutant CO-R "$IDX" \
+  '            if class.open {
+                return MethodLookup::Inconclusive;
+            }
+            if let Some(m) = class.singleton_methods.get(name) {' \
+  '            if let Some(m) = class.singleton_methods.get(name) {' \
   unrecognized_class_body_call_keeps_the_receiver_open \
-  'THE FLIP GATE: the emission ignores the blocker and fires on an OPEN receiver'
+  'THE LOOKUP GATE: an open singleton ancestor is treated as closed and emits E0101'
 
 echo
 if (( fail )); then

@@ -7768,7 +7768,7 @@ impl ProjectIndex {
     /// inventory's business, not this consult's (bead ita-asx).
     ///
     /// Bead ita-obx (2026-09-21, measured on rails): the chain used to
-    /// stop at `Class`/`Module`, so every ActiveSupport core extension
+    /// stop at `Class`/`Module`, so every `ActiveSupport` core extension
     /// written as `class Object; def in?(...)` or
     /// `class Object; def with(...)` — project source, inside the very
     /// project being checked — read as absent on a class-object receiver.

@@ -528,7 +528,7 @@ const KERNEL_PRIVATE_INSTANCE_METHODS: &[&str] = &[
 /// receiver inside `module JSONTest::EncodingTestCases`, whose own file
 /// does `require "bigdecimal"` at :3. The name is a Capitalized Kernel
 /// conversion function, so it can never collide with a project method
-/// name written in the ordinary snake_case convention.
+/// name written in the ordinary `snake_case` convention.
 const GEM_KERNEL_METHODS: &[&str] = &["Stoplight", "Rainbow", "_", "s_", "BigDecimal"];
 /// Instance methods Mocha (`stubs`/`expects`/`unstub`, loaded via
 /// `mocha/minitest`) and Minitest's own `minitest/mock` (`stub`) mix into

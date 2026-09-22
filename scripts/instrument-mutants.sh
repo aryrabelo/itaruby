@@ -165,11 +165,43 @@ PY
   git_clean -C "$1" config user.name probe
   git_clean -C "$1" add -A >/dev/null 2>&1
   git_clean -C "$1" commit -qm seed >/dev/null 2>&1
+  # The lab fabricates the DISK PRECONDITION the replay cases need, the
+  # same way it already fabricates `cargo` and `ita`: replay.sh refuses to
+  # create a worktree under a 6 GiB floor, so on a machine below the floor
+  # both replay cases would report "mutant did NOT reproduce" with an empty
+  # witness — a broken fixture wearing the words of a real finding
+  # (AGENTS.md, binding). This `df` always answers "plenty".
+  #
+  # It fabricates the RESOURCE, never the PORTABILITY: it is a strict POSIX
+  # `df`, so it rejects the BSD-only `-g` that GNU `df` also rejects, and
+  # refuses any path outside this lab the way a Linux box refuses
+  # /System/Volumes/Data. Those were exactly the two macOS assumptions that
+  # made replay.sh judge NOTHING on the first Linux run of the gauntlet
+  # workflow (2026-09-22) while this harness blamed the mutant. Written
+  # this way the stub ACCUSES that defect on every platform instead of
+  # hiding it: reintroduce either assumption and both replay cases go red.
+  cat >"$1/fakebin/df" <<'DF'
+#!/bin/sh
+# An unset root would make the path guard below a bare `*` — permissive,
+# and silently so. Refuse instead.
+: "${LAB_DF_ROOT:?lab df: LAB_DF_ROOT unset}"
+for a in "$@"; do
+  case $a in
+    -P | -k | -Pk | -kP) ;;
+    -*) echo "df: invalid option -- '${a#-}'" >&2; exit 1 ;;
+    "$LAB_DF_ROOT"*) ;;
+    *) echo "df: $a: No such file or directory" >&2; exit 1 ;;
+  esac
+done
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+echo 'lab 104857600 1048576 103809024 1% /'
+DF
+  chmod +x "$1/fakebin/df"
 }
 run_replay() { # DIR TAG
   ( cd "$1" && PATH="$1/fakebin:$PATH" \
       BUG_REPLAY_CORPORA="$corpora" BUG_REPLAY_WORKTREES="$LAB/wts-$2" \
-      PROBE_WITNESS="$1/witness.txt" \
+      PROBE_WITNESS="$1/witness.txt" LAB_DF_ROOT="$LAB" \
       bash "$1/scripts/bug-replay/replay.sh" --repos rails --limit 1 --skip-srb \
       >>"$1/log.txt" 2>&1 )
 }

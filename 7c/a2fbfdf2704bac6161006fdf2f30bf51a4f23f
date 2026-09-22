@@ -1,0 +1,14 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 4786
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7ca2fbfdf2704bac6161006fdf2f30bf51a4f23f",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

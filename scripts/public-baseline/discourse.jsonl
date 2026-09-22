@@ -1,5 +1,12 @@
+{"code":"E0101","column":11,"line":79,"message":"undefined method `models_by_provider` for class `DiscourseAi::Completions::Llm`","path":"discourse/plugins/discourse-ai/lib/completions/llm.rb","severity":"error"}
+{"code":"E0101","column":12,"line":33,"message":"undefined method `find` for class `DiscourseSubscriptions::User`","path":"discourse/plugins/discourse-subscriptions/app/serializers/discourse_subscriptions/payment_serializer.rb","severity":"error"}
+{"code":"E0101","column":17,"line":62,"message":"undefined method `RuntimeError` for class `ColorMath::Converters`","path":"discourse/lib/color_math.rb","severity":"error"}
+{"code":"E0101","column":27,"line":74,"message":"undefined method `apply_hunk` for class `DiscourseAi::Utils::DiffUtils`","path":"discourse/plugins/discourse-ai/app/models/ai_artifact.rb","severity":"error"}
+{"code":"E0101","column":29,"line":73,"message":"undefined method `apply_hunk` for class `DiscourseAi::Utils::DiffUtils`","path":"discourse/plugins/discourse-ai/app/models/ai_artifact.rb","severity":"error"}
+{"code":"E0101","column":31,"line":72,"message":"undefined method `apply_hunk` for class `DiscourseAi::Utils::DiffUtils`","path":"discourse/plugins/discourse-ai/app/models/ai_artifact.rb","severity":"error"}
 {"code":"E0101","column":5,"line":77,"message":"undefined method `import_user_account_id` for `BulkImport::VBulletin5`","path":"discourse/script/bulk_import/vbulletin5.rb","severity":"error"}
 {"code":"E0101","column":5,"line":91,"message":"undefined method `create_oauth_records` for `BulkImport::VBulletin5`","path":"discourse/script/bulk_import/vbulletin5.rb","severity":"error"}
+{"code":"E0101","column":51,"line":137,"message":"undefined method `id` for class `DiscourseAi::Agents::General`","path":"discourse/plugins/discourse-ai/app/controllers/discourse_ai/ai_bot/bot_controller.rb","severity":"error"}
 {"code":"E0101","column":52,"line":1510,"message":"undefined method `user_email` for `BulkImport::Base`","path":"discourse/script/bulk_import/base.rb","severity":"error"}
 {"code":"E0104","column":1,"line":10,"message":"unresolved constant `RSpec::Mocks::ArgumentMatchers`","path":"discourse/spec/support/mocks.rb","severity":"warning"}
 {"code":"E0104","column":1,"line":10,"message":"unresolved constant `Spring`","path":"discourse/config/spring.rb","severity":"warning"}
@@ -543,8 +550,8 @@
 {"code":"E0104","column":16,"line":276,"message":"unresolved constant `MultiTargetCheck`","path":"discourse/spec/services/problem_check_spec.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":278,"message":"unresolved constant `SeedFu`","path":"discourse/plugins/voice/spec/services/voice/badge_granter_hooks_spec.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":28,"message":"unresolved constant `Enums::SiteSettingDatatype::GROUP`","path":"discourse/migrations/importer/lib/migrations/importer/steps/site_settings_with_dependencies.rb","severity":"warning"}
-{"code":"E0104","column":16,"line":29,"message":"unresolved constant `RSS::Error`","path":"discourse/plugins/discourse-rss-polling/app/services/discourse_rss_polling/rss_feed/action/fetch_feed.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":29,"message":"unresolved constant `Rinku`","path":"discourse/lib/twitter_api.rb","severity":"warning"}
+{"code":"E0104","column":16,"line":29,"message":"unresolved constant `RSS::Error`","path":"discourse/plugins/discourse-rss-polling/app/services/discourse_rss_polling/rss_feed/action/fetch_feed.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":3,"message":"unresolved constant `::Chat::LookupChannelThreads::Contract`","path":"discourse/plugins/chat/spec/services/chat/lookup_channel_threads_spec.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":3,"message":"unresolved constant `Propshaft::Helper`","path":"discourse/spec/lib/freedom_patches/propshaft_patches_spec.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":30,"message":"unresolved constant `ActiveModel::ArraySerializer`","path":"discourse/app/controllers/post_localizations_controller.rb","severity":"warning"}
@@ -1463,11 +1470,11 @@
 {"code":"E0104","column":5,"line":48,"message":"unresolved constant `Rake::Task`","path":"discourse/script/bulk_import/vanilla.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":48,"message":"unresolved constant `Sidekiq::Testing`","path":"discourse/spec/jobs/periodical_updates_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":499,"message":"unresolved constant `Aws::S3::Resource`","path":"discourse/lib/s3_helper.rb","severity":"warning"}
-{"code":"E0104","column":5,"line":5,"message":"unresolved constant `RSpec::Core::Example`","path":"discourse/spec/lib/turbo_tests/flaky/manager_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":5,"message":"unresolved constant `Rake::Task`","path":"discourse/plugins/discourse-data-explorer/db/migrate/20200902225712_fix_query_ids.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":5,"message":"unresolved constant `Rake::Task`","path":"discourse/plugins/discourse-data-explorer/spec/tasks/data_explorer_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":5,"message":"unresolved constant `Rake::Task`","path":"discourse/spec/tasks/migrate_advanced_search_banner_to_welcome_banner_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":5,"message":"unresolved constant `Rake::Task`","path":"discourse/spec/tasks/migrate_discourse_gifs_to_core_spec.rb","severity":"warning"}
+{"code":"E0104","column":5,"line":5,"message":"unresolved constant `RSpec::Core::Example`","path":"discourse/spec/lib/turbo_tests/flaky/manager_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":50,"message":"unresolved constant `RSS::Atom::Entry`","path":"discourse/lib/feed_element_installer.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":51,"message":"unresolved constant `MALFORMED_MARKERS`","path":"discourse/spec/script/i18n_lint_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":53,"message":"unresolved constant `ConcurrentJob`","path":"discourse/spec/jobs/jobs_base_spec.rb","severity":"warning"}
@@ -1489,8 +1496,8 @@
 {"code":"E0104","column":5,"line":68,"message":"unresolved constant `Autospec::QunitRunner`","path":"discourse/lib/autospec/manager.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":69,"message":"unresolved constant `ConcurrentJob`","path":"discourse/spec/jobs/jobs_base_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":7,"message":"unresolved constant `ActiveModel::ArraySerializer`","path":"discourse/app/serializers/invited_serializer.rb","severity":"warning"}
-{"code":"E0104","column":5,"line":7,"message":"unresolved constant `RSpec::Core::Formatters`","path":"discourse/lib/turbo_tests/progress_formatter.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":7,"message":"unresolved constant `Rake::Task`","path":"discourse/plugins/discourse-data-explorer/spec/tasks/fix_query_ids_spec.rb","severity":"warning"}
+{"code":"E0104","column":5,"line":7,"message":"unresolved constant `RSpec::Core::Formatters`","path":"discourse/lib/turbo_tests/progress_formatter.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":7,"message":"unresolved constant `Sidekiq::Stats`","path":"discourse/app/jobs/base.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":70,"message":"unresolved constant `ActiveModel::ArraySerializer`","path":"discourse/app/controllers/access_control_lists_controller.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":70,"message":"unresolved constant `RSS::Rss::Channel::Item`","path":"discourse/lib/feed_element_installer.rb","severity":"warning"}
@@ -1500,8 +1507,8 @@
 {"code":"E0104","column":5,"line":83,"message":"unresolved constant `Sidekiq::Testing`","path":"discourse/spec/jobs/periodical_updates_spec.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":87,"message":"unresolved constant `MaxMindDB`","path":"discourse/lib/discourse_ip_info.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":9,"message":"unresolved constant `::Mongo::Logger`","path":"discourse/script/import_scripts/nodebb/mongo.rb","severity":"warning"}
-{"code":"E0104","column":5,"line":9,"message":"unresolved constant `RSpec::Core::Formatters`","path":"discourse/lib/turbo_tests/base_formatter.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":9,"message":"unresolved constant `Rake::Task`","path":"discourse/spec/lib/tasks/s3_rake_spec.rb","severity":"warning"}
+{"code":"E0104","column":5,"line":9,"message":"unresolved constant `RSpec::Core::Formatters`","path":"discourse/lib/turbo_tests/base_formatter.rb","severity":"warning"}
 {"code":"E0104","column":5,"line":907,"message":"unresolved constant `Rake`","path":"discourse/lib/plugin/instance.rb","severity":"warning"}
 {"code":"E0104","column":50,"line":1027,"message":"unresolved constant `TempIntegrationSteps::Second`","path":"discourse/migrations/core/spec/lib/conversion/scheduler_integration_spec.rb","severity":"warning"}
 {"code":"E0104","column":50,"line":1104,"message":"unresolved constant `TempIntegrationSteps::Zebra`","path":"discourse/migrations/core/spec/lib/conversion/scheduler_integration_spec.rb","severity":"warning"}
@@ -1621,8 +1628,8 @@
 {"code":"E0104","column":7,"line":105,"message":"unresolved constant `Capybara::Playwright::Driver`","path":"discourse/spec/support/system/driver.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":105,"message":"unresolved constant `RailsCacheCounter`","path":"discourse/spec/lib/concern/cached_counting_spec.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":106,"message":"unresolved constant `MiniRacer::Context`","path":"discourse/plugins/discourse-workflows/lib/discourse_workflows/js_sandbox.rb","severity":"warning"}
-{"code":"E0104","column":7,"line":107,"message":"unresolved constant `RSpec::Core::Notifications::ExampleNotification`","path":"discourse/lib/turbo_tests.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":107,"message":"unresolved constant `RailsMultisite::Middleware`","path":"discourse/config/initializers/200-first_middlewares.rb","severity":"warning"}
+{"code":"E0104","column":7,"line":107,"message":"unresolved constant `RSpec::Core::Notifications::ExampleNotification`","path":"discourse/lib/turbo_tests.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":108,"message":"unresolved constant `DependenciesTestModule::Users`","path":"discourse/migrations/core/spec/lib/common/step_dependencies_spec.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":108,"message":"unresolved constant `RailsFailover::ActiveRecord::Middleware`","path":"discourse/config/initializers/200-first_middlewares.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":109,"message":"unresolved constant `DependenciesTestModule::ExtendedUsers`","path":"discourse/migrations/core/spec/lib/common/step_dependencies_spec.rb","severity":"warning"}

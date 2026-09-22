@@ -2848,6 +2848,45 @@ impl DefWalker<'_> {
                 // call) still opens it — narrowing further would risk a
                 // false E0101 the way bead ita-d0j's dynamic-include gap
                 // did.
+                // Bead ita-sce (2026-09-21, found by the inference bench's
+                // own `singleton_class_eval` row the day the class-object
+                // track armed): `X.singleton_class.class_eval do
+                // define_method(:generate) { ... } end` installs a real
+                // CLASS METHOD on `X` through a body this walker does not
+                // read. `class << X` and `X.singleton_class.prepend M`
+                // were already held-aside singleton patches; the
+                // eval/send family on the same receiver was not, so `X`
+                // read as a complete, closed class object and
+                // `X.generate` became a false E0101 the moment the arm
+                // started emitting. Fail-closed: the patch carries no
+                // methods, only openness, and `declared_owner_required`
+                // makes `merge_file_fragments` drop it when the project
+                // never declares `X` (the TCPSocket rule — inventing the
+                // class is the defect this avoids).
+                if let Some(owner) = singleton_class_owner(&call) {
+                    if is_eval_name(call.name().as_slice())
+                        || matches!(
+                            call.name().as_slice(),
+                            b"send"
+                                | b"public_send"
+                                | b"__send__"
+                                | b"define_method"
+                                | b"define_singleton_method"
+                                | b"alias_method"
+                                | b"attr_reader"
+                                | b"attr_writer"
+                                | b"attr_accessor"
+                        )
+                    {
+                        let mut frag =
+                            ClassFragment::new(owner, false, nesting.to_vec());
+                        frag.declared_owner_required = true;
+                        frag.open = true;
+                        frag.open_reason = Some(OpenReason::EvalOrSend);
+                        self.fragments.push(frag);
+                        return;
+                    }
+                }
                 if call.block().is_some_and(|b| b.as_block_node().is_some()) {
                     let Some(i) = frag_idx else { return };
                     if call.name().as_slice() == b"define_method" && call.receiver().is_none() {

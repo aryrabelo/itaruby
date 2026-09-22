@@ -74,7 +74,7 @@ A shared `--dir` mixes results across cases, so the bench verifies that every
 diagnostic's **path** belongs to the case being judged; a row reading on
 another case's file fails.
 
-## The ledger (12 cases, measured 2026-09-17)
+## The ledger (12 cases, measured 2026-09-17; two rows re-pinned 2026-09-21)
 
 | Case | Family | itaruby | Sorbet (no annotations) |
 |---|---|---|---|
@@ -82,8 +82,8 @@ another case's file fails.
 | `namespace_reopen_typo` | nested + compact `class A::B` | hit | hit |
 | `attr_reader_typo` | method-defining macro | hit | hit |
 | `include_mixin_arity` | `include`, arity | hit | hit |
-| `extend_singleton_typo` | `extend` → singleton | **miss (our gap)** | hit, plus one FP of its own |
-| `included_hook_class_method_typo` | `self.included` + `base.extend` | **miss (our gap)** | hit |
+| `extend_singleton_typo` | `extend` → singleton | **hit (closed 2026-09-21)** | hit, plus one FP of its own |
+| `included_hook_class_method_typo` | `self.included` + `base.extend` | **hit (closed 2026-09-21)** | hit |
 | `define_method_loop` | `define_method` over a list | no false positive; **blind** (see below) | needs an annotation |
 | `method_missing_proxy` | `method_missing` forwarder | correctly silent; **blind** (see below) | needs an annotation |
 | `singleton_class_eval` | singleton `class_eval` | no false positive; **blind** (see below) | needs an annotation |
@@ -91,9 +91,11 @@ another case's file fails.
 | `respond_to_guard` | `respond_to?` capability guard | silent (correct) | silent — control |
 | `const_missing_namespace` | `self.const_missing` | silent — **was an E0104 false positive, fixed 2026-09-17** | also reports |
 
-Summary: 4 both prove, 2 Sorbet proves and itaruby does not, 3 rows where
-Sorbet needs an annotation and itaruby does not false-positive, 2 mutual
-controls, 1 itaruby false positive found by this bench and since fixed.
+Summary: 6 both prove, **0 Sorbet proves and itaruby does not**, 3 rows
+where Sorbet needs an annotation and itaruby does not false-positive, 2
+mutual controls, 2 itaruby false positives found by this bench and since
+fixed (`const_missing_namespace` 2026-09-17, `singleton_class_eval`
+2026-09-21 — see the Open debt section).
 
 ### Silence is not inference — the positive controls
 
@@ -110,17 +112,33 @@ as "understands this pattern". The bench prints this limitation itself.
 
 ### Open debt, recorded rather than ratcheted
 
-* **Two real gaps** (`extend_singleton_typo`, `included_hook_class_method_typo`):
-  itaruby stays silent where a typo is a certain `NoMethodError`. An attempt
-  to close them was built and measured on 2026-09-17 and **reverted**:
-  reporting the singleton `NotFound` residue added 703/36/4109 diagnostics to
-  rails/mastodon/discourse, and even narrowed to explicit receivers plus a
-  did-you-mean near miss it still added 216/0/12, all false
+* **The two real gaps CLOSED 2026-09-21** (`extend_singleton_typo`,
+  `included_hook_class_method_typo`). The first attempt, on 2026-09-17,
+  was built, measured and **reverted**: reporting the singleton
+  `NotFound` residue added 703/36/4109 diagnostics to
+  rails/mastodon/discourse, and even narrowed to explicit receivers plus
+  a did-you-mean near miss it still added 216/0/12, all false
   (`SecureRandom.uuid`, `Kernel.rand`, `mattr_accessor` writers,
-  `class << self` accessors). Closing them needs `mattr_accessor`/
-  `cattr_accessor`, `class << self` `attr_*`, and stdlib module-function
-  surfaces indexed first. Characterized in
-  `crates/itaruby_semantic/tests/singleton_lookup.rs`.
+  `class << self` accessors). What shipped instead was a MEASUREMENT: the
+  dark-singleton census bucketed every would-be accusation as
+  `closed_notfound`, twelve beads turned each populated mechanism into a
+  NAMED open reason or an indexed surface, the public-corpus residue fell
+  from 54 records to 8, every survivor was read at its byte offset and
+  proven to raise, and only then did the arm start emitting
+  (`scripts/public-baseline/README.md`, AGENTS.md's class-object section).
+  Both rows re-pinned here the same day; the mechanisms' mutants live in
+  `scripts/class-object-flip-mutants.sh`.
+* **This bench found the flip's one false positive, the day it armed.**
+  `singleton_class_eval`'s no-annotation fixture
+  (`Report.singleton_class.class_eval do define_method(:generate) ... end`
+  then `Report.generate`) runs clean under MRI and the armed track
+  accused it: `class << X` and `X.singleton_class.prepend M` were already
+  held-aside singleton patches, but the eval/send family on the same
+  receiver was not, so `Report` read as a complete closed class object.
+  Fixed in `index.rs` the same day (bead ita-sce, fail-closed: the patch
+  carries openness only, and an owner the project never declares is
+  dropped). The row is a positive-control row, which is exactly why it
+  caught this.
 * `extend_singleton_typo` also shows Sorbet reporting `new` inside the
   extended module, a line that runs fine once the module is extended into a
   class. Recorded as observed; no fairness leg is filed for it, so the bench

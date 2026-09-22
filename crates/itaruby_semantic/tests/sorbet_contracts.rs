@@ -581,3 +581,249 @@ end
 "));
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }
+
+/// A `T.nilable` parameter seeds `Integer | nil` into the body, and this
+/// checker does not strip nil through `||`, `||=` or the usual guards. Each
+/// method below returns a value that is never nil at runtime, so nil
+/// membership in the inferred union is unproven and must not accuse.
+#[test]
+fn nilable_return_through_defaults_and_guards_stays_silent() {
+    let diags = check("nilable-return", r"
+class ContractNilableReturn
+  extend T::Sig
+  def initialize
+    @count = nil
+  end
+  def load_count
+    @count = 3
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def or_default(x)
+    x || 0
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def or_assign(x)
+    x ||= 0
+    x
+  end
+  sig { returns(Integer) }
+  def local_or_assign
+    r = nil
+    r ||= 1
+    r
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def blank_guard(x)
+    return 0 if x.blank?
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def and_guard(x)
+    return 0 unless x && x > 0
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def is_a_guard(x)
+    unless x.is_a?(Integer)
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def eq_nil_guard(x)
+    if x == nil
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def bang_guard(x)
+    if !x
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def paren_return_guard(x)
+    (return 0) unless x
+    x
+  end
+  sig { returns(Integer) }
+  def ivar_guard
+    return 0 unless @count
+    @count
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def explicit_return_after_guard(x)
+    return x if x
+    0
+  end
+  sig { params(x: T.nilable(Integer)).returns(T::Array[Integer]) }
+  def wrapped_in_array(x)
+    return [] if x.nil?
+    [x]
+  end
+end
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// The E0103 side of the same false positive: the caller's own
+/// `T.nilable(String)` parameter reaches a non-nilable parameter only
+/// after a default or a guard this checker does not narrow through.
+#[test]
+fn nilable_argument_through_defaults_and_guards_stays_silent() {
+    let diags = check("nilable-argument", r#"
+class ContractNilableArgument
+  extend T::Sig
+  def initialize
+    @label = nil
+  end
+  def load_label
+    @label = "loaded"
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def or_default(name)
+    shout(name || "anon")
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def or_assign(name)
+    name ||= "anon"
+    shout(name)
+  end
+  sig { returns(String) }
+  def local_or_assign
+    r = nil
+    r ||= "anon"
+    shout(r)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def blank_guard(name)
+    return "anon" if name.blank?
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def and_guard(name)
+    return "anon" unless name && name.size > 0
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def is_a_guard(name)
+    unless name.is_a?(String)
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def eq_nil_guard(name)
+    if name == nil
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def bang_guard(name)
+    if !name
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def paren_return_guard(name)
+    (return "anon") unless name
+    shout(name)
+  end
+  sig { returns(String) }
+  def ivar_guard
+    return "anon" unless @label
+    shout(@label)
+  end
+end
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A bare `nil` read back from a local or an instance variable is a flow
+/// fact, not a proof: writes this checker cannot see (an attribute writer,
+/// a block, reflection) may have replaced it. Only a `nil` written where
+/// the value is consumed proves it. The same holds for a local: a nil local
+/// that reaches a contract unchanged in straight-line code is a real bug
+/// this rule gives up (a false negative, acceptable under invariant #1);
+/// the block-written local is the shape where the read is NOT the value.
+#[test]
+fn nil_read_from_a_variable_is_not_proof() {
+    let diags = check("nil-variable", r"
+class ContractNilVariable
+  extend T::Sig
+  attr_writer :label
+  def initialize
+    @label = nil
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(String) }
+  def ivar_argument
+    shout(@label)
+  end
+  sig { returns(String) }
+  def ivar_return
+    @label
+  end
+  def current_label
+    @label
+  end
+  sig { returns(String) }
+  def call_result_argument
+    shout(current_label)
+  end
+  sig { params(items: T::Array[String]).returns(String) }
+  def block_written_local(items)
+    value = nil
+    items.each { |item| value = item }
+    shout(value)
+  end
+end
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// Controls that keep the nil rule a contract and not a blind spot: a
+/// literal `nil` in return or argument position still accuses, and so
+/// does a union whose non-nil member is itself a mismatch.
+#[test]
+fn literal_nil_and_mismatched_union_members_still_accuse() {
+    let source = r#"
+class ContractNilLiteral
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(Integer) }
+  def tail_nil
+    nil
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def return_nil(flag)
+    return nil if flag
+    1
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def mixed_union(flag)
+    flag ? "wrong" : nil
+  end
+end
+ContractNilLiteral.new.shout(nil)
+"#;
+    let diags = check("nil-literal", source, None);
+    let names: Vec<&str> = diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109"))
+        .map(|d| &source[d.start..d.end]).collect();
+    assert_eq!(contract_codes(&diags), ["E0109", "E0109", "E0109", "E0103"], "{diags:?}");
+    assert_eq!(names, ["tail_nil", "return_nil", "mixed_union", "nil"], "{diags:?}");
+}

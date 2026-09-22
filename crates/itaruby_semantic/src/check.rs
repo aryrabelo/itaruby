@@ -34,6 +34,9 @@ struct CallTypeArgs<'a> {
     positional: &'a [PositionalArg],
     /// None means splats/forwarding/blocks made named binding unprovable.
     keywords: Option<&'a [KeywordArg]>,
+    /// Spans of the arguments WRITTEN as a literal `nil` — the only nil a
+    /// Sorbet contract may accuse (see `contract_accuses`).
+    nil_literals: &'a [(usize, usize)],
 }
 
 /// Bead ita-qst: every `#: as <target>` inline-cast comment
@@ -1758,11 +1761,18 @@ impl Checker<'_> {
             return;
         }
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+        // A bare `nil` is proven only where it is WRITTEN: a `return` with
+        // no value or a literal `nil`, or a literal `nil` as the tail.
+        let tail_nil = match body.as_statements_node() {
+            Some(statements) => statements.body().iter().last().is_some_and(|n| matches!(n, Node::NilNode { .. })),
+            None => matches!(body, Node::NilNode { .. }),
+        };
+        let returns_nil = safety.returns_literal_nil;
         // Explicit returns make the existing inference fold Unknown. Inspect
         // their proven values independently; never treat that Unknown as nil.
-        let actual = returns.iter().find(|ty| !compatible(ty, &expected, self.index))
+        let actual = returns.iter().find(|ty| contract_accuses(ty, &expected, returns_nil, self.index))
             .or_else(|| {
-                (!return_terminal(&body) && !compatible(last, &expected, self.index)).then_some(last)
+                (!return_terminal(&body) && contract_accuses(last, &expected, tail_nil, self.index)).then_some(last)
             });
         if let Some(actual) = actual {
             let loc = def.name_loc();
@@ -3188,6 +3198,7 @@ impl Checker<'_> {
         // Arguments.
         let mut pos_args: Vec<(Ty, (usize, usize), Option<String>)> = Vec::new();
         let mut kw_args: Vec<KeywordArg> = Vec::new();
+        let mut nil_literals: Vec<(usize, usize)> = Vec::new();
         let mut sorbet_args_known = call.block().is_none();
         let mut exact_arity = true;
         if let Some(args) = call.arguments() {
@@ -3216,6 +3227,9 @@ impl Checker<'_> {
                                     let ty = self.infer_expr(&value, env, self_ty, scope);
                                     let ty = self.apply_cast_comment(ty, loc.start_offset());
                                     let name = String::from_utf8_lossy(key.unescaped()).into_owned();
+                                    if matches!(value, Node::NilNode { .. }) {
+                                        nil_literals.push((loc.start_offset(), loc.end_offset()));
+                                    }
                                     if kw_args.iter().any(|(previous, _, _)| previous == &name) {
                                         sorbet_args_known = false;
                                     }
@@ -3250,6 +3264,9 @@ impl Checker<'_> {
                         let lit = a
                             .as_string_node()
                             .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+                        if matches!(a, Node::NilNode { .. }) {
+                            nil_literals.push((loc.start_offset(), loc.end_offset()));
+                        }
                         pos_args.push((t, (loc.start_offset(), loc.end_offset()), lit));
                     }
                 }
@@ -3294,6 +3311,7 @@ impl Checker<'_> {
         let typed_args = CallTypeArgs {
             positional: &pos_args,
             keywords: sorbet_args_known.then_some(kw_args.as_slice()),
+            nil_literals: &nil_literals,
         };
 
         // E0108 is decided from the operand NODES, independently of
@@ -4648,10 +4666,12 @@ impl Checker<'_> {
             return;
         }
         for (name, (ty, span, _)) in positional_names.iter().zip(args.positional) {
-            self.check_sorbet_argument(sig, nesting, method, name, ty, *span);
+            let literal_nil = args.nil_literals.contains(span);
+            self.check_sorbet_argument(sig, nesting, method, name, (ty, *span, literal_nil));
         }
         for (name, ty, span) in keyword_args {
-            self.check_sorbet_argument(sig, nesting, method, name, ty, *span);
+            let literal_nil = args.nil_literals.contains(span);
+            self.check_sorbet_argument(sig, nesting, method, name, (ty, *span, literal_nil));
         }
     }
 
@@ -4661,12 +4681,12 @@ impl Checker<'_> {
         nesting: &[String],
         method: &str,
         name: &str,
-        actual: &Ty,
-        span: (usize, usize),
+        // The argument's type, its span, and whether it is WRITTEN `nil`.
+        (actual, span, literal_nil): (&Ty, (usize, usize), bool),
     ) {
         let Some((_, expr)) = sig.params.iter().find(|(param, _)| param == name) else { return };
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
-        if !compatible(actual, &expected, self.index) {
+        if contract_accuses(actual, &expected, literal_nil, self.index) {
             self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
                 format!("argument `{name}` of `{method}` expects {}, got {}",
                     ty_name(&expected, self.index), ty_name(actual, self.index)));
@@ -5091,6 +5111,29 @@ fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
     }
 }
 
+/// Sorbet contract conformance (E0103/E0109) under invariant #1. Nil
+/// membership is a FLOW fact this checker cannot prove: a `T.nilable`
+/// param seeds `T | nil` into the body and nothing strips nil through
+/// `x || d`, `x ||= d` or guards such as `return if x.blank?`, and a bare
+/// `nil` read back from a local, an ivar or a call may have been replaced
+/// by a write it never saw (an attribute writer, reflection). So every
+/// `nil` inside `actual` counts as Unknown — the rest of a union still
+/// answers for itself — unless the caller proved the value is a `nil`
+/// written right there (`literal_nil`), which keeps a top-level `Nil`.
+fn contract_accuses(actual: &Ty, expected: &Ty, literal_nil: bool, index: &ProjectIndex) -> bool {
+    fn unprove_nil(t: &Ty) -> Ty {
+        match t {
+            Ty::Nil => Ty::Unknown,
+            Ty::Union(parts) => Ty::Union(parts.iter().map(unprove_nil).collect()),
+            Ty::Array(e) => Ty::Array(Box::new(unprove_nil(e))),
+            Ty::Hash(k, v) => Ty::Hash(Box::new(unprove_nil(k)), Box::new(unprove_nil(v))),
+            other => other.clone(),
+        }
+    }
+    let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil } else { unprove_nil(actual) };
+    !compatible(&proven, expected, index)
+}
+
 /// Short type rendering shared by diagnostics, hover, and the CLI: `nil`,
 /// `Integer`, `String`, project class paths, `Foo | nil` unions.
 pub fn ty_name(t: &Ty, index: &ProjectIndex) -> String {
@@ -5457,9 +5500,23 @@ fn stmts_diverge(stmts: &ruby_prism::StatementsNode<'_>) -> bool {
 #[derive(Default)]
 struct ReturnContractSafety {
     uncertain: bool,
+    /// Some `return` is written as `return` or `return nil`: the only
+    /// `nil` an explicit return may be accused of (see `contract_accuses`).
+    returns_literal_nil: bool,
 }
 
 impl<'pr> Visit<'pr> for ReturnContractSafety {
+    fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        let literal = match node.arguments() {
+            None => true,
+            Some(args) => {
+                let values: Vec<Node<'pr>> = args.arguments().iter().collect();
+                matches!(values.as_slice(), [Node::NilNode { .. }])
+            }
+        };
+        self.returns_literal_nil |= literal;
+        ruby_prism::visit_return_node(self, node);
+    }
     fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {
         self.uncertain = true;
     }

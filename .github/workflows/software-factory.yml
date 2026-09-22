@@ -42,10 +42,14 @@ jobs:
 
   hazards:
     runs-on: ubuntu-latest
-    # gitleaks-action v2 reads the PR's commits via the pulls API; the
-    # workflow-level `contents: read` alone makes that call fail with
-    # "Resource not accessible by integration" (measured 2026-08-25, run
-    # 32895841304). contents:read stays for the checkout/fetch itself.
+    # gitleaks-action reads the PR's commits via the pulls API
+    # (`GET /repos/{owner}/{repo}/pulls/{pull_number}/commits`, src/gitleaks.js);
+    # the workflow-level `contents: read` alone makes that call fail with
+    # "Resource not accessible by integration" (measured 2026-08-25 on v2,
+    # run 32895841304). v3 makes the same call: its `src/` is byte-identical
+    # to v2's (the major only moves the runtime node20 -> node24), and the
+    # step passed under exactly this permission set on run 35704767121
+    # (2026-09-22). contents:read stays for the checkout/fetch itself.
     permissions:
       contents: read
       pull-requests: read

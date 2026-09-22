@@ -567,6 +567,15 @@ pub struct FileDefs {
     /// never visits a `def` body, which is where every rails call site
     /// lives).
     pub load_hook_bases: Vec<(String, Vec<String>)>,
+    /// Instance-variable names this file writes through a path the
+    /// checker's per-class ivar walk cannot attribute to a class: outside
+    /// an instance `def` of a class/module body, inside a block that may
+    /// rebind `self`, a multiple/rescue/`for` target, or reflection
+    /// (`instance_variable_set(:@x, ...)`, `remove_instance_variable`).
+    /// See `ProjectIndex::hidden_ivar_writes`.
+    pub hidden_ivar_writes: Vec<String>,
+    /// Reflection wrote an instance variable whose name is not a literal.
+    pub hidden_ivar_writes_any: bool,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -639,6 +648,10 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         const_returning_methods: Vec::new(),
         load_hook_bases: Vec::new(),
         def_locals: Vec::new(),
+        ivar_scopes: Vec::new(),
+        call_blocks_lexical: Vec::new(),
+        hidden_ivar_writes: Vec::new(),
+        hidden_ivar_writes_any: false,
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -660,6 +673,8 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         attributed_mixin_edges: scan.attributed_mixin_edges,
         const_returning_methods: scan.const_returning_methods,
         load_hook_bases: scan.load_hook_bases,
+        hidden_ivar_writes: scan.hidden_ivar_writes,
+        hidden_ivar_writes_any: scan.hidden_ivar_writes_any,
     }
 }
 
@@ -862,6 +877,29 @@ struct FileScan {
     /// name OVERWRITES the entry with nothing — a local reassigned to
     /// something else must not keep resolving to its old value.
     def_locals: Vec<FxHashMap<String, Vec<MixinReceiver>>>,
+    /// Where an `@x` write here would land, innermost last — see
+    /// `IvarScope` and `FileDefs::hidden_ivar_writes`.
+    ivar_scopes: Vec<IvarScope>,
+    /// One entry per call node being visited: does its block provably
+    /// keep lexical `self` (`core::core_block_keeps_lexical_self`)?
+    call_blocks_lexical: Vec<bool>,
+    hidden_ivar_writes: Vec<String>,
+    hidden_ivar_writes_any: bool,
+}
+
+/// Whose instance variable an `@x` write at this point of `FileScan`'s
+/// walk provably targets. Only `InstanceDef` is a place the checker's
+/// per-class walk (`Checker::ivar_ty`) sees as a write on that class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvarScope {
+    /// A `class`/`module` body itself.
+    Body,
+    /// A receiverless `def` directly in a class/module body, or a block
+    /// inside one that provably keeps lexical `self`.
+    InstanceDef,
+    /// Anything else: toplevel, `def self.x`, `class << self`, a `def`
+    /// nested in a block, or a block that may rebind `self`.
+    Opaque,
 }
 
 impl FileScan {
@@ -890,15 +928,55 @@ impl<'pr> Visit<'pr> for FileScan {
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         let path = node.constant_path();
         self.push_scope(&path);
+        self.ivar_scopes.push(IvarScope::Body);
         ruby_prism::visit_class_node(self, node);
+        self.ivar_scopes.pop();
         self.pop_scope(&path);
     }
 
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         let path = node.constant_path();
         self.push_scope(&path);
+        self.ivar_scopes.push(IvarScope::Body);
         ruby_prism::visit_module_node(self, node);
+        self.ivar_scopes.pop();
         self.pop_scope(&path);
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.ivar_scopes.push(IvarScope::Opaque);
+        ruby_prism::visit_singleton_class_node(self, node);
+        self.ivar_scopes.pop();
+    }
+
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_write_node(self, node);
+    }
+
+    fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_or_write_node(self, node);
+    }
+
+    fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_and_write_node(self, node);
+    }
+
+    fn visit_instance_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
+    ) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_operator_write_node(self, node);
+    }
+
+    fn visit_instance_variable_target_node(&mut self, node: &ruby_prism::InstanceVariableTargetNode<'pr>) {
+        // `@a, @b = ...`, `rescue => @e`, `for @x in ...`: the checker's
+        // ivar walk captures none of these, so each is hidden everywhere.
+        self.hide_ivar(node.name().as_slice());
+        ruby_prism::visit_instance_variable_target_node(self, node);
     }
 
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
@@ -918,17 +996,28 @@ impl<'pr> Visit<'pr> for FileScan {
             }
         }
         self.note_const_returning_body(node);
+        let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
+        let scope = if in_body && node.receiver().is_none() { IvarScope::InstanceDef } else { IvarScope::Opaque };
+        self.ivar_scopes.push(scope);
         self.nested += 1;
         self.def_locals.push(FxHashMap::default());
         ruby_prism::visit_def_node(self, node);
         self.def_locals.pop();
         self.nested -= 1;
+        self.ivar_scopes.pop();
     }
 
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        // The call that owns this block is the innermost one being
+        // visited: its receiver and arguments were walked (and popped)
+        // before its block.
+        let lexical = self.call_blocks_lexical.last() == Some(&true);
+        let in_def = self.ivar_scopes.last() == Some(&IvarScope::InstanceDef);
+        self.ivar_scopes.push(if lexical && in_def { IvarScope::InstanceDef } else { IvarScope::Opaque });
         self.nested += 1;
         ruby_prism::visit_block_node(self, node);
         self.nested -= 1;
+        self.ivar_scopes.pop();
     }
 
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
@@ -958,6 +1047,9 @@ impl<'pr> Visit<'pr> for FileScan {
     }
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.note_ivar_reflection(node);
+        let name = String::from_utf8_lossy(node.name().as_slice());
+        self.call_blocks_lexical.push(core::core_block_keeps_lexical_self(&name));
         self.note_dynamic_mixin(node);
         self.note_attributed_mixin(node);
         self.note_refinement(node);
@@ -965,10 +1057,45 @@ impl<'pr> Visit<'pr> for FileScan {
         self.note_injection(node);
         self.note_load_hook_base(node);
         ruby_prism::visit_call_node(self, node);
+        self.call_blocks_lexical.pop();
     }
 }
 
 impl FileScan {
+    /// An `@x` write the checker's per-class walk would not attribute to
+    /// the class it really lands on — see `IvarScope`.
+    fn note_ivar_write(&mut self, name: &[u8]) {
+        if self.ivar_scopes.last() != Some(&IvarScope::InstanceDef) {
+            self.hide_ivar(name);
+        }
+    }
+
+    fn hide_ivar(&mut self, name: &[u8]) {
+        let name = String::from_utf8_lossy(name).into_owned();
+        if !self.hidden_ivar_writes.contains(&name) {
+            self.hidden_ivar_writes.push(name);
+        }
+    }
+
+    /// `instance_variable_set(:@x, v)` / `remove_instance_variable(:@x)`
+    /// on any receiver: a write to `@x` of whatever object it reaches. A
+    /// name that is not a plain literal could be any ivar.
+    fn note_ivar_reflection(&mut self, node: &ruby_prism::CallNode<'_>) {
+        if !matches!(node.name().as_slice(), b"instance_variable_set" | b"remove_instance_variable") {
+            return;
+        }
+        let first = node.arguments().and_then(|args| args.arguments().iter().next());
+        let literal = first.as_ref().and_then(|arg| {
+            arg.as_symbol_node()
+                .map(|sym| sym.unescaped().to_vec())
+                .or_else(|| arg.as_string_node().map(|s| s.unescaped().to_vec()))
+        });
+        match literal {
+            Some(name) => self.hide_ivar(&name),
+            None => self.hidden_ivar_writes_any = true,
+        }
+    }
+
     /// `<dynamic-receiver>.include/extend/prepend(<literal constant>)` —
     /// see this struct's doc comment for why the RECEIVER is never the
     /// key.
@@ -4758,6 +4885,13 @@ pub struct ProjectIndex {
     /// supplied by a descendant, and claiming `NotFound` there is a false
     /// positive (see `descendant_defines`).
     pub subclasses: FxHashMap<ClassId, Vec<ClassId>>,
+    /// Every ivar name some file writes through a path the checker's
+    /// per-class ivar walk cannot attribute (`FileDefs::hidden_ivar_writes`),
+    /// project-wide and name-keyed: the receiving object may be of any
+    /// class, so the name is unproven on every class.
+    pub hidden_ivar_writes: FxHashSet<String>,
+    /// Some file wrote an ivar by a non-literal name: every ivar is unproven.
+    pub hidden_ivar_writes_any: bool,
     /// Distinct literal `require '<lib>'` targets across every project
     /// file (W3 require/autoload). Ruby's `require` is process-global, so
     /// the stdlib gate consults this project-wide set, never per-file:
@@ -5118,6 +5252,8 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
     index.attributed_mixin_raw.extend(defs.attributed_mixin_edges.iter().cloned());
     index.load_hook_raw.extend(defs.load_hook_bases.iter().cloned());
+    index.hidden_ivar_writes.extend(defs.hidden_ivar_writes.iter().cloned());
+    index.hidden_ivar_writes_any |= defs.hidden_ivar_writes_any;
     for name in &defs.string_source_consts {
         if !index.string_source_consts.contains(name) {
             index.string_source_consts.push(name.clone());

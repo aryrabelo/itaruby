@@ -2041,14 +2041,7 @@ impl Checker<'_> {
                 // Side channel for `ivar_ty`'s silent re-walk: capture this
                 // assignment's type when it matches the (class, name) it's
                 // currently collecting for.
-                if let SelfTy::Instance(c) = self_ty {
-                    let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                    if let Some((cap_class, values)) = self.ivar_capture.as_mut() {
-                        if *cap_class == c {
-                            values.entry(name).or_default().push(ty.clone());
-                        }
-                    }
-                }
+                self.capture_ivar_write(self_ty, n.name().as_slice(), ty.clone());
                 ty
             }
             Node::ClassVariableWriteNode { .. } => {
@@ -2059,22 +2052,26 @@ impl Checker<'_> {
                 let n = node.as_global_variable_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope)
             }
-            // ponytail: `||=`/`&&=`/op-assign ivar writes don't feed
-            // `ivar_ty` — contract scope is the literal `@x = <expr>`
-            // form; widen the net here if a fixture ever needs it.
+            // `||=`/`&&=`/op-assign ivar writes are not typed here, but they
+            // ARE writes: each one feeds `ivar_ty` an Unknown, so an ivar
+            // whose only literal write is `@x = nil` never reads back as
+            // exactly nil once `@x ||= compute` exists.
             Node::InstanceVariableOrWriteNode { .. } => {
                 let n = node.as_instance_variable_or_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
             Node::InstanceVariableAndWriteNode { .. } => {
                 let n = node.as_instance_variable_and_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
             Node::InstanceVariableOperatorWriteNode { .. } => {
                 let n = node.as_instance_variable_operator_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
 
@@ -3743,7 +3740,12 @@ impl Checker<'_> {
                     if exact_arity {
                         self.check_core_arity(cm, &name, pos_args.len(), msg_loc);
                     }
-                    let ret = core_ret_to_ty(cm.ret, t);
+                    let args: Vec<Ty> = pos_args.iter().map(|(ty, _, _)| ty.clone()).collect();
+                    let shape = CoreCallShape {
+                        args: exact_arity.then_some(args.as_slice()),
+                        int_literal: first_int_literal(call),
+                    };
+                    let ret = core_call_ret(cc, &name, cm.ret, t, &shape);
                     if ret == Ty::Unknown {
                         self.note_unknown_origin(call, UnkOrigin::CoreRet, None);
                     }
@@ -4915,19 +4917,78 @@ impl Checker<'_> {
     /// (Unknown never manufactures a diagnostic, only a possible false
     /// negative), confirmed measured on corpus-c: identical error hashes (2)
     /// and warning ceiling (4321) before and after this bead.
+    ///
+    /// The fold only sees `@name` writes in `class`'s own instance
+    /// methods, so it is a proof only when no other writer exists:
+    /// `ivar_writes_hidden` turns every other writer path into Unknown.
     fn ivar_ty(&mut self, class: ClassId, name: &str) -> Ty {
-        if let Some(map) = self.ivar_class_memo.get(&class) {
-            return map.get(name).cloned().unwrap_or(Ty::Unknown);
+        if !self.ensure_ivar_walk(class) {
+            return Ty::Unknown; // recursive read mid-computation: fixpoint fallback
+        }
+        let own = self.ivar_class_memo.get(&class).and_then(|map| map.get(name)).cloned();
+        match own {
+            Some(ty) if ty != Ty::Unknown && !self.ivar_writes_hidden(class, name) => ty,
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// Walks `class`'s instance methods once and memoizes the folded
+    /// writes; `false` while that walk is already in progress.
+    fn ensure_ivar_walk(&mut self, class: ClassId) -> bool {
+        if self.ivar_class_memo.contains_key(&class) {
+            return true;
         }
         if !self.ivar_class_in_progress.insert(class) {
-            return Ty::Unknown; // recursive read mid-computation: fixpoint fallback
+            return false;
         }
         let collected = self.walk_class_ivars(class);
         self.ivar_class_in_progress.remove(&class);
-        let result_map = fold_ivar_writes(collected);
-        let ty = result_map.get(name).cloned().unwrap_or(Ty::Unknown);
-        self.ivar_class_memo.insert(class, result_map);
-        ty
+        self.ivar_class_memo.insert(class, fold_ivar_writes(collected));
+        true
+    }
+
+    /// Can `@name` on an instance of `class` be written by anything the
+    /// per-class walk did not see as a typed write? Every answer this
+    /// cannot rule out is `true` (invariant #1: an ivar whose only
+    /// visible write is `@x = nil` must not read back as exactly nil
+    /// when an attribute writer or reflection can replace it):
+    ///
+    /// - a write the index saw outside any class's instance method, in a
+    ///   block that may rebind `self`, or through reflection
+    ///   (`ProjectIndex::hidden_ivar_writes`);
+    /// - a writer method `name=` (`attr_writer`/`attr_accessor`, a
+    ///   `define_method`, a hand-written one) anywhere in the ancestry or
+    ///   the descendants, or an ancestry that cannot rule one out;
+    /// - a write to the same name in any ancestor's or descendant's own
+    ///   instance methods, which run on this same object.
+    fn ivar_writes_hidden(&mut self, class: ClassId, name: &str) -> bool {
+        if self.index.hidden_ivar_writes_any || self.index.hidden_ivar_writes.contains(name) {
+            return true;
+        }
+        let writer = format!("{}=", name.trim_start_matches('@'));
+        if !matches!(self.index.lookup_method(class, &writer), MethodLookup::NotFound)
+            || self.index.descendant_defines(class, &writer, false)
+        {
+            return true;
+        }
+        let (ancestors, _) = self.index.ancestors(class);
+        let family: Vec<ClassId> =
+            ancestors.into_iter().chain(descendants_of(self.index, class)).filter(|&c| c != class).collect();
+        family.into_iter().any(|member| {
+            !self.ensure_ivar_walk(member)
+                || self.ivar_class_memo.get(&member).is_some_and(|map| map.contains_key(name))
+        })
+    }
+
+    /// Side channel for `ivar_ty`'s silent re-walk: record one write's type
+    /// when it lands on the (class, name) being collected.
+    fn capture_ivar_write(&mut self, self_ty: SelfTy, name: &[u8], ty: Ty) {
+        let SelfTy::Instance(c) = self_ty else { return };
+        if let Some((cap_class, values)) = self.ivar_capture.as_mut() {
+            if *cap_class == c {
+                values.entry(String::from_utf8_lossy(name).into_owned()).or_default().push(ty);
+            }
+        }
     }
 
     /// Single silent walk of every instance method of `class`, capturing
@@ -5024,6 +5085,22 @@ impl Checker<'_> {
     }
 }
 
+/// Every transitive subclass of `id` (the runtime classes an instance
+/// method of `id` can run on).
+fn descendants_of(index: &ProjectIndex, id: ClassId) -> Vec<ClassId> {
+    let mut out = Vec::new();
+    let mut stack = vec![id];
+    while let Some(cur) = stack.pop() {
+        for &kid in index.subclasses.get(&cur).into_iter().flatten() {
+            if !out.contains(&kid) {
+                out.push(kid);
+                stack.push(kid);
+            }
+        }
+    }
+    out
+}
+
 /// Fold each ivar's collected assignment types (from `Checker::walk_class_ivars`)
 /// into one `Ty` per name: two assignments of the same type keep that type;
 /// a differing type, or any `Unknown`, collapses straight to `Ty::Unknown` —
@@ -5094,6 +5171,10 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
 fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
     match (arg, param) {
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
+        // An instance of a MODULE (`self` in a module method, a value typed
+        // by a module name) is an instance of some class that includes it,
+        // which this checker cannot name: never proof against anything.
+        (Ty::Instance(a), _) if index.class(*a).is_module => true,
         (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index)),
         (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index)),
         (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index),
@@ -5170,6 +5251,155 @@ fn arity_str(m: &MethodSig) -> String {
     } else {
         format!("{}..{}{}", m.required, m.required + m.optional, rest)
     }
+}
+
+/// What a core call site proves about its arguments: `args` is the
+/// positional argument types when the call shape is exact (no splat, no
+/// keyword hash, no `...`), and `int_literal` the value of a first
+/// argument written as a plain Integer literal.
+struct CoreCallShape<'a> {
+    args: Option<&'a [Ty]>,
+    int_literal: Option<i64>,
+}
+
+/// The first positional argument's value when it is written as an
+/// Integer literal (`2`, `-1`), else `None`.
+fn first_int_literal(call: &CallNode<'_>) -> Option<i64> {
+    let args = call.arguments()?;
+    let first = args.arguments().iter().next()?;
+    let text = first.as_integer_node()?.location().as_slice().to_vec();
+    String::from_utf8(text).ok()?.replace('_', "").parse().ok()
+}
+
+/// A core method's return at THIS call site. The table's `CoreRet` is
+/// the answer for the argument-free form (or an argument that cannot
+/// change the type); every method below returns a different type
+/// depending on its arguments, so it answers only when the argument
+/// types make the result trivially provable and is `Ty::Unknown`
+/// otherwise (invariant #1: a wrong precise type here becomes an E0101,
+/// E0103 or E0109 accusation downstream).
+fn core_call_ret(cc: CoreClass, name: &str, ret: CoreRet, recv: &Ty, shape: &CoreCallShape<'_>) -> Ty {
+    let Some(args) = shape.args else {
+        return if core_ret_depends_on_args(cc, name) { Ty::Unknown } else { core_ret_to_ty(ret, recv) };
+    };
+    let answer = match cc {
+        CoreClass::Integer => integer_call_ret(name, args, shape.int_literal),
+        CoreClass::Float => float_call_ret(name, args, shape.int_literal),
+        CoreClass::Array => array_call_ret(name, args, recv),
+        _ => None,
+    };
+    answer.unwrap_or_else(|| core_ret_to_ty(ret, recv))
+}
+
+/// `Integer` methods whose return follows the arguments; `None` means
+/// the table's own return applies.
+fn integer_call_ret(name: &str, args: &[Ty], int_literal: Option<i64>) -> Option<Ty> {
+    let ty = match name {
+        // Arithmetic takes the operand's numeric class (`1 * 1.5` is a
+        // Float); anything else (Rational, BigDecimal, an unknown object's
+        // `coerce`) is unproven.
+        "+" | "-" | "*" | "/" | "%" => match args {
+            [Ty::Int] => Ty::Int,
+            [Ty::Float] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        // A negative exponent answers a Rational: only a literal
+        // non-negative one is proven Integer.
+        "**" => match (args, int_literal) {
+            ([Ty::Int], Some(n)) if n >= 0 => Ty::Int,
+            _ => Ty::Unknown,
+        },
+        // `clamp` returns the receiver or one of its bounds.
+        "clamp" => match args {
+            [Ty::Int, Ty::Int] => Ty::Int,
+            _ => Ty::Unknown,
+        },
+        _ => return None,
+    };
+    Some(ty)
+}
+
+/// `Float` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn float_call_ret(name: &str, args: &[Ty], int_literal: Option<i64>) -> Option<Ty> {
+    let ty = match name {
+        // An Integer or Float operand keeps a Float; a BigDecimal or
+        // Complex one does not.
+        "+" | "-" | "*" | "/" | "%" => match args {
+            [Ty::Int | Ty::Float] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        // `(-8.0) ** 0.5` is a Complex: only an Integer exponent is proven.
+        "**" => match args {
+            [Ty::Int] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        "round" | "floor" | "ceil" => float_digits_ret(args, int_literal),
+        _ => return None,
+    };
+    Some(ty)
+}
+
+/// `Float#round`/`#floor`/`#ceil`: no digits (or digits <= 0) answer an
+/// Integer, positive digits a Float; digits nobody wrote are unproven.
+fn float_digits_ret(args: &[Ty], int_literal: Option<i64>) -> Ty {
+    match (args, int_literal) {
+        ([], _) => Ty::Int,
+        ([Ty::Int], Some(n)) if n > 0 => Ty::Float,
+        ([Ty::Int], Some(_)) => Ty::Int,
+        _ => Ty::Unknown,
+    }
+}
+
+/// `Array` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn array_call_ret(name: &str, args: &[Ty], recv: &Ty) -> Option<Ty> {
+    match name {
+        // With a count, these return an Array of elements, not one.
+        "first" | "last" | "min" | "max" | "pop" | "shift" => match (args, recv) {
+            ([], _) => None,
+            ([Ty::Int], Ty::Array(_)) => Some(recv.clone()),
+            _ => Some(Ty::Unknown),
+        },
+        "flatten" => Some(flatten_ret(recv, args.is_empty())),
+        _ => None,
+    }
+}
+
+/// Does `core_call_ret` read the arguments for this method? Those answer
+/// `Unknown` when the call shape hides the arguments (a splat, a keyword
+/// hash, `...`).
+fn core_ret_depends_on_args(cc: CoreClass, name: &str) -> bool {
+    match cc {
+        CoreClass::Integer => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "clamp"),
+        CoreClass::Float => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "round" | "floor" | "ceil"),
+        CoreClass::Array => {
+            matches!(name, "first" | "last" | "min" | "max" | "pop" | "shift" | "flatten")
+        }
+        _ => false,
+    }
+}
+
+/// `Array#flatten`: the receiver's type only when its elements cannot
+/// be flattened at all (a core scalar), the innermost element type for
+/// a full flatten of nested arrays of scalars; anything that may respond
+/// to `to_ary` (a project instance, an unknown, a union) is unproven.
+fn flatten_ret(recv: &Ty, full: bool) -> Ty {
+    fn scalar(t: &Ty) -> bool {
+        matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool | Ty::Nil | Ty::Hash(_, _))
+    }
+    let Ty::Array(elem) = recv else { return Ty::Unknown };
+    if scalar(elem) {
+        return recv.clone();
+    }
+    if !full {
+        return Ty::Unknown;
+    }
+    let mut inner: &Ty = elem;
+    while let Ty::Array(e) = inner {
+        inner = e;
+    }
+    if scalar(inner) { Ty::Array(Box::new(inner.clone())) } else { Ty::Unknown }
 }
 
 fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {

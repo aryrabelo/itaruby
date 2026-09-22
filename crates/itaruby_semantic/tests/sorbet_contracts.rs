@@ -789,6 +789,26 @@ class ContractNilVariable
     shout(value)
   end
 end
+# No writer path the index can see: the ivar still infers as nil, and the
+# contract still refuses to call a nil read back from it proven.
+class ContractNilBareIvar
+  extend T::Sig
+  def initialize
+    @label = nil
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(String) }
+  def ivar_argument
+    shout(@label)
+  end
+  sig { returns(String) }
+  def ivar_return
+    @label
+  end
+end
 ", None);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }
@@ -1008,4 +1028,319 @@ ContractKid.new.echo(ContractParent::ContractNode.new)
     assert_eq!(contract_names(source, &diags), ["build"], "{diags:?}");
     let plain = source.find("class ContractPlainKid").unwrap();
     assert!(diags.iter().filter(|d| d.code == "E0109").all(|d| d.start > plain), "{diags:?}");
+}
+
+// -- core returns follow their arguments (a wrong precise type accuses) --
+
+fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+    diags.iter().map(|d| d.code).collect()
+}
+
+#[test]
+fn integer_arithmetic_takes_the_operand_type() {
+    let diags = check("int-operand", r"
+class ContractIntOperand
+  extend T::Sig
+  sig { params(x: Integer).returns(Float) }
+  def half(x)
+    x + 0.5
+  end
+  sig { params(x: Integer, y: T.untyped).returns(Float) }
+  def scaled(x, y)
+    x * y
+  end
+  sig { params(x: Integer).returns(T::Boolean) }
+  def ratio(x)
+    (x * 1.5).nan?
+  end
+  sig { params(x: Float, y: T.untyped).returns(Integer) }
+  def decimal(x, y)
+    x * y
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def wrong(x)
+    x * 1.5
+  end
+end
+", None);
+    // Only the provable Float into an Integer contract accuses.
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Float"), "{diags:?}");
+}
+
+#[test]
+fn float_rounding_with_digits_is_not_an_integer() {
+    let diags = check("float-digits", r"
+class ContractFloatDigits
+  extend T::Sig
+  sig { params(x: Float).returns(Float) }
+  def cents(x)
+    x.round(2)
+  end
+  sig { params(x: Float, n: Integer).returns(Float) }
+  def floored(x, n)
+    x.floor(n)
+  end
+  sig { params(x: Float).returns(T::Boolean) }
+  def odd_cents(x)
+    x.ceil(1).nan?
+  end
+  sig { params(x: Float).returns(String) }
+  def whole(x)
+    x.round
+  end
+end
+", None);
+    // `round` with no digits still proves an Integer.
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Integer"), "{diags:?}");
+}
+
+#[test]
+fn array_count_argument_returns_an_array() {
+    let diags = check("array-count", r"
+class ContractArrayCount
+  extend T::Sig
+  sig { params(x: T::Array[Integer]).returns(T::Array[Integer]) }
+  def head(x)
+    x.first(2)
+  end
+  sig { params(x: T::Array[Integer]).returns(T::Array[Integer]) }
+  def top(x)
+    x.max(2)
+  end
+  sig { params(x: T::Array[Integer]).returns(T.untyped) }
+  def pairs(x)
+    x.pop(2).each_slice(2)
+  end
+  sig { params(x: T::Array[Integer], counts: T::Array[Integer]).returns(T::Array[Integer]) }
+  def splatted(x, counts)
+    x.last(*counts)
+  end
+  sig { params(x: T::Array[Integer]).returns(String) }
+  def one(x)
+    x.first
+  end
+end
+", None);
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Integer"), "{diags:?}");
+}
+
+#[test]
+fn flatten_drops_the_nesting() {
+    let diags = check("flatten", r"
+class ContractFlatten
+  extend T::Sig
+  sig { params(x: T::Array[T::Array[Integer]]).returns(T::Array[Integer]) }
+  def flat(x)
+    x.flatten
+  end
+  sig { params(x: T::Array[T::Array[Integer]]).returns(T::Array[String]) }
+  def wrong(x)
+    x.flatten
+  end
+end
+", None);
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Array[Integer]"), "{diags:?}");
+}
+
+#[test]
+fn integer_clamp_with_float_bounds_is_unproven() {
+    let diags = check("clamp", r"
+class ContractClamp
+  extend T::Sig
+  sig { params(x: Integer).returns(Float) }
+  def bounded(x)
+    x.clamp(0.5, 2.5)
+  end
+  sig { params(x: Integer).returns(String) }
+  def wrong(x)
+    x.clamp(1, 5)
+  end
+end
+", None);
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Integer"), "{diags:?}");
+}
+
+// -- an ivar is proven only when every writer is visible --
+
+#[test]
+fn ivar_with_an_attribute_writer_is_unproven() {
+    let source = r#"
+class ContractIvarWriter
+  extend T::Sig
+  attr_writer :name
+  attr_accessor :mode
+  def initialize
+    @name = nil
+    @mode = :auto
+  end
+  sig { returns(String) }
+  def shout
+    raise "unset" if @name.nil?
+    @name.upcase
+  end
+  sig { returns(String) }
+  def label
+    @mode
+  end
+end
+class ContractIvarReader
+  extend T::Sig
+  def initialize
+    @mode = :auto
+  end
+  sig { returns(String) }
+  def label
+    @mode
+  end
+end
+"#;
+    let diags = check("ivar-writer", source, None);
+    // The class with no writer path keeps its proof.
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got Symbol"), "{diags:?}");
+    assert!(diags[0].start > source.find("class ContractIvarReader").unwrap(), "{diags:?}");
+}
+
+#[test]
+fn ivar_written_by_reflection_is_unproven() {
+    let diags = check("ivar-reflection", r"
+class ContractIvarReflected
+  extend T::Sig
+  def initialize
+    @count = nil
+  end
+  sig { returns(Integer) }
+  def total
+    raise ArgumentError if @count.nil?
+    @count.abs
+  end
+end
+ContractIvarReflected.new.instance_variable_set(:@count, 3)
+class ContractIvarEvaled
+  extend T::Sig
+  def initialize
+    @size = nil
+  end
+  sig { returns(Integer) }
+  def total
+    @size.abs
+  end
+end
+ContractIvarEvaled.new.instance_eval { @size = 3 }
+", None);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn ivar_written_elsewhere_in_the_family_is_unproven() {
+    let diags = check("ivar-family", r"
+class ContractIvarThing
+end
+class ContractIvarBase
+  def load
+    @value = compute
+    @cache ||= compute
+  end
+  def compute
+    3
+  end
+end
+class ContractIvarChild < ContractIvarBase
+  extend T::Sig
+  def initialize
+    @value = nil
+    @cache = nil
+    @thing = ContractIvarThing.new
+  end
+  def refill
+    @cache ||= compute
+  end
+  sig { returns(Integer) }
+  def value
+    raise if @value.nil?
+    @value.abs
+  end
+  sig { returns(Integer) }
+  def cache
+    raise if @cache.nil?
+    @cache.abs
+  end
+  def poke
+    @thing.absent_thing_method
+  end
+end
+", None);
+    // `@thing` has one visible writer and no other path: still proven.
+    assert_eq!(codes(&diags), ["E0101"], "{diags:?}");
+    assert!(diags[0].message.contains("absent_thing_method"), "{diags:?}");
+}
+
+#[test]
+fn ivar_compound_writes_in_the_same_class_are_unproven() {
+    let diags = check("ivar-compound", r"
+class ContractIvarMemo
+  extend T::Sig
+  def initialize
+    @memo = nil
+    @pair = nil
+  end
+  def fill
+    @memo ||= 3
+    @pair, @rest = [1, 2]
+  end
+  sig { returns(Integer) }
+  def memo
+    raise if @memo.nil?
+    @memo.abs
+  end
+  sig { returns(Integer) }
+  def pair
+    raise if @pair.nil?
+    @pair.abs
+  end
+end
+", None);
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+// -- self in a module is an instance of an unknown includer --
+
+#[test]
+fn module_self_is_never_proof_against_an_includer() {
+    let diags = check("module-self", r"
+module ContractGreets
+  extend T::Sig
+  sig { returns(ContractPerson) }
+  def me
+    self
+  end
+  sig { returns(String) }
+  def text
+    self
+  end
+  def register
+    ContractRegistry.new.store(self)
+  end
+end
+class ContractPerson
+  include ContractGreets
+end
+class ContractRegistry
+  extend T::Sig
+  sig { params(person: ContractPerson).void }
+  def store(person); end
+  sig { returns(ContractPerson) }
+  def me
+    self
+  end
+end
+", None);
+    // A class's own `self` is still proven.
+    assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
+    assert!(diags[0].message.contains("got ContractRegistry"), "{diags:?}");
 }

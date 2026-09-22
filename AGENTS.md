@@ -163,6 +163,13 @@ found, and the launch bar is winning on both.
   constant as falsely silenced when names are attributed through the key.
   Attribute by name with the column in the key, and count silenced sites
   from the message side, never from key survivors.
+- A surface-routing control must pin the blamed call site, not only the
+  diagnostic count, code and method name (learned 2026-09-22, binding).
+  `extended-hook-mutants.sh` MUT-E moves `def base.pi` from singleton to
+  instance. Once both tracks report E0101, a fixture calling both surfaces
+  can still report one E0101 for `pi`, but on the opposite call. The named
+  control must reject that relocation; do not weaken or replace the real
+  surface mutation to make a count-only assertion fail.
 - A blind mutant means the suite lacks a control, not that the code is safe
   (learned 2026-08-26, binding): add the fixture that would catch it, prove
   the mutant fails it, and only then count the mutant as covered.

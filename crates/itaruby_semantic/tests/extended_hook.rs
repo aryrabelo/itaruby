@@ -53,10 +53,11 @@ fn errors(name: &str) -> Vec<String> {
     let db = Db::default();
     let file = SourceFile::new(&db, path.into(), text);
     ProjectFiles::new(&db, vec![file]);
+    let lines = itaruby_semantic::LineIndex::new(file.text(&db));
     itaruby_semantic::check_file(&db, file)
         .iter()
         .filter(|d| d.severity == itaruby_semantic::Severity::Error)
-        .map(|d| format!("{}: {}", d.code, d.message))
+        .map(|d| format!("{}:{}: {}", lines.line_col(file.text(&db), d.start).0 + 1, d.code, d.message))
         .collect()
 }
 
@@ -86,7 +87,9 @@ fn class_eval_block_hook_install_resolves_silently() {
 fn singleton_def_hook_keeps_the_instance_surface_closed() {
     let diags = errors("singleton_def_hook_keeps_the_instance_surface_closed.rb");
     assert_eq!(diags.len(), 1, "`def base.pi` is a singleton method, not an instance one: {diags:?}");
-    assert!(diags[0].contains("E0101"), "expected E0101: {diags:?}");
+    // The singleton flip makes the misfiled install accuse the class call
+    // instead. A count, code and method name cannot distinguish the two.
+    assert!(diags[0].starts_with("24:E0101:"), "expected E0101 on the instance call, never the correct singleton call on line 22: {diags:?}");
     assert!(diags[0].contains("`pi`") && diags[0].contains("ExtHookSingletonUser"), "expected the instance call to be blamed: {diags:?}");
 }
 

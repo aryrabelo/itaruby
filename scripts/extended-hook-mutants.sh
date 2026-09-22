@@ -21,7 +21,9 @@
 #          -> class_eval_block_hook_install_resolves_silently must fail
 #   MUT-E  `def base.x` is filed on the INSTANCE surface
 #          -> singleton_def_hook_keeps_the_instance_surface_closed must
-#             fail: a singleton method is one surface away from the call
+#             fail at the instance call: after the singleton E0101 flip,
+#             misfiling moves the diagnostic to the correct class call;
+#             the count, code and method name alone remain unchanged
 #   MUT-F  the `send` family drops out of the unreadable installers
 #          -> send_hook_opens_the_extender must fail
 #   MUT-G  `instance_eval`/`instance_exec` drop out of the unreadable set
@@ -194,6 +196,9 @@ mutant MUT-D "$IDX" \
   class_eval_block_hook_install_resolves_silently \
   'the bare `def`s inside a literal class_eval block stop being read'
 
+# Keep this mutation at the harvest's real surface decision. Its named
+# control must pin the blamed call site, not just one E0101 mentioning `pi`:
+# moving that error from the instance call to the class call is the defect.
 mutant MUT-E "$IDX" \
   '                self.fragments[i].hook_singleton_installs.push((name, span_of(stmt)));' \
   '                self.fragments[i].hook_instance_installs.push((name, span_of(stmt)));' \

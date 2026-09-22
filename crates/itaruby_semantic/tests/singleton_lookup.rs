@@ -107,27 +107,33 @@ fn check_fixture(name: &str) -> Vec<String> {
         .collect()
 }
 
-/// GAP: `Page.find_by_slog` against `extend Findable` is a certain
-/// `NoMethodError` and is not reported. MRI raises on this exact file.
+/// CLOSED 2026-09-21 (the class-object flip): `Page.find_by_slog` against
+/// `extend Findable` is a certain `NoMethodError` — MRI raises on this
+/// exact file — and the class-object track now reports it. This was one
+/// of the two rows where Sorbet proved a bug itaruby missed
+/// (`scripts/inference-bench-README.md`); the gate is
+/// `inconclusive_reason(c, true) == None`, i.e. the receiver's whole
+/// singleton chain is closed.
 #[test]
-fn extend_provided_class_method_typo_is_a_known_gap_currently_silent() {
-    let diags = check_fixture("extend_typo_accuses.rb");
-    assert!(
-        diags.is_empty(),
-        "known gap changed: the extend-typo now reports {diags:?} — if this is a deliberate \
-         fix, re-run scripts/public-gate.sh (the last attempt added 216 false positives to \
-         rails) and flip this test"
+fn extend_provided_class_method_typo_accuses() {
+    assert_eq!(
+        check_fixture("extend_typo_accuses.rb"),
+        vec![
+            "19:6:E0101 undefined method `find_by_slog` for class `Page`".to_string()
+        ]
     );
 }
 
-/// GAP: the Rails concern shape, same story.
+/// CLOSED 2026-09-21, the Rails concern shape, same story: the typo on
+/// `base.extend(ClassMethods)`'s injected name is a certain
+/// `NoMethodError` and is now reported.
 #[test]
-fn included_hook_class_method_typo_is_a_known_gap_currently_silent() {
-    let diags = check_fixture("included_hook_typo_accuses.rb");
-    assert!(
-        diags.is_empty(),
-        "known gap changed: the concern-typo now reports {diags:?} — re-run the public and \
-         corpus gates before flipping this test"
+fn included_hook_class_method_typo_accuses() {
+    assert_eq!(
+        check_fixture("included_hook_typo_accuses.rb"),
+        vec![
+            "22:8:E0101 undefined method `default_scope_nmae` for class `Record`".to_string()
+        ]
     );
 }
 

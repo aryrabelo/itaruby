@@ -517,7 +517,19 @@ const KERNEL_PRIVATE_INSTANCE_METHODS: &[&str] = &[
 /// discard variable never reaches this table at all, and adding the name
 /// here can only silence a genuine unresolved CALL, never shadow a
 /// variable read.
-const GEM_KERNEL_METHODS: &[&str] = &["Stoplight", "Rainbow", "_", "s_"];
+/// `BigDecimal` joined 2026-09-21 (bead ita-bgd, dark-census
+/// measurement): `Kernel#BigDecimal(...)` is installed by `require
+/// "bigdecimal"`, a BUNDLED gem in Ruby 3.4 — `ruby --disable-gems -e
+/// 'require "bigdecimal"'` raises `LoadError`, so
+/// `gen-core-inventory.rb`'s harvest can never see it, exactly like the
+/// four names above. Measured as 4 of rails' 33 class-object residue
+/// records: `activesupport/test/json/encoding_test_cases.rb:78-79`
+/// calls `BigDecimal("0.0")` / `BigDecimal("2.5")` with an implicit
+/// receiver inside `module JSONTest::EncodingTestCases`, whose own file
+/// does `require "bigdecimal"` at :3. The name is a Capitalized Kernel
+/// conversion function, so it can never collide with a project method
+/// name written in the ordinary snake_case convention.
+const GEM_KERNEL_METHODS: &[&str] = &["Stoplight", "Rainbow", "_", "s_", "BigDecimal"];
 /// Instance methods Mocha (`stubs`/`expects`/`unstub`, loaded via
 /// `mocha/minitest`) and Minitest's own `minitest/mock` (`stub`) mix into
 /// `Object` when the test framework is required — never a genuine Ruby

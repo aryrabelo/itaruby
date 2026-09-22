@@ -251,9 +251,23 @@ fn gem_namespace(gem: &str) -> Option<String> {
     // * `ruby-vips` 2.3.0 (mastodon `Gemfile.lock:802`) defines
     //   `module Vips` at `lib/vips/image.rb:9` (and in every other
     //   `lib/vips/*.rb`).
+    // * `queue_classic` 4.0.0 (rails `Gemfile.lock:423`) defines
+    //   `module QC` at `lib/queue_classic.rb:5` (read out of the gem
+    //   archive at that exact version, not inferred from the corpus
+    //   reopening). The lock name and the constant share no letters at
+    //   all, so `gem_namespace_key` cannot pair them: this is precisely
+    //   the "differs in LETTERS, not merely in capitalization" case this
+    //   table exists for. Measured as 2 of rails' 33 class-object
+    //   residue records — `QC.default_conn_adapter` and
+    //   `QC.default_conn_adapter=` at
+    //   `activejob/test/support/integration/adapters/queue_classic.rb:35-36`,
+    //   against a project fragment (`activejob/test/support/
+    //   queue_classic/inline.rb:4`) that reopens `QC` only to redefine
+    //   three `QC::Queue` methods.
     match gem {
         "kt-paperclip" => return Some("Paperclip".to_string()),
         "ruby-vips" => return Some("Vips".to_string()),
+        "queue_classic" => return Some("QC".to_string()),
         _ => {}
     }
     if gem.is_empty() {

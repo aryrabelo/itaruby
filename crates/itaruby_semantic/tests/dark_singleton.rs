@@ -1,8 +1,10 @@
 //! The dark singleton census: what the class-object track WOULD accuse.
 //!
-//! The `Ty::Class` `MethodLookup::NotFound`/`Inconclusive` arms are silent on
-//! purpose (the known extend/concern gaps, `singleton_lookup.rs`). This suite
-//! pins the census that measures that silence two-sidedly:
+//! Since 2026-09-21 the `Ty::Class` `MethodLookup::NotFound` arm EMITS
+//! E0101 whenever `inconclusive_reason(c, true)` is `None` — the census
+//! is what proved that gate empty of populated silence, and it stays on
+//! as the instrument that would show the next population arriving. This
+//! suite pins both sides:
 //!
 //! * the two gap fixtures must bucket `closed_notfound` — the residue, i.e.
 //!   exactly what a class-object E0101 fires on if the track ever arms;
@@ -53,9 +55,13 @@ fn dark_fixture(name: &str) -> (Vec<String>, Vec<String>) {
 /// buckets `open(inconclusive_no_blocker)`: the missing Class/Module tail —
 /// measured here first.)
 #[test]
-fn extend_typo_is_closed_notfound_and_still_silent() {
+fn extend_typo_accuses_on_the_class_object_track() {
     let (diags, recs) = dark_fixture("extend_typo.rb");
-    assert!(diags.is_empty(), "gap changed: {diags:?}");
+    assert_eq!(
+        diags,
+        vec!["19:6:E0101 undefined method `find_by_slog` for class `Page`".to_string()],
+        "the residue bucket is exactly what the armed track accuses"
+    );
     assert!(
         recs.iter().any(|r| r == "Page find_by_slog closed_notfound"),
         "the extend typo must be the residue bucket: {recs:?}"
@@ -70,9 +76,15 @@ fn extend_typo_is_closed_notfound_and_still_silent() {
 /// GAP 2: the concern-backbone typo, same expectation. (`Record.include`
 /// buckets `open(inconclusive_no_blocker)` like gap 1's `extend`.)
 #[test]
-fn included_hook_typo_is_closed_notfound_and_still_silent() {
+fn included_hook_typo_accuses_on_the_class_object_track() {
     let (diags, recs) = dark_fixture("included_hook_typo.rb");
-    assert!(diags.is_empty(), "gap changed: {diags:?}");
+    assert_eq!(
+        diags,
+        vec![
+            "22:8:E0101 undefined method `default_scope_nmae` for class `Record`".to_string()
+        ],
+        "the residue bucket is exactly what the armed track accuses"
+    );
     assert!(
         recs.iter()
             .any(|r| r == "Record default_scope_nmae closed_notfound"),
@@ -213,7 +225,11 @@ fn project_defined_raise_resolves_and_records_nothing() {
 #[test]
 fn singleton_tail_typo_stays_closed_notfound() {
     let (diags, recs) = dark_fixture("singleton_tail_typo_still_closed.rb");
-    assert!(diags.is_empty(), "the track is still not armed: {diags:?}");
+    assert_eq!(
+        diags.len(),
+        1,
+        "a non-tail typo is the residue, and the armed track accuses it: {diags:?}"
+    );
     assert!(
         recs.iter().any(|r| r == "Job performm closed_notfound"),
         "a non-tail typo must stay in the residue bucket: {recs:?}"
@@ -267,7 +283,11 @@ fn census_foreign_body_walk_records_nothing_in_the_host() {
     let (a_diags, a_recs) = check_file_dark(&db, a);
     let (b_diags, b_recs) = check_file_dark(&db, b);
     assert!(a_diags.is_empty(), "calling into b stays silent: {a_diags:?}");
-    assert!(b_diags.is_empty(), "the residue stays silent: {b_diags:?}");
+    assert_eq!(
+        b_diags.len(),
+        1,
+        "the residue is exactly one armed accusation, in its OWN file: {b_diags:?}"
+    );
     assert!(
         a_recs.is_empty(),
         "the host file must record nothing from the foreign body walk: {a_recs:?}"

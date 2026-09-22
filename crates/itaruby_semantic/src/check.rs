@@ -1176,6 +1176,36 @@ impl Checker<'_> {
         })
     }
 
+    /// Rendering-only did-you-mean data for the class-object E0101: the
+    /// closest name among exactly the surface the failed lookup searched
+    /// — every ancestor's SINGLETON methods plus every `extend`ed
+    /// module's instance methods. Same contract as
+    /// `method_suggestion`: called only from the arm that has already
+    /// decided to emit, so it can never change a decision, and it never
+    /// reaches for a name the lookup itself would not have found.
+    fn singleton_method_suggestion(&self, c: ClassId, name: &str) -> Option<Suggestion> {
+        let (ancestors, _) = self.index.ancestors(c);
+        let mut names: Vec<&str> = Vec::new();
+        for &a in &ancestors {
+            let class = self.index.class(a);
+            names.extend(class.singleton_methods.keys().map(String::as_str));
+            for ext in &class.extends {
+                if let Some(mid) = self.index.resolve_const(&class.nesting, ext) {
+                    names.extend(self.index.class(mid).methods.keys().map(String::as_str));
+                }
+            }
+        }
+        let best = closest_name(name, names.into_iter())?;
+        let def = match self.index.lookup_singleton(c, best) {
+            MethodLookup::Found(m, _) => Some((m.file, m.name_span.0)),
+            _ => None,
+        };
+        Some(Suggestion {
+            name: best.to_string(),
+            def,
+        })
+    }
+
     /// Rendering-only did-you-mean data for E0104 (w12 closure): closest
     /// indexed constant within edit distance 2 — class/module paths from
     /// `by_path`, value constants from the new `index.consts` map. A bare
@@ -3139,7 +3169,24 @@ impl Checker<'_> {
         // while the block's real `self` is the part being built. A block
         // proven to keep lexical self never raised the count (bead
         // ita-uye) — see `rebindable_block_depth`.
-        if call.receiver().is_none() && self.rebindable_block_depth > 0 {
+        //
+        // Bead ita-slf (2026-09-21): an EXPLICIT `self` receiver in such
+        // a block is the same call in a different spelling — `self` IS
+        // the rebound object, so `self.send_shortcut = value` inside
+        // `base.define_method(:chat_send_shortcut=) { |v| ... }`
+        // (discourse `plugins/chat/lib/chat/user_option_extension.rb:116`)
+        // and `self.description = "..."` inside `Class.new(Command) do`
+        // (`migrations/core/lib/migrations/cli/bootstrap.rb:62`) name the
+        // UserOption instance and the anonymous subclass, never the
+        // lexically enclosing class the walk types them against. Both
+        // were census residue records on receivers that never see the
+        // call. A NAMED receiver (`helper.step`) is untouched: rebinding
+        // `self` does not move a local, which is exactly what
+        // `testdata/rebindable_guard/
+        // explicit_receiver_in_rebindable_block_accuses.rb` pins.
+        if self.rebindable_block_depth > 0
+            && call.receiver().is_none_or(|r| r.as_self_node().is_some())
+        {
             self.tally_inconclusive(None);
             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
             return Ty::Unknown;
@@ -3451,6 +3498,34 @@ impl Checker<'_> {
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                         Ty::Unknown
                     },
+                    // THE CLASS-OBJECT FLIP (2026-09-21). A conclusive
+                    // `NotFound` here is a certain `NoMethodError` — the
+                    // receiver IS a class object whose whole singleton
+                    // surface this index read (its own ancestry's
+                    // singleton methods, every `extend`ed module's
+                    // ancestry, project reopenings of
+                    // `Class`/`Module`/`Object`/`Kernel`, the core
+                    // bare-call tail, the stdlib singleton inventory, the
+                    // lock-gated mocking-gem names) and `blocker` is the
+                    // proof that nothing in that ancestry is open.
+                    //
+                    // The gate is `inconclusive_reason(c, true) == None`,
+                    // exactly the predicate the dark census bucketed as
+                    // `ClosedNotFound` while this arm was silent — which
+                    // is why the flip is a MEASUREMENT, not a guess. At
+                    // the flip commit the public-corpus residue was
+                    // rails 1 / mastodon 0 / discourse 7, every one of
+                    // them read at its byte offset and proven to raise
+                    // (`scripts/public-baseline/README.md`); the
+                    // populations that used to sit here — block-nested
+                    // class definitions, `Object`/`Kernel` core-ext
+                    // reopenings, transitive `extend` ancestry,
+                    // `include Singleton`, sclass-includes, def-body
+                    // `eval`, `self` inside a rebindable block, generated
+                    // string source, gem namespaces and bundled-gem
+                    // Kernel functions — are each a NAMED reason now, and
+                    // each has a mutant in
+                    // `scripts/class-object-flip-mutants.sh`.
                     MethodLookup::NotFound => {
                         let blocker = self.index.inconclusive_reason(c, true);
                         let receiver = self.index.class(c).path.clone();
@@ -3459,6 +3534,26 @@ impl Checker<'_> {
                             Some(b) => DarkVerdict::Open(format!("{b:?}")),
                         };
                         self.dark_record(msg_loc, &receiver, &name, verdict);
+                        if blocker.is_none() {
+                            self.tally(Bucket::Diagnosed);
+                            self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
+                            let message =
+                                format!("undefined method `{name}` for class `{receiver}`");
+                            let suggestion = if self.silent {
+                                None
+                            } else {
+                                self.singleton_method_suggestion(c, &name)
+                            };
+                            self.emit_with(
+                                msg_loc.0,
+                                msg_loc.1,
+                                E0101_UNKNOWN_METHOD,
+                                Severity::Error,
+                                message,
+                                suggestion,
+                            );
+                            return Ty::Unknown;
+                        }
                         self.tally_inconclusive(blocker);
                         self.tally_ar_base(blocker, c);
                         self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
@@ -3689,7 +3784,9 @@ impl Checker<'_> {
             Some(Blocker::Unresolved) => s.anc_unresolved += 1,
             Some(Blocker::Declared) => s.anc_declared += 1,
             Some(Blocker::Project(OpenReason::UnknownClassBodyCall)) => s.anc_dsl += 1,
-            Some(Blocker::Project(OpenReason::ClassBodyBlock)) => s.anc_block += 1,
+            Some(Blocker::Project(
+                OpenReason::ClassBodyBlock | OpenReason::BlockNestedDefinition,
+            )) => s.anc_block += 1,
             Some(Blocker::Project(
                 OpenReason::DynamicSuperclass
                 | OpenReason::DynamicMixinReceiver
@@ -3700,6 +3797,7 @@ impl Checker<'_> {
                 | OpenReason::EvalOrSend
                 | OpenReason::SingletonClassExpr
                 | OpenReason::NestedDefOwner
+                | OpenReason::StringSourceDefined
             )) => s.anc_meta += 1,
             Some(Blocker::Project(OpenReason::MethodMissing | OpenReason::AbstractRaise)) => {
                 s.anc_missing += 1;

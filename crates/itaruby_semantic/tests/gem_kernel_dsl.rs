@@ -68,3 +68,19 @@ fn unrelated_bare_call_still_warns_e0101() {
         "expected the diagnostic to name the unresolved method, got: {diags:?}"
     );
 }
+
+/// Bead ita-bgd: `BigDecimal(...)` is the same shape one gem further out
+/// — a bundled gem's Kernel conversion function, invisible to
+/// `gen-core-inventory.rb`'s `--disable-gems` harvest for exactly the
+/// reason `gem` and `URI` are. Measured as 4 of rails' 33 class-object
+/// census residue records, all in a module BODY (implicit receiver), so
+/// the receiver is the module's class object.
+#[test]
+fn bundled_gem_kernel_conversion_function_stays_silent() {
+    let diags = check_fixture("bigdecimal.rb");
+    assert!(
+        diags.is_empty(),
+        "`Kernel#BigDecimal` comes from the bundled bigdecimal gem: a bare \
+         call must never accuse E0101, got: {diags:?}"
+    );
+}

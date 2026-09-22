@@ -140,3 +140,28 @@ fn prefix_delegate_hook_opens_the_extender() {
     let diags = errors("prefix_delegate_hook_opens_the_extender.rb");
     assert!(diags.is_empty(), "`prefix: true` rewrites the installed name, so this hook installs something unreadable here: {diags:?}");
 }
+
+/// Bead ita-dsm: `base.define_singleton_method(:x)` in the hook installs
+/// on the EXTENDER's class object — the track `extend` dispatches on.
+/// Only the instance spelling (`base.define_method`) was read before, so
+/// discourse's `Migrations::Enum` contributed nothing at all.
+#[test]
+fn define_singleton_method_hook_lands_on_the_extenders_class_object() {
+    assert!(
+        errors("define_singleton_method_hook_resolves_silently.rb").is_empty(),
+        "the hook installs it: silence"
+    );
+}
+
+/// Bead ita-esc, fail-closed: every read of `base` the shallow walk did
+/// not consume is `base` escaping into code this harvest never reads, so
+/// the extender's surface is UNKNOWN. discourse's `Migrations::Enum`
+/// installs inside `TracePoint.new(:end) do ... end.enable`, which the
+/// top-level statement scan cannot see.
+#[test]
+fn hook_base_escaping_into_a_block_opens_the_extender() {
+    assert!(
+        errors("hook_base_escaping_a_block_opens_the_extender.rb").is_empty(),
+        "an unreadable install must open the extender, never accuse"
+    );
+}

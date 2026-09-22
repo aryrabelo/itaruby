@@ -1,0 +1,112 @@
+AGENTS.md
+  h_b156936c57c455 300,304-355
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 2362-2415,2429-2431
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 1277-1398
+crates/itaruby_semantic/tests/const_missing.rs
+  h_b156936c57c455 1-95
+crates/itaruby_semantic/tests/mattr_accessor.rs
+  h_b156936c57c455 1-124
+crates/itaruby_semantic/tests/singleton_lookup.rs
+  h_b156936c57c455 1-107
+scripts/const-missing-mutants.sh
+  h_b156936c57c455 1-123
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 272-300
+scripts/inference-bench-README.md
+  h_b156936c57c455 1-164
+scripts/inference-bench-selftest.sh
+  h_b156936c57c455 1-234
+scripts/inference-bench.jsonl
+  h_b156936c57c455 1-12
+scripts/inference-bench.rb
+  h_b156936c57c455 1-369
+scripts/inference-gate.sh
+  h_b156936c57c455 1-64
+scripts/instrument-mutants.sh
+  h_b156936c57c455 27-41,48-62
+testdata/const_missing/bare_ref_inside_hook_namespace_silent.rb
+  h_b156936c57c455 1-14
+testdata/const_missing/bare_ref_outside_hook_namespace_still_warns.rb
+  h_b156936c57c455 1-17
+testdata/const_missing/grandparent_qualified_still_warns.rb
+  h_b156936c57c455 1-14
+testdata/const_missing/hook_silences_qualified_ref.rb
+  h_b156936c57c455 1-10
+testdata/const_missing/no_hook_still_warns.rb
+  h_b156936c57c455 1-10
+testdata/const_missing/sibling_namespace_hook_still_warns.rb
+  h_b156936c57c455 1-13
+testdata/gauntlet_inference/attr_reader_typo/no_annotations/plain.rb
+  h_b156936c57c455 1-12
+testdata/gauntlet_inference/const_missing_namespace/no_annotations/plain.rb
+  h_b156936c57c455 1-10
+testdata/gauntlet_inference/define_method_loop/no_annotations/plain.rb
+  h_b156936c57c455 1-17
+testdata/gauntlet_inference/define_method_loop/positive_control/plain.rb
+  h_b156936c57c455 1-17
+testdata/gauntlet_inference/define_method_loop/with_annotations/plain.rb
+  h_b156936c57c455 1-17
+testdata/gauntlet_inference/define_method_loop/with_annotations/shim.rbi
+  h_b156936c57c455 1-12
+testdata/gauntlet_inference/delegate_macro/no_annotations/plain.rb
+  h_b156936c57c455 1-34
+testdata/gauntlet_inference/extend_singleton_typo/no_annotations/plain.rb
+  h_b156936c57c455 1-18
+testdata/gauntlet_inference/include_mixin_arity/no_annotations/plain.rb
+  h_b156936c57c455 1-14
+testdata/gauntlet_inference/included_hook_class_method_typo/no_annotations/plain.rb
+  h_b156936c57c455 1-21
+testdata/gauntlet_inference/method_missing_proxy/no_annotations/plain.rb
+  h_b156936c57c455 1-31
+testdata/gauntlet_inference/method_missing_proxy/positive_control/plain.rb
+  h_b156936c57c455 1-31
+testdata/gauntlet_inference/method_missing_proxy/with_annotations/plain.rb
+  h_b156936c57c455 1-31
+testdata/gauntlet_inference/method_missing_proxy/with_annotations/shim.rbi
+  h_b156936c57c455 1-7
+testdata/gauntlet_inference/namespace_reopen_typo/no_annotations/plain.rb
+  h_b156936c57c455 1-18
+testdata/gauntlet_inference/open_class_reopen_typo/no_annotations/plain.rb
+  h_b156936c57c455 1-21
+testdata/gauntlet_inference/respond_to_guard/no_annotations/plain.rb
+  h_b156936c57c455 1-25
+testdata/gauntlet_inference/singleton_class_eval/no_annotations/plain.rb
+  h_b156936c57c455 1-11
+testdata/gauntlet_inference/singleton_class_eval/positive_control/plain.rb
+  h_b156936c57c455 1-11
+testdata/gauntlet_inference/singleton_class_eval/with_annotations/plain.rb
+  h_b156936c57c455 1-11
+testdata/gauntlet_inference/singleton_class_eval/with_annotations/shim.rbi
+  h_b156936c57c455 1-6
+testdata/mattr_accessor/accessors_resolve_silently.rb
+  h_b156936c57c455 1-61
+testdata/mattr_accessor/instance_accessor_false_has_no_instance_reader.rb
+  h_b156936c57c455 1-36
+testdata/mattr_accessor/instance_writer_false_keeps_reader.rb
+  h_b156936c57c455 1-36
+testdata/mattr_accessor/typo_stays_silent_class_open.rb
+  h_b156936c57c455 1-45
+testdata/singleton_lookup/builtin_surface_silent.rb
+  h_b156936c57c455 1-17
+testdata/singleton_lookup/extend_correct_silent.rb
+  h_b156936c57c455 1-17
+testdata/singleton_lookup/extend_typo_accuses.rb
+  h_b156936c57c455 1-19
+testdata/singleton_lookup/included_hook_correct_silent.rb
+  h_b156936c57c455 1-21
+testdata/singleton_lookup/included_hook_typo_accuses.rb
+  h_b156936c57c455 1-22
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "009132f85068e24211035684f195ecd19d8236ba",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

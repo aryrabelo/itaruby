@@ -3,6 +3,8 @@
 
 Run: python3 scripts/sorbet-contracts-mutants.py            (full family)
      python3 scripts/sorbet-contracts-mutants.py --anchors  (count every needle, build nothing)
+     python3 scripts/sorbet-contracts-mutants.py --only TEXT (only mutants whose label contains TEXT;
+                                                             a development aid, never a gate verdict)
 
 Each mutant removes ONE contract decision and must be accused by a NAMED test.
 Needles are literal and counted with `src.count(needle)` against the source
@@ -382,7 +384,11 @@ def main():
         result, _ = exercise(copy, CHECK, originals[CHECK], sources[CHECK] + "\nnot valid Rust;\n", MUTATIONS[0][4])
         require(result, "INVALID-build", "compiler guard")
 
-        for label, path, needle, after, expected in MUTATIONS:
+        only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv[1:] else None
+        selected = [m for m in MUTATIONS if only is None or only in m[0]]
+        if not selected:
+            raise SystemExit(f"--only {only!r} matches no mutant label")
+        for label, path, needle, after, expected in selected:
             mutant = sources[path].replace(needle, after, 1)
             result, evidence = exercise(copy, path, originals[path], mutant, expected)
             require(result, "CAUGHT", label)
@@ -390,6 +396,9 @@ def main():
 
         result, _ = exercise(copy, first, originals[first], sources[first], None)
         require(result, "PASS", "restored positive control")
+    if only is not None:
+        print(f"PARTIAL: {len(selected)} of {len(MUTATIONS)} mutants (--only {only!r}); not a family verdict")
+        return
     print(f"PASS: {len(MUTATIONS)} sorbet contract mutants and all four evidence guards")
 
 

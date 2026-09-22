@@ -1,0 +1,18 @@
+AGENTS.md
+  h_b156936c57c455 561-570
+docs/CHANGELOG.md
+  h_b156936c57c455 11-22
+scripts/public-baseline/README.md
+  h_b156936c57c455 268-308
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c22dd747833f18c3dd3801cdca893239ad30f133",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

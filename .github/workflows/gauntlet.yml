@@ -1,0 +1,180 @@
+name: gauntlet
+
+# The gates from scripts/gauntlet-gates.sh, fanned out. On one machine the
+# ten mutant families run in series because each one rewrites the source
+# in place (AGENTS.md: a concurrent reader reads a mutant); here every
+# family gets its own runner, so the wall time is the longest family, not
+# the sum. Wave-of-2026-09-21 measurement on the dev machine under load:
+# ~5 h in series.
+#
+# What is NOT here, on purpose:
+#   gate d  - the three private corpora never leave the machines that host
+#             them; the local `./scripts/dev gates` + `anchor` stay the only
+#             proof of corpus-a/b/c.
+#   gate c  - the testdata mutation probe is inline in gauntlet-gates.sh and
+#             runs there (two seconds; not worth a second convention).
+# So a green run here is the gauntlet's `PASS (incomplete)` by construction,
+# never a full proof. The corpus anchor still decides a merge.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gauntlet-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # Gate a + b + c2: the suite, a warning-free release build, and the
+  # unwrap shape over production source.
+  suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build (zero warnings is the contract)
+        run: cargo build --release 2>&1 | tee target/build.txt; ! grep -q '^warning' target/build.txt
+      - name: cargo test --workspace
+        run: cargo test --workspace
+      - name: Unwrap shape (every production unwrap is a prism downcast)
+        run: ./scripts/unwrap-gate.sh
+
+  # Gate c1 needs one job per harness. The list is read from the tree so a
+  # branch that adds a family (e.g. class-object-flip) is covered on that
+  # branch and main is not asked for a file it does not have.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      families: ${{ steps.ls.outputs.families }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ls
+        run: |
+          fams=$(ls scripts/*-mutants.sh | xargs -n1 basename | sed 's/-mutants\.sh$//' | grep -vx instrument | jq -R . | jq -sc .)
+          echo "families=$fams" >> "$GITHUB_OUTPUT"
+          echo "$fams"
+
+  mutants:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJson(needs.plan.outputs.families) }}
+    name: mutants (${{ matrix.family }})
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      # A dead anchor costs a family, so the count runs first, as gate c1
+      # does locally (scripts/mutant-anchors: refuses while a harness holds
+      # the tree, which cannot happen on a fresh runner).
+      - name: Every needle matches exactly once
+        run: ./scripts/mutant-anchors
+      - name: ${{ matrix.family }} mutants (each accused by a named test, source restored byte-identical)
+        run: ./scripts/${{ matrix.family }}-mutants.sh
+      - name: Tree is clean after the harness
+        if: always()
+        run: git status --porcelain && test -z "$(git status --porcelain)"
+
+  # Gate c2b/c2c: the evidence producers and the reporters, two-sided.
+  instruments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Evidence instruments (instrument-mutants)
+        run: ./scripts/instrument-mutants.sh
+      - name: gate-digest selftest
+        run: ./scripts/gate-digest-selftest.sh
+      - name: gate-triage selftest (offline by construction)
+        run: ./scripts/gate-triage-selftest.sh
+      - name: public-gate selftest
+        run: ./scripts/public-gate-selftest.sh
+
+  # Gate c3: the loose column, asked for explicitly. Keying off $CI is the
+  # trap AGENTS.md names; a copied ceiling is a fabricated measurement.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p itaruby_semantic --bench check -- --noplot
+      - env:
+          PERF_COLUMN: ci
+        run: ./scripts/perf-gate.sh --no-run
+
+  # Gate e: navigation oracle against the versioned fixture.
+  navigation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - run: cargo build --release
+      - run: ./scripts/nav-gate.sh scripts/navfixture/oracle.jsonl
+
+  # Gate g: the annotation-free bench, MRI as ground truth, srb pinned to
+  # the version the ledger was measured against (a different version is a
+  # skip of that leg by the bench's own rule, never a silent pass).
+  inference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - name: Pinned sorbet
+        run: gem install sorbet -v 0.6.13437 --no-document
+      - run: cargo build --release
+      - run: ./scripts/inference-bench-selftest.sh
+      - run: ./scripts/inference-gate.sh
+
+  # Gate f: the four public Rails apps, each at its pinned sha, cloned
+  # shallow and cached by the declaration's hash. The script never clones
+  # here (PUBLIC_GATE_CLONE unset): a missing clone is this job's bug, not
+  # a skip. The time ceilings in scripts/public-corpora.txt are dev-machine
+  # numbers; a red on time alone here is a measurement to record as a CI
+  # column, never a reason to raise the dev ceiling.
+  public:
+    runs-on: ubuntu-latest
+    env:
+      PUBLIC_CORPORA_ROOT: ${{ github.workspace }}/../public-corpora
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        id: corpora
+        with:
+          path: ${{ env.PUBLIC_CORPORA_ROOT }}
+          key: public-corpora-${{ hashFiles('scripts/public-corpora.txt') }}
+      - name: Shallow-clone each declared repo at its pinned sha
+        if: steps.corpora.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$PUBLIC_CORPORA_ROOT"
+          grep -v '^#' scripts/public-corpora.txt | while read -r id url sha ceiling clone_dir; do
+            [ -n "$id" ] || continue
+            dir="$PUBLIC_CORPORA_ROOT/${clone_dir:-$id}"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$url"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+            echo "$id @ $(git -C "$dir" rev-parse --short HEAD)"
+          done
+      - run: cargo build --release
+      - run: ./scripts/public-gate.sh

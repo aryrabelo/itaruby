@@ -87,7 +87,7 @@ fn included_hook_typo_is_closed_notfound_and_still_silent() {
 
 /// THE bucketing guard: an unrecognized class-body call stands the receiver
 /// down, so the typo buckets `open`, never `closed_notfound`. A mutant that
-/// ignores the blocker labels every NotFound closed and fails here.
+/// ignores the blocker labels every `NotFound` closed and fails here.
 #[test]
 fn unrecognized_class_body_call_keeps_the_receiver_open() {
     let (diags, recs) = dark_fixture("open_receiver_typo.rb");
@@ -146,8 +146,8 @@ fn kernel_tail_raise_buckets_known_tail_and_still_silent() {
 }
 
 /// The rest of the measured tail family, same expectation, one assertion
-/// per name: rand/caller/Array/URI/puts/sleep/block_given?/require_relative
-/// all bucket known_tail (the exact names the census histogram carried).
+/// per name: `rand`/`caller`/`Array`/`URI`/`puts`/`sleep`/`block_given?`/`require_relative`
+/// all bucket `known_tail` (the exact names the census histogram carried).
 #[test]
 fn kernel_tail_family_buckets_known_tail() {
     let (diags, recs) = dark_fixture("kernel_tail_bare_call_family_silent.rb");
@@ -174,7 +174,7 @@ fn kernel_tail_family_buckets_known_tail() {
 }
 
 /// A bare tail call at CLASS-BODY level runs with the class object as
-/// `self` too, and buckets known_tail the same way.
+/// `self` too, and buckets `known_tail` the same way.
 #[test]
 fn class_body_kernel_tail_buckets_known_tail() {
     let (diags, recs) = dark_fixture("class_body_kernel_tail_still_silent.rb");
@@ -228,7 +228,7 @@ fn singleton_tail_typo_stays_closed_notfound() {
 /// Bead ita-nst: the nested `def self.fetch_data` now RESOLVES, so the
 /// census records nothing for it — before the filing this exact fixture
 /// bucketed `Report fetch_data closed_notfound` (the red that motivated
-/// the bead, measured on discourse's EmotionDashboardReport shape).
+/// the bead, measured on discourse's `EmotionDashboardReport` shape).
 #[test]
 fn nested_def_self_in_block_resolves_and_records_nothing() {
     let (diags, recs) = dark_fixture("nested_def_self_in_block_resolves.rb");

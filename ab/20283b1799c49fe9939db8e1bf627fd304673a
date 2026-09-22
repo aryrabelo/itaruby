@@ -1,0 +1,26 @@
+AGENTS.md
+  h_b156936c57c455 358,361,497-508,656-661
+docs/CHANGELOG.md
+  h_b156936c57c455 11-49,79-114
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 92-113,180-185,187-188
+scripts/inference-bench-selftest.sh
+  h_b156936c57c455 57-65
+scripts/operand-types-mutants.sh
+  h_b156936c57c455 215-224,226,228,233-236,239,241
+scripts/public-baseline/README.md
+  h_b156936c57c455 23-25,195-238,255,257,259,262,264-266
+scripts/public-baseline/discourse.jsonl
+  h_b156936c57c455 547,1466,1493,1504,1625
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "ab20283b1799c49fe9939db8e1bf627fd304673a",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

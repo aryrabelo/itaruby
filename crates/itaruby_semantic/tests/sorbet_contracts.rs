@@ -1910,3 +1910,206 @@ end
     assert_eq!(contract_names(source, &diags), ["tail_union", "explicit_union", "k", "single"], "{diags:?}");
 }
 
+
+// -- nominal compatibility: a class proves NOT to be a core value only from a complete ancestry --
+
+/// A project subclass of a core class IS that core value under
+/// sorbet-runtime (`SafeStr.new("x").is_a?(String)`), and so is a subclass
+/// of a project reopen of it or of a class some `.rbi` declares (a gem
+/// class the project reopens without restating its superclass). An
+/// `Instance` is held to a core scalar or collection type only when its
+/// ancestry is complete and names nothing that is, or may be, that core
+/// type — see the control test that follows.
+#[test]
+fn core_subclass_instances_satisfy_core_contracts() {
+    let source = r#"
+class ContractSafeStr < String
+end
+class ContractParams < Hash
+end
+class ContractRows < Array
+end
+class Hash
+  def contract_nominal_touch; self; end
+end
+class ContractReopenParams < Hash
+end
+class ContractGemBuffer
+  def contract_gem_touch; self; end
+end
+class ContractGemChild < ContractGemBuffer
+end
+class ContractCoreSubclasses
+  extend T::Sig
+  sig { params(text: String, data: T::Hash[Symbol, T.untyped], rows: T::Array[Integer]).void }
+  def take(text, data, rows); end
+  sig { returns(String) }
+  def text
+    ContractSafeStr.new("x")
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def params
+    ContractParams.new
+  end
+  sig { returns(T::Array[Integer]) }
+  def rows
+    ContractRows.new
+  end
+  sig { returns(T.nilable(String)) }
+  def maybe_text
+    ContractSafeStr.new("y")
+  end
+  sig { returns(T::Hash[String, Integer]) }
+  def reopened
+    ContractReopenParams.new
+  end
+  sig { returns(String) }
+  def gem_buffer
+    ContractGemBuffer.new
+  end
+  sig { returns(String) }
+  def gem_child
+    ContractGemChild.new
+  end
+end
+ContractCoreSubclasses.new.take(ContractSafeStr.new("a"), ContractParams.new, ContractRows.new)
+ContractCoreSubclasses.new.take(ContractGemChild.new, ContractReopenParams.new, ContractRows.new)
+"#;
+    let diags = check("core-subclasses", source, Some(r"
+class ContractGemBuffer < String
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The controls that keep the ancestry rule a contract: a plain project
+/// class, and a project subclass chain, whose complete ancestry names no
+/// core type are still accused against `String`, `Hash` and `Array`, in a
+/// return and in an argument.
+#[test]
+fn closed_project_ancestry_still_accuses_core_contracts() {
+    let source = r"
+class ContractPlainValue
+end
+class ContractPlainChild < ContractPlainValue
+end
+class ContractClosedAncestry
+  extend T::Sig
+  sig { params(text: String).void }
+  def take(text); end
+  sig { returns(String) }
+  def text
+    ContractPlainValue.new
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def data
+    ContractPlainChild.new
+  end
+  sig { returns(T::Array[Integer]) }
+  def rows
+    ContractPlainValue.new
+  end
+end
+ContractClosedAncestry.new.take(ContractPlainChild.new)
+";
+    let diags = check("closed-ancestry", source, None);
+    assert_eq!(
+        contract_names(source, &diags),
+        ["text", "data", "rows", "ContractPlainChild.new"],
+        "{diags:?}"
+    );
+}
+
+/// Any class can gain a module at runtime by reflection the index never
+/// sees as an ancestor edge (`Late.include(M)`, `Late.send(:include, M)`,
+/// `Late.class_eval { include M }`, a class method that calls `include`),
+/// and `extend` makes a class object itself an instance of the module. So
+/// a module-typed contract never accuses anything.
+#[test]
+fn module_typed_contracts_never_accuse() {
+    let source = r#"
+module ContractPlugin
+end
+class ContractLateInclude
+end
+ContractLateInclude.include(ContractPlugin)
+class ContractLateSend
+end
+ContractLateSend.send(:include, ContractPlugin)
+class ContractLateEval
+end
+ContractLateEval.class_eval { include ContractPlugin }
+class ContractLateHook
+  def self.plug
+    include ContractPlugin
+  end
+end
+ContractLateHook.plug
+class ContractLateExtend
+end
+ContractLateExtend.extend(ContractPlugin)
+class ContractPluginUser
+  extend T::Sig
+  sig { params(plugin: ContractPlugin).void }
+  def take(plugin); end
+  sig { returns(ContractPlugin) }
+  def included
+    ContractLateInclude.new
+  end
+  sig { returns(ContractPlugin) }
+  def sent
+    ContractLateSend.new
+  end
+  sig { returns(ContractPlugin) }
+  def evaluated
+    ContractLateEval.new
+  end
+  sig { returns(ContractPlugin) }
+  def hooked
+    ContractLateHook.new
+  end
+  sig { returns(ContractPlugin) }
+  def extended
+    ContractLateExtend
+  end
+  sig { returns(ContractPlugin) }
+  def text
+    "a string with the module mixed in by reflection"
+  end
+end
+ContractPluginUser.new.take(ContractLateInclude.new)
+ContractPluginUser.new.take(ContractLateHook.new)
+ContractPluginUser.new.take(1)
+"#;
+    let diags = check("module-contracts", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The control for the module rule: a CLASS-typed contract is still held
+/// nominally — an unrelated project class, a core value and a class object
+/// are accused, in a return and in an argument.
+#[test]
+fn class_typed_contracts_still_accuse_unrelated_values() {
+    let source = r#"
+class ContractClassTarget
+end
+class ContractClassStranger
+end
+class ContractClassUser
+  extend T::Sig
+  sig { params(target: ContractClassTarget).void }
+  def take(target); end
+  sig { returns(ContractClassTarget) }
+  def stranger
+    ContractClassStranger.new
+  end
+  sig { returns(ContractClassTarget) }
+  def text
+    "text"
+  end
+end
+ContractClassUser.new.take(ContractClassStranger.new)
+"#;
+    let diags = check("class-contracts", source, None);
+    assert_eq!(contract_names(source, &diags), ["stranger", "text", "ContractClassStranger.new"], "{diags:?}");
+}

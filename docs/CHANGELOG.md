@@ -83,6 +83,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value to its collection CATEGORY only: sorbet-runtime erases type
   arguments, so `{a: 1}` under `returns(T::Hash[String, T.untyped])` runs and
   is not accused, while a Hash returned under `returns(String)` is.
+  Nominal types fail closed in both directions. A project class is held to
+  a core scalar or collection type (`String`, `Hash`, `Array`, ...) only
+  when its ancestry is complete, no ancestor is open and no `sorbet/rbi`
+  file declares an ancestor: `class SafeStr < String`, a subclass of a
+  project `class Hash` reopen, or of a gem class the project reopens
+  without restating its superclass IS that core value under
+  sorbet-runtime, and is not accused. The trade-off is a false negative:
+  an instance of an open class (a Rails model with `validates`) is no
+  longer accused under `returns(String)`, while a closed plain class still
+  is. A MODULE-typed contract never accuses anything, since any class can
+  gain a module by reflection the index never records as an ancestor
+  (`Late.include(M)`, `Late.send(:include, M)`, `Late.class_eval { include
+  M }`, a class method calling `include`, `X.extend(M)`); the trade-off is
+  that `returns(SomeModule)` checks nothing. A class-typed contract still
+  accuses an unrelated class. These rules sit in the shared compatibility
+  check, so RBS-comment E0103 follows them too.
   A client RBI supplies the same contracts only when it matches the source
   definition exactly: owner, dispatch track and Ruby parameter layout. The
   RBI informs calls and checks the source body's return. It does not replace

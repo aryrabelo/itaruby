@@ -1831,9 +1831,10 @@ impl Checker<'_> {
         let returns_nil = safety.returns_literal_nil;
         // Explicit returns make the existing inference fold Unknown. Inspect
         // their proven values independently; never treat that Unknown as nil.
-        let actual = returns.iter().find(|ty| contract_accuses(ty, &expected, returns_nil, self.index))
+        let actual = returns.iter().find(|ty| contract_accuses(ty, &expected, returns_nil, self.index, self.rbi_map))
             .or_else(|| {
-                (!return_terminal(&body) && contract_accuses(last, &expected, tail_nil, self.index)).then_some(last)
+                (!return_terminal(&body) && contract_accuses(last, &expected, tail_nil, self.index, self.rbi_map))
+                    .then_some(last)
             });
         if let Some(actual) = actual {
             let loc = def.name_loc();
@@ -4704,7 +4705,7 @@ impl Checker<'_> {
             let Some(param_ty) = param_tys.get(i) else {
                 break;
             };
-            if !compatible(arg_ty, param_ty, self.index) {
+            if !compatible(arg_ty, param_ty, self.index, self.rbi_map) {
                 let message = format!(
                     "argument {} of `{name}` expects {}, got {}",
                     i + 1,
@@ -4758,7 +4759,7 @@ impl Checker<'_> {
     ) {
         let Some((_, expr)) = sig.params.iter().find(|(param, _)| param == name) else { return };
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
-        if contract_accuses(actual, &expected, literal_nil, self.index) {
+        if contract_accuses(actual, &expected, literal_nil, self.index, self.rbi_map) {
             self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
                 format!("argument `{name}` of `{method}` expects {}, got {}",
                     ty_name(&expected, self.index), ty_name(actual, self.index)));
@@ -5234,6 +5235,10 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
     }
 }
 
+/// `RbiProject`'s `constant name -> declaring .rbi files` map, as the
+/// checker holds it.
+type RbiMap = HashMap<String, Vec<std::path::PathBuf>>;
+
 /// Strict-but-safe compatibility: Unknown always passes. An `Instance` arg
 /// also passes when the param class is in its ancestry (a subclass IS the
 /// param type at runtime) — or when that ancestry is incomplete, because
@@ -5241,28 +5246,71 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
 /// accusation. Surfaced by bead ita-p24: once malformed sig comments stopped
 /// dying as E0105, genuine subtype calls (e.g. `Entry::Method` into
 /// `(entry: Entry)`) fired E0103 on exact-equality.
-fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
+///
+/// Both nominal questions fail closed. A MODULE-typed param is never
+/// proof against anything: any class, core ones included, can gain a
+/// module at runtime by reflection this index never records as an
+/// ancestor edge (`Late.include(M)`, `Late.send(:include, M)`,
+/// `Late.class_eval { include M }`, a class method that calls `include`),
+/// and `X.extend(M)` makes a class object itself an `M`. An `Instance` arg
+/// against a core scalar or collection param is accused only when
+/// `may_be_core_value` rules the core type out — `class SafeStr < String`
+/// IS a String under sorbet-runtime.
+fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
     match (arg, param) {
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
         // An instance of a MODULE (`self` in a module method, a value typed
         // by a module name) is an instance of some class that includes it,
         // which this checker cannot name: never proof against anything.
         (Ty::Instance(a), _) if index.class(*a).is_module => true,
-        (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index)),
-        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index)),
-        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index),
+        (_, Ty::Instance(p)) if index.class(*p).is_module => true,
+        (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index, rbi)),
+        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index, rbi)),
+        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index, rbi),
         (Ty::Hash(ak, av), Ty::Hash(pk, pv)) => {
-            compatible(ak, pk, index) && compatible(av, pv, index)
+            compatible(ak, pk, index, rbi) && compatible(av, pv, index, rbi)
         }
-        (Ty::Instance(a), Ty::Instance(p)) => {
-            if a == p {
-                return true;
-            }
-            let (anc, complete) = index.ancestors(*a);
-            anc.contains(p) || !complete
-        }
+        (Ty::Instance(a), p) => instance_compatible(*a, p, index, rbi),
         (a, p) => a == p,
     }
+}
+
+/// `compatible` for an instance of project class `a` against a param that
+/// is neither Unknown, a union nor a module.
+fn instance_compatible(a: ClassId, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+    match param {
+        Ty::Instance(p) => {
+            if a == *p {
+                return true;
+            }
+            let (anc, complete) = index.ancestors(a);
+            anc.contains(p) || !complete
+        }
+        // Neither a sig nor an RBS param ever resolves to `Ty::Class`, so
+        // every param left here is a core scalar or collection.
+        _ => may_be_core_value(a, index, rbi),
+    }
+}
+
+/// Could an instance of project class `id` be a core value (a `String`, a
+/// `Hash`, an `Array`, ...)? Only a superclass edge makes a class one, so
+/// the answer is NO only when every link of its ancestry is known and
+/// none of them may be a core class: the ancestry is complete (`class
+/// SafeStr < String` leaves `String` unresolved), no ancestor is `open`
+/// (a core reopen such as `class Hash` is `ReopenedExternal`, a
+/// `declarations/gems.rbi` class `DeclaredExternal`, and since the first
+/// recorded reason wins, no open reason is trusted to rule either out),
+/// and no `sorbet/rbi` file declares an ancestor's path (a project
+/// reopening of a gem class written without its superclass looks like a
+/// fresh Object subclass here). Any doubt is `true`, never an accusation.
+/// The trade-off is a false negative: an instance of an open project
+/// class (a Rails model with `validates`) is no longer accused against
+/// `String` and friends.
+fn may_be_core_value(id: ClassId, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+    let (ancestors, complete) = index.ancestors(id);
+    !complete
+        || ancestors.iter().any(|&c| index.class(c).open)
+        || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))
 }
 
 /// Sorbet contract conformance (E0103/E0109) under invariant #1.
@@ -5285,9 +5333,15 @@ fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
 /// union answers for itself — unless the caller proved the value is a
 /// `nil` written right there (`literal_nil`), which keeps a top-level
 /// `Nil`. Nils nested in a collection go with its erased type arguments.
-fn contract_accuses(actual: &Ty, expected: &Ty, literal_nil: bool, index: &ProjectIndex) -> bool {
+fn contract_accuses(
+    actual: &Ty,
+    expected: &Ty,
+    literal_nil: bool,
+    index: &ProjectIndex,
+    rbi: Option<&RbiMap>,
+) -> bool {
     if literal_nil && *actual == Ty::Nil {
-        return !compatible(&Ty::Nil, expected, index);
+        return !compatible(&Ty::Nil, expected, index, rbi);
     }
     // `Ty::union` flattens, so a union's members are never unions.
     let members = match actual {
@@ -5295,7 +5349,7 @@ fn contract_accuses(actual: &Ty, expected: &Ty, literal_nil: bool, index: &Proje
         single => std::slice::from_ref(single),
     };
     let judged: Vec<Ty> = members.iter().filter(|m| **m != Ty::Nil).map(erase_type_arguments).collect();
-    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index))
+    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index, rbi))
 }
 
 /// Sorbet's generics are erased at runtime: sorbet-runtime checks that a

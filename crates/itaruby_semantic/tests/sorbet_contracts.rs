@@ -2113,3 +2113,243 @@ ContractClassUser.new.take(ContractClassStranger.new)
     let diags = check("class-contracts", source, None);
     assert_eq!(contract_names(source, &diags), ["stranger", "text", "ContractClassStranger.new"], "{diags:?}");
 }
+
+// -- redefinition: every path that redefines or shadows a signed method --
+
+/// A signed class method and a signed instance method, each called once
+/// with a String. `BODY` goes inside the class body.
+const SCALED: &str = r#"
+class ContractScaleCfg
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def self.scale(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+  BODY
+end
+ContractScaleCfg.scale("text")
+ContractScaleCfg.new.grow("text")
+"#;
+
+/// Each answers one of the names with a String-taking body.
+const STRING_SCALE: &str = r"
+module ContractStringScale
+  def scale(x)
+    x.to_s
+  end
+end
+module ContractStringGrow
+  def grow(x)
+    x.to_s
+  end
+end
+";
+
+fn scaled(body: &str) -> String {
+    SCALED.replace("BODY", body)
+}
+
+/// The accused call sites of a `SCALED` project, by receiver method.
+fn scaled_accusations(diags: &[Diagnostic], sources: &[&str]) -> Vec<String> {
+    let calls = sources[0];
+    diags
+        .iter()
+        .filter(|d| matches!(d.code, "E0103" | "E0109"))
+        .map(|d| {
+            let line_start = calls[..d.start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = calls[d.start..].find('\n').map_or(calls.len(), |i| d.start + i);
+            calls[line_start..line_end].trim().to_owned()
+        })
+        .collect()
+}
+
+/// `def Const.m` written anywhere — top level, another class body, a
+/// method body — redefines `Const`'s singleton `m`: the signed `def
+/// self.m` is no longer proven to be what runs. The instance track keeps
+/// its contract.
+#[test]
+fn def_on_a_constant_redefines_its_singleton_contract() {
+    let base = scaled("");
+    let redefs = [
+        "def ContractScaleCfg.scale(x)\n  x.to_s\nend\n",
+        "class ContractScaleOther\n  def ContractScaleCfg.scale(x)\n    x.to_s\n  end\nend\n",
+        "module ContractScaleBoot\n  def self.boot\n    def ContractScaleCfg.scale(x)\n      x.to_s\n    end\n  end\nend\n",
+    ];
+    for (i, redef) in redefs.iter().enumerate() {
+        let sources = [base.as_str(), *redef];
+        let diags = check_files(&format!("def-on-const-{i}"), &sources);
+        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.new.grow(\"text\")"], "{redef}: {diags:?}");
+    }
+
+    let sources = [base.as_str(), "class ContractScaleOther; end\ndef ContractScaleOther.scale(x)\n  x.to_s\nend\n"];
+    let control = check_files("def-on-const-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the def lands on another constant: {control:?}"
+    );
+    // `def X.grow` lands on the class object, never on its instances.
+    let sources = [base.as_str(), "def ContractScaleCfg.grow(x)\n  x.to_s\nend\n"];
+    let control = check_files("def-on-const-instance-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "a class-object def must keep the instance contract of the same name: {control:?}"
+    );
+    // `def Integer.+` is a class method: `100 + "R$"` still raises
+    // `TypeError` under MRI, so the operand check still accuses it.
+    let diags = check("def-on-core", "def Integer.+(other)\n  other\nend\nprice = 100\nprice + \"R$\"\n", None);
+    assert!(diags.iter().any(|d| d.code == "E0108"), "{diags:?}");
+}
+
+/// A prepend lands in FRONT of the class it targets: a module prepended
+/// to the singleton class — `class << self; prepend M; end` in the body,
+/// `X.singleton_class.prepend(M)` from outside, `class << X` out of line —
+/// shadows the signed class method it answers, also from a method body. A
+/// module whose methods are not fully known takes every contract on that
+/// track off.
+#[test]
+fn singleton_prepend_takes_the_shadowed_contract_off() {
+    // The last shape's module answers no `scale` itself: its `prepended`
+    // hook defines one on the singleton class it lands on.
+    let shapes: [(&str, &str); 6] = [
+        ("class << self\n    prepend ContractStringScale\n  end", ""),
+        ("", "ContractScaleCfg.singleton_class.prepend(ContractStringScale)\n"),
+        (
+            "",
+            "module ContractScaleInstall\n  def self.install\n    ContractScaleCfg.singleton_class.prepend(ContractStringScale)\n  end\nend\nContractScaleInstall.install\n",
+        ),
+        ("", "class << ContractScaleCfg\n  prepend ContractStringScale\nend\n"),
+        ("class << self\n    prepend ContractScaleUnknown::Patch\n  end", ""),
+        (
+            "class << self\n    prepend ContractScaleHooked\n  end",
+            "module ContractScaleHooked\n  def self.prepended(base)\n    base.define_method(:scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+    ];
+    for (i, (body, outside)) in shapes.iter().enumerate() {
+        let target = scaled(body);
+        let extra = format!("{STRING_SCALE}{outside}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("singleton-prepend-{i}"), &sources);
+        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.new.grow(\"text\")"], "{body}{outside}: {diags:?}");
+    }
+
+    // A fully known module that does not answer `scale` shadows nothing.
+    let target = scaled("class << self\n    prepend ContractScaleQuiet\n  end");
+    let quiet = "module ContractScaleQuiet\n  def quiet; end\nend\n";
+    let sources = [target.as_str(), quiet];
+    let control = check_files("singleton-prepend-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the prepended module shadows nothing: {control:?}"
+    );
+}
+
+/// An instance-track prepend, in the body or from outside, shadows the
+/// signed instance method it answers; the class method keeps its contract.
+#[test]
+fn instance_prepend_takes_the_shadowed_contract_off() {
+    let shapes: [(&str, &str); 3] = [
+        ("prepend ContractStringGrow", ""),
+        ("", "ContractScaleCfg.prepend(ContractStringGrow)\n"),
+        ("prepend ContractScaleUnknown::Patch", ""),
+    ];
+    for (i, (body, outside)) in shapes.iter().enumerate() {
+        let target = scaled(body);
+        let extra = format!("{STRING_SCALE}{outside}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("instance-prepend-{i}"), &sources);
+        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.scale(\"text\")"], "{body}{outside}: {diags:?}");
+    }
+}
+
+/// An `include`/`extend` written OUTSIDE the class runs the module's
+/// `included`/`extended` hook on it exactly as one in the body does: the
+/// hook may redefine or prepend over anything, so every contract of the
+/// class comes off. A hookless module mixed in from outside keeps them.
+#[test]
+fn external_mixin_hook_takes_the_contract_off() {
+    let hooks = [
+        (
+            "ContractScaleCfg.extend(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.extended(base)\n    base.define_singleton_method(:scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+        (
+            "ContractScaleCfg.extend(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.extended(base)\n    base.singleton_class.prepend(ContractStringScale)\n  end\nend\n",
+        ),
+        (
+            "ContractScaleCfg.include(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.included(base)\n    base.prepend(ContractStringGrow)\n  end\nend\n",
+        ),
+    ];
+    for (i, (call, hook)) in hooks.iter().enumerate() {
+        let target = scaled("");
+        let extra = format!("{STRING_SCALE}{hook}{call}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("external-hook-{i}"), &sources);
+        assert!(scaled_accusations(&diags, &sources).is_empty(), "{hook}{call}: {diags:?}");
+    }
+
+    // The in-body spelling stays silent too.
+    let target = scaled("extend ContractScaleHook");
+    let extra = format!("{STRING_SCALE}{}", hooks[1].1);
+    let sources = [target.as_str(), extra.as_str()];
+    let diags = check_files("external-hook-in-body", &sources);
+    assert!(scaled_accusations(&diags, &sources).is_empty(), "{diags:?}");
+
+    let target = scaled("");
+    let plain = "module ContractScalePlain\n  def plain; end\nend\nContractScaleCfg.include(ContractScalePlain)\nContractScaleCfg.extend(ContractScalePlain)\n";
+    let sources = [target.as_str(), plain];
+    let control = check_files("external-hook-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the external mixin has no hook: {control:?}"
+    );
+}
+
+/// Whatever redefines a subclass from outside its body — a hooked mixin, a
+/// `define_method`, a prepend of a module nobody can read — is a dispatch
+/// target the parent's contract cannot speak for.
+#[test]
+fn outside_redefinition_of_a_subclass_keeps_the_parent_contract_off_the_call() {
+    const FAMILY: &str = r#"
+class ContractScaleParent
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+class ContractScaleChild < ContractScaleParent
+  CHILD
+end
+class ContractScaleUser
+  extend T::Sig
+  sig { params(parent: ContractScaleParent).void }
+  def use(parent)
+    parent.grow("text")
+  end
+end
+"#;
+    let hook = "module ContractScaleHook\n  def self.included(base)\n    base.define_method(:grow) { |x| x.to_s }\n  end\nend\n";
+    let shapes = [
+        ("", format!("{hook}ContractScaleChild.include(ContractScaleHook)\n")),
+        ("", "ContractScaleChild.define_method(:grow) { |x| x.to_s }\n".to_owned()),
+        ("prepend ContractScaleUnknown::Patch", String::new()),
+    ];
+    for (i, (child, outside)) in shapes.iter().enumerate() {
+        let family = FAMILY.replace("CHILD", child);
+        let diags = check_files(&format!("outside-family-{i}"), &[&family, outside]);
+        assert!(contract_codes(&diags).is_empty(), "{child}{outside}: {diags:?}");
+    }
+
+    let control = check_files("outside-family-control", &[&FAMILY.replace("CHILD", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the redefinition: {control:?}");
+}

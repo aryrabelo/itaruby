@@ -358,6 +358,13 @@ pub struct ClassFragment {
     pub includes: Vec<String>,
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
+    /// Modules prepended to the SINGLETON class (`class << self; prepend
+    /// M; end`, `X.singleton_class.prepend(M)`, `class << X; prepend M;
+    /// end`). Each is also an `extends` edge, which is how lookup reads
+    /// it; this list keeps the one thing that edge loses — a prepend
+    /// lands IN FRONT of the class's own singleton methods, so it can
+    /// shadow a signed one (`poison_prepend_shadowed_contracts`).
+    pub singleton_prepends: Vec<String>,
     /// `mixes_in_class_methods ::X` args (Sorbet `T::Helpers` — Tapioca's
     /// RBI rendering of the `included do extend X end` /
     /// `ActiveSupport::Concern` `ClassMethods` idiom). Never consulted by
@@ -427,6 +434,7 @@ impl ClassFragment {
             includes: Vec::new(),
             prepends: Vec::new(),
             extends: Vec::new(),
+            singleton_prepends: Vec::new(),
             methods: Vec::new(),
             singleton_methods: Vec::new(),
             consts: Vec::new(),
@@ -783,6 +791,12 @@ pub enum PollutionSource {
     /// include M; end`), resolved project-wide once every file is merged
     /// — see `resolve_keyed_pollution`.
     Module(String),
+    /// The inner source, landing on the target's SINGLETON track only
+    /// (`def X.m` written anywhere, `X.singleton_class.prepend(M)`,
+    /// `X.singleton_class.define_method(:m)`). A class-object method is
+    /// never an instance operator or coercion hook, so core pollution
+    /// ignores it; it only takes written contracts off.
+    Singleton(Box<PollutionSource>),
     /// A body no AST here can read (a string eval, a dynamic
     /// `define_method`, a class-body block, an unrecognized macro): any
     /// method name at all.
@@ -994,6 +1008,13 @@ impl<'pr> Visit<'pr> for FileScan {
                     PollutionSource::Names(vec![name]),
                 ));
             }
+        }
+        // `def X.m` anywhere — top level, another class, a method body —
+        // redefines `X`'s class method `m` when it runs.
+        if let Some(target) = node.receiver().as_ref().and_then(const_path_str) {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            let source = PollutionSource::Names(vec![name]);
+            self.push_keyed(Some(target.trim_start_matches("::")), vec![PollutionSource::Singleton(Box::new(source))]);
         }
         self.note_const_returning_body(node);
         let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
@@ -1556,6 +1577,12 @@ impl FileScan {
         }
         let sources = definer_sources(node);
         if sources.is_empty() {
+            return;
+        }
+        // `X.singleton_class.<definer>` lands on `X`'s class object.
+        if let Some(owner) = singleton_class_owner(node) {
+            let sources = sources.into_iter().map(|s| PollutionSource::Singleton(Box::new(s))).collect();
+            self.push_keyed(Some(owner.trim_start_matches("::")), sources);
             return;
         }
         let Some(target) = self.injection_target(node) else {
@@ -2256,6 +2283,19 @@ impl DefWalker<'_> {
         frag.declared_owner_required = true;
         self.fragments.push(frag);
         self.fragments.len() - 1
+    }
+
+    /// An `include`/`prepend` that lands on fragment `i`'s SINGLETON
+    /// class: the `extends` edge lookup walks, and for a prepend the
+    /// record that it answers first (`ClassFragment::singleton_prepends`).
+    fn singleton_mixin(&mut self, i: usize, name: &[u8], path: String) {
+        let frag = &mut self.fragments[i];
+        if name == b"prepend" && !frag.singleton_prepends.contains(&path) {
+            frag.singleton_prepends.push(path.clone());
+        }
+        if !frag.extends.contains(&path) {
+            frag.extends.push(path);
+        }
     }
 
 
@@ -3185,11 +3225,7 @@ impl DefWalker<'_> {
                         if let Some(args) = call.arguments() {
                             for arg in &args.arguments() {
                                 match const_path_str(&arg) {
-                                    Some(path) => {
-                                        if !self.fragments[oi].extends.contains(&path) {
-                                            self.fragments[oi].extends.push(path);
-                                        }
-                                    }
+                                    Some(path) => self.singleton_mixin(oi, call.name().as_slice(), path),
                                     None => all_literal = false,
                                 }
                             }
@@ -3237,9 +3273,7 @@ impl DefWalker<'_> {
                                     // conclusive miss) and claimed an
                                     // instance surface the code never gets.
                                     "include" | "prepend" if in_singleton => {
-                                        if !self.fragments[i].extends.contains(&path) {
-                                            self.fragments[i].extends.push(path);
-                                        }
+                                        self.singleton_mixin(i, call.name().as_slice(), path);
                                     }
                                     "include" => self.fragments[i].includes.push(path),
                                     "extend" => self.fragments[i].extends.push(path),
@@ -4789,6 +4823,8 @@ pub struct ClassDef {
     pub includes: Vec<String>,
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
+    /// See `ClassFragment::singleton_prepends`.
+    pub singleton_prepends: Vec<String>,
     pub methods: FxHashMap<String, MethodSig>,
     pub singleton_methods: FxHashMap<String, MethodSig>,
     pub consts: Vec<String>,
@@ -4896,8 +4932,12 @@ pub struct ProjectIndex {
     /// Every class or module that includes, prepends or extends a module,
     /// keyed by that module (`build_mixer_map`).
     pub mixers: FxHashMap<ClassId, Vec<Mixer>>,
-    /// Classes whose `include`/`prepend` runs code on them
-    /// (`poison_include_time_redefinitions`).
+    /// Classes something may redefine behind their written bodies: an
+    /// `include`/`prepend` that runs code on them
+    /// (`poison_include_time_redefinitions`), a source written outside
+    /// them (`poison_injected_contracts`), or a prepend whose module is not
+    /// fully known (`poison_prepend_shadowed_contracts`). A contract higher
+    /// in their family never treats one as a plain inheritor.
     pub include_time_code: FxHashSet<ClassId>,
     /// Every ivar name some file writes through a path the checker's
     /// per-class ivar walk cannot attribute (`FileDefs::hidden_ivar_writes`),
@@ -5134,6 +5174,7 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     build_subclass_map(&mut index);
     build_mixer_map(&mut index);
     poison_include_time_redefinitions(&mut index);
+    poison_prepend_shadowed_contracts(&mut index);
     build_methods_by_name(&mut index);
     index
 }
@@ -5407,6 +5448,7 @@ fn merge_file_fragments(
         class.includes.extend(frag.includes.iter().cloned());
         class.prepends.extend(frag.prepends.iter().cloned());
         class.extends.extend(frag.extends.iter().cloned());
+        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());
         class.consts.extend(frag.consts.iter().cloned());
         for md in &frag.methods {
             merge_source_method(&mut class.methods, md, file, &frag.nesting);
@@ -6258,6 +6300,7 @@ fn apply_singleton_patches(index: &mut ProjectIndex) {
         let class = &mut index.classes[id.0 as usize];
         // Before the `extends` loop below moves `frag.extends` out.
         merge_hook_installs(class, &frag, file);
+        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());
         for path in frag.extends {
             if !class.extends.contains(&path) {
                 class.extends.push(path);
@@ -6338,6 +6381,7 @@ fn resolve_keyed_pollution(index: &mut ProjectIndex) {
     for (target, nesting, source) in std::mem::take(&mut index.keyed_raw) {
         let names: Vec<String> = match &source {
             PollutionSource::Names(n) => n.clone(),
+            PollutionSource::Singleton(_) => continue,
             PollutionSource::Opaque => Vec::new(),
             // An unresolvable module — a gem's, a `DeclaredExternal`
             // namespace's, or one this project reopens dynamically — can
@@ -7623,12 +7667,17 @@ fn poison_contract(method: &mut MethodSig) {
 /// Name-keyed redefinitions written from outside the class body
 /// (`X.class_eval { def m }`, `X.define_method(:m)`, `X.send(:alias_method,
 /// ...)`, `X.instance_eval`, a string eval on `X`) poison the contracts of
-/// the names they define on every track. A body that cannot be read, or an
-/// injected module whose methods cannot be enumerated, poisons every
-/// contract of the class. A receiver no constant names stays out of reach,
-/// as it is for every other check.
+/// the names they define on every track; `def X.m` only on the singleton
+/// track. A body that cannot be read, or an injected module whose methods
+/// cannot be enumerated — including one whose mixin hook runs on `X`
+/// (`X.include(M)`, `X.extend(M)` with `M.included`/`M.extended`), which
+/// can redefine or prepend over anything — poisons every contract of the
+/// class. The class's own methods are not the only ones it now answers
+/// differently, so a contract higher in its family stops treating it as a
+/// plain inheritor. A receiver no constant names stays out of reach, as it
+/// is for every other check.
 fn poison_injected_contracts(index: &mut ProjectIndex) {
-    let hits: Vec<(ClassId, Option<Vec<String>>)> = index
+    let hits: Vec<(ClassId, Option<Vec<String>>, bool)> = index
         .keyed_raw
         .iter()
         .filter_map(|(target, nesting, source)| {
@@ -7636,20 +7685,27 @@ fn poison_injected_contracts(index: &mut ProjectIndex) {
             let id = index
                 .resolve_const(nesting, target)
                 .or_else(|| index.by_path.get(target).copied())?;
+            let (source, singleton_only) = match source {
+                PollutionSource::Singleton(inner) => (inner.as_ref(), true),
+                other => (other, false),
+            };
             let names = match source {
                 PollutionSource::Names(n) => Some(n.clone()),
-                PollutionSource::Module(path) => module_method_names(index, nesting, path),
-                PollutionSource::Opaque => None,
+                PollutionSource::Module(path) => known_mixin_names(index, nesting, path),
+                PollutionSource::Opaque | PollutionSource::Singleton(_) => None,
             };
-            Some((id, names))
+            Some((id, names, singleton_only))
         })
         .collect();
-    for (id, names) in hits {
+    for (id, names, singleton_only) in hits {
+        index.include_time_code.insert(id);
         let class = &mut index.classes[id.0 as usize];
         match names {
             Some(names) => {
                 for name in &names {
-                    class.methods.get_mut(name).map(poison_contract);
+                    if !singleton_only {
+                        class.methods.get_mut(name).map(poison_contract);
+                    }
                     class.singleton_methods.get_mut(name).map(poison_contract);
                 }
             }
@@ -7658,6 +7714,57 @@ fn poison_injected_contracts(index: &mut ProjectIndex) {
                 .values_mut()
                 .chain(class.singleton_methods.values_mut())
                 .for_each(poison_contract),
+        }
+    }
+}
+
+/// The methods mixing in `path` can put on its target, or `None` when that
+/// set is not fully known: the module is unresolved, open, too deep for
+/// `module_method_names`, or its chain runs a mixin hook, which can define
+/// or prepend anything on the target at the moment of the mixin.
+fn known_mixin_names(index: &ProjectIndex, nesting: &[String], path: &str) -> Option<Vec<String>> {
+    let module = index.resolve_const(nesting, path)?;
+    let hooked = index.ancestors(module).0.iter().any(|&a| {
+        let m = index.class(a);
+        runs_code_on_includer(m) || EXTEND_HOOKS.iter().any(|hook| m.singleton_methods.contains_key(*hook))
+    });
+    if hooked {
+        return None;
+    }
+    module_method_names(index, nesting, path)
+}
+
+/// Singleton methods Ruby runs on the extender when `extend` itself runs.
+const EXTEND_HOOKS: &[&str] = &["extended", "extend_object"];
+
+/// A prepend lands IN FRONT of its target, on the instance track
+/// (`prepend M`) or the singleton track (`class << self; prepend M; end`,
+/// `X.singleton_class.prepend(M)`, `class << X; prepend M; end`): every
+/// method the module answers shadows the target's own definition of that
+/// name, so the written contract no longer governs the call. A module
+/// whose method set is not fully known (`known_mixin_names`) may shadow
+/// anything on that track, so every contract there comes off and a
+/// contract higher in the family stops treating the target as a plain
+/// inheritor.
+fn poison_prepend_shadowed_contracts(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, bool, Option<Vec<String>>)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        let Ok(raw) = u32::try_from(i) else { continue };
+        let tracks = class.prepends.iter().map(|p| (false, p));
+        for (singleton, path) in tracks.chain(class.singleton_prepends.iter().map(|p| (true, p))) {
+            hits.push((ClassId(raw), singleton, known_mixin_names(index, &class.nesting, path)));
+        }
+    }
+    for (id, singleton, names) in hits {
+        let class = &mut index.classes[id.0 as usize];
+        let track = if singleton { &mut class.singleton_methods } else { &mut class.methods };
+        if let Some(names) = names {
+            for name in &names {
+                track.get_mut(name).map(poison_contract);
+            }
+        } else {
+            track.values_mut().for_each(poison_contract);
+            index.include_time_code.insert(id);
         }
     }
 }
@@ -7709,6 +7816,7 @@ impl ProjectIndex {
             includes: Vec::new(),
             prepends: Vec::new(),
             extends: Vec::new(),
+            singleton_prepends: Vec::new(),
             methods: FxHashMap::default(),
             singleton_methods: FxHashMap::default(),
             consts: Vec::new(),

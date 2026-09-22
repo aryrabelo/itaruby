@@ -17,7 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an `include`/`prepend` may run code on the includer (an `included` or
   `prepended` hook, or a project module the index cannot read to the end,
   such as a concern with an `included do` block). A gem's own module stays
-  out of reach, as for every other check. The contract also stays off
+  out of reach, as for every other check. A prepend takes off the
+  contract of every method its module answers, on the track it lands on:
+  `prepend M` for instance methods, and `class << self; prepend M; end`,
+  `X.singleton_class.prepend(M)` (a method body included) or `class << X;
+  prepend M; end` for class methods. A prepended module whose method set is not fully known
+  (unresolved, open, or running a mixin hook) takes off every contract on
+  that track. `def X.m` written anywhere (top level, another class, a
+  method body) takes off the contract of `X`'s class method `m`, and only
+  that one: the instance method of the same name keeps its contract, and
+  `def Integer.+` leaves the operand check alone. An `X.include(M)` or
+  `X.extend(M)` written outside `X` takes off every contract on `X` when
+  `M`'s chain has an `included`, `extended`, `prepended` or
+  `append_features` hook, because the hook can redefine or prepend
+  anything there. Any source written outside a subclass (a hooked mixin, a
+  `define_method`, a `class_eval`) and any prepend of a module that is not
+  fully known also keep a parent's contract off calls on a receiver of the
+  parent's type. The trade-off is a false negative: a signed method loses
+  its contract, including the E0109 check of its own body, whenever a
+  prepend could shadow it, even if the prepended method calls `super`.
+  The contract also stays off
   every call a receiver of
   that type could send elsewhere. That covers a subclass override, a
   mixin that answers first in a subclass, and, for a module's method, an

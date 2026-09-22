@@ -1,0 +1,14 @@
+crates/itaruby_semantic/tests/singleton_track.rs
+  h_b156936c57c455 262,276-279,968
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d08a030e1c5647b17bddb23b1f02b64b9c06cb9b",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+AGENTS.md
+  h_b156936c57c455 251-265
+crates/itaruby/src/main.rs
+  h_b156936c57c455 374
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 3701-3702
+crates/itaruby_semantic/src/core.rs
+  h_b156936c57c455 633,648
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 103-108,2494-2522,2542-2575,3557-3566,3568-3585,3595,3603,3607,3609-3610,3613,3619-3657,3771-3777,3779-3781,3783,3816,3823-3847,3850-3855,3867-3878,5806-5807
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 227-244
+crates/itaruby_semantic/tests/singleton_track.rs
+  h_b156936c57c455 240-292,912-914
+docs/CHANGELOG.md
+  h_b156936c57c455 11-32
+scripts/singleton-mutants.sh
+  h_b156936c57c455 378,380-386
+testdata/dark_singleton/nested_class_typo_stays_closed.rb
+  h_b156936c57c455 1-15
+testdata/dark_singleton/nested_def_self_in_block_resolves.rb
+  h_b156936c57c455 1-23
+testdata/singleton_track/nested_def_self_arity_accuses.rb
+  h_b156936c57c455 1-22
+testdata/singleton_track/nested_def_self_in_instance_body_opens.rb
+  h_b156936c57c455 1-19
+testdata/singleton_track/nested_plain_def_files_instance_track.rb
+  h_b156936c57c455 1-17
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "7fca0e832f93b7acef11036473e13ad7ce2781ec",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

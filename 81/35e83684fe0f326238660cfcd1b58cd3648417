@@ -1,0 +1,20 @@
+AGENTS.md
+  h_b156936c57c455 338
+docs/CHANGELOG.md
+  h_b156936c57c455 45-55
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 94-119
+scripts/operand-types-mutants.sh
+  h_b156936c57c455 1-244
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "8135e83684fe0f326238660cfcd1b58cd3648417",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

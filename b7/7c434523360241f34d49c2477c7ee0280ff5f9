@@ -1,0 +1,26 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 1446-1494,1932-1933,1942-1951,3107-3111,3113,3117-3118,3129-3133,3137-3143,3156-3157,3162-3237
+crates/itaruby_semantic/tests/singleton_track.rs
+  h_b156936c57c455 171-239,791-794
+scripts/singleton-mutants.sh
+  h_b156936c57c455 51-57,298-328
+testdata/singleton_track/def_body_attr_accessor_arity_accuses.rb
+  h_b156936c57c455 1-14
+testdata/singleton_track/def_body_foreign_literal_definer_resolves_silently.rb
+  h_b156936c57c455 1-19
+testdata/singleton_track/def_body_instance_def_definer_resolves_silently.rb
+  h_b156936c57c455 1-18
+testdata/singleton_track/def_body_literal_definers_resolve_silently.rb
+  h_b156936c57c455 1-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b77c434523360241f34d49c2477c7ee0280ff5f9",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

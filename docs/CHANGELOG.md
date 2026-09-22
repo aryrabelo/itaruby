@@ -28,8 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   RBI wrapper leaves the verdict unsoftened. That verdict is the dark
   census's own `closed_notfound` bucket, so the flip is a measurement
   rather than an argument: twelve mechanisms landed first and
-  the public-corpus residue fell **54 records -> 8** (rails 33 -> 1,
-  mastodon 1 -> 0, discourse 20 -> 7). The 8 survivors are the 8
+  the public-corpus residue fell **54 records → 8** (rails 33 → 1,
+  mastodon 1 → 0, discourse 20 → 7). The 8 survivors are the 8
   diagnostics the flip emits, every one read at its byte offset and
   proven to raise (ledger in `scripts/public-baseline/README.md`):
   rails' `RaisesNoMethodError` fixture (by design), discourse's

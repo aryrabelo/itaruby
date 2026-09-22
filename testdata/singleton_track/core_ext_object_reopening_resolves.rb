@@ -5,7 +5,10 @@
 # `Object` (the exact shape activesupport's core_ext/object/inclusion.rb
 # and core_ext/object/with.rb ship) defines a method EVERY class object
 # answers. The class-object track must walk past `Class`/`Module` into
-# `Object`: `Stone.obx_in?(Gem)` resolves, MRI runs to completion.
+# `Object` (the exact shape activesupport's core_ext/object/inclusion.rb
+# and core_ext/object/with.rb ship) defines a method EVERY class object
+# answers. The class-object track must walk past `Class`/`Module` into
+# `Object`: `Stone.obx_in?(Stone)` resolves, MRI runs to completion.
 class Object
   def obx_in?(other)
     other == self

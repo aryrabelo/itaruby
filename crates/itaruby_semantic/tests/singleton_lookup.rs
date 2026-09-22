@@ -1,12 +1,22 @@
-//! CHARACTERIZATION OF A KNOWN GAP — these tests pin CURRENT behavior, not
-//! desired behavior. Two certain `NoMethodError`s go unreported:
-//! a typo on an `extend`ed module's class method, and a typo on the class
-//! method a Rails concern injects via
-//! `def self.included(base); base.extend(ClassMethods); end`.
+//! THE CLASS-OBJECT FLIP, CLOSED 2026-09-21
 //!
-//! Why the gap is still open (measured 2026-09-17, do not re-litigate
-//! without re-measuring): the `Ty::Class` `MethodLookup::NotFound` arm in
-//! `check.rs` is silent on purpose. An attempt to report that residue was
+//! The gap is CLOSED. Two `NoMethodError`s that went unreported before the
+//! flip are now diagnostics:
+//! * a typo on an `extend`ed module's class method (`Page.find_by_slog`), and
+//! * a typo on a class method a Rails concern injects via
+//!   `def self.included(base); base.extend(ClassMethods); end`
+//!   (`Record.default_scope_nmae`).
+//!
+//! These tests pin the CLOSED state. The two fixtures now assert E0101
+//! emission. The flip landed twelve mechanisms that populate the
+//! singleton-surface inventory and reduced the public-corpus residue from
+//! 54 records to 8 (every one read at its byte offset and proven to raise
+//! in `scripts/public-baseline/README.md`).
+//!
+//! ## Historical context — why the gap was measured as open
+//!
+//! Pre-flip (2026-09-17), the `Ty::Class` `MethodLookup::NotFound` arm in
+//! `check.rs` was silent on purpose. An attempt to report that residue was
 //! built and measured against the public corpora:
 //!
 //!   * bare residue report ...... rails +703, mastodon +36, discourse +4109
@@ -14,7 +24,7 @@
 //!     of a class method the index can actually see (the "it is a typo"
 //!     signal) ................... rails +216, mastodon +0, discourse +12
 //!
-//! and every sample inspected in the remainder was a FALSE positive on a
+//! Every sample inspected in the remainder was a FALSE positive on a
 //! method that really exists: `SecureRandom.uuid` and `Kernel.rand`
 //! (stdlib module-function surfaces this checker has no inventory for),
 //! `ActiveRecord::Marshalling.format_version`,
@@ -24,24 +34,22 @@
 //! occurrences), and `RequireProfiler.stats` (`class << self` accessors).
 //!
 //! A class object's singleton surface is supplied by populations no project
-//! index here contains, so "absent from what I can see" is not evidence of
-//! absence (AGENTS.md, binding) and reporting the residue violates
-//! invariant #1. Closing the gap needs those populations indexed FIRST:
+//! index contained, so "absent from what I can see" was not evidence of
+//! absence (AGENTS.md, binding) and reporting the residue would have violated
+//! invariant #1. Closing the gap required those populations indexed FIRST:
 //! (1) `mattr_accessor`/`cattr_accessor`, (2) `class << self` `attr_*`,
-//! (3) stdlib module-function inventories. Then the residue can be
-//! re-measured against all three private corpora plus the public ones.
+//! (3) stdlib module-function inventories. The flip landed all three plus nine
+//! other beads.
 //!
-//! RESIDUE, AND WHAT THE NUMBER MEANS (re-measured 2026-09-18 at
-//! 588b5ed, after the singleton-track steps through the class-level
-//! attribute macros, the mocking-gem softening, and the concern-edge
-//! harvest gate). The metric is the only one that can ever become a
-//! diagnostic: a lookup that reaches this arm has already passed
-//! `lookup_singleton` (which returns `Inconclusive` the moment ANY
-//! ancestor is open) and `soften_not_found` (kernel/object singleton
-//! surface, stdlib inventory, mocking-gem population, dynamic mixins,
-//! gem reopenings), so "residue" == `NotFound` AND the singleton
-//! surface provably closed AND unsoftened. Probe built from the exact
-//! revision under test; total sites in parentheses:
+//! ## Measurement history (2026-09-18 audit)
+//!
+//! Pre-flip residue (re-measured at 588b5ed, after the singleton-track steps
+//! through the class-level attribute macros, the mocking-gem softening, and
+//! the concern-edge harvest gate). The metric: a lookup reaching `NotFound`
+//! has already passed `lookup_singleton` (which returns `Inconclusive` the
+//! moment ANY ancestor is open) and `soften_not_found` (kernel/object
+//! singleton surface, stdlib inventory, mocking-gem population, dynamic
+//! mixins, gem reopenings). Probe built from the exact revision under test:
 //!
 //!   corpus    | explicit receiver (total)
 //!   rails     |  42 (193)
@@ -49,8 +57,7 @@
 //!   discourse |  14 (605)
 //!   corpus-c  |   2 (1665)
 //!
-//! Not zero — the flip stays blocked. The remaining explicit-receiver
-//! families, by what really supplies the name:
+//! The explicit-receiver families (why they stayed open pre-flip):
 //!
 //! * `ActiveSupport` core extensions on `Module`/`Class` objects (`descendants`,
 //!   `module_parent*`, `in?`): 19 of rails' 42 — a gem's own core-extension
@@ -69,24 +76,6 @@
 //!   reopens (`DiscourseSubscriptions`).
 //! * rails' `RaisesNoMethodError.foobar_method_doesnt_exist`: 1 DELIBERATE
 //!   true positive — the fixture exists to raise `NoMethodError`.
-//!
-//! A number measured on a probe built from UNCOMMITTED-then-reverted
-//! source is not a measurement (learned the hard way the same day: the
-//! pre-fix 650/44/4572/1701 was reported as "unchanged by the fix" when
-//! it was simply the old build twice). Rebuild the probe from the exact
-//! revision under test.
-//!
-//! Where the remaining residue lives, by receiver (explicit only):
-//! discourse `DiscourseEvent.track_events` 205, `FileUtils.*` 270,
-//! `GlobalSetting.*` 36; rails `ActiveSupport::Dependencies.*` 23,
-//! `ActionDispatch::ExceptionWrapper.*` 12. `FileUtils` is family (e)
-//! (stdlib singleton inventory); `DiscourseEvent`/`GlobalSetting` are
-//! `define_singleton_method`/`method_missing`-shaped openness the index
-//! does not yet prove, i.e. step N+1's OPEN reasons, not family (e).
-//!
-//! When someone closes it, these tests fail — that is the point. Flip them
-//! to assert the diagnostic, and re-run `scripts/public-gate.sh` and the
-//! corpus gates before believing it.
 //!
 //! Fixtures in `testdata/singleton_lookup/`.
 
@@ -111,9 +100,9 @@ fn check_fixture(name: &str) -> Vec<String> {
 /// `extend Findable` is a certain `NoMethodError` — MRI raises on this
 /// exact file — and the class-object track now reports it. This was one
 /// of the two rows where Sorbet proved a bug itaruby missed
-/// (`scripts/inference-bench-README.md`); the gate is
-/// `inconclusive_reason(c, true) == None`, i.e. the receiver's whole
-/// singleton chain is closed.
+/// (`scripts/inference-bench-README.md`); singleton lookup has already
+/// proved the receiver's whole singleton chain closed and complete, and
+/// the RBI wrapper leaves that `NotFound` unsoftened.
 #[test]
 fn extend_provided_class_method_typo_accuses() {
     assert_eq!(

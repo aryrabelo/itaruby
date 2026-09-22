@@ -226,11 +226,15 @@ fn project_defined_raise_resolves_and_records_nothing() {
     );
 }
 
-/// The accusation survives the tail: a TYPO inside a `def self.` body is
-/// not a tail name, stays silent today, and remains the residue — exactly
-/// what a class-object E0101 fires on once the track arms.
+/// The typo inside a `def self.` body is conclusive until proven otherwise.
+/// Before the flip (bead ita-sgl closes the gap), a TYPO inside a `def self.`
+/// body on a singleton-mixin receiver like `Job` would stay silent. After the
+/// flip, the typo is a certain `NoMethodError` — the receiver's resolved
+/// singleton ancestry includes the three installed names, not this typo, and
+/// the class-object track reports it. The name must be one of the three
+/// installed names for the softening to apply; a typo fails the gate.
 #[test]
-fn singleton_tail_typo_stays_closed_notfound() {
+fn singleton_tail_typo_accuses_after_the_flip() {
     let (diags, recs) = dark_fixture("singleton_tail_typo_still_closed.rb");
     assert_eq!(
         diags.len(),

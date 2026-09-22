@@ -671,6 +671,9 @@ static BARE_CALL_TAIL: std::sync::LazyLock<std::collections::HashSet<&'static st
             .map(|l| &l[l.rfind('~').expect("filtered: has ~") + 1..])
             .chain(KERNEL_PRIVATE_INSTANCE_METHODS.iter().copied())
             .chain(CLASS_MODULE_ONLY_METHODS.iter().copied())
+            .chain(GEM_KERNEL_METHODS.iter().copied())
+            .chain(TEST_FRAMEWORK_OBJECT_MIXIN_METHODS.iter().copied())
+            .chain(ACTIVE_SUPPORT_OBJECT_MIXIN_METHODS.iter().copied())
             .collect()
     });
 

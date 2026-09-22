@@ -279,8 +279,8 @@ offset. Verdicts:
 |---|---|---|
 | `ColorMath::Converters#RuntimeError` (discourse, 4) | **TRUE POSITIVE — real bug in discourse** | `lib/color_math.rb:62`: `raise new RuntimeError("Hex color must be 6 characters")` — parsed as `raise(new(RuntimeError("…")))`; `RuntimeError` is a constant, not a method, so the validation branch raises NoMethodError instead of the intended message. Author meant `RuntimeError.new(...)`. |
 | `RaisesNoMethodError#foobar_method_doesnt_exist` (rails, 1) | TRUE POSITIVE (by design) | `activesupport/test/autoloading_fixtures/raises_no_method_error.rb` — the fixture exists to raise NoMethodError. |
-| `DiscourseAi::Completions::Llm#models_by_provider` (discourse, 1) | census noise (instance-context call) | `llm.rb:79` is inside `def valid_provider_models` — an INSTANCE method; the census bucketed it on the class-object track. Instrument finding, not a flip site. |
-| `DiscourseAi::Utils::DiffUtils#apply_hunk` (discourse, 3) | census noise (instance-context call) | `ai_artifact.rb:72-74` calls `differ.apply_hunk(...)` on a LOCAL; no `apply_hunk` def exists anywhere in the tree (dead path), but this belongs to the instance track, not the class-object census. |
+| `DiscourseAi::Completions::Llm#models_by_provider` (discourse, 1) | **SUPERSEDED — re-audited 2026-09-21 at the flip.** Previously classified as "census noise (instance-context call)" but re-examined as true positive: `llm.rb:79` sits inside `def valid_provider_models`, a SINGLETON method (class `<< self` block spans lines 20-150), so the bare call is on the class object. No `def self.models_by_provider` exists tree-wide; this is a real dead singleton method. |
+| `DiscourseAi::Utils::DiffUtils#apply_hunk` (discourse, 3) | **SUPERSEDED — re-audited 2026-09-21 at the flip.** Previously classified as "census noise (instance-context call)" but re-examined as true positive: `ai_artifact.rb:72-74` receives a LOCAL `differ = DiscourseAi::Utils::DiffUtils` (a module object), so the call is on the class-object track and conclusive. No `def self.apply_hunk` on the module; this is dead code. |
 | `DiscourseAi::Agents::General#id` (discourse, 1) | likely TRUE POSITIVE — re-verify at flip | `bot_controller.rb:136` `DiscourseAi::Agents::General.id`; no `def self.id` found tree-wide. Chain closed per census. |
 
 **Populated — every one must stay silent; each names its bead (98 sites):**
@@ -315,9 +315,20 @@ gated on `inconclusive_reason(c, true) == None` — the exact predicate the
 dark census had been bucketing as `closed_notfound` while the arm was
 silent. Twelve mechanisms landed first, each a NAMED open reason or an
 indexed surface keyed on the receiver's own chain, and the census residue
-on the three pinned clones went **rails 33 / mastodon 1 / discourse 20
-(54 records) -> rails 1 / mastodon 0 / discourse 7 (8 records)**, every
-remaining one read at its byte offset and proven to raise.
+| bead | mechanism | records closed (rails/mastodon/discourse) |
+|---|---|---|
+| ita-xta | `extend M` walks M's OWN ANCESTRY (`include`/`prepend`), and an OPEN ancestor there makes the surface unreadable rather than empty | 1 / 0 / 2 |
+
+### NEW lines — 8 total; 7 true positives, 1 by-design fixture
+
+**Rails:** 1 error (the `RaisesNoMethodError#foobar_method_doesnt_exist` fixture at `activesupport/test/autoloading_fixtures/raises_no_method_error.rb:4`, designed to raise `NoMethodError` — not a discovered defect).
+
+**Discourse:** 7 errors — every one a true positive, read at its byte offset and proven to raise.
+
+Tree-wide greps below are over the pinned `-head` clone, `--include=*.rb`,
+for `def <name>` / `def self.<name>` / `attr_*` / `alias` / `alias_method`
+/ `define_method(:<name>` / `define_singleton_method(:<name>` / `delegate`
+/ `method_missing` on the receiver and every ancestor of its chain.
 
 Per-mechanism, measured on the pinned `-head` clones:
 

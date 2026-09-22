@@ -1,5 +1,5 @@
 # Bead ita-dsm: the SINGLETON spelling of a `self.extended(base)` install.
-# `base.define_singleton_method(:values) { ... }` puts the name on the
+# `base.define_singleton_method(:dsm_values) { ... }` puts the name on the
 # EXTENDER's class object — the track `extend` dispatches on — so a call
 # to it resolves. discourse's `Migrations::Enum`
 # (`migrations/core/lib/migrations/common/enum.rb`) is the measured shape.

@@ -95,7 +95,7 @@ Summary: 6 both prove, **0 Sorbet proves and itaruby does not**, 3 rows
 where Sorbet needs an annotation and itaruby does not false-positive, 2
 mutual controls, 2 itaruby false positives found by this bench and since
 fixed (`const_missing_namespace` 2026-09-17, `singleton_class_eval`
-2026-09-21 — see the Open debt section).
+2026-09-21 — see the Open debt section). **Total: 12 cases.**
 
 ### Silence is not inference — the positive controls
 

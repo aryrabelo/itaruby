@@ -1,0 +1,26 @@
+AGENTS.md
+  h_b156936c57c455 242-269,295
+docs/CHANGELOG.md
+  h_b156936c57c455 12-39
+scripts/bug-replay/replay.sh
+  h_b156936c57c455 59-80,88,91,95,119,121,129,132,171,186,265,295
+scripts/bug-replay/selftest.sh
+  h_b156936c57c455 34-42
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 60-66,104-121
+scripts/instrument-mutants.sh
+  h_b156936c57c455 1-215
+scripts/public-baseline/README.md
+  h_b156936c57c455 14-22,62-68,74-78,80-85
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "4c3b0071654ec563b4f0eecd9fca8f8dabb96a28",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

@@ -1,0 +1,26 @@
+AGENTS.md
+  h_b156936c57c455 347
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 3691-3696,3698,3701-3705
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 361-374,488-489,498-499,565-570,613,696-805,2150-2160,2290,2381-2382,2669-2684
+crates/itaruby_semantic/tests/operand_types.rs
+  h_b156936c57c455 821-844,854-1166
+docs/CHANGELOG.md
+  h_b156936c57c455 78-83,169-214
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 80-93,96-98
+scripts/operand-types-mutants.sh
+  h_b156936c57c455 19-21,222-224,229-230,234-295,310
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "30637d86eb49499b8195c9b530fd4ea5c4ef0c3e",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

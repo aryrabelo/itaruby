@@ -186,3 +186,14 @@ jobs:
           done
       - run: cargo build --release
       - run: ./scripts/public-gate.sh
+      # The verdict names target/gauntlet/public-<id>-drift.txt; without
+      # this the runner deletes it and a red reads as "3 gone" with no
+      # way to see which three (measured 2026-09-22: two red runs, zero
+      # lines of drift readable). Public corpora only — the private
+      # ones never run here.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: public-gate
+          path: target/gauntlet/public-*
+          if-no-files-found: ignore

@@ -708,6 +708,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `scripts/dev anchor` now runs the anchor the way AGENTS.md's block
+  does (2026-09-21): from `~/Sites/personal-team/itaruby` on `work`
+  (the checkout that holds the corpora map — `~/Sites/itaruby` has none
+  and SKIPs both corpora while printing `PASS (incomplete)`), in a
+  disposable detached worktree with the map copied in, under
+  `PERF_COLUMN=ci`, and with the sha fetched from `$ANCHOR_REMOTE`
+  (default `private`). The old verb moved `~/Sites/itaruby`'s HEAD,
+  fetched `origin` — which on `work` is the public squash-rooted repo
+  since the 2026-09-18 split and cannot carry this history (`fatal:
+  invalid reference: <sha>`, measured twice) — and judged perf against
+  the m5 dev column. `work` now carries the `private` remote.
+- README's "Benchmarked against Sorbet" now states the annotation-free
+  bench in both directions: the two rows Sorbet wins
+  (`extend_singleton_typo`, `included_hook_class_method_typo`), the
+  measured reason the blanket fix was reverted (216/0/12 false positives),
+  the populations to index first, and the one Invariant #1 violation the
+  bench found and that was fixed the same day.
 - The singleton track files every method-defining form where it really
   lands, and one rails false positive goes with it. Four defects, found
   by review before the `Ty::Class` `NotFound` arm reports and each one a

@@ -133,8 +133,24 @@ cmd_anchor() {
   say "anchor run on $WORK_HOST — $branch @ ${sha:0:7}"
   # Checking out the local HEAD there is the point: an anchor run against
   # whatever the remote machine happened to have checked out is a false green.
-  out=$(ssh "$WORK_HOST" "cd ~/Sites/itaruby && git fetch -q && git checkout -q $sha \
-    && PATH=\"\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh" 2>&1)
+  #
+  # The remote command mirrors AGENTS.md's anchor block exactly, because each
+  # piece is a measured trap (2026-09-18/21): the checkout that holds the
+  # corpora map is ~/Sites/personal-team/itaruby (~/Sites/itaruby has none and
+  # SKIPs both corpora green); the run happens in a disposable worktree so
+  # another agent's checkout never moves; the map is COPIED into it (a fresh
+  # worktree has none); the sha is fetched from $ANCHOR_REMOTE, default
+  # `private`, since `origin` on work is the public squash-rooted repo and
+  # cannot carry this history; PERF_COLUMN=ci because work has no measured
+  # dev column and a copied ceiling is a fabricated measurement.
+  local wt="~/Sites/worktrees/ita-anchor-${sha:0:7}"
+  out=$(ssh "$WORK_HOST" "cd ~/Sites/personal-team/itaruby \
+    && git fetch -q ${ANCHOR_REMOTE:-private} \
+    && git worktree add -f --detach $wt $sha \
+    && cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt $wt/scripts/corpora-local.txt \
+    && cd $wt \
+    && PERF_COLUMN=ci PATH=\"\$(brew --prefix ruby)/bin:\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh; \
+    s=\$?; cd ~/Sites/personal-team/itaruby && git worktree remove --force $wt; exit \$s" 2>&1)
   status=$?
   printf '%s\n' "$out"
   if [[ $status -ne 0 && $status -ne 2 ]]; then

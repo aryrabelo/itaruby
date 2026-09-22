@@ -492,7 +492,7 @@ Anchor flow (run gates on `work` against an exact sha, in a disposable
 worktree — never disturb the checkout another agent may be using):
 
 ```sh
-ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q origin main && \
+ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q private main && \
   git worktree add -f --detach ~/Sites/worktrees/ita-anchor-<slug> <sha> && \
   cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt \
      ~/Sites/worktrees/ita-anchor-<slug>/scripts/corpora-local.txt && \
@@ -507,6 +507,18 @@ checkout on another branch with no map, and following it silently SKIPs both
 corpora while the transcript still ends in `PASS (incomplete)` (learned
 2026-09-18, binding, measured). Read the `corpus gate proved:` line and
 require it to name `corpus-a` AND `corpus-b` before calling an anchor green.
+
+The sha travels through the `private` remote, never `origin` (learned
+2026-09-21, binding, measured): since the 2026-09-18 split, `origin` on
+`work` is the PUBLIC repo (`aryrabelo/itaruby`, a squash-rooted curated
+history that shares no ancestor with this one), so `git fetch -q origin`
+there fetches nothing this repository commits, and the anchor fails with
+`fatal: invalid reference: <sha>` — twice in one night before the remote
+was read. `work` now carries `private -> git@github.com:aryrabelo/itaruby-private.git`;
+`scripts/dev anchor` fetches from `$ANCHOR_REMOTE` (default `private`) and
+builds the disposable worktree exactly as the block above does. The public
+repo is synced by cherry-pick with the lead's decision, never by a push of
+`main`: `git push public main` is rejected as non-fast-forward by design.
 
 Explicit `PATH` because a non-interactive ssh shell does not load
 `~/.cargo/bin` — without it `sf` and friends "don't exist" on `work` even when

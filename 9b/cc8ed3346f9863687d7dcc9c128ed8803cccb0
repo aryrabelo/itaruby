@@ -1,0 +1,38 @@
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 3688-3691,3693-3698
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 348-356,455-456,471-472,597-602,1111-1147,1959-1965,2182-2183
+crates/itaruby_semantic/tests/operand_types.rs
+  h_b156936c57c455 389-686
+docs/CHANGELOG.md
+  h_b156936c57c455 29-48,100-119
+testdata/operand_types/float_times_string_accuses.rb
+  h_b156936c57c455 11-14
+testdata/operand_types/int_minus_nil_accuses.rb
+  h_b156936c57c455 12-15
+testdata/operand_types/int_plus_string_accuses.rb
+  h_b156936c57c455 13-17
+testdata/operand_types/interpolation_only_silent.rb
+  h_b156936c57c455 25-30
+testdata/operand_types/literal_pair_accuses.rb
+  h_b156936c57c455 10-13
+testdata/operand_types/op_assign_silent.rb
+  h_b156936c57c455 24-37
+testdata/operand_types/param_operand_silent.rb
+  h_b156936c57c455 18-28
+testdata/operand_types/reassigned_in_branch_silent.rb
+  h_b156936c57c455 15-24
+testdata/operand_types/string_plus_int_accuses.rb
+  h_b156936c57c455 12-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "9bcc8ed3346f9863687d7dcc9c128ed8803cccb0",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

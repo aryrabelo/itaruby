@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A Sorbet contract no longer outlives a redefinition of its method. The
+  `sig` (inline or RBI) is dropped, and the body kept for inference, when
+  the method is redefined by an out-of-line `class << X` body, by a
+  `self.extended(base)` hook install, by a named-receiver
+  `class_eval`/`instance_eval`/`define_method`/`alias_method`/`send` (a
+  body that cannot be read drops every contract on that class), or when
+  an `include`/`prepend` may run code on the includer (an `included` or
+  `prepended` hook, or a project module the index cannot read to the end,
+  such as a concern with an `included do` block). A gem's own module stays
+  out of reach, as for every other check. The contract also stays off
+  every call a receiver of
+  that type could send elsewhere. That covers a subclass override, a
+  mixin that answers first in a subclass, and, for a module's method, an
+  override anywhere under an includer or extender. Each case was a
+  reproduced false E0103 and has a synthetic test with a control that
+  still accuses.
+- Contract cost is per definition, not per call. With a `sorbet/rbi`
+  directory present, every call to an unsigned method used to walk the
+  receiver's whole subclass tree twice. Now the contract is resolved once
+  per definition per file, the family walk runs only for a definition that
+  has a contract, and the return memo is read before any contract lookup.
+  Release binary on a synthetic 1500-subclass project with `sorbet/rbi`
+  present: CPU user 0.83s -> 0.06s (4 calls per subclass), 13.72s -> 5.43s (40 calls per subclass; ~4.9s of it is present without sorbet/rbi too), 8.29s -> 0.32s (same, base methods signed); median of 3 runs, 2026-09-22. A counter-based test
+  (`contract_work_is_per_definition_not_per_call`) bounds the work.
+- Known false negatives, documented rather than guessed. `.new` on a class
+  with `extend T::Sig` does not check the arguments against `initialize`'s
+  `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or
+  post parameter drops its whole contract, the return included, so neither
+  E0103 nor E0109 fires for it.
 - Class-object flip regression fixtures now distinguish the missing `sig`
   provider from the missing instance method in the no-RBI lookup control.
   Existing return-inference fixtures declare `extend T::Sig` without

@@ -1344,3 +1344,337 @@ end
     assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
     assert!(diags[0].message.contains("got ContractRegistry"), "{diags:?}");
 }
+
+// -- every redefinition path takes a written contract off the method --
+
+/// Several source files, one project: a redefinition written in another
+/// file reaches the class only through a merge-time pass.
+fn check_files(name: &str, sources: &[&str]) -> Vec<Diagnostic> {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-{name}"));
+    let files: Vec<SourceFile> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, text)| SourceFile::new(&db, root.join(format!("source{i}.rb")), (*text).to_owned()))
+        .collect();
+    ProjectFiles::new(&db, files.clone());
+    ClosedWorld::new(&db, true);
+    files.iter().flat_map(|f| check_file(&db, *f).clone()).collect()
+}
+
+const PATCHED_TARGET: &str = r#"
+class ContractPatchSink
+  extend T::Sig
+  sig { params(text: String).void }
+  def self.take(text); end
+end
+class ContractPatchTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def self.echo(value)
+    value
+  end
+end
+ContractPatchTarget.echo("text")
+ContractPatchSink.take(ContractPatchTarget.echo(1))
+"#;
+
+/// An out-of-line `class << X` body redefines `X.echo`: the written
+/// signature no longer governs the method that runs. The control without
+/// the patch keeps this a contract rather than a blind spot.
+#[test]
+fn singleton_patch_redefinition_takes_the_contract_off() {
+    let patch = r"
+class << ContractPatchTarget
+  def echo(value)
+    value.to_s
+  end
+end
+";
+    let diags = check_files("singleton-patch", &[PATCHED_TARGET, patch]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("singleton-patch-control", &[PATCHED_TARGET]);
+    assert_eq!(contract_codes(&control), ["E0103", "E0103"], "control must accuse without the patch: {control:?}");
+}
+
+/// A module's `self.extended(base)` hook redefines the extender's method
+/// when `extend` runs, after the signed `def` was written.
+#[test]
+fn extended_hook_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractHookTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+  EXTENSION
+end
+ContractHookTarget.new.echo("text")
+"#;
+    let hook = r"
+module ContractHookInstaller
+  def self.extended(base)
+    base.define_method(:echo) { |value| value.to_s }
+  end
+end
+";
+    let diags = check_files("extended-hook", &[&TARGET.replace("EXTENSION", "extend ContractHookInstaller"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("extended-hook-control", &[&TARGET.replace("EXTENSION", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the extend: {control:?}");
+}
+
+/// A block reopening in another file redefines the method: like any other
+/// duplicate definition, neither signature is proven to be the one that runs.
+#[test]
+fn class_eval_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractEvalTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+ContractEvalTarget.new.echo("text")
+"#;
+    let reopen = r"
+ContractEvalTarget.class_eval do
+  def echo(value)
+    value.to_s
+  end
+end
+";
+    let diags = check_files("class-eval", &[TARGET, reopen]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let reopened = r"
+class ContractEvalTarget
+  alias_method :echo, :to_s
+end
+";
+    let diags = check_files("alias-reopen", &[TARGET, reopened]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A descendant that mixes in a module answering the name dispatches to
+/// that module, never to the signed parent body.
+#[test]
+fn descendant_mixin_override_keeps_the_parent_contract_off_the_call() {
+    const PARENT: &str = r#"
+class ContractMixinParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+module ContractMixinText
+  def echo(value)
+    value.to_s
+  end
+end
+class ContractMixinChild < ContractMixinParent
+  MIXIN
+end
+class ContractMixinUser
+  extend T::Sig
+  sig { params(parent: ContractMixinParent).void }
+  def use(parent)
+    parent.echo("text")
+  end
+end
+"#;
+    let diags = check_files("descendant-mixin", &[&PARENT.replace("MIXIN", "include ContractMixinText")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let diags = check_files("descendant-prepend", &[&PARENT.replace("MIXIN", "prepend ContractMixinText")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("descendant-mixin-control", &[&PARENT.replace("MIXIN", "")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the mixin: {control:?}");
+}
+
+/// A module's signed method runs only where no class between an includer
+/// and the module redefines it. An includer's subclass that does is a
+/// dispatch target the module's contract cannot speak for.
+#[test]
+fn module_contract_yields_to_an_includer_family_override() {
+    const CONCERN: &str = r#"
+module ContractConcern
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+class ContractConcernHost
+  include ContractConcern
+end
+class ContractConcernChild < ContractConcernHost
+  OVERRIDE
+end
+class ContractConcernUser
+  extend T::Sig
+  sig { params(host: ContractConcernHost).void }
+  def use(host)
+    host.echo("text")
+  end
+end
+"#;
+    let overridden = CONCERN.replace("OVERRIDE", "def echo(value)\n    value.to_s\n  end");
+    let diags = check_files("module-family", &[&overridden]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("module-family-control", &[&CONCERN.replace("OVERRIDE", "")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the override: {control:?}");
+}
+
+/// A module's `included` hook, in either spelling, redefines the
+/// includer's method when `include` runs, after the signed `def`.
+#[test]
+fn included_hook_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractIncludedTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+  INCLUSION
+end
+ContractIncludedTarget.new.echo("text")
+"#;
+    let hook = r"
+module ContractIncludedHook
+  def self.included(base)
+    base.define_method(:echo) { |value| value.to_s }
+  end
+end
+";
+    let concern = r"
+module ContractIncludedConcern
+  extend ActiveSupport::Concern
+  included do
+    def echo(value)
+      value.to_s
+    end
+  end
+end
+";
+    let diags = check_files("included-hook", &[&TARGET.replace("INCLUSION", "include ContractIncludedHook"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let diags = check_files("included-concern", &[&TARGET.replace("INCLUSION", "include ContractIncludedConcern"), concern]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // The block still runs when an earlier macro opened the module first.
+    let macro_first = concern.replace("  included do", "  contract_setting :flag\n  included do");
+    let diags = check_files("included-macro-first", &[&TARGET.replace("INCLUSION", "include ContractIncludedConcern"), &macro_first]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("included-hook-control", &[&TARGET.replace("INCLUSION", ""), hook, concern]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
+}
+
+// -- cost: contract work is per definition, never per call --
+
+/// A base class, `members` subclasses in their own files, and twelve calls
+/// per subclass to the base's two methods, checked with a `sorbet/rbi`
+/// directory present (the RBI declares only an unrelated class). Returns
+/// the contract work the whole check did on this thread.
+fn family_work(name: &str, members: usize, signed: bool) -> itaruby_semantic::check::ContractWork {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-{name}"));
+    let dir = root.join("sorbet/rbi");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rbi = dir.join("unrelated.rbi");
+    std::fs::write(&rbi, "class ContractUnrelated\n  sig { returns(Integer) }\n  def value; end\nend\n").unwrap();
+    RbiProject::new(&db, itaruby_semantic::rbi::build_rbi_index(&[rbi]).constants);
+    let sig = |text: &str| if signed { format!("  sig {{ {text} }}\n") } else { String::new() };
+    let base = format!(
+        "class ContractFamilyBase\n  extend T::Sig\n{}  def helper\n    1\n  end\n{}  def other(value)\n    value\n  end\nend\n",
+        sig("returns(Integer)"),
+        sig("params(value: Integer).returns(Integer)"),
+    );
+    let mut files = vec![SourceFile::new(&db, root.join("base.rb"), base)];
+    for i in 0..members {
+        let calls = "    a = helper\n    b = other(a)\n    c = ContractFamilyBase.new.helper\n".repeat(4);
+        let text = format!("class ContractFamilyMember{i} < ContractFamilyBase\n  def run\n{calls}    a\n  end\nend\n");
+        files.push(SourceFile::new(&db, root.join(format!("member{i}.rb")), text));
+    }
+    ProjectFiles::new(&db, files.clone());
+    ClosedWorld::new(&db, true);
+    let before = itaruby_semantic::check::contract_work();
+    for file in &files {
+        check_file(&db, *file);
+    }
+    let after = itaruby_semantic::check::contract_work();
+    itaruby_semantic::check::ContractWork {
+        family_visits: after.family_visits - before.family_visits,
+        contract_resolutions: after.contract_resolutions - before.contract_resolutions,
+        return_probes: after.return_probes - before.return_probes,
+    }
+}
+
+/// Measured before this bound existed: a 1500-member family checked in
+/// 26.3s instead of 0.56s once `sorbet/rbi` existed, because every call to
+/// an unsigned method walked the whole family twice. Each file now
+/// resolves a definition's contract once, walks the family only for a
+/// definition that has a contract, and reads the return memo before
+/// asking for a contract at all.
+#[test]
+fn contract_work_is_per_definition_not_per_call() {
+    const MEMBERS: u64 = 60;
+    let files = MEMBERS + 1;
+    let unsigned = family_work("family-unsigned", 60, false);
+    assert_eq!(unsigned.family_visits, 0, "no contract, no family walk: {unsigned:?}");
+    // Per file: the base's two methods and the member's own `run`
+    // (182 measured; one contract per call would be over 900).
+    assert!(unsigned.contract_resolutions <= 4 * files, "{unsigned:?}");
+    // Per file: three return keys, member#helper, member#other and
+    // base#helper (180 measured; one probe per call would be 732).
+    assert!(unsigned.return_probes <= 4 * files, "{unsigned:?}");
+
+    let signed = family_work("family-signed", 60, true);
+    assert!(signed.contract_resolutions <= 4 * files, "{signed:?}");
+    // One walk of the family per signed definition per file (7320
+    // measured; one walk per call would be ten times that).
+    assert!(signed.family_visits <= 3 * MEMBERS * files, "{signed:?}");
+}
+
+/// Include-time code in a subclass may redefine the inherited method on
+/// that subclass, through a body no harvest reads.
+#[test]
+fn include_time_code_in_a_descendant_keeps_the_parent_contract_off_the_call() {
+    const FAMILY: &str = r#"
+class ContractHookParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+class ContractHookChild < ContractHookParent
+  INCLUSION
+end
+class ContractHookUser
+  extend T::Sig
+  sig { params(parent: ContractHookParent).void }
+  def use(parent)
+    parent.echo("text")
+  end
+end
+"#;
+    let hook = r#"
+module ContractOpaqueHook
+  def self.included(base)
+    base.class_eval("def echo(value) = value.to_s")
+  end
+end
+"#;
+    let diags = check_files("descendant-include-time", &[&FAMILY.replace("INCLUSION", "include ContractOpaqueHook"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("descendant-include-time-control", &[&FAMILY.replace("INCLUSION", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
+}

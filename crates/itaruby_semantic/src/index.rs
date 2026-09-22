@@ -4805,6 +4805,14 @@ pub struct ClassDef {
     pub table_name: Option<TableNameDecl>,
 }
 
+/// One reverse mixin edge: `class` includes or prepends the keyed module,
+/// or (`extends`) puts it on its singleton.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mixer {
+    pub class: ClassId,
+    pub extends: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct ProjectIndex {
     pub classes: Vec<ClassDef>,
@@ -4885,6 +4893,12 @@ pub struct ProjectIndex {
     /// supplied by a descendant, and claiming `NotFound` there is a false
     /// positive (see `descendant_defines`).
     pub subclasses: FxHashMap<ClassId, Vec<ClassId>>,
+    /// Every class or module that includes, prepends or extends a module,
+    /// keyed by that module (`build_mixer_map`).
+    pub mixers: FxHashMap<ClassId, Vec<Mixer>>,
+    /// Classes whose `include`/`prepend` runs code on them
+    /// (`poison_include_time_redefinitions`).
+    pub include_time_code: FxHashSet<ClassId>,
     /// Every ivar name some file writes through a path the checker's
     /// per-class ivar walk cannot attribute (`FileDefs::hidden_ivar_writes`),
     /// project-wide and name-keyed: the receiving object may be of any
@@ -5089,6 +5103,8 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     apply_attributed_mixin_edges(&mut index);
     resolve_refined_core(&mut index);
     resolve_eval_polluted_core(&mut index);
+    // Before `resolve_keyed_pollution` consumes the raw name-keyed sources.
+    poison_injected_contracts(&mut index);
     // Name-keyed pollution resolves LAST of the three: it is the only
     // one that reads other classes' method sets (`Module(...)`), so
     // every fragment, declaration and gem-reopening pass must already
@@ -5116,6 +5132,8 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // `ClassMethods` edges to the same field this pass walks).
     apply_extended_hooks(&mut index);
     build_subclass_map(&mut index);
+    build_mixer_map(&mut index);
+    poison_include_time_redefinitions(&mut index);
     build_methods_by_name(&mut index);
     index
 }
@@ -5151,6 +5169,74 @@ pub fn project_consts(
 /// resolves here rather than a scan of every class on each miss — the
 /// naive version would run on the E0101 candidate path, which is hot
 /// (bead ita-9p9 is the standing reminder of what that costs).
+/// Singleton methods Ruby runs on the includer when `include`/`prepend`
+/// itself runs.
+const INCLUDE_HOOKS: &[&str] = &["included", "prepended", "append_features", "prepend_features"];
+
+/// An `include`/`prepend` whose module chain runs code on the includer —
+/// a hook method, or a module-body block such as a concern's `included do`
+/// — may redefine any of the includer's methods, and nothing orders that
+/// against the includer's own `def`s. Every contract on such a class is
+/// poisoned, and the class is remembered so a contract higher in its
+/// family does not treat it as a plain inheritor.
+fn poison_include_time_redefinitions(index: &mut ProjectIndex) {
+    let hit: Vec<ClassId> = (0..index.classes.len())
+        .filter_map(|i| u32::try_from(i).ok().map(ClassId))
+        .filter(|&id| {
+            let class = index.class(id);
+            class.includes.iter().chain(&class.prepends).any(|name| {
+                let Some(module) = index.resolve_const(&class.nesting, name) else { return false };
+                index.ancestors(module).0.iter().any(|&a| runs_code_on_includer(index.class(a)))
+            })
+        })
+        .collect();
+    for id in hit {
+        let class = &mut index.classes[id.0 as usize];
+        class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
+        index.include_time_code.insert(id);
+    }
+}
+
+/// A hook method, or a project module this index could not read to the
+/// end: an open module's first recorded reason can hide a later
+/// `included do` block, so any project-side openness counts. A gem's own
+/// module (declared or reopened external, or never resolved) stays out of
+/// reach, as it is for every other check.
+fn runs_code_on_includer(module: &ClassDef) -> bool {
+    INCLUDE_HOOKS.iter().any(|hook| module.singleton_methods.contains_key(*hook))
+        || (module.open
+            && !matches!(
+                module.open_reason,
+                Some(OpenReason::DeclaredExternal | OpenReason::ReopenedExternal | OpenReason::AbstractRaise)
+            ))
+}
+
+/// Reverse `include`/`prepend`/`extend` edges, resolved exactly as
+/// `linearize` and `extended_module_surface` resolve them. Built after
+/// every merge pass, so a concern's `ClassMethods` edge is included.
+fn build_mixer_map(index: &mut ProjectIndex) {
+    let mut edges: Vec<(ClassId, Mixer)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        let Ok(raw) = u32::try_from(i) else { continue };
+        let mixer = ClassId(raw);
+        for name in class.includes.iter().chain(&class.prepends) {
+            if let Some(module) = index.resolve_const(&class.nesting, name) {
+                edges.push((module, Mixer { class: mixer, extends: false }));
+            }
+        }
+        for name in &class.extends {
+            if let Some(module) = index.resolve_const(&class.nesting, name) {
+                edges.push((module, Mixer { class: mixer, extends: true }));
+            }
+        }
+    }
+    for (module, mixer) in edges {
+        if module != mixer.class {
+            index.mixers.entry(module).or_default().push(mixer);
+        }
+    }
+}
+
 fn build_subclass_map(index: &mut ProjectIndex) {
     let edges: Vec<(ClassId, ClassId)> = (0..index.classes.len())
         .filter_map(|i| {
@@ -5781,19 +5867,30 @@ fn apply_one_extended_hook(index: &mut ProjectIndex, extender: ClassId, module: 
     };
     let class = &mut index.classes[extender.0 as usize];
     for (name, span, file) in instance {
-        class
-            .methods
-            .entry(name)
-            .or_insert_with(|| hook_install_sig(span, file));
+        install_hook_method(&mut class.methods, name, span, file);
     }
     for (name, span, file) in singleton {
-        class
-            .singleton_methods
-            .entry(name)
-            .or_insert_with(|| hook_install_sig(span, file));
+        install_hook_method(&mut class.singleton_methods, name, span, file);
     }
     if opaque {
         merge_open(index, extender, OpenReason::EvalOrSend);
+    }
+}
+
+/// First-wins for the body, as every merge here. An install over a method
+/// the extender already defines runs when `extend` runs, so the written
+/// signature of that method is no longer proven to govern it.
+fn install_hook_method(
+    methods: &mut FxHashMap<String, MethodSig>,
+    name: String,
+    span: (usize, usize),
+    file: SourceFile,
+) {
+    match methods.entry(name) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(hook_install_sig(span, file));
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),
     }
 }
 
@@ -6167,10 +6264,14 @@ fn apply_singleton_patches(index: &mut ProjectIndex) {
             }
         }
         for md in &frag.singleton_methods {
-            class
-                .singleton_methods
-                .entry(md.name.clone())
-                .or_insert_with(|| method_sig(md, file, &frag.nesting));
+            match class.singleton_methods.entry(md.name.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(method_sig(md, file, &frag.nesting));
+                }
+                // The body kept here is still the first one, but the patch
+                // redefined it: no written signature is proven to govern.
+                std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),
+            }
         }
         if frag.open {
             class.open = true;
@@ -7511,6 +7612,56 @@ fn merge_source_method(
     methods.insert(definition.name.clone(), method);
 }
 
+/// A redefinition the merge cannot order keeps a body for inference but
+/// never a Sorbet contract, inline or RBI (`sorbet_annotated` blocks the
+/// RBI lookup the same way a written but unusable `sig` does).
+fn poison_contract(method: &mut MethodSig) {
+    method.sorbet_sig = None;
+    method.sorbet_annotated = true;
+}
+
+/// Name-keyed redefinitions written from outside the class body
+/// (`X.class_eval { def m }`, `X.define_method(:m)`, `X.send(:alias_method,
+/// ...)`, `X.instance_eval`, a string eval on `X`) poison the contracts of
+/// the names they define on every track. A body that cannot be read, or an
+/// injected module whose methods cannot be enumerated, poisons every
+/// contract of the class. A receiver no constant names stays out of reach,
+/// as it is for every other check.
+fn poison_injected_contracts(index: &mut ProjectIndex) {
+    let hits: Vec<(ClassId, Option<Vec<String>>)> = index
+        .keyed_raw
+        .iter()
+        .filter_map(|(target, nesting, source)| {
+            let target = target.as_deref()?.trim_start_matches("::");
+            let id = index
+                .resolve_const(nesting, target)
+                .or_else(|| index.by_path.get(target).copied())?;
+            let names = match source {
+                PollutionSource::Names(n) => Some(n.clone()),
+                PollutionSource::Module(path) => module_method_names(index, nesting, path),
+                PollutionSource::Opaque => None,
+            };
+            Some((id, names))
+        })
+        .collect();
+    for (id, names) in hits {
+        let class = &mut index.classes[id.0 as usize];
+        match names {
+            Some(names) => {
+                for name in &names {
+                    class.methods.get_mut(name).map(poison_contract);
+                    class.singleton_methods.get_mut(name).map(poison_contract);
+                }
+            }
+            None => class
+                .methods
+                .values_mut()
+                .chain(class.singleton_methods.values_mut())
+                .for_each(poison_contract),
+        }
+    }
+}
+
 /// Result of a method lookup on a project class.
 #[derive(Debug)]
 pub enum MethodLookup<'a> {
@@ -7940,6 +8091,70 @@ impl ProjectIndex {
             }
         }
         false
+    }
+
+    /// Can a call typed at `owner` reach any body other than this exact
+    /// definition (`file`, `def_span`) of `name`? Walks every class a
+    /// receiver typed `owner` may really be: subclasses, and for a module
+    /// its includers and prependers, with an `extend` moving the walk to
+    /// that extender's singleton track. Each one must either leave the
+    /// name alone (no mixins, not open, no own definition) or resolve it,
+    /// through the checker's own lookup, back to this very definition.
+    /// Anything else — an override, a mixin answering first, an open
+    /// member, an inconclusive lookup — is a divergence, fail-closed.
+    pub fn contract_dispatch_diverges(
+        &self,
+        owner: ClassId,
+        name: &str,
+        singleton: bool,
+        file: SourceFile,
+        def_span: (usize, usize),
+    ) -> bool {
+        let mut stack = vec![(owner, singleton)];
+        let mut seen = FxHashSet::default();
+        while let Some((cur, on_singleton)) = stack.pop() {
+            if !seen.insert((cur, on_singleton)) {
+                continue;
+            }
+            let kids = self.subclasses.get(&cur).into_iter().flatten().map(|&k| (k, on_singleton));
+            let mixed = self.mixers.get(&cur).into_iter().flatten().filter_map(|m| match (m.extends, on_singleton) {
+                (false, track) => Some((m.class, track)),
+                (true, false) => Some((m.class, true)),
+                // Extending a module never exposes its singleton methods.
+                (true, true) => None,
+            });
+            for (kid, track) in kids.chain(mixed).collect::<Vec<_>>() {
+                crate::check::note_contract_work(|w| w.family_visits += 1);
+                if self.member_diverges(kid, name, track, file, def_span) {
+                    return true;
+                }
+                stack.push((kid, track));
+            }
+        }
+        false
+    }
+
+    fn member_diverges(
+        &self,
+        id: ClassId,
+        name: &str,
+        singleton: bool,
+        file: SourceFile,
+        def_span: (usize, usize),
+    ) -> bool {
+        let class = self.class(id);
+        if class.open || self.include_time_code.contains(&id) {
+            return true;
+        }
+        let own = if singleton { &class.singleton_methods } else { &class.methods };
+        let mixes = !class.includes.is_empty()
+            || !class.prepends.is_empty()
+            || (singleton && !class.extends.is_empty());
+        if !mixes {
+            return own.contains_key(name);
+        }
+        let found = if singleton { self.lookup_singleton(id, name) } else { self.lookup_method(id, name) };
+        !matches!(found, MethodLookup::Found(m, _) if m.file == file && m.def_span == def_span)
     }
 
     /// The refined instance-track counterpart of `descendant_defines`

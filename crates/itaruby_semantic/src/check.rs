@@ -211,6 +211,7 @@ fn check_file_inner(
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -542,6 +543,7 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -609,6 +611,7 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -704,6 +707,7 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -779,6 +783,7 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -908,6 +913,41 @@ enum NarrowKind {
     NilCheckOrGuard,
 }
 
+type Contract = (crate::sorbet_sig::SorbetSig, Vec<String>);
+type ContractKey = (SourceFile, (usize, usize), String);
+
+/// Work the Sorbet contract path did on this thread, counted so that a
+/// regression test can bound it without a wall clock.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContractWork {
+    /// Family members `ProjectIndex::contract_dispatch_diverges` visited.
+    pub family_visits: u64,
+    /// Uncached `effective_sorbet` answers.
+    pub contract_resolutions: u64,
+    /// `sig_fill` calls on the return path.
+    pub return_probes: u64,
+}
+
+thread_local! {
+    static CONTRACT_WORK: std::cell::Cell<ContractWork> = std::cell::Cell::new(ContractWork::default());
+}
+
+/// This thread's contract work so far.
+#[doc(hidden)]
+#[must_use]
+pub fn contract_work() -> ContractWork {
+    CONTRACT_WORK.with(std::cell::Cell::get)
+}
+
+pub(crate) fn note_contract_work(update: impl FnOnce(&mut ContractWork)) {
+    CONTRACT_WORK.with(|cell| {
+        let mut work = cell.get();
+        update(&mut work);
+        cell.set(work);
+    });
+}
+
 struct Checker<'db> {
     db: &'db dyn salsa::Database,
     index: &'db ProjectIndex,
@@ -929,6 +969,8 @@ struct Checker<'db> {
     /// Explicit `return` types of the method body currently being inferred.
     returns: Vec<Ty>,
     return_memo: FxHashMap<(ClassId, String, bool), Ty>,
+    /// `effective_sorbet` answers by definition and called name.
+    contract_memo: std::cell::RefCell<FxHashMap<ContractKey, Option<Contract>>>,
     /// Bead ita-mv5: same `(ClassId, name, singleton)` key as
     /// `return_memo`, written/read alongside it — only ever holds an
     /// entry when the memoized return WAS `Ty::Unknown` (a known return
@@ -1461,40 +1503,59 @@ impl Checker<'_> {
         if method.sorbet_sig.is_none() && (method.sorbet_annotated || self.rbi_map.is_none()) {
             return None;
         }
-        let path = method.nesting.last()?;
-        let (name, singleton) = self.dispatching_name(method, name, path)?;
-        if method.sorbet_annotated {
-            return method.sorbet_sig.clone().map(|sig| (sig, method.nesting.clone()));
+        // Every call to the method asks, and the answer is fixed by the
+        // definition while the index is.
+        let key = (method.file, method.def_span, name.to_owned());
+        if let Some(hit) = self.contract_memo.borrow().get(&key) {
+            return hit.clone();
         }
-        let declaration = crate::index::source_rbi_method(path, name, singleton, self.rbi_map?)?;
-        if !declaration.matches_source(method) {
-            return None;
-        }
-        declaration.definition.sorbet_sig.map(|sig| (sig, declaration.nesting))
+        note_contract_work(|w| w.contract_resolutions += 1);
+        let contract = self.resolve_contract(method, name);
+        self.contract_memo.borrow_mut().insert(key, contract.clone());
+        contract
     }
 
-    /// The name and dispatch track this exact definition answers on, or
-    /// `None` when the owner is open or a descendant redefines the name —
-    /// in both cases no signature written here is proven to govern the
-    /// call that reaches it.
+    /// `effective_sorbet`'s uncached half.
+    fn resolve_contract(
+        &self,
+        method: &MethodSig,
+        name: &str,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        let path = method.nesting.last()?;
+        let (owner, name, singleton) = self.dispatching_name(method, name, path)?;
+        // Cheap first: most unsigned methods have no RBI declaration, and
+        // the dispatch walk below visits a whole family.
+        let contract = if method.sorbet_annotated {
+            method.sorbet_sig.clone().map(|sig| (sig, method.nesting.clone()))
+        } else {
+            let declaration = crate::index::source_rbi_method(path, name, singleton, self.rbi_map?)?;
+            if !declaration.matches_source(method) {
+                return None;
+            }
+            declaration.definition.sorbet_sig.map(|sig| (sig, declaration.nesting))
+        }?;
+        let diverges = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);
+        (!diverges).then_some(contract)
+    }
+
+    /// The owner, name and dispatch track this exact definition answers
+    /// on, or `None` when the owner is open: no signature written there is
+    /// proven to govern the call that reaches it.
     fn dispatching_name<'n>(
         &self,
         method: &MethodSig,
         name: &'n str,
         path: &str,
-    ) -> Option<(&'n str, bool)> {
+    ) -> Option<(ClassId, &'n str, bool)> {
         let owner = *self.index.by_path.get(path)?;
         let class = self.index.class(owner);
         if class.open {
             return None;
         }
-        let name = if name == "new" && class.methods.get("initialize").is_some_and(|m| {
-            m.file == method.file && m.def_span == method.def_span
-        }) { "initialize" } else { name };
-        let singleton = class.singleton_methods.get(name).is_some_and(|m| {
-            m.file == method.file && m.def_span == method.def_span
-        });
-        (!self.index.descendant_defines(owner, name, singleton)).then_some((name, singleton))
+        let same = |m: &MethodSig| m.file == method.file && m.def_span == method.def_span;
+        let name = if name == "new" && class.methods.get("initialize").is_some_and(same) { "initialize" } else { name };
+        let singleton = class.singleton_methods.get(name).is_some_and(same);
+        Some((owner, name, singleton))
     }
 
     fn sorbet_of_def(
@@ -4754,11 +4815,8 @@ impl Checker<'_> {
             self.set_ret_cause(None);
             return Ty::Unknown;
         }
-        let declared = self.sig_fill(m, name);
-        if declared != Ty::Unknown {
-            self.set_ret_cause(None);
-            return declared;
-        }
+        // A memo entry is only ever written after `sig_fill` answered
+        // Unknown for this same key, so it is read first.
         let key = (class, name.to_string(), singleton);
         if let Some(t) = self.return_memo.get(&key) {
             let t = t.clone();
@@ -4773,6 +4831,11 @@ impl Checker<'_> {
             };
             self.set_ret_cause(cause);
             return t;
+        }
+        let declared = self.sig_fill(m, name);
+        if declared != Ty::Unknown {
+            self.set_ret_cause(None);
+            return declared;
         }
         if !self.in_progress.insert(key.clone()) {
             self.set_ret_cause(None);
@@ -4851,6 +4914,7 @@ impl Checker<'_> {
     /// Consumer types use the explicit contract; the source body is checked
     /// independently by `check_method_body`, never against this assumed result.
     fn sig_fill(&self, m: &MethodSig, name: &str) -> Ty {
+        note_contract_work(|w| w.return_probes += 1);
         self.effective_sorbet(m, name)
             .filter(|(sig, _)| !sig.void)
             .and_then(|(sig, nesting)| sig.ret.map(|expr| {

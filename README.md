@@ -60,7 +60,11 @@ name (E0103). A client RBI supplies the same contracts only when it matches
 the Ruby definition exactly: owner, instance or class-method track, and
 parameter layout. Everything else stays silent rather than guessed:
 generics, procs, overloads, rest and block parameters, duplicate
-definitions, open classes, and stale or conflicting RBIs. Keep running
+definitions or any other redefinition (a `class << X` patch, a hook, a
+`class_eval`), open classes, and stale or conflicting RBIs. Two known
+gaps follow from that: `Foo.new(...)` is not checked against
+`initialize`'s `sig`, and a method with a `*rest`, `**kwrest`, `&block` or
+post parameter loses its whole contract, the return type included. Keep running
 `srb tc` alongside itaruby to preserve your existing Sorbet checks.
 
 ## Quick start

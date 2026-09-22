@@ -2312,39 +2312,15 @@ impl DefWalker<'_> {
     fn harvest_extended_call(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
         let name = String::from_utf8_lossy(call.name().as_slice()).into_owned();
         match name.as_str() {
-            "delegate" => match hook_delegate_names(call) {
-                Some(names) => {
-                    for (n, span) in names {
-                        self.fragments[i].hook_instance_installs.push((n, span));
-                    }
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },
-            "define_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_instance_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },
-            // Bead ita-dsm: the SINGLETON spelling of the same install.
-            // `base.define_singleton_method(:values) { ... }` puts the
-            // name on the extender's class object, which is exactly the
-            // track `extend` dispatches on — discourse's
-            // `Migrations::Enum` (`migrations/core/lib/migrations/common/
-            // enum.rb`) installs `valid?` and `values` this way and four
-            // census residue records read as conclusive misses on them.
-            "define_singleton_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_singleton_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },
+            "delegate" => self.harvest_hook_delegate(i, call),
+            "define_method" => self.harvest_hook_define(i, call, false),
+            // Bead ita-dsm: the SINGLETON spelling of the same install —
+            // `base.define_singleton_method(:values) { ... }` puts the name
+            // on the extender's class object, the very track `extend`
+            // dispatches on. discourse's `Migrations::Enum` installs
+            // `valid?`/`values` this way (four census residue records were
+            // conclusive misses on them).
+            "define_singleton_method" => self.harvest_hook_define(i, call, true),
             "class_eval" | "module_eval" | "class_exec" | "module_exec" => {
                 self.harvest_extended_eval_block(i, call);
             }
@@ -2352,6 +2328,43 @@ impl DefWalker<'_> {
                 self.fragments[i].hook_installs_opaque = true;
             }
             _ => {}
+        }
+    }
+
+    /// `extend M`'s `delegate :a, :b, to: ...` files each named method on
+    /// the extender's instance surface; an unreadable form makes the whole
+    /// install opaque. Split from `harvest_extended_call` for the ceiling.
+    fn harvest_hook_delegate(&mut self, i: usize, call: &ruby_prism::CallNode<'_>) {
+        match hook_delegate_names(call) {
+            Some(names) => {
+                for (n, span) in names {
+                    self.fragments[i].hook_instance_installs.push((n, span));
+                }
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
+        }
+    }
+
+    /// `define_method`/`define_singleton_method` in a hook body: a literal
+    /// name is filed (on the singleton surface when `singleton`, else the
+    /// instance surface); a non-literal name makes the install opaque.
+    fn harvest_hook_define(
+        &mut self,
+        i: usize,
+        call: &ruby_prism::CallNode<'_>,
+        singleton: bool,
+    ) {
+        match hook_define_method_name(call) {
+            Some(n) => {
+                let loc = call.location();
+                let span = (loc.start_offset(), loc.end_offset());
+                if singleton {
+                    self.fragments[i].hook_singleton_installs.push((n, span));
+                } else {
+                    self.fragments[i].hook_instance_installs.push((n, span));
+                }
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
         }
     }
 
@@ -7973,65 +7986,57 @@ impl ProjectIndex {
         if kernel_hit {
             return MethodLookup::Inconclusive;
         }
-        // Singleton-track family (e): the stdlib's own class-object
-        // surface. `FileUtils.mkdir_p`, `SecureRandom.uuid`,
-        // `Kernel.rand` are real methods living in no project index —
-        // 270 of discourse's explicit-receiver residue sites and the
-        // single largest family left. Mechanically harvested, never
-        // hand-listed (`declarations/stdlib_singletons.txt`).
-        if singleton && stdlib_singleton_method(&self.class(id).path, name) {
+        let softened = if singleton {
+            self.singleton_surface_softens(id, name)
+        } else {
+            // The instance-side dynamic mixin: a module mixed into
+            // instances by a runtime `include`/`prepend` the walker could
+            // not resolve, keyed on the method name.
+            self.dynamic_mixin_covers(&self.dynamic_mixin_instance_targets, name)
+        };
+        if softened {
             return MethodLookup::Inconclusive;
+        }
+        MethodLookup::NotFound
+    }
+
+    /// The class-object-only softenings, split from `soften_not_found` so
+    /// the parent stays under the complexity ceiling. Order and
+    /// short-circuit are identical to the inline sequence they replaced;
+    /// each arm keeps the measurement that justifies it. Softening only —
+    /// never a signature, so no arity is manufactured from a method this
+    /// index never read.
+    fn singleton_surface_softens(&self, id: ClassId, name: &str) -> bool {
+        // Singleton-track family (e): the stdlib's own class-object
+        // surface. `FileUtils.mkdir_p`, `SecureRandom.uuid`, `Kernel.rand`
+        // are real methods living in no project index — 270 of discourse's
+        // explicit-receiver residue sites and the single largest family
+        // left. Mechanically harvested (`declarations/stdlib_singletons.txt`).
+        if stdlib_singleton_method(&self.class(id).path, name) {
+            return true;
         }
         // Bead ita-sgl: the stdlib `Singleton` mixin. `include Singleton`
         // runs `Singleton.included(klass)`, whose body does
         // `klass.extend SingletonClassMethods` — so the includer's CLASS
-        // OBJECT gains exactly `instance`, `_load` and `clone`
-        // (verified against the running interpreter:
-        // `Class.new { include Singleton }.singleton_class.ancestors`
-        // is `[#<Class:...>, Singleton::SingletonClassMethods,
-        // #<Class:Object>]`). No project fragment holds those names, so
-        // `ActionDispatch::ServerTiming::Subscriber.instance`
-        // (`actionpack/lib/action_dispatch/middleware/server_timing.rb:49`)
-        // and `ActiveModel::NullMutationTracker.instance`
-        // (`activemodel/lib/active_model/dirty.rb:395`) read as a
-        // conclusive miss on code that runs — 3 of rails' 33 residue
-        // records.
-        //
-        // DOUBLY KEYED, never blanket: the RECEIVER's own resolved
-        // ancestry must contain the constant `Singleton` (a project
-        // `Singleton` shadowing the stdlib one is the same constant this
-        // lookup walks, so no guess is involved — rails itself reopens
-        // `module Singleton` in
-        // `activesupport/lib/active_support/core_ext/object/duplicable.rb:71`,
-        // which is why these sites resolve their chain at all), AND the
-        // NAME must be one of the three that mixin really installs.
-        // Softening only — never a signature, so no arity can be
-        // manufactured from a method this index never read.
-        if singleton
-            && matches!(name, "instance" | "_load" | "clone")
-            && self.includes_singleton_mixin(id)
-        {
-            return MethodLookup::Inconclusive;
+        // OBJECT gains exactly `instance`, `_load` and `clone`. DOUBLY
+        // KEYED, never blanket: the receiver's own resolved ancestry must
+        // contain the constant `Singleton`, AND the name must be one of the
+        // three that mixin really installs.
+        if matches!(name, "instance" | "_load" | "clone") && self.includes_singleton_mixin(id) {
+            return true;
         }
         // The mocking gems' class-object surface (`X.any_instance`):
-        // name-keyed, lock-gated — see `apply_mock_singleton_surface`'s
-        // doc comment for the measurement and the mechanism choice.
-        // Receiver-blind by construction (every class object gets the
-        // name from the gem), so ONLY the name may carry the proof, and
-        // only while this project's own lock declares a gem that really
-        // installs it.
-        if singleton && self.mock_singleton_methods.iter().any(|m| m == name) {
-            return MethodLookup::Inconclusive;
+        // name-keyed, lock-gated (see `apply_mock_singleton_surface`).
+        // Receiver-blind by construction, so ONLY the name may carry the
+        // proof, and only while this project's lock declares a gem that
+        // really installs it.
+        if self.mock_singleton_methods.iter().any(|m| m == name) {
+            return true;
         }
-        let targets = if singleton {
-            &self.dynamic_mixin_singleton_targets
-        } else {
-            &self.dynamic_mixin_instance_targets
-        };
-        if self.dynamic_mixin_covers(targets, name) {
-            return MethodLookup::Inconclusive;
-        }
-        MethodLookup::NotFound
+        // The dynamic singleton mixin: a module extended onto the class
+        // object by a runtime call the walker could not resolve, keyed on
+        // the method name.
+        self.dynamic_mixin_covers(&self.dynamic_mixin_singleton_targets, name)
     }
 
     /// Bead ita-sgl: does `id`'s resolved ancestry include the constant

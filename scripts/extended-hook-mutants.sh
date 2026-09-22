@@ -160,28 +160,13 @@ else
 fi
 
 mutant MUT-A "$IDX" \
-  '            "delegate" => match hook_delegate_names(call) {
-                Some(names) => {
-                    for (n, span) in names {
-                        self.fragments[i].hook_instance_installs.push((n, span));
-                    }
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },' \
+  '            "delegate" => self.harvest_hook_delegate(i, call),' \
   '            "delegate" => {}' \
   delegate_hook_install_is_exactly_the_named_method \
   'the delegate arm stops filing: the hook names nothing'
 
 mutant MUT-B "$IDX" \
-  '            "define_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_instance_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },' \
+  '            "define_method" => self.harvest_hook_define(i, call, false),' \
   '            "define_method" => {}' \
   define_method_hook_install_resolves_silently \
   'the define_method arm stops filing'
@@ -247,44 +232,50 @@ mutant MUT-H "$IDX" \
   'a class_eval argument stops failing closed: a string body installs whatever it says'
 
 mutant MUT-I "$IDX" \
-  '            "define_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_instance_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
+  '        match hook_define_method_name(call) {
+            Some(n) => {
+                let loc = call.location();
+                let span = (loc.start_offset(), loc.end_offset());
+                if singleton {
+                    self.fragments[i].hook_singleton_installs.push((n, span));
+                } else {
+                    self.fragments[i].hook_instance_installs.push((n, span));
                 }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },' \
-  '            "define_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_instance_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
+        }' \
+  '        match hook_define_method_name(call) {
+            Some(n) => {
+                let loc = call.location();
+                let span = (loc.start_offset(), loc.end_offset());
+                if singleton {
+                    self.fragments[i].hook_singleton_installs.push((n, span));
+                } else {
+                    self.fragments[i].hook_instance_installs.push((n, span));
                 }
-                None => {}
-            },' \
+            }
+            None => {}
+        }' \
   dynamic_define_method_hook_opens_the_extender \
   'a non-literal define_method stops failing closed: the name it installed is never read'
 
 mutant MUT-J "$IDX" \
-  '            "delegate" => match hook_delegate_names(call) {
-                Some(names) => {
-                    for (n, span) in names {
-                        self.fragments[i].hook_instance_installs.push((n, span));
-                    }
+  '        match hook_delegate_names(call) {
+            Some(names) => {
+                for (n, span) in names {
+                    self.fragments[i].hook_instance_installs.push((n, span));
                 }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },' \
-  '            "delegate" => match hook_delegate_names(call) {
-                Some(names) => {
-                    for (n, span) in names {
-                        self.fragments[i].hook_instance_installs.push((n, span));
-                    }
+            }
+            None => self.fragments[i].hook_installs_opaque = true,
+        }' \
+  '        match hook_delegate_names(call) {
+            Some(names) => {
+                for (n, span) in names {
+                    self.fragments[i].hook_instance_installs.push((n, span));
                 }
-                None => {}
-            },' \
+            }
+            None => {}
+        }' \
   dynamic_delegate_hook_opens_the_extender \
   'a non-literal delegate stops failing closed: the names it installed are never read'
 

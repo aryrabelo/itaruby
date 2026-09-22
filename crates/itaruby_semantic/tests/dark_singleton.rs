@@ -81,7 +81,7 @@ fn included_hook_typo_accuses_on_the_class_object_track() {
     assert_eq!(
         diags,
         vec![
-            "22:8:E0101 undefined method `default_scope_nmae` for class `Record`".to_string()
+            "19:8:E0101 undefined method `default_scope_nmae` for class `Record`".to_string()
         ],
         "the residue bucket is exactly what the armed track accuses"
     );

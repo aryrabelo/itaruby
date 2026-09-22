@@ -671,16 +671,21 @@ fn sclass_call_attr_reader_arity_is_checked() {
     assert_eq!(diags("sclass_call_attr_arity_accuses.rb"), vec!["7:8:E0102"]);
 }
 
-/// The ground-truth side of the typo: MRI raises `NoMethodError` on
-/// `Config.endpointt` (line 5). The checker stays silent — the
-/// singleton `NotFound` arm is characterized in
-/// `singleton_lookup.rs` — but the fixture pins WHY a filed name
-/// matters: without the filing this call site is indistinguishable
-/// from the typo by the index.
+/// The armed side of the typo: MRI raises `NoMethodError` on
+/// `Config.endpointt` (line 5), because `endpoint` is filed on the
+/// singleton surface by `singleton_class.attr_accessor :endpoint`
+/// (line 2). Before the class-object flip this was census residue and
+/// the checker stayed silent; after it, the receiver is conclusively
+/// closed and the misspelling is E0101 at the call — the same win as
+/// the two Sorbet rows. The filing is what makes the receiver closed
+/// rather than inconclusive; without it this site would be an
+/// unprovable `NotFound`, not a diagnostic.
 #[test]
-fn sclass_call_attr_typo_stays_characterized_silent() {
-    let d = diags("sclass_call_attr_typo_would_be_not_found.rb");
-    assert!(d.is_empty(), "expected characterized silence, got {d:?}");
+fn sclass_call_attr_typo_accuses_after_the_flip() {
+    assert_eq!(
+        diags("sclass_call_attr_typo_would_be_not_found.rb"),
+        vec!["5:8:E0101"]
+    );
 }
 
 /// The concern edge is the gate: a module that calls `class_methods do`
@@ -1064,7 +1069,7 @@ fn singleton_mixin_instance_never_accuses() {
 fn singleton_mixin_typo_accuses_after_the_flip() {
     let (_, _, open) = facts("singleton_mixin_typo_stays_closed.rb", "SglTypoTracker");
     assert!(!open, "the receiver must stay closed or the control proves nothing");
-    assert_eq!(diags("singleton_mixin_typo_stays_closed.rb"), vec!["19:19:E0101"]);
+    assert_eq!(diags("singleton_mixin_typo_stays_closed.rb"), vec!["19:16:E0101"]);
 }
 
 /// Bead ita-blk: the `class` keyword inside a class-body block defines

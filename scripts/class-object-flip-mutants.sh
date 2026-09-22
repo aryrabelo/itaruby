@@ -226,20 +226,16 @@ mutant CO-C "$IDX" \
   'the class-object chain stops at Class/Module: Object/Kernel reopenings go unread'
 
 mutant CO-D "$IDX" \
-  '        if singleton
-            && matches!(name, "instance" | "_load" | "clone")
-            && self.includes_singleton_mixin(id)
-        {
-            return MethodLookup::Inconclusive;
+  '        if matches!(name, "instance" | "_load" | "clone") && self.includes_singleton_mixin(id) {
+            return true;
         }' \
   '' \
   singleton_mixin_instance_never_accuses \
   'the include-Singleton softening is cut'
 
 mutant CO-E "$IDX" \
-  '            && matches!(name, "instance" | "_load" | "clone")
-            && self.includes_singleton_mixin(id)' \
-  '            && self.includes_singleton_mixin(id)' \
+  'matches!(name, "instance" | "_load" | "clone") && self.includes_singleton_mixin(id)' \
+  'self.includes_singleton_mixin(id)' \
   singleton_mixin_typo_accuses_after_the_flip \
   'the Singleton softening loses its NAME gate and swallows the typo too'
 
@@ -257,15 +253,7 @@ mutant CO-G "$IDX" \
   'the registered fragment is born CLOSED: a body nobody read becomes a surface'
 
 mutant CO-H "$IDX" \
-  '            "define_singleton_method" => match hook_define_method_name(call) {
-                Some(n) => {
-                    let loc = call.location();
-                    self.fragments[i]
-                        .hook_singleton_installs
-                        .push((n, (loc.start_offset(), loc.end_offset())));
-                }
-                None => self.fragments[i].hook_installs_opaque = true,
-            },' \
+  '            "define_singleton_method" => self.harvest_hook_define(i, call, true),' \
   '' \
   define_singleton_method_hook_lands_on_the_extenders_class_object \
   'the singleton spelling of a hook install stops being filed'

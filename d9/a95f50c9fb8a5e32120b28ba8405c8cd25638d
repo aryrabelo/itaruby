@@ -1,0 +1,46 @@
+.software-factory/locks/generated.lock.json
+  h_b156936c57c455 5
+AGENTS.md
+  h_b156936c57c455 548-560
+crates/itaruby/src/main.rs
+  h_b156936c57c455 665
+crates/itaruby_semantic/declarations/core_inventory.txt
+  h_b156936c57c455 1112-1215
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 14,119-124,3431-3448
+crates/itaruby_semantic/src/core.rs
+  h_b156936c57c455 478-485,631-670
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 7364-7369
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 43,128-226
+docs/CHANGELOG.md
+  h_b156936c57c455 11-26
+scripts/dark-singleton-summary
+  h_b156936c57c455 43,52-53,56-63
+scripts/gen-core-inventory.rb
+  h_b156936c57c455 85-107
+scripts/singleton-mutants.sh
+  h_b156936c57c455 62-70,82,85,95-96,112,364-379,382-383,393
+testdata/dark_singleton/class_body_kernel_tail_still_silent.rb
+  h_b156936c57c455 1-14
+testdata/dark_singleton/kernel_tail_bare_call_family_silent.rb
+  h_b156936c57c455 1-55
+testdata/dark_singleton/kernel_tail_raise_silently.rb
+  h_b156936c57c455 1-25
+testdata/dark_singleton/project_defined_raise_wins_over_inventory.rb
+  h_b156936c57c455 1-17
+testdata/dark_singleton/singleton_tail_typo_still_closed.rb
+  h_b156936c57c455 1-11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d9a95f50c9fb8a5e32120b28ba8405c8cd25638d",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

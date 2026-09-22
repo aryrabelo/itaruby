@@ -1,0 +1,44 @@
+AGENTS.md
+  h_b156936c57c455 360,636-659
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 39-44,456-472,540-542,560-561,580-649,740-755,811,813,815,825-842,845,858,873-986,1740-1822,2506,3803-3982,4236-4250,4336-4343,4471-4478,4486-4493,4503-4515,4842-4928
+crates/itaruby_semantic/tests/mixin_attribution.rs
+  h_b156936c57c455 1-263
+docs/CHANGELOG.md
+  h_b156936c57c455 11-39
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 152-155,159
+scripts/mixin-attribution-mutants.sh
+  h_b156936c57c455 1-256
+testdata/mixin_attribution/attributed_literal_receiver_resolves_silently.rb
+  h_b156936c57c455 1-31
+testdata/mixin_attribution/attributed_receiver_across_files_call_site.rb
+  h_b156936c57c455 1-23
+testdata/mixin_attribution/attributed_receiver_across_files_definition.rb
+  h_b156936c57c455 1-27
+testdata/mixin_attribution/attributed_receiver_from_ternary_resolves_silently.rb
+  h_b156936c57c455 1-49
+testdata/mixin_attribution/foreign_class_eval_defs_are_not_filed_here.rb
+  h_b156936c57c455 1-33
+testdata/mixin_attribution/interpolated_eval_defs_resolve_silently.rb
+  h_b156936c57c455 1-37
+testdata/mixin_attribution/interpolated_eval_unlisted_name_accuses.rb
+  h_b156936c57c455 1-30
+testdata/mixin_attribution/singleton_track_stays_closed.rb
+  h_b156936c57c455 1-33
+testdata/mixin_attribution/ternary_without_method_missing_still_accuses.rb
+  h_b156936c57c455 1-41
+testdata/mixin_attribution/unattributed_dynamic_receiver_still_accuses.rb
+  h_b156936c57c455 1-27
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "bddae94c912d5d6663bb346fef3511c01cdc2d38",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

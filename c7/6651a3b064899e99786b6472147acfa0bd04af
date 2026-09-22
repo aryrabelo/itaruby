@@ -1,0 +1,22 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 1431-1445,2044-2048,2668-2673,2683,2702,2800-2801,2812
+crates/itaruby_semantic/tests/singleton_track.rs
+  h_b156936c57c455 128-170,648-769
+scripts/singleton-mutants.sh
+  h_b156936c57c455 40-50,239-290
+testdata/singleton_track/sclass_define_method_is_not_an_instance_method.rb
+  h_b156936c57c455 1-15
+testdata/singleton_track/sclass_define_method_resolves_silently.rb
+  h_b156936c57c455 1-24
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c76651a3b064899e99786b6472147acfa0bd04af",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

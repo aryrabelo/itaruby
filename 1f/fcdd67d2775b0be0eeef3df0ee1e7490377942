@@ -1,0 +1,14 @@
+scripts/singleton-mutants.sh
+  h_b156936c57c455 18-23,36-39,72-76
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1ffcdd67d2775b0be0eeef3df0ee1e7490377942",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

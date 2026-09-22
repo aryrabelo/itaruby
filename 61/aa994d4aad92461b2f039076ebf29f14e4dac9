@@ -1,0 +1,36 @@
+AGENTS.md
+  h_b156936c57c455 545-552
+crates/itaruby/src/main.rs
+  h_b156936c57c455 6-9,329-331,337,345-347,354,358-436,438-439,453-455,476,487,497-499,512-513,517,519-528,530-537,630-683,709-711,717,719,724-726,765
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 94-120,124-143,189-190,226,228,231,520-521,587-588,682-683,757-758,903-907,1074,2814,2846-2866,2947,3424-3439,3447-3452,4869,4873
+crates/itaruby_semantic/src/lib.rs
+  h_b156936c57c455 16-17
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 1-126
+docs/CHANGELOG.md
+  h_b156936c57c455 11-23
+scripts/dark-singleton-summary
+  h_b156936c57c455 1-67
+testdata/dark_singleton/extend_correct.rb
+  h_b156936c57c455 1-13
+testdata/dark_singleton/extend_typo.rb
+  h_b156936c57c455 1-19
+testdata/dark_singleton/included_hook_typo.rb
+  h_b156936c57c455 1-19
+testdata/dark_singleton/open_receiver_typo.rb
+  h_b156936c57c455 1-14
+testdata/dark_singleton/stdlib_receiver.rb
+  h_b156936c57c455 1-4
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "61aa994d4aad92461b2f039076ebf29f14e4dac9",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

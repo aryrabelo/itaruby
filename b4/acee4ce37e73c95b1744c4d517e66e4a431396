@@ -1,0 +1,30 @@
+scripts/gate-digest
+  h_b156936c57c455 266
+scripts/gate-triage
+  h_b156936c57c455 1-303
+scripts/gate-triage-fixture/answers/bad.json
+  h_b156936c57c455 1-3
+scripts/gate-triage-fixture/answers/perf-fail.json
+  h_b156936c57c455 1-6
+scripts/gate-triage-fixture/loaded/load.txt
+  h_b156936c57c455 1
+scripts/gate-triage-fixture/rev-drift/transcript.txt
+  h_b156936c57c455 1-33
+scripts/gate-triage-fixture/skipped/transcript.txt
+  h_b156936c57c455 1-35
+scripts/gate-triage-selftest.sh
+  h_b156936c57c455 1-283
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 212-224
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b4acee4ce37e73c95b1744c4d517e66e4a431396",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

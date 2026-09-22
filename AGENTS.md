@@ -886,6 +886,45 @@ Per-run artifacts land in `target/gauntlet/` (gitignored).
 4. Remove stale or contradictory text.
 5. Run verification when relevant.
 6. Report any docs intentionally left unchanged and why.
+7. Close through the `closing` gate (below) before the pull request.
+
+### The closing gate — asked of Jev, every time a change closes
+
+"The gates passed" used to be a sentence in a hand-off. It is now the
+`closing` gate in `.software-factory/policy.yaml`, and three rules hold it:
+
+- `L3.GATE_HAS_FRESH_EVIDENCE` — `scripts/closing-evidence` runs
+  `./scripts/dev gates` on the committed tree, writes
+  `.software-factory/evidence/closing-run.json` (the gate digest with every
+  private-corpus revision removed, plus seven assertions policy requires) and
+  `sf seal closing` binds it to the implementation digest. Any later change to
+  the checker, a baseline, a mutant family or the gate scripts expires it.
+- `L4.CLAIM_CITES_ITS_EVIDENCE` — the sentence below is the closing claim and
+  names the gate that proves it.
+- `L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE` — `scripts/claim-judge-gate` asks
+  TypeSafe's Jev (reference oracle from nicolasmelo1/software-factory#63,
+  `scripts/claim-judge.mjs`) whether that report supports that sentence:
+  `supports` at confidence ≥ 0.8, and a negated twin (the `supports` and
+  `says_nothing` criteria swapped) that must be REFUSED, or the oracle is
+  approving anything. The deterministic part runs first: the question must
+  carry the marked sentence and the sealed report byte for byte, so re-running
+  the gates or rewording the claim without re-asking Jev is red. Verdicts are
+  cached in `.software-factory/evidence/jev/closing.cache.json` and committed.
+
+Where it is enforced: CI on every pull request (`sf check --allow-commands`,
+nothing filtered, no TypeSafe key — a verdict missing from the cache is red).
+The pre-commit hook runs `scripts/sf-check-local`, which tolerates exactly
+the two closing findings (printed, not hidden) so a commit is not forced to
+be a closing. Needs `TYPESAFE_API_KEY` locally; the request leaves the
+machine, so nothing private may enter the report — `closing-evidence` strips
+corpus revisions and error-set hashes and the corpus ids are the generic ones.
+It proves corpus-c on this machine only; corpus-a/b still need
+`./scripts/dev anchor` on `work`, exactly as before.
+
+To close: commit, run `scripts/closing-evidence`, commit the files it names.
+
+<!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
+At the closing commit every gate `./scripts/dev gates` runs on this machine passed: the corpus gate proved corpus-c with zero new errors, the public corpora showed no drift, every per-fix source mutant was accused by a named test, the drift detectors were proven to fire, and the checker source was untouched after the mutants ran.
 
 ## Child DOX Index
 

@@ -140,8 +140,8 @@ cmd_anchor() {
   # SKIPs both corpora green); the run happens in a disposable worktree so
   # another agent's checkout never moves; the map is COPIED into it (a fresh
   # worktree has none); the sha is fetched from $ANCHOR_REMOTE, default
-  # `private`, since `origin` on work is the public squash-rooted repo and
-  # cannot carry this history; PERF_COLUMN=ci because work has no measured
+  # `origin` (the public repo IS the repository since 2026-09-22; before
+  # that, `private`); PERF_COLUMN=ci because work has no measured
   # dev column and a copied ceiling is a fabricated measurement; ruby by
   # ABSOLUTE path, because `brew` itself is not on a non-interactive ssh
   # PATH — `$(brew --prefix ruby)` expands to nothing there and gate 0b
@@ -151,7 +151,7 @@ cmd_anchor() {
   local wt="~/Sites/worktrees/ita-anchor-${sha:0:7}"
   local keep="~/Sites/temp-files/ita-anchor-${sha:0:7}-\$(date +%Y%m%d-%H%M%S)"
   out=$(ssh "$WORK_HOST" "cd ~/Sites/personal-team/itaruby \
-    && git fetch -q ${ANCHOR_REMOTE:-private} \
+    && git fetch -q ${ANCHOR_REMOTE:-origin} \
     && git worktree add -f --detach $wt $sha \
     && cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt $wt/scripts/corpora-local.txt \
     && cd $wt \

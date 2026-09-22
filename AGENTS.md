@@ -558,7 +558,7 @@ Anchor flow (run gates on `work` against an exact sha, in a disposable
 worktree — never disturb the checkout another agent may be using):
 
 ```sh
-ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q private main && \
+ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q origin main && \
   git worktree add -f --detach ~/Sites/worktrees/ita-anchor-<slug> <sha> && \
   cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt \
      ~/Sites/worktrees/ita-anchor-<slug>/scripts/corpora-local.txt && \
@@ -574,17 +574,21 @@ corpora while the transcript still ends in `PASS (incomplete)` (learned
 2026-09-18, binding, measured). Read the `corpus gate proved:` line and
 require it to name `corpus-a` AND `corpus-b` before calling an anchor green.
 
-The sha travels through the `private` remote, never `origin` (learned
-2026-09-21, binding, measured): since the 2026-09-18 split, `origin` on
-`work` is the PUBLIC repo (`aryrabelo/itaruby`, a squash-rooted curated
-history that shares no ancestor with this one), so `git fetch -q origin`
-there fetches nothing this repository commits, and the anchor fails with
-`fatal: invalid reference: <sha>` — twice in one night before the remote
-was read. `work` now carries `private -> git@github.com:aryrabelo/itaruby-private.git`;
-`scripts/dev anchor` fetches from `$ANCHOR_REMOTE` (default `private`) and
-builds the disposable worktree exactly as the block above does. The public
-repo is synced by cherry-pick with the lead's decision, never by a push of
-`main`: `git push public main` is rejected as non-fast-forward by design.
+The split is over (2026-09-22): `aryrabelo/itaruby` (public) is THE
+repository; `aryrabelo/itaruby-private` is an archive that receives nothing
+new. On 2026-09-22 the 21 commits the public lacked were cherry-picked onto
+it with their original messages after a mechanical secrecy audit (every
+segment of the corpus path and of the anchor host's name counted across
+messages and tree: zero new hits), and the trees were proved byte-identical
+before each push. Until then the two repos shared no ancestor, `origin` on
+`work` fetched nothing this repository committed, and the anchor failed
+with `fatal: invalid reference: <sha>` — twice in one night before the
+remote was read (learned 2026-09-21, binding, measured). `scripts/dev
+anchor` fetches from `$ANCHOR_REMOTE`, default `origin`; on `work` the
+`private` remote may still exist and is never the answer. Every commit
+message, PR title and PR body is a public surface from the first byte — the
+secrecy wall's five surfaces above are no longer "audited before sync",
+they are live.
 
 Explicit `PATH` because a non-interactive ssh shell does not load
 `~/.cargo/bin` — without it `sf` and friends "don't exist" on `work` even when

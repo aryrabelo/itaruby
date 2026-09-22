@@ -49,6 +49,12 @@ every would-be accusation on the three public corpora until the residue
 was 8 records across rails/mastodon/discourse, each read and proven to
 raise under MRI.
 
+This alpha is not a replacement for Sorbet in annotated projects. Support
+for existing Sorbet `sig`s and RBI files is partial, including extraction
+of some return types. Full contract checking of parameters and returns,
+and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
+alongside itaruby to preserve your existing Sorbet checks.
+
 ## Quick start
 
 ```sh

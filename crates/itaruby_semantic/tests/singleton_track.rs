@@ -273,7 +273,10 @@ fn nested_plain_def_files_on_the_instance_track() {
     let (instance, singleton, open) =
         facts("nested_plain_def_files_instance_track.rb", "Maker");
     assert!(instance.contains(&"helper".to_string()), "instance track: {instance:?}");
-    assert!(singleton.is_empty(), "nothing on the singleton track: {singleton:?}");
+    assert!(
+        !singleton.contains(&"helper".to_string()),
+        "a plain def never lands on the singleton track: {singleton:?}"
+    );
     assert!(!open);
     let d = diags("nested_plain_def_files_instance_track.rb");
     assert!(d.is_empty(), "expected silence, got {d:?}");

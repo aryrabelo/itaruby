@@ -38,10 +38,10 @@ jobs:
   suite:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - name: Release build (zero warnings is the contract)
-        run: cargo build --release 2>&1 | tee target/build.txt; ! grep -q '^warning' target/build.txt
+        run: mkdir -p target && cargo build --release 2>&1 | tee target/build.txt && ! grep -q '^warning' target/build.txt
       - name: cargo test --workspace
         run: cargo test --workspace
       - name: Unwrap shape (every production unwrap is a prism downcast)
@@ -55,7 +55,7 @@ jobs:
     outputs:
       families: ${{ steps.ls.outputs.families }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: ls
         run: |
           fams=$(ls scripts/*-mutants.sh | xargs -n1 basename | sed 's/-mutants\.sh$//' | grep -vx instrument | jq -R . | jq -sc .)
@@ -71,7 +71,7 @@ jobs:
         family: ${{ fromJson(needs.plan.outputs.families) }}
     name: mutants (${{ matrix.family }})
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: mutants
@@ -93,11 +93,15 @@ jobs:
   instruments:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      # instrument-mutants exercises replay.sh, which reads the release
-      # binary gate b has already built by the time the local gauntlet
-      # reaches c2b; a fresh runner has none (measured: first CI run).
+      # replay.sh, exercised by instrument-mutants, is judged by ruby and
+      # reads the release binary gate b has already built by the time the
+      # local gauntlet reaches c2b; a fresh runner has neither (measured:
+      # first two CI runs).
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
       - run: cargo build --release
       - name: Evidence instruments (instrument-mutants)
         run: ./scripts/instrument-mutants.sh
@@ -113,7 +117,7 @@ jobs:
   perf:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - run: cargo bench -p itaruby_semantic --bench check -- --noplot
       - env:
@@ -124,7 +128,7 @@ jobs:
   navigation:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - uses: ruby/setup-ruby@v1
         with:
@@ -138,7 +142,7 @@ jobs:
   inference:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
       - uses: ruby/setup-ruby@v1
         with:
@@ -160,9 +164,9 @@ jobs:
     env:
       PUBLIC_CORPORA_ROOT: ${{ github.workspace }}/../public-corpora
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         id: corpora
         with:
           path: ${{ env.PUBLIC_CORPORA_ROOT }}

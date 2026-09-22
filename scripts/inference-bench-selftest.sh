@@ -24,6 +24,11 @@
 # tree instead of the mutated copy (the 2026-09-17 positive-control trap).
 set -uo pipefail
 
+# BSD sed wants `-i ''`, GNU sed wants `-i` with no argument; both accept a
+# temp file and a move (measured: the first CI run on ubuntu failed every
+# mutant with "can't read s/.../: No such file or directory").
+sed_inplace() { local expr=$1 file=$2; sed "$expr" "$file" >"$file.tmp" && mv "$file.tmp" "$file"; }
+
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 ITA=$ROOT/target/release/ita
@@ -104,7 +109,7 @@ check_mutant() {
 
 say 'M1 the bug is silently fixed — an `accuse` fixture that no longer raises'
 rebuild_lab
-sed -i '' 's/total_cent$/total_cents/' "$LAB/$CASES/open_class_reopen_typo/no_annotations/plain.rb"
+sed_inplace 's/total_cent$/total_cents/' "$LAB/$CASES/open_class_reopen_typo/no_annotations/plain.rb"
 check_mutant 'M1 runtime no longer proves the bug' 'open_class_reopen_typo' 'MRI exited 0'
 
 say 'M2 a `silent` fixture that actually raises — silence would be a false negative'
@@ -119,7 +124,7 @@ check_mutant 'M3 fairness leg drift' 'method_missing_proxy' 'NOT the same progra
 
 say 'M4 the pinned sigil is changed under the bench'
 rebuild_lab
-sed -i '' '1s/.*/# typed: false/' "$LAB/$CASES/attr_reader_typo/no_annotations/plain.rb"
+sed_inplace '1s/.*/# typed: false/' "$LAB/$CASES/attr_reader_typo/no_annotations/plain.rb"
 check_mutant 'M4 sigil drift' 'attr_reader_typo' 'manifest pins'
 
 say 'M5 an expected itaruby diagnostic line is wrong'
@@ -147,7 +152,7 @@ say 'M10 the positive control stops raising — it controls for nothing'
 rebuild_lab
 # Repair the planted typo. MRI now exits 0, so the control can no longer
 # tell "correctly silent" from "blind", and the bench must say so.
-sed -i '' 's/config\.hostt/config.host/' "$LAB/$CASES/define_method_loop/positive_control/plain.rb"
+sed_inplace 's/config\.hostt/config.host/' "$LAB/$CASES/define_method_loop/positive_control/plain.rb"
 check_mutant 'M10 positive control no longer raises' 'define_method_loop' 'controls for nothing'
 
 say 'M11 a positive control directory the manifest does not declare'

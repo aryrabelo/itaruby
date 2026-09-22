@@ -12,7 +12,7 @@ jobs:
   factory:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Install sf
@@ -31,7 +31,7 @@ jobs:
   tests:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Rust test suite
         run: cargo test --workspace
       - name: Gem test suite
@@ -50,11 +50,11 @@ jobs:
       contents: read
       pull-requests: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Committed secrets
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Dependency vulnerabilities
@@ -70,7 +70,7 @@ jobs:
   perf:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # The launch bar for this project is beating an established
       # typechecker on speed, and until now nothing in CI would have
       # noticed a ten-times regression. The ceiling that decides pass/fail
@@ -90,7 +90,7 @@ jobs:
   races:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # `ita check` fans every file out across threads and the LSP server
       # shares a queue plus a cancel set between two threads, so this is
       # not a single-threaded program that could honestly disable the rule.

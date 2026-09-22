@@ -1,0 +1,223 @@
+name: gauntlet
+
+# The gates from scripts/gauntlet-gates.sh, fanned out. On one machine the
+# ten mutant families run in series because each one rewrites the source
+# in place (AGENTS.md: a concurrent reader reads a mutant); here every
+# family gets its own runner, so the wall time is the longest family, not
+# the sum. Wave-of-2026-09-21 measurement on the dev machine under load:
+# ~5 h in series.
+#
+# What is NOT here, on purpose:
+#   gate d  - the three private corpora never leave the machines that host
+#             them; the local `./scripts/dev gates` + `anchor` stay the only
+#             proof of corpus-a/b/c.
+#   gate c  - the testdata mutation probe is inline in gauntlet-gates.sh and
+#             runs there (two seconds; not worth a second convention).
+# So a green run here is the gauntlet's `PASS (incomplete)` by construction,
+# never a full proof. The corpus anchor still decides a merge.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gauntlet-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  # Gate a + b + c2: the suite, a warning-free release build, and the
+  # unwrap shape over production source.
+  suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Release build (zero warnings is the contract)
+        run: mkdir -p target && cargo build --release 2>&1 | tee target/build.txt && ! grep -q '^warning' target/build.txt
+      - name: cargo test --workspace
+        run: cargo test --workspace
+      - name: Unwrap shape (every production unwrap is a prism downcast)
+        run: ./scripts/unwrap-gate.sh
+
+  # Gate c1 needs one job per harness. The list is read from the tree so a
+  # branch that adds a family (e.g. class-object-flip) is covered on that
+  # branch and main is not asked for a file it does not have.
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      families: ${{ steps.ls.outputs.families }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: ls
+        run: |
+          fams=$(ls scripts/*-mutants.sh | xargs -n1 basename | sed 's/-mutants\.sh$//' | grep -vx instrument | jq -R . | jq -sc .)
+          echo "families=$fams" >> "$GITHUB_OUTPUT"
+          echo "$fams"
+
+  mutants:
+    needs: plan
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        family: ${{ fromJson(needs.plan.outputs.families) }}
+    name: mutants (${{ matrix.family }})
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutants
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      # A dead anchor costs a family, so the count runs first, as gate c1
+      # does locally (scripts/mutant-anchors: refuses while a harness holds
+      # the tree, which cannot happen on a fresh runner).
+      - name: Every needle matches exactly once
+        run: ./scripts/mutant-anchors
+      - name: ${{ matrix.family }} mutants (each accused by a named test, source restored byte-identical)
+        run: ./scripts/${{ matrix.family }}-mutants.sh
+      - name: Tree is clean after the harness
+        if: always()
+        run: git status --porcelain && test -z "$(git status --porcelain)"
+
+  # Gate c1's Python family owns its temporary source tree and anchor checks;
+  # the shell-family discovery above intentionally remains unchanged.
+  ancestry-mutants:
+    name: mutants (conflicting-superclasses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Ancestry and alias source mutants (isolated public-source copy)
+        run: python3 scripts/conflicting-superclasses-mutants.py
+
+  # Gate c2b/c2c: the evidence producers and the reporters, two-sided.
+  instruments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      # replay.sh, exercised by instrument-mutants, is judged by ruby and
+      # reads the release binary gate b has already built by the time the
+      # local gauntlet reaches c2b; a fresh runner has neither (measured:
+      # first two CI runs).
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - run: cargo build --release
+      - name: Evidence instruments (instrument-mutants)
+        run: ./scripts/instrument-mutants.sh
+      - name: gate-digest selftest
+        run: ./scripts/gate-digest-selftest.sh
+      - name: gate-triage selftest (offline by construction)
+        run: ./scripts/gate-triage-selftest.sh
+      - name: public-gate selftest
+        run: ./scripts/public-gate-selftest.sh
+      - name: public drift attribution selftest
+        run: ./scripts/public-drift-attrib-selftest.sh
+
+  # Gate c3: the loose column, asked for explicitly. Keying off $CI is the
+  # trap AGENTS.md names; a copied ceiling is a fabricated measurement.
+  perf:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo bench -p itaruby_semantic --bench check -- --noplot
+      - env:
+          PERF_COLUMN: ci
+        run: ./scripts/perf-gate.sh --no-run
+
+  # Gate e: navigation oracle against the versioned fixture.
+  navigation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - run: cargo build --release
+      - run: ./scripts/nav-gate.sh scripts/navfixture/oracle.jsonl
+
+  # Gate g: the annotation-free bench, MRI as ground truth, srb pinned to
+  # the version the ledger was measured against (a different version is a
+  # skip of that leg by the bench's own rule, never a silent pass).
+  inference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.4'
+      - name: Pinned sorbet
+        run: gem install sorbet -v 0.6.13437 --no-document
+      - run: cargo build --release
+      - run: ./scripts/inference-bench-selftest.sh
+      - run: ./scripts/inference-gate.sh
+
+  # Gate f: the four public Rails apps, each at its pinned sha, cloned
+  # shallow and cached by the declaration's hash. The script never clones
+  # here (PUBLIC_GATE_CLONE unset): a missing clone is this job's bug, not
+  # a skip. PUBLIC_COLUMN selects measured hosted-runner ceilings explicitly;
+  # the dev-machine ratchet remains untouched. Only the declared missing
+  # GitLab baseline is an accepted incomplete result, never another SKIP.
+  public:
+    runs-on: ubuntu-latest
+    env:
+      PUBLIC_CORPORA_ROOT: ${{ github.workspace }}/../public-corpora
+      PUBLIC_COLUMN: ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v6
+        id: corpora
+        with:
+          path: ${{ env.PUBLIC_CORPORA_ROOT }}
+          key: public-corpora-${{ hashFiles('scripts/public-corpora.txt', 'scripts/public-baseline/*.jsonl') }}
+      - name: Shallow-clone each declared repo at its pinned sha
+        if: steps.corpora.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$PUBLIC_CORPORA_ROOT"
+          grep -v '^#' scripts/public-corpora.txt | while read -r id url sha ceiling clone_dir; do
+            [ -n "$id" ] || continue
+            [ -s "scripts/public-baseline/$id.jsonl" ] || continue
+            dir="$PUBLIC_CORPORA_ROOT/${clone_dir:-$id}"
+            git init -q "$dir"
+            git -C "$dir" remote add origin "$url"
+            git -C "$dir" fetch -q --depth 1 origin "$sha"
+            git -C "$dir" checkout -q FETCH_HEAD
+            echo "$id @ $(git -C "$dir" rev-parse --short HEAD)"
+          done
+      - run: cargo build --release
+      - name: Public corpus gate (only GitLab baseline may be absent)
+        run: |
+          mkdir -p target/gauntlet
+          if ./scripts/public-gate.sh | tee target/gauntlet/public-verdict.txt; then
+            exit 0
+          else
+            rc=$?
+          fi
+          [ "$rc" -eq 2 ] &&
+            grep -Fxq 'public corpus gate skipped (not judged on this machine): public corpus (gitlab-foss)' target/gauntlet/public-verdict.txt
+      # The verdict names target/gauntlet/public-<id>-drift.txt; without
+      # this the runner deletes it and a red reads as "3 gone" with no
+      # way to see which three (measured 2026-09-22: two red runs, zero
+      # lines of drift readable). Public corpora only — the private
+      # ones never run here.
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: public-gate
+          path: target/gauntlet/public-*
+          if-no-files-found: ignore

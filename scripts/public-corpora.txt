@@ -13,7 +13,7 @@
 # the diffs are written in the clear).
 #
 # Format: one repo per line, whitespace-separated:
-#   <id> <git-url> <pinned-sha> <time_ceiling_s> [<clone-dir>]
+#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>]
 # `<pinned-sha>` is the exact default-branch HEAD these numbers were measured
 # against, pinned so a repo rename/rebase cannot silently move the corpus
 # under a baseline. Clone the repo into $PUBLIC_CORPORA_ROOT/<id>; a missing
@@ -30,10 +30,10 @@
 # semantics stand unchanged (a missing or wrong-HEAD canonical clone is a
 # SKIP, or a repair under PUBLIC_GATE_CLONE=1).
 #
-# `time_ceiling_s` is a real measured number on the measuring machine, set
-# to the anchored wall time x1.5 (rounded up) when the baseline was
-# generated — slack is debt (AGENTS.md, binding), so a comfortably-under
-# reading is tightened in the same commit.
+# Ceilings are measured per machine: PUBLIC_COLUMN=dev (default) reads the
+# first number; PUBLIC_COLUMN=ci reads the second, never a fallback to dev.
+# An absent or malformed selected ceiling FAILS. Each measured ceiling is
+# anchored wall time x1.5, rounded up — slack is debt (AGENTS.md, binding).
 #
 # Pins, all from `git ls-remote <url> HEAD`:
 #   2026-09-02  rails 3df2cbea2027026a29edb92cbb7e336a63e35444
@@ -59,7 +59,16 @@
 #
 # Slack is debt (AGENTS.md, binding): a comfortably-under reading means
 # tighten the ceiling in the same commit.
-rails https://github.com/rails/rails 6610cb45b39b6a2c1f260f90bbe920b5899f844b 3 rails-head
-mastodon https://github.com/mastodon/mastodon 2c92a56e5d0fb490cc2e49a0dd9652499000fcb4 2 mastodon-head
-discourse https://github.com/discourse/discourse eff621544daf344ce70e470b7f54f27bc75b68d9 10 discourse-head
+#
+# CI column: ubuntu-latest public job 106770382792, release build at
+# 49819636ab294d35eb71f9ebc57de7ee309d036c, 2026-09-22:
+# https://github.com/aryrabelo/itaruby/actions/runs/35735079298
+# Official job log measured rails 4.238s, mastodon 1.258s, discourse 22.667s.
+# Applying the SAME x1.5/round-up contract gives 7s, 2s, 35s. These are
+# hosted-runner anchors, not evidence of a parent/head performance change.
+# Dev ceilings remain the measured M5 values above. GitLab remains unmeasured
+# in CI and has no CI ceiling; its missing baseline still produces a SKIP.
+rails https://github.com/rails/rails 6610cb45b39b6a2c1f260f90bbe920b5899f844b 3:7 rails-head
+mastodon https://github.com/mastodon/mastodon 2c92a56e5d0fb490cc2e49a0dd9652499000fcb4 2:2 mastodon-head
+discourse https://github.com/discourse/discourse eff621544daf344ce70e470b7f54f27bc75b68d9 10:35 discourse-head
 gitlab-foss https://gitlab.com/gitlab-org/gitlab-foss.git 4a42053c3a8274a18d5d71fff2f88ba23e5a69e9 600

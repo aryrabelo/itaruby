@@ -12,7 +12,7 @@
 #      missing baseline, or a broken ita binary — the summary names which
 #
 # Repos are declared one per line in scripts/public-corpora.txt:
-#   <id> <git-url> <pinned-sha> <time_ceiling_s> [<clone-dir>]
+#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>]
 # (ids: rails, mastodon, discourse, gitlab-foss — public code, so no
 # secrecy wall here; the diagnostic baseline for each id is stored IN THE
 # CLEAR in scripts/public-baseline/<id>.jsonl, normalized by stripping each
@@ -66,6 +66,13 @@ CLONE_ROOT=${PUBLIC_CORPORA_ROOT:-$HOME/Sites/temp-files/public-corpora}
 ATTRIB=${PUBLIC_ATTRIB:-$ROOT/scripts/public-drift-attrib}
 ART=${ART:-$ROOT/target/gauntlet}
 SRB_TIMEOUT=600
+# Like PERF_COLUMN, this is explicit: a local shell exporting CI must not
+# silently trade its measured dev ceiling for a hosted-runner ceiling.
+COLUMN=${PUBLIC_COLUMN:-dev}
+if [[ $COLUMN != dev && $COLUMN != ci ]]; then
+  printf 'FAIL public corpus: PUBLIC_COLUMN must be dev or ci, got %q\n' "$COLUMN"; exit 1
+fi
+printf 'public gate: column=%s\n' "$COLUMN"
 
 # The artifact directory MUST exist before anything writes into it. Until
 # 2026-09-17 it did not: on a fresh tree (or after `rm -rf target/`),
@@ -261,11 +268,23 @@ while read -r id url sha ceiling clone_dir; do
 
   # Wall-time ceiling. Slack is debt (AGENTS.md, binding): the ceiling is a
   # real measured number per machine, set to measured time x1.5 (rounded up)
-  # when the baseline was anchored — never invented.
-  if python3 -c "import sys; sys.exit(0 if $elapsed > $ceiling else 1)"; then
-    bad "public time ceiling ($id): ${elapsed}s > ${ceiling}s"
+  # when the baseline was anchored — never invented. A missing CI number
+  # fails closed: another machine's column is not a fallback measurement.
+  dev_ceiling=${ceiling%%:*}
+  ci_ceiling=
+  [[ $ceiling == *:* ]] && ci_ceiling=${ceiling#*:}
+  case $COLUMN in
+    dev) limit=$dev_ceiling ;;
+    ci)  limit=$ci_ceiling ;;
+  esac
+  if [[ -z $limit ]]; then
+    bad "public time ceiling ($id): no $COLUMN ceiling measured (declare <dev>:<ci> in $CORPORA_FILE; never copy the other column)"
+  elif [[ ! $limit =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    bad "public time ceiling ($id): invalid $COLUMN ceiling $limit"
+  elif python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= float(sys.argv[2]) else 1)' "$elapsed" "$limit"; then
+    ok "public time ceiling ($id): ${elapsed}s <= ${limit}s"
   else
-    ok "public time ceiling ($id): ${elapsed}s <= ${ceiling}s"
+    bad "public time ceiling ($id): ${elapsed}s > ${limit}s (or comparison failed)"
   fi
 
   if (( SRB_PRESENT )); then

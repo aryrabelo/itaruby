@@ -165,14 +165,102 @@ PY
   git_clean -C "$1" config user.name probe
   git_clean -C "$1" add -A >/dev/null 2>&1
   git_clean -C "$1" commit -qm seed >/dev/null 2>&1
+  # The lab fabricates the DISK PRECONDITION the replay cases need, the
+  # same way it already fabricates `cargo` and `ita`: replay.sh refuses to
+  # create a worktree under a 6 GiB floor, so on a machine below the floor
+  # both replay cases would report "mutant did NOT reproduce" with an empty
+  # witness — a broken fixture wearing the words of a real finding
+  # (AGENTS.md, binding). This `df` always answers "plenty".
+  #
+  # It fabricates the RESOURCE, never the PORTABILITY: it is a strict POSIX
+  # `df`, so it rejects the BSD-only `-g` that GNU `df` also rejects, and
+  # refuses any path outside this lab the way a Linux box refuses
+  # /System/Volumes/Data. Those were exactly the two macOS assumptions that
+  # made replay.sh judge NOTHING on the first Linux run of the gauntlet
+  # workflow (2026-09-22) while this harness blamed the mutant. Written
+  # this way the stub ACCUSES that defect on every platform instead of
+  # hiding it: reintroduce either assumption and both replay cases go red.
+  cat >"$1/fakebin/df" <<'DF'
+#!/bin/sh
+# An unset root would make the path guard below a bare `*` — permissive,
+# and silently so. Refuse instead.
+: "${LAB_DF_ROOT:?lab df: LAB_DF_ROOT unset}"
+root=${LAB_DF_ROOT%/}
+for a in "$@"; do
+  case $a in
+    -P | -k | -Pk | -kP) ;;
+    -*) echo "df: invalid option -- '${a#-}'" >&2; exit 1 ;;
+    "$root" | "$root"/*) ;;
+    *) echo "df: $a: No such file or directory" >&2; exit 1 ;;
+  esac
+done
+echo 'Filesystem 1024-blocks Used Available Capacity Mounted on'
+echo 'lab 104857600 1048576 103809024 1% /'
+DF
+  chmod +x "$1/fakebin/df"
 }
 run_replay() { # DIR TAG
   ( cd "$1" && PATH="$1/fakebin:$PATH" \
       BUG_REPLAY_CORPORA="$corpora" BUG_REPLAY_WORKTREES="$LAB/wts-$2" \
-      PROBE_WITNESS="$1/witness.txt" \
+      PROBE_WITNESS="$1/witness.txt" LAB_DF_ROOT="$LAB" \
       bash "$1/scripts/bug-replay/replay.sh" --repos rails --limit 1 --skip-srb \
       >>"$1/log.txt" 2>&1 )
 }
+
+# Probe the generated df itself: the resource is fake, but the path/option
+# contract must still reject Linux-incompatible calls and sibling prefixes.
+say 'case replay-df-paths — normalized root, children, never sibling prefixes'
+df_lab=$LAB/df-contract
+mk_replay "$df_lab" "$ROOT/scripts/bug-replay/replay.sh"
+df_probe() { # PROGRAM ROOT PATH -> transcript; return actual df status
+  LAB_DF_ROOT="$2" "$1" -Pk "$3" 2>&1
+}
+for root in "$LAB" "$LAB/"; do
+  for path in "$LAB" "$LAB/child"; do
+    text=$(df_probe "$df_lab/fakebin/df" "$root" "$path"); rc=$?
+    if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+      ok 'df accepts lab root and descendants with either root spelling'
+    else bad "df rejects valid lab path $path (root $root)"; fi
+  done
+done
+text=$(df_probe "$df_lab/fakebin/df" "$LAB" "${LAB}-sibling"); rc=$?
+if (( rc != 0 )) && [[ $text == *'No such file or directory'* ]]; then
+  ok 'df rejects sibling prefix'
+else bad 'df accepted sibling prefix'; fi
+text=$(LAB_DF_ROOT="$LAB" "$df_lab/fakebin/df" -g "$LAB" 2>&1); rc=$?
+if (( rc != 0 )) && [[ $text == *'invalid option'* ]]; then
+  ok 'df rejects BSD-only option'
+else bad 'df accepted BSD-only option'; fi
+
+for name in raw-root sibling-prefix; do
+  case $name in
+    raw-root) needle='root=${LAB_DF_ROOT%/}'; replacement='root=$LAB_DF_ROOT' ;;
+    sibling-prefix) needle='"$root" | "$root"/*)'; replacement='"$root"*)' ;;
+  esac
+  mutant=$df_lab/df-$name
+  if ! mutate "$df_lab/fakebin/df" "$mutant" "$needle" "$replacement" ||
+      cmp -s "$df_lab/fakebin/df" "$mutant"; then
+    bad "INVALIDO-cmp: df $name"; continue
+  fi
+  if ! sh -n "$mutant"; then bad "INVALIDO-parse: df $name"; continue; fi
+  chmod +x "$mutant"
+  case $name in
+    raw-root)
+      text=$(df_probe "$mutant" "$LAB/" "$LAB"); rc=$?
+      if (( rc != 0 )) && [[ $text == *'No such file or directory'* ]]; then
+        ok 'df raw-root mutant falsely rejects normalized ancestor'
+      else bad 'df raw-root mutant did NOT reproduce'; fi ;;
+    sibling-prefix)
+      text=$(df_probe "$mutant" "$LAB" "${LAB}-sibling"); rc=$?
+      if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+        ok 'df sibling-prefix mutant accepts outside path'
+      else bad 'df sibling-prefix mutant did NOT reproduce'; fi ;;
+  esac
+  text=$(df_probe "$mutant" "$LAB" "$LAB/child"); rc=$?
+  if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+    ok "df $name mutant preserves valid descendant"
+  else bad "df $name mutation breaks valid descendant"; fi
+done
 
 # ---------- case 2: replay run isolation ----------
 say 'case replay-run-isolation — two invocations must never share one results file'

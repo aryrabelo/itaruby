@@ -13,29 +13,16 @@
 //! already resolved trivially (any assignment registers its own name,
 //! regardless of what the RHS is).
 //!
-//! Fix (`crates/itaruby_semantic/src/index.rs`): `ProjectIndex::const_aliases`
-//! records every such write (LHS full path -> (write-site lexical
-//! nesting, RHS path as written)); `const_exists`'s qualified branch
-//! tries `resolve_const_via_alias` as a fallback when `resolve_const`
-//! fails to resolve the prefix, chasing the alias chain (each hop
-//! resolved from ITS OWN write-site scope, matching real Ruby) with a
-//! cycle guard and a hop cap — a miss degrades silently, never a panic.
-//! `resolve_const` itself is untouched: it must stay lexical-only per its
-//! own doc comment (widening it could manufacture a false
-//! E0101/E0102/E0103, invariant #1).
+//! `ProjectIndex::const_aliases` records the write-site scope and literal
+//! RHS. Class resolution and constant existence share a bounded path walk,
+//! reevaluating each RHS in that scope. Only proven identities become types;
+//! cycles, exhausted hop budgets, and conflicting ancestry remain unknown.
+//! Plain value constants retain their independent membership checks.
 //!
-//! MUTANTS THIS FILE MUST CATCH:
-//!   1. The `.or_else(|| self.resolve_const_via_alias(...))` fallback
-//!      dropped from `const_exists` -> both `*_nested_access_resolves`
-//!      tests fail (the false E0104 comes back).
-//!   2. `resolve_const_via_alias`'s cycle guard (`visited`) removed ->
-//!      `cycle_alias_silent.rb` spins forever instead of completing —
-//!      caught simply by this whole test binary finishing.
-//!   3. `resolve_const_via_alias` widened to resolve unconditionally on a
-//!      miss (e.g. returning some arbitrary `ClassId` instead of `None`)
-//!      -> both negative-control tests
-//!      (`alias_to_undefined_name_stays_a_genuine_miss`,
-//!      `no_alias_negative_control_still_warns`) wrongly go silent.
+//! These fixtures distinguish valid alias resolution from genuine missing
+//! members/non-literal RHSs. `ancestry_review_controls` and the isolated
+//! ancestry mutant harness additionally exercise per-hop scope barriers,
+//! lexical-alias precedence, cycles, and the shared traversal budget.
 
 fn dir() -> &'static str {
     concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/const_alias")
@@ -117,18 +104,18 @@ fn qualified_alias_nested_access_resolves() {
     );
 }
 
-/// Mutant 2: a cyclic alias chain must never hang or panic, and (mutant
-/// 3's other half) must never fabricate a suppression for a reference
-/// that genuinely resolves nowhere.
+/// Mutant 2: a cyclic alias chain must never hang or panic. Under the
+/// shared tri-state walk a cycle is INCONCLUSIVE, not a proven miss, so a
+/// reference through it is suppression-only (no E0104) — the `Ambiguous`
+/// arm of `ConstResolution`, never fabricating a type either. The
+/// genuine-missing controls below still accuse, so this silence is scoped
+/// to real uncertainty, not a blanket suppressor.
 #[test]
 fn alias_cycle_degrades_to_silent_miss_without_panic() {
     let diags = check_single("cycle_alias_silent.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].contains("E0104"), "expected E0104, got: {:?}", diags[0]);
     assert!(
-        diags[0].contains("ConstAliasCycleA::NOPE"),
-        "message should name the unresolved reference, got: {:?}",
-        diags[0]
+        diags.is_empty(),
+        "a cyclic alias is inconclusive, not a proven miss: expected no diagnostic, got: {diags:?}"
     );
 }
 
@@ -278,11 +265,9 @@ fn control_member_through_alias_still_accuses() {
     );
 }
 
-/// Mutant (b): a cyclic alias reached via a multi-segment reference must
-/// degrade to a silent miss (genuine E0104), never hang. Bounded by the
-/// whole test's own harness timeout, but asserted explicitly here too so
-/// a regression reads as a normal test failure instead of a wedged CI
-/// job.
+/// A cyclic alias reached via a multi-segment reference is inconclusive:
+/// it proves neither a class identity nor absence. Bound the probe so a
+/// cycle-guard regression cannot hang CI.
 #[test]
 fn alias_cycle_through_nested_access_never_hangs() {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -294,13 +279,7 @@ fn alias_cycle_through_nested_access_never_hangs() {
         .recv_timeout(std::time::Duration::from_secs(10))
         .expect("cyclic alias through a nested reference must not hang");
     let ref_diags = &diags[1];
-    assert_eq!(ref_diags.len(), 1, "expected exactly 1 diagnostic, got: {ref_diags:?}");
-    assert!(ref_diags[0].contains("E0104"), "expected E0104, got: {:?}", ref_diags[0]);
-    assert!(
-        ref_diags[0].contains("ConstAlias47yCycleA::Deep::NOPE"),
-        "message should name the unresolved reference, got: {:?}",
-        ref_diags[0]
-    );
+    assert!(ref_diags.is_empty(), "cyclic alias uncertainty must not emit E0104: {ref_diags:?}");
 }
 
 /// Negative control: a non-literal RHS (`X = SomeCall.call`, `X = 42`) is

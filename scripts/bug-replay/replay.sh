@@ -96,16 +96,40 @@ trap 'write_manifest yes' EXIT
 HAVE_SRB=0
 command -v srb >/dev/null && [[ $skip_srb -eq 0 ]] && HAVE_SRB=1
 
+# avail_gib DIR -> whole GiB available on the filesystem that will HOLD DIR.
+# `df` cannot measure a path that does not exist yet, so the walk climbs to
+# the nearest existing ancestor.
+#
+# `df -Pk` is POSIX: portable block size, portable one-line-per-filesystem
+# output. Until 2026-09-22 this read `df -g /System/Volumes/Data` — two
+# macOS assumptions in one line, the BSD-only `-g` flag and an Apple volume
+# path — so on Linux `df` failed, `avail` came back empty, and EVERY
+# worktree hit the "unknown GiB free" abort below. replay.sh then judged
+# nothing, and the two replay cases of scripts/instrument-mutants.sh
+# reported "mutant did NOT reproduce the defect" with an empty witness: a
+# broken fixture wearing the words of a real finding (AGENTS.md, binding).
+# Measured on the first Linux run of the gauntlet workflow, 2026-09-22.
+#
+# Measuring $WTROOT rather than a hardcoded volume is also the only honest
+# reading: the floor exists to protect the disk the worktrees land on, and
+# nothing says that is the boot volume.
+avail_gib() {
+  local d=$1
+  while [[ -n $d && $d != / && ! -d $d ]]; do d=$(dirname "$d"); done
+  [[ -d $d ]] || return 1
+  df -Pk "$d" 2>/dev/null | awk 'NR==2 {print int($4 / 1048576)}'
+}
+
 # ensure_wt ID SHA -> echoes the worktree dir, or fails
 ensure_wt() {
   local wt="$WTROOT/$1/$2" avail
   [[ -f $wt/.git ]] && { echo "$wt"; return 0; }
   # disk guard: a worktree add materializes git objects; under the floor it
   # must abort loudly, not fill the last GiBs (this machine crashed that way once)
-  avail=$(df -g /System/Volumes/Data 2>/dev/null | awk 'NR==2 {print $4}')
+  avail=$(avail_gib "$WTROOT")
   if [[ -z $avail || $avail -lt 6 ]]; then
-    printf 'replay: ABORT — %s GiB free on /System/Volumes/Data (floor: 6 GiB); refusing to create worktree %s\n' \
-      "${avail:-unknown}" "$wt" >&2
+    printf 'replay: ABORT — %s GiB free on the filesystem holding %s (floor: 6 GiB); refusing to create worktree %s\n' \
+      "${avail:-unknown}" "$WTROOT" "$wt" >&2
     return 3
   fi
   git -C "$CORPORA/$1" worktree add --detach "$wt" "$2" >/dev/null 2>&1 \

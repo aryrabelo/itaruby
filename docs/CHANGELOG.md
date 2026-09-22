@@ -22,6 +22,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver's diagnostic silence with the same typo on a closed receiver.
 
 ### Added
+- Reconcile conflicting superclass headers after project indexing instead of
+  selecting the first filesystem entry. Inherited methods and constants
+  become inconclusive, including navigation and global-name collisions;
+  same resolved bases and ordinary reopenings retain their checks. Conflict
+  uncertainty crosses intermediate qualified namespaces and blocks schema
+  synthesis and Class fallbacks, without discarding a known own constructor.
+  Alias traversal preserves each RHS's scope and shares class/uncertainty
+  outcomes with existence checks; cycles and hop limits stay inconclusive.
+  Both-order controls and isolated mutants run under local gate c1 and CI.
+  Baselines unchanged; validation is deferred to the integration wave.
+- Public gauntlet CI plumbing (2026-09-22): explicit measured CI timing
+  column, leaving dev ceilings unchanged; only the intentionally absent
+  GitLab baseline may produce an accepted incomplete result. Unbaselined
+  corpora are not cloned, drift-attribution selftests join CI, and the
+  replay disk stub accepts trailing-slash lab roots without accepting
+  sibling prefixes. Two-sided controls accompany these decisions.
 - **The class-object E0101 flip (2026-09-21).** A conclusive
   `MethodLookup::NotFound` on the class-object track is now a diagnostic:
   singleton lookup has already proved closed, complete ancestry, and its

@@ -46,6 +46,17 @@ found, and the launch bar is winning on both.
   wrong answer never is.
 - **Fail-closed everywhere:** where itaruby cannot prove, it stays silent and
   the gap becomes roadmap — never a diagnostic (binding, 2026-08-24).
+- Conflicting superclass headers are unknown ancestry, not a file-order
+  winner (learned 2026-09-22, binding). Compare resolved identities in each
+  header's lexical scope; same-base and bare reopenings remain valid.
+  Constants stay suppression-only under conflict, including global-fallback
+  collisions and intermediate qualified prefixes. Remove conflict-dependent
+  headers before schema/RBI consumers inspect their spelling. Every alias RHS
+  uses its write-site scope; known lexical aliases precede global barriers,
+  and cycles/hop limits are inconclusive, not absent constants. Focused proof:
+  `conflicting_superclasses`, `ancestry_review_controls`, and
+  `scripts/conflicting-superclasses-mutants.py` (gate c1 and CI); public
+  baselines require a fresh measured audit after source changes.
 - A code path that turns silence into an error must never read absence of
   evidence as evidence of absence (learned 2026-08-24, binding): a gate that
   finds no signal on an upward search (e.g. no Gemfile discovered within N
@@ -560,6 +571,13 @@ gate exists to catch (learned 2026-08-26, binding). Until `work` has a
 measured column of its own, run the anchor there with `PERF_COLUMN=ci`; a
 ceiling copied between machines is a fabricated measurement, and raising the
 `m5` column to fit a slower machine is the loosening this repository forbids.
+
+The public-corpus gate uses the same explicit selection: `PUBLIC_COLUMN`
+defaults to `dev`; `ci` reads the second number in `scripts/public-corpora.txt`.
+Both columns use that file's measured-time x1.5/round-up contract; a missing
+selected ceiling fails, never borrows another machine's number. The hosted
+workflow accepts exit 2 only when the complete skip list is the intentionally
+unbaselined GitLab corpus. Any other skip, drift, or failure remains red.
 
 Anchor flow (run gates on `work` against an exact sha, in a disposable
 worktree — never disturb the checkout another agent may be using):

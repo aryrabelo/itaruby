@@ -27,6 +27,31 @@ pub enum TableNameDecl {
     Dynamic,
 }
 
+/// `ProjectIndex::const_fallback`'s answer for a Sorbet sig name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstFallback {
+    /// Every cref's ancestry is known and none carries the name.
+    Proven,
+    /// A known ancestor namespace carries the name as another binding.
+    Shadowed,
+    /// Some ancestry cannot be inspected; no namespace is known to shadow.
+    Opaque,
+}
+
+/// Open reasons that say nothing about a class's ancestors or constants.
+fn constant_neutral_open(reason: Option<OpenReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            OpenReason::MethodMissing
+                | OpenReason::AbstractRaise
+                | OpenReason::DynamicAttrArg
+                | OpenReason::DynamicDefineMethod
+                | OpenReason::DynamicAliasMethod
+        )
+    )
+}
+
 /// Why a class fragment was marked `open` (bead ita-anc, census only — see
 /// `ProjectIndex::inconclusive_reason`). Recorded at every `open = true`
 /// site in `DefWalker`/`merge_declared_fragment`; first reason wins when
@@ -8737,6 +8762,41 @@ impl ProjectIndex {
             self.toplevel_consts.contains(name) || stdlib_declares(&self.requires, nesting, name)
         }
     }
+    /// Sorbet contract names: what the crefs' ancestors say about `first`
+    /// once the lexical walk fell through to `top`, the top-level binding
+    /// (`None`: no project class there). Ruby consults the cref's ancestors
+    /// before the top level, so a known ancestor namespace carrying `first`
+    /// as anything but `top` shadows the fallback. Ancestry that is missing,
+    /// incomplete, ambiguous or open for a reason that could hide ancestors
+    /// or constants (a gem class, a dynamic mixin) proves nothing. Every
+    /// nesting level is consulted, not only the innermost: over-silencing is
+    /// acceptable, a wrong nominal type is not (invariant #1).
+    pub fn const_fallback(&self, nesting: &[String], first: &str, top: Option<ClassId>) -> ConstFallback {
+        let mut verdict = ConstFallback::Proven;
+        for level in nesting {
+            let Some(&id) = self.by_path.get(level) else {
+                verdict = ConstFallback::Opaque;
+                continue;
+            };
+            let (chain, complete) = self.ancestors(id);
+            if !complete {
+                verdict = ConstFallback::Opaque;
+            }
+            for a in chain {
+                let c = self.class(a);
+                if c.consts.iter().any(|k| k == first)
+                    || self.by_path.get(&format!("{}::{first}", c.path)).is_some_and(|&r| Some(r) != top)
+                {
+                    return ConstFallback::Shadowed;
+                }
+                if self.ambiguous_ancestry.contains(&a) || (c.open && !constant_neutral_open(c.open_reason)) {
+                    verdict = ConstFallback::Opaque;
+                }
+            }
+        }
+        verdict
+    }
+
     /// Does `simple` exist, or might conflicting ancestry provide it?
     /// This suppression-only answer never gives a type/navigation target.
     fn const_in_ancestors(&self, id: ClassId, simple: &str) -> bool {

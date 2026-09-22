@@ -9,8 +9,8 @@
 
 use ruby_prism::{CallNode, Node};
 
-use crate::index::ProjectIndex;
-use crate::types::Ty;
+use crate::index::{ConstFallback, ProjectIndex};
+use crate::types::{ClassId, Ty};
 
 /// A single, unambiguous Sorbet contract. Parameter names are Ruby names, never
 /// positional guesses. `void` discards the result; it does not promise `nil`.
@@ -181,10 +181,56 @@ pub fn resolve_sig_ty(expr: &str, index: &ProjectIndex, nesting: &[String]) -> T
         if !name.starts_with("::") && shadowed_prefix(bare, index, nesting) {
             return Some(Ty::Unknown);
         }
-        if let Some(id) = index.resolve_const(nesting, name) {
-            return Some(scalar_ty(&index.class(id).path).unwrap_or(Ty::Instance(id)));
+        let ty = match index.resolve_const(nesting, name) {
+            Some(id) => nominal_ty(id, index),
+            None => scalar_ty(bare)?,
+        };
+        if ty == Ty::Unknown || name.starts_with("::") {
+            return Some(ty);
         }
-        None
+        Some(match inherited_fallback(bare, index, nesting) {
+            ConstFallback::Shadowed => Ty::Unknown,
+            ConstFallback::Opaque if matches!(ty, Ty::Instance(_)) => Ty::Unknown,
+            _ => ty,
+        })
+    })
+}
+
+/// Once no lexical scope carries the first segment, Ruby asks the crefs'
+/// ancestors before the top level. A name a known ancestor namespace
+/// carries is `Unknown`; a project class reached through the top-level
+/// fallback also needs every cref's ancestry to be known. Core scalars
+/// survive opaque (gem) ancestry: only a proven shadow retracts them.
+fn inherited_fallback(name: &str, index: &ProjectIndex, nesting: &[String]) -> ConstFallback {
+    let first = name.split("::").next().unwrap_or(name);
+    if nesting.iter().any(|level| index.by_path.contains_key(&format!("{level}::{first}"))) {
+        return ConstFallback::Proven;
+    }
+    index.const_fallback(nesting, first, index.by_path.get(first).copied())
+}
+
+/// A project class id in its sig meaning. A project reopen of a core
+/// constant (`class Hash`, `module Comparable`, `class Object`) is still the
+/// core constant: a scalar keeps its scalar type and the rest stay `Unknown`,
+/// never an `Instance` no core value is compatible with. So does a project
+/// module mixed into a core class, which core values satisfy invisibly.
+fn nominal_ty(id: ClassId, index: &ProjectIndex) -> Ty {
+    let path = &index.class(id).path;
+    if let Some(ty) = scalar_ty(path) {
+        return ty;
+    }
+    if crate::core::is_known_core_constant(path) {
+        return Ty::Unknown;
+    }
+    if mixed_into_core(id, index) {
+        return Ty::Unknown;
+    }
+    Ty::Instance(id)
+}
+
+fn mixed_into_core(id: ClassId, index: &ProjectIndex) -> bool {
+    index.class(id).is_module && crate::core::core_namespace_names().iter().any(|core| {
+        index.by_path.get(*core).is_some_and(|&reopen| reopen != id && index.ancestors(reopen).0.contains(&id))
     })
 }
 

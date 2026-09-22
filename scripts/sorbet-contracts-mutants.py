@@ -24,6 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 SRC = Path("crates/itaruby_semantic/src")
 CHECK = SRC / "check.rs"
 INDEX = SRC / "index.rs"
+SIG = SRC / "sorbet_sig.rs"
 TESTS = ("sorbet_contracts", "sorbet_contract_parser", "project_sigs", "sorbet_sig")
 
 # (label, file, needle, replacement, named test(s) that must FAIL)
@@ -132,6 +133,23 @@ MUTATIONS = [
      "    let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil }",
      "    let proven = if false && literal_nil && *actual == Ty::Nil { Ty::Nil }",
      "literal_nil_and_mismatched_union_members_still_accuse"),
+    # -- sig names: a core name stays core, an inherited name never falls to the top level
+    ("reopened core name becomes a project instance", SIG,
+     "    if crate::core::is_known_core_constant(path) {\n        return Ty::Unknown;\n    }\n",
+     "",
+     "reopened_core_names_keep_their_core_meaning"),
+    ("module mixed into core keeps its instance", SIG,
+     "    if mixed_into_core(id, index) {\n        return Ty::Unknown;\n    }\n",
+     "",
+     "project_module_mixed_into_core_never_accuses_core_values"),
+    ("ancestor namespace shadow ignored", INDEX,
+     "                    return ConstFallback::Shadowed;\n",
+     "                    let _ = ();\n",
+     "inherited_namespace_constants_never_bind_to_top_level"),
+    ("opaque ancestry proves the top-level fallback", SIG,
+     "            ConstFallback::Opaque if matches!(ty, Ty::Instance(_)) => Ty::Unknown,\n",
+     "",
+     "inherited_namespace_constants_never_bind_to_top_level"),
 ]
 
 

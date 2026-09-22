@@ -827,3 +827,185 @@ ContractNilLiteral.new.shout(nil)
     assert_eq!(contract_codes(&diags), ["E0109", "E0109", "E0109", "E0103"], "{diags:?}");
     assert_eq!(names, ["tail_nil", "return_nil", "mixed_union", "nil"], "{diags:?}");
 }
+
+fn contract_names<'a>(source: &'a str, diags: &[Diagnostic]) -> Vec<&'a str> {
+    diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109")).map(|d| &source[d.start..d.end]).collect()
+}
+
+/// A project reopen of a core class/module is still the core constant: a
+/// bare core name in a sig keeps its scalar meaning or stays `Unknown`, and
+/// never becomes a project `Instance` that no literal value can satisfy.
+/// The reopened `Integer` control keeps the scalar contract live.
+#[test]
+fn reopened_core_names_keep_their_core_meaning() {
+    let source = r#"
+class Hash
+  def contract_core_touch; self; end
+end
+class Array
+  def contract_core_touch; self; end
+end
+class Object
+  def contract_core_touch; self; end
+end
+class BasicObject
+end
+class Numeric
+end
+module Comparable
+end
+module Enumerable
+end
+module Kernel
+end
+class Integer
+  def contract_core_touch; self; end
+end
+class ContractCoreReopen
+  extend T::Sig
+  sig { params(value: Hash).returns(Hash) }
+  def hash_echo(value)
+    { a: 1 }
+  end
+  sig { params(value: Array).returns(Array) }
+  def array_echo(value)
+    [1, 2]
+  end
+  sig { params(value: Object).returns(Object) }
+  def object_echo(value)
+    1
+  end
+  sig { params(value: BasicObject).returns(BasicObject) }
+  def basic_echo(value)
+    "text"
+  end
+  sig { params(value: Numeric).returns(Numeric) }
+  def numeric_echo(value)
+    1.5
+  end
+  sig { params(value: Comparable).returns(Comparable) }
+  def comparable_echo(value)
+    "text"
+  end
+  sig { params(value: Enumerable).returns(Kernel) }
+  def enumerable_echo(value)
+    :sym
+  end
+  sig { returns(Integer) }
+  def still_integer
+    "not an integer"
+  end
+end
+reopen = ContractCoreReopen.new
+reopen.hash_echo({ a: 1 })
+reopen.array_echo([1])
+reopen.object_echo(1)
+reopen.basic_echo(:sym)
+reopen.numeric_echo(2)
+reopen.comparable_echo("x")
+reopen.enumerable_echo([1])
+"#;
+    let diags = check("core-reopen", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["still_integer"], "{diags:?}");
+}
+
+/// A project module mixed into a core class is satisfied by core values the
+/// checker cannot relate to it: the name stays `Unknown`. A project class
+/// that only a project class includes keeps its contract.
+#[test]
+fn project_module_mixed_into_core_never_accuses_core_values() {
+    let source = r"
+module ContractCoreMixin
+end
+class Integer
+  include ContractCoreMixin
+end
+class ContractMixinTarget
+end
+class ContractMixinUser
+  extend T::Sig
+  sig { params(value: ContractCoreMixin).returns(ContractCoreMixin) }
+  def echo(value)
+    1
+  end
+  sig { returns(ContractMixinTarget) }
+  def target
+    2
+  end
+end
+ContractMixinUser.new.echo(1)
+";
+    let diags = check("core-mixin", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["target"], "{diags:?}");
+}
+
+/// Ruby looks a constant up in the ancestors of the cref before the top
+/// level. A name some ancestor namespace could answer, or any name inside a
+/// class whose ancestry is not fully known, is `Unknown`; a fully known,
+/// unshadowed ancestry keeps the top-level binding and its contract.
+#[test]
+fn inherited_namespace_constants_never_bind_to_top_level() {
+    let source = r#"
+class ContractNode
+end
+class ContractParent
+  class ContractNode
+  end
+  class String
+  end
+end
+class ContractKid < ContractParent
+  extend T::Sig
+  sig { params(value: ContractNode).returns(ContractNode) }
+  def echo(value)
+    value
+  end
+  sig { returns(ContractNode) }
+  def build
+    ContractParent::ContractNode.new
+  end
+  sig { returns(String) }
+  def text
+    ContractParent::String.new
+  end
+end
+module ContractMix
+  class ContractLeaf
+  end
+end
+class ContractLeaf
+end
+class ContractIncluder
+  extend T::Sig
+  include ContractMix
+  sig { returns(ContractLeaf) }
+  def leaf
+    ContractMix::ContractLeaf.new
+  end
+end
+class ContractUnknownKid < ContractUnresolvedBase
+  extend T::Sig
+  sig { returns(ContractNode) }
+  def build
+    "anything"
+  end
+end
+class ContractPlainParent
+end
+class ContractPlainKid < ContractPlainParent
+  extend T::Sig
+  sig { returns(ContractNode) }
+  def build
+    "not a node"
+  end
+end
+ContractKid.new.echo(ContractParent::ContractNode.new)
+"#;
+    let diags = check("ancestor-namespace", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["build"], "{diags:?}");
+    let plain = source.find("class ContractPlainKid").unwrap();
+    assert!(diags.iter().filter(|d| d.code == "E0109").all(|d| d.start > plain), "{diags:?}");
+}

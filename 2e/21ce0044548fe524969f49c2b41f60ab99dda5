@@ -1,0 +1,14 @@
+crates/itaruby_semantic/tests/stdlib_singletons.rs
+  h_b156936c57c455 68-84,87-89,100-105,107-109,112-163
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "2e21ce0044548fe524969f49c2b41f60ab99dda5",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

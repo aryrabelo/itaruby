@@ -95,6 +95,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # instrument-mutants exercises replay.sh, which reads the release
+      # binary gate b has already built by the time the local gauntlet
+      # reaches c2b; a fresh runner has none (measured: first CI run).
+      - run: cargo build --release
       - name: Evidence instruments (instrument-mutants)
         run: ./scripts/instrument-mutants.sh
       - name: gate-digest selftest

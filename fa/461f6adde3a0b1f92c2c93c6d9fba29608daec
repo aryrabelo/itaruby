@@ -1,0 +1,16 @@
+crates/itaruby_semantic/tests/mattr_accessor.rs
+  h_b156936c57c455 1
+docs/CHANGELOG.md
+  h_b156936c57c455 43-90,93-126,237-267
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "fa461f6adde3a0b1f92c2c93c6d9fba29608daec",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

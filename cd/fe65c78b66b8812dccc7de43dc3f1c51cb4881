@@ -1,0 +1,14 @@
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 90,149-150,177,231
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cdfe65c78b66b8812dccc7de43dc3f1c51cb4881",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

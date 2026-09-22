@@ -259,7 +259,7 @@ fn nested_def_self_in_block_files_on_the_singleton_track() {
 
 /// The filing carries DATA, not just a name: the nested `def
 /// self.fetch_data(x)` has one required parameter, so the wrong-arity
-/// call on line 22 is an E0102 MRI really raises (ArgumentError, given 2
+/// call on line 22 is an E0102 MRI really raises (`ArgumentError`, given 2
 /// expected 1). Before the bead the call was silent residue.
 #[test]
 fn nested_def_self_arity_is_checked() {
@@ -273,6 +273,10 @@ fn nested_plain_def_files_on_the_instance_track() {
     let (instance, singleton, open) =
         facts("nested_plain_def_files_instance_track.rb", "Maker");
     assert!(instance.contains(&"helper".to_string()), "instance track: {instance:?}");
+    assert!(
+        !singleton.contains(&"helper".to_string()),
+        "a plain def never lands on the singleton track: {singleton:?}"
+    );
     assert!(!open);
     let d = diags("nested_plain_def_files_instance_track.rb");
     assert!(d.is_empty(), "expected silence, got {d:?}");
@@ -961,7 +965,7 @@ fn core_ext_class_reopening_resolves_on_the_class_object_track() {
 
 /// The reopening carries a REAL signature: `descendants(need)` takes one
 /// argument, so the zero-argument call on the class object is an E0102
-/// MRI really raises (ArgumentError, given 0 expected 1). Resolution is
+/// MRI really raises (`ArgumentError`, given 0 expected 1). Resolution is
 /// checkable knowledge, not just silence.
 #[test]
 fn core_ext_class_reopening_arity_is_checked() {

@@ -3,7 +3,7 @@
 //!
 //! Entered only for the diagnostic whose CALL is the DIRECT subject of
 //! `assert_raises`/`assert_raise` (the minitest block body) or of an
-//! `expect { ... }.to raise_error(...)` block (RSpec). Measured corpus
+//! `expect { ... }.to raise_error(...)` block (`RSpec`). Measured corpus
 //! site: `spec/lib/guardian/tag_guardian_spec.rb:98-100`, where the
 //! spec deliberately omits the required tag inside
 //! `expect { ... }.to raise_error(ArgumentError)`.
@@ -12,7 +12,7 @@
 //! the block keeps firing, which is what `nested_subject_still_accuses`
 //! pins. Fixtures live in `testdata/asserted_raise/` and are
 //! MRI-executable — the two `*_silent` fixtures exit 0, the two
-//! `*_accuses` fixtures really raise ArgumentError on their diagnosed
+//! `*_accuses` fixtures really raise `ArgumentError` on their diagnosed
 //! line (verified with ruby 3.4.2).
 
 fn check_fixture(name: &str) -> Vec<String> {
@@ -49,7 +49,7 @@ fn silent(name: &str) {
 
 /// SILENT: `expect { Guardian.new.can_edit_tag? }.to raise_error(...)` —
 /// the arity error is the assertion's whole point. MRI catches the
-/// ArgumentError inside the matcher and exits 0.
+/// `ArgumentError` inside the matcher and exits 0.
 #[test]
 fn rspec_expect_raise_error_subject_is_silent() {
     silent("rspec_expect_raise_error_silent.rb");
@@ -57,21 +57,21 @@ fn rspec_expect_raise_error_subject_is_silent() {
 
 /// SILENT: the minitest spelling of the same assertion —
 /// `assert_raises(ArgumentError) { Guardian.new.can_edit_tag? }`. MRI
-/// catches the ArgumentError and exits 0.
+/// catches the `ArgumentError` and exits 0.
 #[test]
 fn minitest_assert_raises_subject_is_silent() {
     silent("minitest_assert_raises_silent.rb");
 }
 
 /// SILENT: minitest's older singular spelling, `assert_raise`, is the same
-/// assertion. MRI catches the ArgumentError and exits 0.
+/// assertion. MRI catches the `ArgumentError` and exits 0.
 #[test]
 fn minitest_assert_raise_singular_spelling_is_silent() {
     silent("minitest_assert_raise_singular_silent.rb");
 }
 
 /// ACCUSED (line 14): the very same zero-argument call, outside any
-/// assertion. MRI raises ArgumentError at line 14.
+/// assertion. MRI raises `ArgumentError` at line 14.
 #[test]
 fn arity_error_outside_an_assertion_still_accuses() {
     let d = only("arity_outside_assertion_accuses.rb");
@@ -85,7 +85,7 @@ fn arity_error_outside_an_assertion_still_accuses() {
 
 /// ACCUSED (line 34): `expect { ... }.to eq(...)` asserts nothing about
 /// exceptions, so the arm does not apply. MRI: the block really raises
-/// ArgumentError, which this matcher does not catch.
+/// `ArgumentError`, which this matcher does not catch.
 #[test]
 fn expect_with_a_non_raise_matcher_still_accuses() {
     let d = only("expect_with_another_matcher_accuses.rb");
@@ -100,7 +100,7 @@ fn expect_with_a_non_raise_matcher_still_accuses() {
 /// ACCUSED (line 45): the arm is one call wide. The direct subject here IS
 /// a call (`record(...)`), but the diagnosed call sits inside it — a
 /// containing span must not silence it. MRI proves the inner call really
-/// raises ArgumentError inside the asserted block.
+/// raises `ArgumentError` inside the asserted block.
 #[test]
 fn call_nested_inside_the_armed_subject_span_still_accuses() {
     let d = only("nested_call_inside_armed_subject_accuses.rb");
@@ -111,7 +111,7 @@ fn call_nested_inside_the_armed_subject_span_still_accuses() {
 /// ACCUSED (line 39): the subject sits one level deeper — inside an array
 /// literal within the `expect` block — so the arity error keeps firing.
 /// That is the narrow scope the owner chose, and this is its control; MRI
-/// proves the call really does raise ArgumentError inside the block.
+/// proves the call really does raise `ArgumentError` inside the block.
 #[test]
 fn call_nested_deeper_in_the_asserted_block_still_accuses() {
     let d = only("nested_subject_still_accuses.rb");

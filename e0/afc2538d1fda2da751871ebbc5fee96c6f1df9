@@ -1,0 +1,175 @@
+AGENTS.md
+  s_12be3cd9892e59::t_cfdd53816d64c9 877-915
+scripts/sf-check-local
+  s_12be3cd9892e59::t_9c1aa469bbbeff 1-51
+scripts/claim-judge-gate
+  s_12be3cd9892e59::t_93cc46a4242a49 1-112
+.githooks/pre-commit
+  s_12be3cd9892e59::t_efa1c67930af6c 8-11,20
+.github/workflows/software-factory.yml
+  s_12be3cd9892e59::t_06813aa0fc39e1 20-25,30-34
+.gitignore
+  s_12be3cd9892e59::t_93fd349dd62fc9 34-35
+.software-factory/locks/factory.lock.json
+  s_12be3cd9892e59::t_805e37fadda831 5-7
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_997fd8b2b718c3 1-11
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/src/orders/service.go
+  s_12be3cd9892e59::t_00df658dae8789 1-6
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/src/orders/service.py
+  s_12be3cd9892e59::t_893526f62d587c 1-2
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/src/orders/service.rb
+  s_12be3cd9892e59::t_27235c5cde1a61 1-3
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/src/orders/service.rs
+  s_12be3cd9892e59::t_9755ea66075288 1-4
+.software-factory/mutations/L0.EXCEPTIONS_HAVE_ONE_HOME/src/orders/service.ts
+  s_12be3cd9892e59::t_a7e4cdeee114d5 1-2
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_b9ef8fe1da66b2 1-11
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/src/app/main.go
+  s_12be3cd9892e59::t_c8a7e620593463 1-7
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/src/app/main.py
+  s_12be3cd9892e59::t_144364c272c31f 1-5
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/src/app/main.rb
+  s_12be3cd9892e59::t_ba2c52cbd8be65 1-5
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/src/app/main.rs
+  s_12be3cd9892e59::t_50a9c4c4492daa 1-5
+.software-factory/mutations/L0.NO_CROSS_LAYER_IMPORT/src/app/main.ts
+  s_12be3cd9892e59::t_72cd9be2f9e61b 1-3
+.software-factory/mutations/L0.ONE_ENTRYPOINT_PER_FILE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_359c7d38402456 1-11
+.software-factory/mutations/L0.ONE_ENTRYPOINT_PER_FILE/src/orders/controllers/orders.py
+  s_12be3cd9892e59::t_f6597750cd65e5 1-8
+.software-factory/mutations/L0.ONE_ENTRYPOINT_PER_FILE/src/orders/controllers/orders.ts
+  s_12be3cd9892e59::t_b124e34f99f156 1-2
+.software-factory/mutations/L0.ONE_ENTRYPOINT_PER_FILE/src/orders/handlers/orders.go
+  s_12be3cd9892e59::t_22bac9aa6ab24d 1-6
+.software-factory/mutations/L0.PERSISTENCE_STAYS_IN_REPOSITORIES/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_9e9508c8d679fc 1-11
+.software-factory/mutations/L0.PERSISTENCE_STAYS_IN_REPOSITORIES/src/orders/controllers/get_order.go
+  s_12be3cd9892e59::t_731785bb9af066 1-5
+.software-factory/mutations/L0.PERSISTENCE_STAYS_IN_REPOSITORIES/src/orders/controllers/get_order.py
+  s_12be3cd9892e59::t_adce4672245659 1-2
+.software-factory/mutations/L0.PERSISTENCE_STAYS_IN_REPOSITORIES/src/orders/controllers/get_order.ts
+  s_12be3cd9892e59::t_d2397216a4a943 1-3
+.software-factory/mutations/L1.COMMENT_STAYS_SUCCINCT/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_bf63dfb2cead64 1-13
+.software-factory/mutations/L1.COMMENT_STAYS_SUCCINCT/src/notes.py
+  s_12be3cd9892e59::t_8542e454130a3f 1-8
+.software-factory/mutations/L1.COMMENT_STAYS_SUCCINCT/src/settings.yaml
+  s_12be3cd9892e59::t_86d683258655a5 1-8
+.software-factory/mutations/L1.INDIRECTION_EARNS_ITS_NAME/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_a9212947acdb48 1-11
+.software-factory/mutations/L1.INDIRECTION_EARNS_ITS_NAME/src/services/compressions.ts
+  s_12be3cd9892e59::t_0ec2a0985a5ca3 1-9
+.software-factory/mutations/L1.INDIRECTION_EARNS_ITS_NAME/src/services/pricing.py
+  s_12be3cd9892e59::t_55f3eb1131c9d8 1-5
+.software-factory/mutations/L1.INDIRECTION_EARNS_ITS_NAME/src/services/pricing.rs
+  s_12be3cd9892e59::t_4e964ccf95e23f 1-5
+.software-factory/mutations/L1.SKIPPED_TESTS_STATE_A_REASON/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_7d8c51d19461c1 5
+.software-factory/mutations/L1.SKIPPED_TESTS_STATE_A_REASON/spec/billing_spec.rb
+  s_12be3cd9892e59::t_ed59e4312bdc7a 1-5
+.software-factory/mutations/L1.SKIPPED_TESTS_STATE_A_REASON/tests/billing.rs
+  s_12be3cd9892e59::t_9c3291adfd1572 1-5
+.software-factory/mutations/L1.SKIPPED_TESTS_STATE_A_REASON/tests/billing.test.ts
+  s_12be3cd9892e59::t_a2151439b738b5 1-6
+.software-factory/mutations/L1.SKIPPED_TESTS_STATE_A_REASON/tests/billing_test.go
+  s_12be3cd9892e59::t_21b3aa1543e2df 1-7
+.software-factory/mutations/L2.CATALOG_ONLY_TIGHTENS/.software-factory/catalog.lock.json
+  s_12be3cd9892e59::t_7e50b828a99867 1-11
+.software-factory/mutations/L2.CATALOG_ONLY_TIGHTENS/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_18f829aaf0387e 1-11
+.software-factory/mutations/L2.DERIVED_ARTIFACTS_MATCH_THEIR_SOURCE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_316f604b3744c3 1-13
+.software-factory/mutations/L2.DERIVED_ARTIFACTS_MATCH_THEIR_SOURCE/generated/schema.json
+  s_12be3cd9892e59::t_ff907ac1f8b4ed 1
+.software-factory/mutations/L2.POLICY_ONLY_TIGHTENS/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_5e7694ceb4c9f4 10-14
+.software-factory/mutations/L2.POLICY_ONLY_TIGHTENS/baseline/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_9e5c5b05b780a8 8,10-12
+.software-factory/mutations/L3.GATE_COVERS_THE_PLAN/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_20409db6614806 1-16
+.software-factory/mutations/L3.GATE_COVERS_THE_PLAN/plans/rewrite-checkout.md
+  s_12be3cd9892e59::t_a1359b314ce253 1-8
+.software-factory/mutations/L3.GATE_HAS_FRESH_EVIDENCE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_0be96f0f8e043c 1-14
+.software-factory/mutations/L3.GATE_HAS_FRESH_EVIDENCE/evidence/checkout-run.json
+  s_12be3cd9892e59::t_3c2d7460a18702 1-6
+.software-factory/mutations/L3.GATE_HAS_FRESH_EVIDENCE/evidence/checkout.json
+  s_12be3cd9892e59::t_90e21d99a857db 1-15
+.software-factory/mutations/L3.GATE_HAS_FRESH_EVIDENCE/src/checkout/charge.py
+  s_12be3cd9892e59::t_ecd5a568df6259 1-2
+.software-factory/mutations/L3.GATE_PLAN_NOT_IN_THE_QUEUE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_dbf9cd252fcd6e 1-17
+.software-factory/mutations/L3.GATE_PLAN_NOT_IN_THE_QUEUE/docs/design/rewrite-checkout.md
+  s_12be3cd9892e59::t_739c2dbf0eff78 1-4
+.software-factory/mutations/L3.GATE_PLAN_NOT_IN_THE_QUEUE/plans/rewrite-checkout.md
+  s_12be3cd9892e59::t_8e76eb9d33cd07 1-8
+.software-factory/mutations/L4.CLAIM_CITES_ITS_EVIDENCE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_8d0f1763be30cf 1-11
+.software-factory/mutations/L4.CLAIM_CITES_ITS_EVIDENCE/docs/landing.md
+  s_12be3cd9892e59::t_f88daa9f039983 1-13
+.software-factory/mutations/L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_9b9a30511af755 1-13
+.software-factory/mutations/L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE/README.md
+  s_12be3cd9892e59::t_78a7996295a7d5 1-2
+.software-factory/mutations/L4.PLAN_PROOF_BUDGET/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_ed227d008a0920 1-11
+.software-factory/mutations/L4.PLAN_PROOF_BUDGET/plans/ceiling.md
+  s_12be3cd9892e59::t_e6589302901036 1-9
+.software-factory/mutations/L4.PLAN_PROOF_BUDGET/plans/floor.md
+  s_12be3cd9892e59::t_5fb9bb83975a9d 1-3
+.software-factory/mutations/L4.PLAN_PROOF_BUDGET/plans/within-budget.md
+  s_12be3cd9892e59::t_46c66daefe5fa0 1-8
+.software-factory/mutations/L4.RULE_PROSE_NAMES_A_REAL_COMMAND/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_16527b8aa89f20 1-13
+.software-factory/mutations/L4.RULE_PROSE_NAMES_A_REAL_COMMAND/.software-factory/rules/local-rule.yaml
+  s_12be3cd9892e59::t_0f6ce7b49f98e0 1-15
+.software-factory/mutations/L5.NO_INERT_RULE/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_b83bc2d8fb4339 8-11,30-55
+.software-factory/mutations/L5.NO_INERT_RULE/package.json
+  s_12be3cd9892e59::t_ca4eb4c4a9c404 1-6
+.software-factory/mutations/L5.NO_INERT_RULE/src/app.py
+  s_12be3cd9892e59::t_0ebdf5a0fca105 2
+.software-factory/mutations/L6.HOME_VARIABLES_ARE_PLATFORM_DERIVED/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_b4f52948e15bfb 1-11
+.software-factory/mutations/L6.HOME_VARIABLES_ARE_PLATFORM_DERIVED/tests/expand.spec.ts
+  s_12be3cd9892e59::t_d885090186b2d0 1-12
+.software-factory/mutations/L6.HOME_VARIABLES_ARE_PLATFORM_DERIVED/tests/expand_test.go
+  s_12be3cd9892e59::t_edf4048688b775 1-16
+.software-factory/mutations/L6.URLS_ARE_DECODED_BY_THE_PLATFORM/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_93d57fd9002632 1-11
+.software-factory/mutations/L6.URLS_ARE_DECODED_BY_THE_PLATFORM/src/loader.go
+  s_12be3cd9892e59::t_af6d805c1c73ee 1-16
+.software-factory/mutations/L6.URLS_ARE_DECODED_BY_THE_PLATFORM/src/loader.js
+  s_12be3cd9892e59::t_9af4dc7a470b2c 1-8
+.software-factory/mutations/L6.WORKFLOWS_ARE_SCANNED/.github/workflows/ci.yml
+  s_12be3cd9892e59::t_bac64ea0d4cf3b 1-11
+.software-factory/mutations/L6.WORKFLOWS_ARE_SCANNED/.software-factory/policy.yaml
+  s_12be3cd9892e59::t_29a170d4bd4da0 1-11
+.software-factory/policy.yaml
+  s_12be3cd9892e59::t_a87dc7c89f3a66 17-50,106-122
+docs/rules.md
+  s_12be3cd9892e59::t_b9ffa2b406bdd6 51,71,87,89,91-103,107-126,193,195,197,229,239
+scripts/claim-judge.mjs
+  s_12be3cd9892e59::t_d5882c1962e63e 1-115
+scripts/closing-evidence
+  s_12be3cd9892e59::t_154b87bd7f0ad5 1-197
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "e0afc2538d1fda2da751871ebbc5fee96c6f1df9",
+  "prompts": {},
+  "sessions": {
+    "s_12be3cd9892e59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca90c1ea-5986-415e-a5ce-7cecb3f99d59",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

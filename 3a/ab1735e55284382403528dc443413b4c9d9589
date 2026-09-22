@@ -1,0 +1,24 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 7313-7314,7317-7334,7342-7385
+crates/itaruby_semantic/tests/singleton_track.rs
+  h_b156936c57c455 913-914,929,942-972
+docs/CHANGELOG.md
+  h_b156936c57c455 11-27
+scripts/singleton-mutants.sh
+  h_b156936c57c455 394-401
+testdata/singleton_track/core_ext_class_reopening_arity_accuses.rb
+  h_b156936c57c455 1-15
+testdata/singleton_track/core_ext_class_reopening_resolves.rb
+  h_b156936c57c455 1-16
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "3aab1735e55284382403528dc443413b4c9d9589",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

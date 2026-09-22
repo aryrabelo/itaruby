@@ -1,5 +1,7 @@
 # itaruby
 
+![itaruby — Ruby type checker, inference-first, zero annotations: write normal Ruby, run `ita check`, get a proven diagnostic](docs/assets/itaruby-how-it-works.webp)
+
 *itá* means "stone" in Tupi — itaruby looks at the stone and says whether it
 is a real ruby. It is a Ruby type checker written in Rust, inference-first
 (in the style of [ty] and [Pyrefly], not Sorbet): no annotations required,

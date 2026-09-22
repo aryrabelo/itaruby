@@ -142,15 +142,22 @@ cmd_anchor() {
   # worktree has none); the sha is fetched from $ANCHOR_REMOTE, default
   # `private`, since `origin` on work is the public squash-rooted repo and
   # cannot carry this history; PERF_COLUMN=ci because work has no measured
-  # dev column and a copied ceiling is a fabricated measurement.
+  # dev column and a copied ceiling is a fabricated measurement; ruby by
+  # ABSOLUTE path, because `brew` itself is not on a non-interactive ssh
+  # PATH — `$(brew --prefix ruby)` expands to nothing there and gate 0b
+  # names /usr/bin/ruby 2.6 (measured 2026-09-21, one run wasted). The
+  # artifacts are copied out BEFORE the worktree goes: a red anchor whose
+  # evidence died with its tree is a verdict nobody can read.
   local wt="~/Sites/worktrees/ita-anchor-${sha:0:7}"
+  local keep="~/Sites/temp-files/ita-anchor-${sha:0:7}-\$(date +%Y%m%d-%H%M%S)"
   out=$(ssh "$WORK_HOST" "cd ~/Sites/personal-team/itaruby \
     && git fetch -q ${ANCHOR_REMOTE:-private} \
     && git worktree add -f --detach $wt $sha \
     && cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt $wt/scripts/corpora-local.txt \
     && cd $wt \
-    && PERF_COLUMN=ci PATH=\"\$(brew --prefix ruby)/bin:\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh; \
-    s=\$?; cd ~/Sites/personal-team/itaruby && git worktree remove --force $wt; exit \$s" 2>&1)
+    && PERF_COLUMN=ci PATH=\"/opt/homebrew/opt/ruby/bin:\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh; \
+    s=\$?; keep=$keep; mkdir -p \$keep && cp -R $wt/target/gauntlet/. \$keep/ && echo \"anchor artifacts: \$keep\"; \
+    cd ~/Sites/personal-team/itaruby && git worktree remove --force $wt; exit \$s" 2>&1)
   status=$?
   printf '%s\n' "$out"
   if [[ $status -ne 0 && $status -ne 2 ]]; then

@@ -497,7 +497,7 @@ ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q private main && \
   cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt \
      ~/Sites/worktrees/ita-anchor-<slug>/scripts/corpora-local.txt && \
   cd ~/Sites/worktrees/ita-anchor-<slug> && \
-  PERF_COLUMN=ci PATH="$(brew --prefix ruby)/bin:$HOME/.cargo/bin:$PATH" ./scripts/gauntlet-gates.sh; \
+  PERF_COLUMN=ci PATH="/opt/homebrew/opt/ruby/bin:$HOME/.cargo/bin:$PATH" ./scripts/gauntlet-gates.sh; \
   cd ~/Sites/personal-team/itaruby && git worktree remove --force ~/Sites/worktrees/ita-anchor-<slug>'
 ```
 
@@ -527,7 +527,14 @@ installed (learned 2026-08-20, binding). The same trap one layer down, for
 resolves `ruby` to `/usr/bin/ruby` 2.6, which cannot parse an endless method
 definition, so gates a, c1 and g fail on the interpreter and not on the code —
 identical run with brew's ruby 4.0.6 turns all three green, every other verdict
-byte-identical. It is a PATH trap, not an ssh trap, and it fires locally too
+byte-identical. And `$(brew --prefix ruby)` does NOT reach it: `brew` itself
+is not on a non-interactive ssh PATH, so the substitution expands to the empty
+string and the PATH prefix becomes `/bin:...`, landing right back on
+`/usr/bin/ruby` 2.6 — the anchor block and `scripts/dev` therefore hardcode
+`/opt/homebrew/opt/ruby/bin` on `work` (learned 2026-09-21, measured: one
+full anchor run wasted, gate 0b naming ruby 2.6.10 under a `PATH` that was
+supposed to prepend brew's ruby). It is a PATH trap, not an ssh trap, and it
+fires locally too
 (learned 2026-09-19, binding, measured): a local `./scripts/dev gates` whose
 environment put `/usr/bin` before mise's shims ran gate a on ruby 2.6, and the
 red surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,

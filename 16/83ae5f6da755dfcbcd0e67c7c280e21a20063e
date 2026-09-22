@@ -1,0 +1,80 @@
+.githooks/pre-commit
+  h_b156936c57c455 19-21
+.software-factory/locks/factory.lock.json
+  h_b156936c57c455 5
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 2728-2739
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 246-251,269,630-637,641-644,960,971-976,979,1462,1729-1733,2013-2018,2151-2153,2224-2226,3180,3500-3513,3518,3527,3551,3577-3666
+crates/itaruby_semantic/src/schema.rs
+  h_b156936c57c455 313,337
+crates/itaruby_semantic/tests/abstract_raise.rs
+  h_b156936c57c455 1-176
+crates/itaruby_semantic/tests/class_body_block.rs
+  h_b156936c57c455 1-87
+docs/CHANGELOG.md
+  h_b156936c57c455 12-48
+scripts/bug-replay/README.md
+  h_b156936c57c455 18-19,35,41-44,67,90-97,136
+scripts/bug-replay/candidates/discourse.jsonl
+  h_b156936c57c455 1-19
+scripts/bug-replay/candidates/mastodon.jsonl
+  h_b156936c57c455 1-300
+scripts/bug-replay/candidates/rails.jsonl
+  h_b156936c57c455 1-203
+scripts/bug-replay/judge.rb
+  h_b156936c57c455 142-165,167-169
+scripts/bug-replay/mine.rb
+  h_b156936c57c455 2-3,15-16,19-20,24-38,45-46,52-53,68,83-84,89-94,124-128,194,201,204,227,230,282-306,308,315-316
+scripts/bug-replay/replay.sh
+  h_b156936c57c455 20-22,79,81-88,183-187,190,199-202,242,261-262,267-268,270
+scripts/bug-replay/selftest.sh
+  h_b156936c57c455 52,56,63,68-69,71-76,79,106,112-119,162,165,169-215
+scripts/corpus-baseline.txt
+  h_b156936c57c455 149-155
+scripts/public-baseline/README.md
+  h_b156936c57c455 17-18,43-57,82-84
+scripts/public-baseline/discourse.jsonl
+  h_b156936c57c455 4-6,538,1447,1468,1594
+scripts/public-baseline/mastodon.jsonl
+  h_b156936c57c455 110
+scripts/public-baseline/rails.jsonl
+  h_b156936c57c455 400
+testdata/abstract_raise/abstract_method_itself_silent.rb
+  h_b156936c57c455 1-15
+testdata/abstract_raise/base_calls_undefined_name_accuses.rb
+  h_b156936c57c455 1-31
+testdata/abstract_raise/descendant_defines_stays_silent.rb
+  h_b156936c57c455 1-27
+testdata/abstract_raise/descendant_mixin_defines_stays_silent.rb
+  h_b156936c57c455 1-27
+testdata/abstract_raise/external_super_stays_silent.rb
+  h_b156936c57c455 1-20
+testdata/abstract_raise/open_descendant_stays_silent.rb
+  h_b156936c57c455 1-25
+testdata/abstract_raise/sibling_open_mixin_still_accuses.rb
+  h_b156936c57c455 1-28
+testdata/abstract_raise/stub_shadowed_by_descendant_silent.rb
+  h_b156936c57c455 1-23
+testdata/abstract_raise/stub_unshadowed_wrong_arity_accuses.rb
+  h_b156936c57c455 1-21
+testdata/class_body_block/abstract_raise_with_delegate_loop_silent.rb
+  h_b156936c57c455 1-24
+testdata/class_body_block/delegate_loop_self_send_silent.rb
+  h_b156936c57c455 1-21
+testdata/class_body_block/no_loop_still_accuses.rb
+  h_b156936c57c455 1-16
+testdata/class_body_block/receiverless_block_already_open.rb
+  h_b156936c57c455 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "1683ae5f6da755dfcbcd0e67c7c280e21a20063e",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

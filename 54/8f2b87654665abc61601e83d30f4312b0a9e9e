@@ -1,0 +1,88 @@
+AGENTS.md
+  h_b156936c57c455 368
+docs/CHANGELOG.md
+  h_b156936c57c455 11-26
+scripts/gate-digest
+  h_b156936c57c455 1-369
+scripts/gate-digest-fixture/absent/REMOVE
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/build.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/const-missing-mutants.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/corpus-corpus-a-error-hashes.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/corpus-corpus-a-errors.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/corpus-corpus-a-expected-hashes.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/corpus-corpus-a.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/gate-digest-selftest.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/inference-selftest.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/instrument-mutants.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/load.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/operand-types-mutants.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/perf.txt
+  h_b156936c57c455 1-4
+scripts/gate-digest-fixture/green/public-rails.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/public.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/sf-changed.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/sf.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/singleton-mutants.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/green/testdata.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/green/tests.txt
+  h_b156936c57c455 1-4
+scripts/gate-digest-fixture/green/transcript.txt
+  h_b156936c57c455 1-33
+scripts/gate-digest-fixture/green/unwrap.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/perf-fail/perf.txt
+  h_b156936c57c455 1-4
+scripts/gate-digest-fixture/perf-fail/transcript.txt
+  h_b156936c57c455 1-32
+scripts/gate-digest-fixture/public-drift/public-rails-drift.txt
+  h_b156936c57c455 1-4
+scripts/gate-digest-fixture/public-drift/public-rails-new.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/public-drift/public.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/public-drift/transcript.txt
+  h_b156936c57c455 1-32
+scripts/gate-digest-fixture/secrecy/corpus-corpus-a-drift.txt
+  h_b156936c57c455 1-4
+scripts/gate-digest-fixture/secrecy/corpus-corpus-a-error-hashes.txt
+  h_b156936c57c455 1-2
+scripts/gate-digest-fixture/secrecy/corpus-corpus-a-new-hashes.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/secrecy/corpus-corpus-a.txt
+  h_b156936c57c455 1
+scripts/gate-digest-fixture/secrecy/transcript.txt
+  h_b156936c57c455 1-32
+scripts/gate-digest-selftest.sh
+  h_b156936c57c455 1-168
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 41-53,56-70,100-101,169-170,201-211,404-409
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "548f2b87654665abc61601e83d30f4312b0a9e9e",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

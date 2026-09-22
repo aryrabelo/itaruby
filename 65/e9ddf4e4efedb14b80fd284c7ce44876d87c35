@@ -1,0 +1,38 @@
+.software-factory/locks/dependencies.lock.json
+  h_b156936c57c455 4-8
+Cargo.toml
+  h_b156936c57c455 5-12
+README.md
+  h_b156936c57c455 11-12
+crates/itaruby/Cargo.toml
+  h_b156936c57c455 5-7
+crates/itaruby_semantic/Cargo.toml
+  h_b156936c57c455 5-7
+crates/itaruby_semantic/declarations/gems.rbi
+  h_b156936c57c455 59-64
+crates/itaruby_semantic/tests/operand_types.rs
+  h_b156936c57c455 664-666
+crates/itaruby_semantic/tests/rbi_nested_declares.rs
+  h_b156936c57c455 25-28
+crates/itaruby_server/Cargo.toml
+  h_b156936c57c455 5-7
+crates/itaruby_syntax/Cargo.toml
+  h_b156936c57c455 5-7
+docs/CHANGELOG.md
+  h_b156936c57c455 192-198
+scripts/bug-replay/README.md
+  h_b156936c57c455 26-29
+scripts/bug-replay/candidates/NOTICE.md
+  h_b156936c57c455 1-26
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "65e9ddf4e4efedb14b80fd284c7ce44876d87c35",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

@@ -9,14 +9,12 @@
 {"code":"E0104","column":1,"line":81,"message":"unresolved constant `LibXML::XML::Document`","path":"rails/activesupport/lib/active_support/xml_mini/libxml.rb","severity":"warning"}
 {"code":"E0104","column":1,"line":82,"message":"unresolved constant `LibXML::XML::Node`","path":"rails/activesupport/lib/active_support/xml_mini/libxml.rb","severity":"warning"}
 {"code":"E0104","column":10,"line":15,"message":"unresolved constant `RedisClient::ConnectionError`","path":"rails/activesupport/test/cache/stores/redis_cache_store_test.rb","severity":"warning"}
-{"code":"E0104","column":10,"line":42,"message":"unresolved constant `Dalli::Client`","path":"rails/actionpack/test/dispatch/session/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":10,"line":42,"message":"unresolved constant `PG::ConnectionBad`","path":"rails/activejob/test/support/integration/adapters/queue_classic.rb","severity":"warning"}
 {"code":"E0104","column":10,"line":56,"message":"unresolved constant `XPath`","path":"rails/actiontext/lib/action_text/system_test_helper.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":10,"message":"unresolved constant `ImageProcessing::MiniMagick`","path":"rails/activestorage/lib/active_storage/transformers/image_magick.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":101,"message":"unresolved constant `::Vips::Image`","path":"rails/activestorage/test/test_helper.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":101,"message":"unresolved constant `Concurrent::Promise`","path":"rails/activestorage/lib/active_storage/service/mirror_service.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":11,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/per_request_digest_cache_test.rb","severity":"warning"}
-{"code":"E0104","column":11,"line":13,"message":"unresolved constant `InTimeZone`","path":"rails/activerecord/test/cases/dirty_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":14,"message":"unresolved constant `ActiveSupport::Logger::Severity`","path":"rails/activerecord/test/cases/log_subscriber_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":142,"message":"unresolved constant `IRB::Color`","path":"rails/railties/lib/rails/commands/console/irb_console.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":157,"message":"unresolved constant `Open3`","path":"rails/activesupport/lib/active_support/continuous_integration/group.rb","severity":"warning"}
@@ -25,11 +23,9 @@
 {"code":"E0104","column":11,"line":20,"message":"unresolved constant `PG::CONNECTION_BAD`","path":"rails/activerecord/test/cases/adapters/postgresql/statement_pool_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":206,"message":"unresolved constant `DEBUG`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":21,"message":"unresolved constant `::Argon2::Password`","path":"rails/activemodel/lib/active_model/secure_password/argon2_password.rb","severity":"warning"}
-{"code":"E0104","column":11,"line":21,"message":"unresolved constant `InTimeZone`","path":"rails/activerecord/test/cases/attribute_methods_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":211,"message":"unresolved constant `INFO`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":212,"message":"unresolved constant `Nokogiri::HTML4`","path":"rails/guides/rails_guides/markdown.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":217,"message":"unresolved constant `WARN`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
-{"code":"E0104","column":11,"line":22,"message":"unresolved constant `ActiveSupport::Logger::Severity`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":223,"message":"unresolved constant `ERROR`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":229,"message":"unresolved constant `FATAL`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":23,"message":"unresolved constant `Resque::Worker`","path":"rails/activejob/test/support/integration/adapters/resque.rb","severity":"warning"}
@@ -39,8 +35,6 @@
 {"code":"E0104","column":11,"line":26,"message":"unresolved constant `::RedisClient`","path":"rails/actioncable/lib/action_cable/subscription_adapter/redis.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":36,"message":"unresolved constant `Prism`","path":"rails/tools/rail_inspector/lib/rail_inspector/requires.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":374,"message":"unresolved constant `Plugin::Engine`","path":"rails/railties/test/engine/lazy_route_set_test.rb","severity":"warning"}
-{"code":"E0104","column":11,"line":41,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/guides/bug_report_templates/action_controller.rb","severity":"warning"}
-{"code":"E0104","column":11,"line":43,"message":"unresolved constant `Dalli::DalliError`","path":"rails/actionpack/test/dispatch/session/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":46,"message":"unresolved constant `::Trilogy`","path":"rails/activerecord/lib/active_record/connection_adapters/trilogy_adapter.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":56,"message":"unresolved constant `Capybara::Selenium::Driver`","path":"rails/actionpack/lib/action_dispatch/system_testing/driver.rb","severity":"warning"}
 {"code":"E0104","column":11,"line":62,"message":"unresolved constant `Capybara::Cuprite::Driver`","path":"rails/actionpack/lib/action_dispatch/system_testing/driver.rb","severity":"warning"}
@@ -69,8 +63,6 @@
 {"code":"E0104","column":12,"line":389,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/loading_test.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":421,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/loading_test.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":449,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/loading_test.rb","severity":"warning"}
-{"code":"E0104","column":12,"line":45,"message":"unresolved constant `Dalli::Client`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
-{"code":"E0104","column":12,"line":49,"message":"unresolved constant `Dalli::DalliError`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":504,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/loading_test.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":55,"message":"unresolved constant `RESTfulController`","path":"rails/railties/test/application/zeitwerk_integration_test.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":559,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/loading_test.rb","severity":"warning"}
@@ -112,7 +104,6 @@
 {"code":"E0104","column":13,"line":45,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/application/configuration_test.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":455,"message":"unresolved constant `::RedisClient::CannotConnectError`","path":"rails/activesupport/test/cache/stores/redis_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":459,"message":"unresolved constant `::RedisClient::CannotConnectError`","path":"rails/activesupport/test/cache/stores/redis_cache_store_test.rb","severity":"warning"}
-{"code":"E0104","column":13,"line":46,"message":"unresolved constant `Dalli::DalliError`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":46,"message":"unresolved constant `Rake`","path":"rails/railties/lib/rails/commands/rake/rake_command.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":8,"message":"unresolved constant `Rack::Test::Methods`","path":"rails/railties/test/railties/mounted_engine_test.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":819,"message":"unresolved constant `OID::Interval`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
@@ -274,8 +265,6 @@
 {"code":"E0104","column":18,"line":414,"message":"unresolved constant `PostsMailer`","path":"rails/railties/test/application/configuration_test.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":43,"message":"unresolved constant `Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":43,"message":"unresolved constant `OID::Cidr`","path":"rails/activerecord/test/cases/adapters/postgresql/cidr_test.rb","severity":"warning"}
-{"code":"E0104","column":18,"line":432,"message":"unresolved constant `Dalli`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
-{"code":"E0104","column":18,"line":436,"message":"unresolved constant `Dalli::Protocol`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":44,"message":"unresolved constant `AddtlGlobalConstants::Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":45,"message":"unresolved constant `GlobalID::Locator`","path":"rails/actiontext/lib/action_text/attachable.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":453,"message":"unresolved constant `BukkitController`","path":"rails/railties/test/railties/engine_test.rb","severity":"warning"}
@@ -294,7 +283,6 @@
 {"code":"E0104","column":18,"line":88,"message":"unresolved constant `Case::Dice`","path":"rails/activesupport/test/constantize_test_cases.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":955,"message":"unresolved constant `::Bukkits::MyMailer`","path":"rails/railties/test/railties/engine_test.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":10,"message":"unresolved constant `Concurrent::AtomicBoolean`","path":"rails/activerecord/lib/active_record/asynchronous_queries_tracker.rb","severity":"warning"}
-{"code":"E0104","column":19,"line":11,"message":"unresolved constant `SQLSubscriber`","path":"rails/activerecord/test/cases/adapters/abstract_mysql_adapter/connection_test.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":131,"message":"unresolved constant `Vips::Error`","path":"rails/activestorage/test/models/variant_test.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":142,"message":"unresolved constant `Google::Cloud::Storage`","path":"rails/activestorage/lib/active_storage/service/gcs_service.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":20,"message":"unresolved constant `TestJob`","path":"rails/activejob/test/integration/queuing_test.rb","severity":"warning"}
@@ -347,19 +335,7 @@
 {"code":"E0104","column":21,"line":31,"message":"unresolved constant `::MessagePack::Bigint`","path":"rails/activesupport/lib/active_support/message_pack/extensions.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":34,"message":"unresolved constant `Rouge::Formatters::HTMLLineHighlighter`","path":"rails/guides/rails_guides/markdown/renderer.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":35,"message":"unresolved constant `Rack::Utils::InvalidParameterError`","path":"rails/activesupport/test/cache/local_cache_middleware_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":401,"message":"unresolved constant `WARN`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":406,"message":"unresolved constant `INFO`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":425,"message":"unresolved constant `WARN`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":430,"message":"unresolved constant `INFO`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":436,"message":"unresolved constant `WARN`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":441,"message":"unresolved constant `INFO`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":447,"message":"unresolved constant `WARN`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":452,"message":"unresolved constant `INFO`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":471,"message":"unresolved constant `WARN`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":476,"message":"unresolved constant `INFO`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":49,"message":"unresolved constant `::WebSocket::Driver`","path":"rails/actioncable/lib/action_cable/server/socket/client_socket.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":495,"message":"unresolved constant `FATAL`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
-{"code":"E0104","column":21,"line":500,"message":"unresolved constant `ERROR`","path":"rails/activejob/test/cases/logging_test.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":52,"message":"unresolved constant `::Selenium::WebDriver::Chrome::Options`","path":"rails/actionpack/lib/action_dispatch/system_testing/browser.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":60,"message":"unresolved constant `::Selenium::WebDriver::Firefox::Options`","path":"rails/actionpack/lib/action_dispatch/system_testing/browser.rb","severity":"warning"}
 {"code":"E0104","column":21,"line":72,"message":"unresolved constant `Redcarpet::Markdown`","path":"rails/guides/rails_guides/markdown.rb","severity":"warning"}
@@ -374,10 +350,8 @@
 {"code":"E0104","column":22,"line":19,"message":"unresolved constant `Prism`","path":"rails/tools/rail_inspector/lib/rail_inspector/configuring.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":201,"message":"unresolved constant `B`","path":"rails/actionview/test/actionpack/controller/view_paths_test.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":21,"message":"unresolved constant `DRbObject`","path":"rails/activesupport/lib/active_support/testing/parallelization/worker.rb","severity":"warning"}
-{"code":"E0104","column":22,"line":23,"message":"unresolved constant `Dalli::Protocol::Meta`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":25,"message":"unresolved constant `Redcarpet::Render::HTML`","path":"rails/guides/rails_guides/markdown/renderer.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":259,"message":"unresolved constant `Prism`","path":"rails/actionview/lib/action_view/template.rb","severity":"warning"}
-{"code":"E0104","column":22,"line":26,"message":"unresolved constant `Dalli::Protocol::Binary`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":262,"message":"unresolved constant `PG::PQERRORS_TERSE`","path":"rails/activerecord/test/cases/adapters/postgresql/postgresql_adapter_test.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":30,"message":"unresolved constant `X`","path":"rails/activesupport/test/dependencies_test.rb","severity":"warning"}
 {"code":"E0104","column":22,"line":33,"message":"unresolved constant `AppTemplate::Application`","path":"rails/railties/test/application/multiple_applications_test.rb","severity":"warning"}
@@ -479,7 +453,6 @@
 {"code":"E0104","column":26,"line":84,"message":"unresolved constant `TestJob`","path":"rails/activejob/test/integration/queuing_test.rb","severity":"warning"}
 {"code":"E0104","column":26,"line":87,"message":"unresolved constant `Concurrent::ThreadLocalVar`","path":"rails/activesupport/lib/active_support/deprecation.rb","severity":"warning"}
 {"code":"E0104","column":26,"line":99,"message":"unresolved constant `DEBUG`","path":"rails/activesupport/lib/active_support/proxy_logger.rb","severity":"warning"}
-{"code":"E0104","column":27,"line":11,"message":"unresolved constant `Dalli::Client`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":128,"message":"unresolved constant `::RedisClient::Config`","path":"rails/activesupport/test/cache/stores/redis_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":1366,"message":"unresolved constant `Bukkits`","path":"rails/railties/test/railties/engine_test.rb","severity":"warning"}
 {"code":"E0104","column":27,"line":19,"message":"unresolved constant `PG::TextEncoder::Array`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql/oid/array.rb","severity":"warning"}
@@ -581,7 +554,6 @@
 {"code":"E0104","column":34,"line":792,"message":"unresolved constant `OID::SpecializedString`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
 {"code":"E0104","column":35,"line":1053,"message":"unresolved constant `OID::WellKnown::FIRST_UNKNOWN_PG_VERSION`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
 {"code":"E0104","column":35,"line":1407,"message":"unresolved constant `PG::TypeMapByOid`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
-{"code":"E0104","column":35,"line":185,"message":"unresolved constant `Dalli::DalliError`","path":"rails/actionpack/test/dispatch/session/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":35,"line":33,"message":"unresolved constant `::MessagePack::Factory`","path":"rails/activesupport/lib/active_support/message_pack/serializer.rb","severity":"warning"}
 {"code":"E0104","column":35,"line":37,"message":"unresolved constant `EXCL`","path":"rails/activesupport/lib/active_support/core_ext/file/atomic.rb","severity":"warning"}
 {"code":"E0104","column":35,"line":40,"message":"unresolved constant `::Trilogy::SSL_VERIFY_IDENTITY`","path":"rails/activerecord/lib/active_record/connection_adapters/trilogy_adapter.rb","severity":"warning"}
@@ -686,8 +658,6 @@
 {"code":"E0104","column":46,"line":1452,"message":"unresolved constant `OID::Hstore`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
 {"code":"E0104","column":46,"line":1460,"message":"unresolved constant `OID::Vector`","path":"rails/activerecord/lib/active_record/connection_adapters/postgresql_adapter.rb","severity":"warning"}
 {"code":"E0104","column":46,"line":32,"message":"unresolved constant `::Trilogy::QUERY_FLAGS_LOCAL_TIMEZONE`","path":"rails/activerecord/lib/active_record/connection_adapters/trilogy/database_statements.rb","severity":"warning"}
-{"code":"E0104","column":46,"line":559,"message":"unresolved constant `Firm::FirmOnTheFly`","path":"rails/activerecord/test/cases/inheritance_test.rb","severity":"warning"}
-{"code":"E0104","column":46,"line":560,"message":"unresolved constant `Firm::FirmOnTheFly`","path":"rails/activerecord/test/cases/inheritance_test.rb","severity":"warning"}
 {"code":"E0104","column":46,"line":72,"message":"unresolved constant `::Selenium::WebDriver::DriverFinder`","path":"rails/actionpack/lib/action_dispatch/system_testing/browser.rb","severity":"warning"}
 {"code":"E0104","column":46,"line":80,"message":"unresolved constant `Parent`","path":"rails/activesupport/test/descendants_tracker_test.rb","severity":"warning"}
 {"code":"E0104","column":47,"line":108,"message":"unresolved constant `SQLite3::Constants::Open::CREATE`","path":"rails/activerecord/test/cases/adapters/sqlite3/transaction_test.rb","severity":"warning"}
@@ -763,7 +733,6 @@
 {"code":"E0104","column":52,"line":179,"message":"unresolved constant `Concurrent::AtomicFixnum`","path":"rails/actioncable/lib/action_cable/channel/base.rb","severity":"warning"}
 {"code":"E0104","column":52,"line":27,"message":"unresolved constant `::Herb::Engine::SecurityError`","path":"rails/actionview/lib/action_view/herb_checker.rb","severity":"warning"}
 {"code":"E0104","column":53,"line":13,"message":"unresolved constant `SQLite3::Constants::Open::CREATE`","path":"rails/activerecord/test/cases/adapters/sqlite3/transaction_test.rb","severity":"warning"}
-{"code":"E0104","column":53,"line":385,"message":"unresolved constant `Dalli::DalliError`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":54,"line":11,"message":"unresolved constant `Rack::Utils::ParameterTypeError`","path":"rails/actionpack/lib/action_dispatch/http/param_error.rb","severity":"warning"}
 {"code":"E0104","column":54,"line":122,"message":"unresolved constant `TestHelper`","path":"rails/actionpack/test/controller/helper_test.rb","severity":"warning"}
 {"code":"E0104","column":54,"line":1255,"message":"unresolved constant `AppTemplate`","path":"rails/railties/test/railties/engine_test.rb","severity":"warning"}
@@ -785,7 +754,6 @@
 {"code":"E0104","column":58,"line":68,"message":"unresolved constant `Child2`","path":"rails/activesupport/test/descendants_tracker_test.rb","severity":"warning"}
 {"code":"E0104","column":6,"line":161,"message":"unresolved constant `SERVICE_CONFIGURATIONS`","path":"rails/activestorage/test/controllers/representations/redirect_controller_test.rb","severity":"warning"}
 {"code":"E0104","column":6,"line":176,"message":"unresolved constant `SERVICE_CONFIGURATIONS`","path":"rails/activestorage/test/controllers/representations/redirect_controller_test.rb","severity":"warning"}
-{"code":"E0104","column":6,"line":22,"message":"unresolved constant `Dalli::VERSION`","path":"rails/activesupport/test/cache/stores/mem_cache_store_test.rb","severity":"warning"}
 {"code":"E0104","column":6,"line":72,"message":"unresolved constant `SERVICE_CONFIGURATIONS`","path":"rails/activestorage/test/controllers/blobs/redirect_controller_test.rb","severity":"warning"}
 {"code":"E0104","column":6,"line":83,"message":"unresolved constant `SERVICE_CONFIGURATIONS`","path":"rails/activestorage/test/controllers/blobs/redirect_controller_test.rb","severity":"warning"}
 {"code":"E0104","column":60,"line":147,"message":"unresolved constant `IRB::Color`","path":"rails/railties/lib/rails/commands/console/irb_console.rb","severity":"warning"}
@@ -832,7 +800,6 @@
 {"code":"E0104","column":7,"line":126,"message":"unresolved constant `AppTemplate::Application`","path":"rails/railties/test/application/multiple_applications_test.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":131,"message":"unresolved constant `TestJob`","path":"rails/activejob/test/integration/queuing_test.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":132,"message":"unresolved constant `TestJob`","path":"rails/activejob/test/integration/queuing_test.rb","severity":"warning"}
-{"code":"E0104","column":7,"line":136,"message":"unresolved constant `IncorporealModel`","path":"rails/activerecord/test/cases/validations_test.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":1531,"message":"unresolved constant `Launchy`","path":"rails/actionpack/test/controller/integration_test.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":1542,"message":"unresolved constant `Launchy`","path":"rails/actionpack/test/controller/integration_test.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":1661,"message":"unresolved constant `TestCase`","path":"rails/activerecord/test/cases/fixtures_test.rb","severity":"warning"}

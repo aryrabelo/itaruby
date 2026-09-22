@@ -1,83 +1,225 @@
-//! Sorbet `sig { ... }` return-type mapping (bead ita-uh1). Maps the raw
-//! source text of a `.returns(...)` argument — captured verbatim by
-//! `index.rs`'s `DefWalker` (see `MethodDef::sorbet_ret` and
-//! `extract_sig_return`), never reparsed as Ruby — to this crate's `Ty`.
+//! Static extraction of a deliberately small Sorbet signature grammar.
 //!
-//! Hand-written recursive-descent scanner over the type-expression text,
-//! same spirit as `structure_sql.rs`'s SQL scanner: stdlib only, no crate
-//! addition, deliberately narrow. **Anything this parser doesn't
-//! recognize maps to `Ty::Unknown`, never a guess** — that is what
-//! preserves invariant #1 here: this function is purely name-based — it
-//! never sees the `ProjectIndex`, so it has no way to resolve a class
-//! name (`::Quantity`, an app model reopened by Tapioca's `dsl/` RBIs) to
-//! a `ClassId`, and guessing one would be a false positive. Read that as
-//! "this function is not the place to resolve a project class name", not
-//! as "project types are permanently out of scope": an index-aware layer
-//! over `dsl/`-generated sigs (Tapioca's per-app-model RBIs, a separate
-//! bead) can sit on top of this one and resolve `Instance`/`Class` where
-//! it actually has the index to do so safely. This module's own contract
-//! stays fixed regardless: it must NEVER produce `Ty::Instance`/
-//! `Ty::Class` itself, only a core scalar, a collection of core types, or
-//! `Unknown`.
-//!
-//! Arity is deliberately out of scope (bead ita-uh1's contract, not this
-//! module's call): only the `.returns(...)` argument is ever captured by
-//! `index.rs` in the first place — `params(...)`/`void`/`override`/
-//! `abstract` never reach this function.
+//! Prism supplies call-chain and argument boundaries; no Ruby is executed.
+//! Type expressions are retained verbatim and resolved separately, with the
+//! declaration's lexical nesting. Unsupported members remain `Unknown`, while
+//! known Array/Hash categories are retained. This is not a full Sorbet checker:
+//! overload selection, generics, proc types, bind and type parameters are not
+//! modeled. Adjacency and rejection of multiple sigs belong to the index walker.
 
+use ruby_prism::{CallNode, Node};
+
+use crate::index::ProjectIndex;
 use crate::types::Ty;
 
-/// Map a sorbet return-type expression's source text to `Ty`.
-/// `Ty::Unknown` for every unrecognized shape — `T.untyped`,
-/// `T.self_type`, `T.proc`, `T::Set[...]`, a class name (project or gem —
-/// this function has no index to resolve one to a `ClassId`; see the
-/// module doc comment), or any other construct this scanner doesn't
-/// model. Covers exactly the sig shapes measured in the reference
-/// corpus's `gems/` RBIs (bead ita-uh1); deliberately does not chase rare
-/// gem-only forms (`T.class_of`, `T.proc`, generics) that never showed up
-/// there.
-pub fn sorbet_ret_ty(expr: &str) -> Ty {
-    parse_ty(expr)
+/// A single, unambiguous Sorbet contract. Parameter names are Ruby names, never
+/// positional guesses. `void` discards the result; it does not promise `nil`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct SorbetSig {
+    pub params: Vec<(String, String)>,
+    pub ret: Option<String>,
+    pub void: bool,
 }
 
-/// Bead ita-tjr: index-aware layer over `sorbet_ret_ty` (see this
-/// module's doc comment for why that function itself never resolves a
-/// name). `None`/absent sig text -> `Ty::Unknown`. Otherwise the same
-/// scalar/compound grammar as `sorbet_ret_ty` runs first; only where a
-/// LEAF of that grammar would fall through to `Unknown` does this layer
-/// try the leaf text against `index.resolve_const(&[], name)` (empty
-/// nesting — sig text carries no lexical scope of its own) and, on a hit,
-/// produce `Ty::Instance(ClassId)`. Resolution happens at the leaves,
-/// not on the whole input, so nesting (`T.nilable(::Quantity)`,
-/// `T::Array[Quantity]`) still reaches the inner name. A name that does
-/// not resolve in the index stays `Ty::Unknown` — never a guess, same
-/// invariant as `sorbet_ret_ty`; this is also the only way this bead can
-/// produce a diagnostic downstream (a wrong resolution -> a wrong
-/// `ClassId` -> a possible false E0101), so a miss here MUST stay a miss.
-pub fn resolve_ret_ty(expr: Option<&str>, index: &crate::index::ProjectIndex) -> Ty {
-    let Some(expr) = expr else {
-        return Ty::Unknown;
+/// Extract a bare `sig` / `sig(:final)` block with one builder call chain.
+/// Foreign receivers, nested blocks, duplicate clauses, dynamic parameter keys
+/// and unknown builder operations fail closed. Known modifiers are metadata,
+/// not permission to infer additional type relationships.
+pub fn extract_sig(node: &Node<'_>) -> Option<SorbetSig> {
+    let call = node.as_call_node()?;
+    if call.name().as_slice() != b"sig" || call.receiver().is_some() {
+        return None;
+    }
+    if call.arguments().is_some() && !symbol_arg_is(&call, &[b"final"]) {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let body = block.body()?.as_statements_node()?;
+    let mut statements = body.body().iter();
+    let current = statements.next()?;
+    if statements.next().is_some() {
+        return None;
+    }
+    let mut sig = SorbetSig {
+        params: Vec::new(),
+        ret: None,
+        void: false,
     };
-    parse_ty_leaf(expr, &|name| index.resolve_const(&[], name).map(Ty::Instance))
+    walk_clause_chain(current, &mut sig)?;
+    (sig.ret.is_some() || sig.void).then_some(sig)
 }
 
-/// `parse_ty`, parameterized by a leaf resolver tried only after
-/// `scalar_ty`/`compound_ty` both miss. `sorbet_ret_ty` itself is
-/// `parse_ty_leaf` with a resolver that always misses (`|_| None`),
-/// unchanged in observable behavior — this function does not duplicate
-/// the grammar, it threads one extra fallback through the existing
-/// recursion (`compound_ty_leaf` below).
+/// Walk the builder chain from the OUTERMOST clause inward through each
+/// receiver — `returns(X).params(...)` arrives as `returns` wrapping
+/// `params`. A repeated clause, a block, or any call operator other than a
+/// plain `.` rejects the whole signature.
+fn walk_clause_chain(mut current: Node<'_>, sig: &mut SorbetSig) -> Option<()> {
+    let mut seen = 0u8;
+    loop {
+        let builder = current.as_call_node()?;
+        if builder.block().is_some()
+            || builder.call_operator_loc().is_some_and(|loc| loc.as_slice() != b".")
+        {
+            return None;
+        }
+        let clause = extract_clause(&builder, sig)?;
+        if seen & clause != 0 {
+            return None;
+        }
+        seen |= clause;
+        match builder.receiver() {
+            Some(receiver) => current = receiver,
+            None => return Some(()),
+        }
+    }
+}
+
+/// The return and void clauses share a bit, rejecting duplicates and mixed
+/// returns/void contracts during the receiver walk.
+fn extract_clause(call: &CallNode<'_>, sig: &mut SorbetSig) -> Option<u8> {
+    match call.name().as_slice() {
+        b"returns" => {
+            let arg = single_arg(call)?;
+            if arg.as_splat_node().is_some() || arg.as_keyword_hash_node().is_some() {
+                return None;
+            }
+            sig.ret = Some(source_text(&arg)?);
+            Some(1)
+        }
+        b"void" if no_args(call) => {
+            sig.void = true;
+            Some(1)
+        }
+        b"params" => {
+            sig.params = extract_params(call)?;
+            Some(2)
+        }
+        b"abstract" if no_args(call) => Some(4),
+        b"override" if no_args(call) => Some(8),
+        b"overridable" if no_args(call) => Some(16),
+        b"final" if no_args(call) => Some(32),
+        b"checked" if symbol_arg_is(call, &[b"always", b"tests", b"never"]) => Some(64),
+        _ => None,
+    }
+}
+
+fn no_args(call: &CallNode<'_>) -> bool {
+    call.arguments().is_none_or(|args| args.arguments().iter().next().is_none())
+}
+
+fn single_arg<'pr>(call: &CallNode<'pr>) -> Option<Node<'pr>> {
+    let args = call.arguments()?;
+    let mut iter = args.arguments().iter();
+    let arg = iter.next()?;
+    iter.next().is_none().then_some(arg)
+}
+
+/// The sole argument is one of the literal symbols `allowed` lists —
+/// `sig(:final)`, `checked(:always)`. A symbol node borrows the argument it
+/// came from, so the comparison happens here rather than handing a reference
+/// back out of the temporary that owns it. Anything else is `false`, which
+/// every caller reads as "reject", including a non-symbol argument.
+fn symbol_arg_is(call: &CallNode<'_>, allowed: &[&[u8]]) -> bool {
+    single_arg(call).is_some_and(|arg| {
+        arg.as_symbol_node().is_some_and(|sym| allowed.contains(&sym.unescaped()))
+    })
+}
+
+fn source_text(node: &Node<'_>) -> Option<String> {
+    Some(std::str::from_utf8(node.location().as_slice()).ok()?.trim().to_owned())
+}
+
+fn extract_params(call: &CallNode<'_>) -> Option<Vec<(String, String)>> {
+    if no_args(call) {
+        return Some(Vec::new());
+    }
+    let hash = single_arg(call)?.as_keyword_hash_node()?;
+    let mut params = Vec::new();
+    for element in &hash.elements() {
+        let assoc = element.as_assoc_node()?;
+        let symbol = assoc.key().as_symbol_node()?;
+        let name = std::str::from_utf8(symbol.unescaped()).ok()?;
+        let mut chars = name.bytes();
+        if !chars.next().is_some_and(|c| c.is_ascii_lowercase() || c == b'_')
+            || !chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+            || params.iter().any(|(existing, _)| existing == name)
+        {
+            return None;
+        }
+        params.push((name.to_owned(), source_text(&assoc.value())?));
+    }
+    Some(params)
+}
+
+/// Index-blind mapping retained for consumers that only know core types.
+/// Nominal project types and every unsupported shape remain `Unknown`.
+pub fn sorbet_ret_ty(expr: &str) -> Ty {
+    parse_ty_leaf(expr, &|_| None)
+}
+
+/// Root-scoped return mapping for consumers without declaration nesting.
+pub fn resolve_ret_ty(expr: Option<&str>, index: &ProjectIndex) -> Ty {
+    expr.map_or(Ty::Unknown, |expr| resolve_sig_ty(expr, index, &[]))
+}
+
+/// Resolve supported type expressions in the declaration's lexical scope.
+/// Absolute `::` names bypass nesting, including inside compounds. Only literal
+/// constant paths reach the index; calls, generics and Sorbet special types do
+/// not become nominal classes just because a similarly named class exists.
+pub fn resolve_sig_ty(expr: &str, index: &ProjectIndex, nesting: &[String]) -> Ty {
+    parse_ty_leaf(expr, &|name| {
+        let bare = name.strip_prefix("::").unwrap_or(name);
+        if !constant_path(bare) || bare.starts_with("T::") {
+            return None;
+        }
+        // A qualified path still looks up its FIRST segment lexically.
+        // resolve_const's dynamic-constant guard only covers simple names,
+        // so reject a shadowed prefix before accepting its global fallback.
+        if !name.starts_with("::") && shadowed_prefix(bare, index, nesting) {
+            return Some(Ty::Unknown);
+        }
+        if let Some(id) = index.resolve_const(nesting, name) {
+            return Some(scalar_ty(&index.class(id).path).unwrap_or(Ty::Instance(id)));
+        }
+        None
+    })
+}
+
+fn shadowed_prefix(name: &str, index: &ProjectIndex, nesting: &[String]) -> bool {
+    let first = name.split("::").next().unwrap_or(name);
+    for level in nesting.iter().rev() {
+        if index.by_path.get(level).is_some_and(|&id| {
+            index.class(id).consts.iter().any(|constant| constant == first)
+        }) {
+            return true;
+        }
+        // A nearer real namespace takes precedence over assignments farther
+        // out. Do not mistake an unrelated outer binding for its shadow.
+        if index.by_path.contains_key(&format!("{level}::{first}")) {
+            return false;
+        }
+    }
+    false
+}
+
+fn constant_path(s: &str) -> bool {
+    s.split("::").all(|part| {
+        let mut bytes = part.bytes();
+        bytes.next().is_some_and(|c| c.is_ascii_uppercase())
+            && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    })
+}
+
 fn parse_ty_leaf(expr: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Ty {
     let s = expr.trim();
-    let s = s.strip_prefix("::").unwrap_or(s).trim();
-    scalar_ty(s)
-        .or_else(|| compound_ty_leaf(s, resolve))
+    let bare = s.strip_prefix("::").unwrap_or(s);
+    compound_ty_leaf(bare, resolve)
         .or_else(|| resolve(s))
+        .or_else(|| scalar_ty(bare))
         .unwrap_or(Ty::Unknown)
-}
-
-fn parse_ty(expr: &str) -> Ty {
-    parse_ty_leaf(expr, &|_| None)
 }
 
 /// The leaf names: a sorbet type that is just a class name we model
@@ -96,39 +238,52 @@ fn scalar_ty(s: &str) -> Option<Ty> {
     })
 }
 
-/// The four compound forms, each recursing through `parse_ty_leaf` so
-/// nesting (`T.nilable(T::Array[String])`) works at any depth AND the
-/// leaf resolver reaches every inner name, not just a top-level one. A
-/// malformed inner shape (`T::Hash` without exactly two parts) is
-/// `Ty::Unknown`, not a guess at the missing half. `compound_ty` (used by
-/// the index-blind `parse_ty`) is this with a resolver that always
-/// misses — see `parse_ty`.
+/// Unknown union members absorb the union; unknown collection members stay
+/// unknown without erasing the independently known Array/Hash category.
 fn compound_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option<Ty> {
     if let Some(inner) = strip_call(s, "T.nilable") {
-        return Some(Ty::union(parse_ty_leaf(inner, resolve), Ty::Nil));
-    }
-    if let Some(inner) = strip_index(s, "T::Array") {
-        return Some(Ty::Array(Box::new(parse_ty_leaf(inner, resolve))));
-    }
-    if let Some(inner) = strip_index(s, "T::Hash") {
-        return Some(match split_top_level(inner, ',').as_slice() {
-            [k, v] => Ty::Hash(
-                Box::new(parse_ty_leaf(k, resolve)),
-                Box::new(parse_ty_leaf(v, resolve)),
-            ),
+        let parts = split_top_level(inner, ',')?;
+        return Some(match parts.as_slice() {
+            [element] => Ty::union(parse_ty_leaf(element, resolve), Ty::Nil),
             _ => Ty::Unknown,
         });
     }
-    let inner = strip_call(s, "T.any")?;
-    let mut tys = split_top_level(inner, ',').into_iter().map(|p| parse_ty_leaf(p, resolve));
+    container_ty_leaf(s, resolve).or_else(|| union_ty_leaf(s, resolve))
+}
+
+/// The two bracketed containers. A member count the spelling does not
+/// support is `Unknown`, exactly as an unreadable inner expression is.
+fn container_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option<Ty> {
+    if let Some(inner) = strip_index(s, "T::Array") {
+        let parts = split_top_level(inner, ',')?;
+        return Some(match parts.as_slice() {
+            [element] => Ty::Array(Box::new(parse_ty_leaf(element, resolve))),
+            _ => Ty::Unknown,
+        });
+    }
+    let parts = split_top_level(strip_index(s, "T::Hash")?, ',')?;
+    Some(match parts.as_slice() {
+        [k, v] => Ty::Hash(
+            Box::new(parse_ty_leaf(k, resolve)),
+            Box::new(parse_ty_leaf(v, resolve)),
+        ),
+        _ => Ty::Unknown,
+    })
+}
+
+/// `T.any(...)` — a single member is not a union and stays `Unknown`.
+fn union_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option<Ty> {
+    let parts = split_top_level(strip_call(s, "T.any")?, ',')?;
+    if parts.len() < 2 {
+        return Some(Ty::Unknown);
+    }
+    let mut tys = parts.into_iter().map(|part| parse_ty_leaf(part, resolve));
     let first = tys.next()?;
     Some(tys.fold(first, Ty::union))
 }
 
-/// `name(...)` — the text between the outermost parens, only when `s` is
-/// exactly that call: nothing before `name`, nothing after the matching
-/// close paren. `None` for a mere prefix collision (`"Integerish(...)"`
-/// does not strip as `"Integer"`) or any other shape.
+/// Strip the outer call spelling. The recursive leaf parser and compound
+/// splitter reject invalid inner syntax, including unmatched delimiters.
 fn strip_call<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     let rest = s.strip_prefix(name)?.trim_start();
     rest.strip_prefix('(')?.strip_suffix(')')
@@ -140,25 +295,47 @@ fn strip_index<'a>(s: &'a str, name: &str) -> Option<&'a str> {
     rest.strip_prefix('[')?.strip_suffix(']')
 }
 
-/// Splits on `sep` at bracket/paren depth 0 only, so
-/// `T::Hash[Symbol, T.nilable(Integer)]`'s inner text splits into exactly
-/// two parts instead of three. Each part is trimmed; empty parts (a
-/// trailing separator) are dropped.
-fn split_top_level(s: &str, sep: char) -> Vec<&str> {
+/// Preserve empty parts as a rejection, and check matching delimiter kinds.
+/// Unsupported strings/blocks never need a textual comma heuristic: their
+/// nodes were already captured intact by Prism and resolve to `Unknown`.
+fn split_top_level(s: &str, sep: char) -> Option<Vec<&str>> {
     let mut parts = Vec::new();
-    let mut depth = 0i32;
+    let mut stack = Vec::new();
     let mut start = 0usize;
     for (i, c) in s.char_indices() {
-        match c {
-            '(' | '[' | '{' => depth += 1,
-            ')' | ']' | '}' => depth -= 1,
-            c if c == sep && depth == 0 => {
-                parts.push(s[start..i].trim());
-                start = i + c.len_utf8();
+        if track_delimiter(c, &mut stack)? {
+            continue;
+        }
+        if c == sep && stack.is_empty() {
+            let part = s[start..i].trim();
+            if part.is_empty() {
+                return None;
             }
-            _ => {}
+            parts.push(part);
+            start = i + c.len_utf8();
+        } else if !(c.is_ascii_alphanumeric() || c.is_ascii_whitespace() || "_:.,".contains(c)) {
+            return None;
         }
     }
-    parts.push(s[start..].trim());
-    parts.into_iter().filter(|p| !p.is_empty()).collect()
+    let last = s[start..].trim();
+    if !stack.is_empty() || last.is_empty() {
+        return None;
+    }
+    parts.push(last);
+    Some(parts)
+}
+
+/// `Some(true)` — `c` opened or correctly closed a nesting delimiter and
+/// the caller has nothing left to decide about it. `Some(false)` — an
+/// ordinary character. `None` — a closer that does not match the opener it
+/// meets, which rejects the whole expression.
+fn track_delimiter(c: char, stack: &mut Vec<char>) -> Option<bool> {
+    match c {
+        '(' => stack.push(')'),
+        '[' => stack.push(']'),
+        '{' => stack.push('}'),
+        ')' | ']' | '}' => return (stack.pop() == Some(c)).then_some(true),
+        _ => return Some(false),
+    }
+    Some(true)
 }

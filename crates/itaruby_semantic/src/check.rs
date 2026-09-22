@@ -23,10 +23,18 @@ use crate::types::{
     ClassId, ConstraintCall, ConstraintProof, Diagnostic, Severity, Suggestion, Ty,
     E0001_SYNTAX_ERROR, E0101_UNKNOWN_METHOD, E0102_WRONG_ARITY, E0103_ARG_TYPE_MISMATCH,
     E0104_UNRESOLVED_CONSTANT, E0105_INVALID_RBS_COMMENT, E0106_IMPOSSIBLE_CAST,
-    E0107_CONSTRAINT_CONTRADICTION, E0108_OPERAND_TYPE_MISMATCH,
+    E0107_CONSTRAINT_CONTRADICTION, E0108_OPERAND_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH,
 };
 
 type Env = FxHashMap<String, Ty>;
+type KeywordArg = (String, Ty, (usize, usize));
+type PositionalArg = (Ty, (usize, usize), Option<String>);
+
+struct CallTypeArgs<'a> {
+    positional: &'a [PositionalArg],
+    /// None means splats/forwarding/blocks made named binding unprovable.
+    keywords: Option<&'a [KeywordArg]>,
+}
 
 /// Bead ita-qst: every `#: as <target>` inline-cast comment
 /// (sorbet.org/docs/rbs-support's "inline type assertion" form) in
@@ -148,6 +156,10 @@ fn check_file_inner(
     dark: bool,
 ) -> (Vec<Diagnostic>, Vec<DarkSingleton>) {
     let text = file.text(db);
+    // RBI files are declarations, not executable source bodies.
+    if file.path(db).extension().is_some_and(|ext| ext == "rbi") {
+        return (Vec::new(), Vec::new());
+    }
     let parse = ruby_prism::parse(text.as_bytes());
     let cast_comments = collect_cast_comments(
         text,
@@ -1432,6 +1444,72 @@ impl Checker<'_> {
         m.and_then(|m| m.sig.clone())
     }
 
+    /// Inline metadata wins, including an unsupported inline signature.
+    /// An RBI is eligible only for this exact source definition's owner,
+    /// dispatch track and Ruby parameter layout.
+    fn effective_sorbet(
+        &self,
+        method: &MethodSig,
+        name: &str,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        if method.sig.is_some() || method.arity_unknown || method.abstract_stub {
+            return None;
+        }
+        if method.sorbet_sig.is_none() && (method.sorbet_annotated || self.rbi_map.is_none()) {
+            return None;
+        }
+        let path = method.nesting.last()?;
+        let (name, singleton) = self.dispatching_name(method, name, path)?;
+        if method.sorbet_annotated {
+            return method.sorbet_sig.clone().map(|sig| (sig, method.nesting.clone()));
+        }
+        let declaration = crate::index::source_rbi_method(path, name, singleton, self.rbi_map?)?;
+        if !declaration.matches_source(method) {
+            return None;
+        }
+        declaration.definition.sorbet_sig.map(|sig| (sig, declaration.nesting))
+    }
+
+    /// The name and dispatch track this exact definition answers on, or
+    /// `None` when the owner is open or a descendant redefines the name —
+    /// in both cases no signature written here is proven to govern the
+    /// call that reaches it.
+    fn dispatching_name<'n>(
+        &self,
+        method: &MethodSig,
+        name: &'n str,
+        path: &str,
+    ) -> Option<(&'n str, bool)> {
+        let owner = *self.index.by_path.get(path)?;
+        let class = self.index.class(owner);
+        if class.open {
+            return None;
+        }
+        let name = if name == "new" && class.methods.get("initialize").is_some_and(|m| {
+            m.file == method.file && m.def_span == method.def_span
+        }) { "initialize" } else { name };
+        let singleton = class.singleton_methods.get(name).is_some_and(|m| {
+            m.file == method.file && m.def_span == method.def_span
+        });
+        (!self.index.descendant_defines(owner, name, singleton)).then_some((name, singleton))
+    }
+
+    fn sorbet_of_def(
+        &self,
+        class: Option<ClassId>,
+        def: &DefNode<'_>,
+        singleton: bool,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        let cd = self.index.class(class?);
+        let name = String::from_utf8_lossy(def.name().as_slice());
+        let method = if singleton { cd.singleton_methods.get(name.as_ref()) } else { cd.methods.get(name.as_ref()) }?;
+        let loc = def.location();
+        if method.def_span != (loc.start_offset(), loc.end_offset()) {
+            return None;
+        }
+        self.effective_sorbet(method, &name)
+    }
+
     /// Check a method body; returns the inferred return type (last expression
     /// unioned with explicit returns).
     fn check_method_body(
@@ -1443,6 +1521,7 @@ impl Checker<'_> {
         sig: Option<&RbsSig>,
     ) -> Ty {
         let mut env = Env::default();
+        let sorbet = self.sorbet_of_def(class, def, singleton);
         let saved_method_params = std::mem::take(&mut self.method_params);
         let saved_block_depth = std::mem::replace(&mut self.rebindable_block_depth, 0);
         if let Some(params) = def.parameters() {
@@ -1548,6 +1627,14 @@ impl Checker<'_> {
                 }
             }
         }
+        if let Some((contract, nesting)) = &sorbet {
+            for (name, expr) in &contract.params {
+                let ty = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+                if ty != Ty::Unknown && env.contains_key(name) {
+                    env.insert(name.clone(), ty);
+                }
+            }
+        }
 
         let self_ty = self_ty_of(class, singleton);
         // E0108's per-scope literal proof. The parameter list is handed
@@ -1573,6 +1660,9 @@ impl Checker<'_> {
         self.current_method_name = saved_name;
         let last_is_unknownish = matches!(last, Ty::Unknown | Ty::Union(_));
         let returns = std::mem::replace(&mut self.returns, saved_returns);
+        if let Some((contract, nesting)) = &sorbet {
+            self.check_sorbet_return(def, contract, nesting, &last, &returns);
+        }
         let folded = returns.into_iter().fold(last, Ty::union);
         if self.census {
             // Bead ita-mv5: classify WHY this method's own return died on
@@ -1648,6 +1738,39 @@ impl Checker<'_> {
         self.rebindable_block_depth = saved_block_depth;
         self.operand_locals = saved_operands;
         folded
+    }
+
+    fn check_sorbet_return(
+        &mut self,
+        def: &DefNode<'_>,
+        contract: &crate::sorbet_sig::SorbetSig,
+        nesting: &[String],
+        last: &Ty,
+        returns: &[Ty],
+    ) {
+        if self.silent || contract.void {
+            return;
+        }
+        let (Some(expr), Some(body)) = (contract.ret.as_deref(), def.body()) else { return };
+        let mut safety = ReturnContractSafety::default();
+        safety.visit(&body);
+        if safety.uncertain {
+            return;
+        }
+        let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+        // Explicit returns make the existing inference fold Unknown. Inspect
+        // their proven values independently; never treat that Unknown as nil.
+        let actual = returns.iter().find(|ty| !compatible(ty, &expected, self.index))
+            .or_else(|| {
+                (!return_terminal(&body) && !compatible(last, &expected, self.index)).then_some(last)
+            });
+        if let Some(actual) = actual {
+            let loc = def.name_loc();
+            self.emit(loc.start_offset(), loc.end_offset(), E0109_RETURN_TYPE_MISMATCH,
+                Severity::Error, format!("return of `{}` expects {}, got {}",
+                    String::from_utf8_lossy(def.name().as_slice()),
+                    ty_name(&expected, self.index), ty_name(actual, self.index)));
+        }
     }
 
     // -- expression inference ----------------------------------------------
@@ -3064,12 +3187,15 @@ impl Checker<'_> {
 
         // Arguments.
         let mut pos_args: Vec<(Ty, (usize, usize), Option<String>)> = Vec::new();
+        let mut kw_args: Vec<KeywordArg> = Vec::new();
+        let mut sorbet_args_known = call.block().is_none();
         let mut exact_arity = true;
         if let Some(args) = call.arguments() {
             for a in &args.arguments() {
                 match &a {
                     Node::SplatNode { .. } | Node::ForwardingArgumentsNode { .. } => {
                         exact_arity = false;
+                        sorbet_args_known = false;
                         self.infer_expr(&a, env, self_ty, scope);
                     }
                     Node::KeywordHashNode { .. } => {
@@ -3077,9 +3203,38 @@ impl Checker<'_> {
                         // when the callee has no keyword params: positional
                         // arity is no longer knowable here.
                         exact_arity = false;
-                        self.infer_expr(&a, env, self_ty, scope);
+                        let Some(hash) = a.as_keyword_hash_node() else {
+                            sorbet_args_known = false;
+                            self.infer_expr(&a, env, self_ty, scope);
+                            continue;
+                        };
+                        for element in &hash.elements() {
+                            if let Some(assoc) = element.as_assoc_node() {
+                                if let Some(key) = assoc.key().as_symbol_node() {
+                                    let value = assoc.value();
+                                    let loc = value.location();
+                                    let ty = self.infer_expr(&value, env, self_ty, scope);
+                                    let ty = self.apply_cast_comment(ty, loc.start_offset());
+                                    let name = String::from_utf8_lossy(key.unescaped()).into_owned();
+                                    if kw_args.iter().any(|(previous, _, _)| previous == &name) {
+                                        sorbet_args_known = false;
+                                    }
+                                    kw_args.push((
+                                        name,
+                                        ty,
+                                        (loc.start_offset(), loc.end_offset()),
+                                    ));
+                                } else {
+                                    sorbet_args_known = false;
+                                    self.infer_expr(&element, env, self_ty, scope);
+                                }
+                            } else {
+                                sorbet_args_known = false;
+                                self.infer_expr(&element, env, self_ty, scope);
+                            }
+                        }
                     }
-                    Node::BlockArgumentNode { .. } => {}
+                    Node::BlockArgumentNode { .. } => { sorbet_args_known = false; }
                     _ => {
                         let loc = a.location();
                         let t = self.infer_expr(&a, env, self_ty, scope);
@@ -3136,6 +3291,10 @@ impl Checker<'_> {
             || span_of_call(call),
             |l| (l.start_offset(), l.end_offset()),
         );
+        let typed_args = CallTypeArgs {
+            positional: &pos_args,
+            keywords: sorbet_args_known.then_some(kw_args.as_slice()),
+        };
 
         // E0108 is decided from the operand NODES, independently of
         // which method table below resolves the operator.
@@ -3212,7 +3371,7 @@ impl Checker<'_> {
                     {
                         self.check_arity(&m, &name, pos_args.len(), msg_loc);
                     }
-                    self.check_sig_args(&m, &name, &pos_args, Some(owner), scope);
+                    self.check_sig_args(&m, &name, &typed_args, Some(owner), scope);
                     if let Some(col_type) = &m.schema_col_type {
                         self.check_schema_cast(col_type, &name, &pos_args);
                     }
@@ -3275,7 +3434,7 @@ impl Checker<'_> {
                     );
                     Ty::Unknown
                 },
-                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false) {
+                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false, &typed_args) {
                     ty
                 } else {
                     let blocker = self.index.inconclusive_reason(c, false);
@@ -3393,7 +3552,7 @@ impl Checker<'_> {
                             if exact_arity {
                                 self.check_arity(&m, "new", pos_args.len(), msg_loc);
                             }
-                            self.check_sig_args(&m, "new", &pos_args, Some(owner), scope);
+                            self.check_sig_args(&m, "new", &typed_args, Some(owner), scope);
                             return Ty::Instance(c);
                         }
                         MethodLookup::Inconclusive => {
@@ -3413,7 +3572,7 @@ impl Checker<'_> {
                             if exact_arity {
                                 self.check_arity(&m, "new", pos_args.len(), msg_loc);
                             }
-                            self.check_sig_args(&m, "new", &pos_args, Some(owner), scope);
+                            self.check_sig_args(&m, "new", &typed_args, Some(owner), scope);
                         }
                         MethodLookup::NotFound => {
                             // Bead ita-gjb: ancestry fully closed with no
@@ -3439,7 +3598,7 @@ impl Checker<'_> {
                             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                         }
                         MethodLookup::Inconclusive => {
-                            if self.rbi_escalate(c, "initialize", false).is_none() {
+                            if self.rbi_escalate(c, "initialize", false, &typed_args).is_none() {
                                 let blocker = self.index.inconclusive_reason(c, true);
                                 self.tally_inconclusive(blocker);
                                 self.tally_ar_base(blocker, c);
@@ -3457,7 +3616,7 @@ impl Checker<'_> {
                         if exact_arity {
                             self.check_arity(&m, &name, pos_args.len(), msg_loc);
                         }
-                        self.check_sig_args(&m, &name, &pos_args, Some(c), scope);
+                        self.check_sig_args(&m, &name, &typed_args, Some(c), scope);
                         let ret = self.method_return(c, &name, true, &m, scope);
                         if ret == Ty::Unknown {
                             self.note_unknown_origin(
@@ -3470,7 +3629,7 @@ impl Checker<'_> {
                     }
                     // Class objects have a large builtin surface (name,
                     // ancestors, ...): never unknown-method here.
-                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true) {
+                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true, &typed_args) {
                         ty
                     } else {
                         let blocker = self.index.inconclusive_reason(c, true);
@@ -3908,18 +4067,15 @@ impl Checker<'_> {
     /// function: step (3) needs no RBI and must still run, which is the
     /// entire point of shipping a curated inventory instead of only
     /// widening the RBI walk.
-    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {
-        if self.silent {
-            return None;
-        }
+    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool, args: &CallTypeArgs<'_>) -> Option<Ty> {
         if let Some(map) = self.rbi_map {
-            if let Some(ty) = crate::index::dsl_method_lookup(self.index, c, name, singleton, map) {
+            if let Some(declaration) = crate::index::dsl_method_contract(self.index, c, name, singleton, map) {
                 self.tally(Bucket::DslMethod);
-                return Some(ty);
+                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
             }
-            if let Some(ty) = crate::index::rbi_method_lookup(self.index, c, name, singleton, map) {
+            if let Some(declaration) = crate::index::rbi_method_contract(self.index, c, name, singleton, map) {
                 self.tally(Bucket::RbiMethod);
-                return Some(ty);
+                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
             }
         }
         if self.index.declared_by(c, "ActiveRecord::Base") {
@@ -3934,6 +4090,22 @@ impl Checker<'_> {
             }
         }
         None
+    }
+
+    fn rbi_contract_call(
+        &mut self,
+        class: ClassId,
+        name: &str,
+        singleton: bool,
+        declaration: &crate::index::RbiMethod,
+        args: &CallTypeArgs<'_>,
+    ) -> Ty {
+        if crate::index::rbi_contract_dispatch_eligible(self.index, class, name, singleton, declaration) {
+            if let (Some(sig), Some(names)) = (&declaration.definition.sorbet_sig, &declaration.definition.positional_names) {
+                self.check_sorbet_args(sig, &declaration.nesting, names, &declaration.definition.keywords, name, args);
+            }
+        }
+        declaration.return_ty(self.index)
     }
 
     /// Bead ita-dqo, deliverable 1 (E0107 constraint contradiction):
@@ -4418,11 +4590,16 @@ impl Checker<'_> {
         &mut self,
         m: &MethodSig,
         name: &str,
-        pos_args: &[(Ty, (usize, usize), Option<String>)],
+        args: &CallTypeArgs<'_>,
         owner: Option<ClassId>,
         scope: &[String],
     ) {
-        let Some(sig) = &m.sig else { return };
+        let Some(sig) = &m.sig else {
+            if let (Some((sig, nesting)), Some(names)) = (self.effective_sorbet(m, name), &m.positional_names) {
+                self.check_sorbet_args(&sig, &nesting, names, &m.keywords, name, args);
+            }
+            return;
+        };
         let sig = sig.clone();
         let param_tys: Vec<Ty> = sig
             .params
@@ -4433,7 +4610,7 @@ impl Checker<'_> {
             })
             .map(|t| self.rbs_to_ty(t, owner, scope, &sig.type_params))
             .collect();
-        for (i, (arg_ty, span, _)) in pos_args.iter().enumerate() {
+        for (i, (arg_ty, span, _)) in args.positional.iter().enumerate() {
             let Some(param_ty) = param_tys.get(i) else {
                 break;
             };
@@ -4452,6 +4629,47 @@ impl Checker<'_> {
                     message,
                 );
             }
+        }
+    }
+
+    fn check_sorbet_args(
+        &mut self,
+        sig: &crate::sorbet_sig::SorbetSig,
+        nesting: &[String],
+        positional_names: &[String],
+        keywords: &[(String, bool)],
+        method: &str,
+        args: &CallTypeArgs<'_>,
+    ) {
+        let Some(keyword_args) = args.keywords else { return };
+        // A keyword hash can be a positional Hash in Ruby. Without a matching
+        // keyword layout, do not guess which parameter received it.
+        if keyword_args.iter().any(|(name, _, _)| !keywords.iter().any(|(kw, _)| kw == name)) {
+            return;
+        }
+        for (name, (ty, span, _)) in positional_names.iter().zip(args.positional) {
+            self.check_sorbet_argument(sig, nesting, method, name, ty, *span);
+        }
+        for (name, ty, span) in keyword_args {
+            self.check_sorbet_argument(sig, nesting, method, name, ty, *span);
+        }
+    }
+
+    fn check_sorbet_argument(
+        &mut self,
+        sig: &crate::sorbet_sig::SorbetSig,
+        nesting: &[String],
+        method: &str,
+        name: &str,
+        actual: &Ty,
+        span: (usize, usize),
+    ) {
+        let Some((_, expr)) = sig.params.iter().find(|(param, _)| param == name) else { return };
+        let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+        if !compatible(actual, &expected, self.index) {
+            self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
+                format!("argument `{name}` of `{method}` expects {}, got {}",
+                    ty_name(&expected, self.index), ty_name(actual, self.index)));
         }
     }
 
@@ -4514,6 +4732,11 @@ impl Checker<'_> {
             self.set_ret_cause(None);
             return Ty::Unknown;
         }
+        let declared = self.sig_fill(m, name);
+        if declared != Ty::Unknown {
+            self.set_ret_cause(None);
+            return declared;
+        }
         let key = (class, name.to_string(), singleton);
         if let Some(t) = self.return_memo.get(&key) {
             let t = t.clone();
@@ -4531,15 +4754,11 @@ impl Checker<'_> {
         }
         if !self.in_progress.insert(key.clone()) {
             self.set_ret_cause(None);
-            // Bead ita-4xy: the fixpoint fallback still consults the sig.
-            // The sig is a static annotation on the def itself, not a
-            // product of this walk, so checking it here costs nothing and
-            // can only turn a blind Unknown into a real type.
-            return self.sig_fill(m);
+            return Ty::Unknown;
         }
         let text = m.file.text(self.db);
         let parse = ruby_prism::parse(text.as_bytes());
-        let mut ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
+        let ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
             let was_silent = self.silent;
             self.silent = true;
             // This walks another method's body — byte offsets there
@@ -4577,7 +4796,7 @@ impl Checker<'_> {
                     }),
                 ),
             );
-            let owner_scope = self.index.class(class).nesting.clone();
+            let owner_scope = m.nesting.clone();
             let t = self.check_method_body(
                 &def,
                 &owner_scope,
@@ -4597,14 +4816,6 @@ impl Checker<'_> {
             Ty::Unknown
         };
         self.in_progress.remove(&key);
-        // Bead ita-4xy: the ONE point where an inferred-body answer would
-        // otherwise surface as the final `Ty::Unknown` — try the sig here,
-        // never before. An inferred body type, however partial, already
-        // won by construction (this arm only runs when `ty` IS Unknown),
-        // so there is no precedence for the sig to steal.
-        if ty == Ty::Unknown {
-            ty = self.sig_fill(m);
-        }
         // Bead ita-mv5: freshly-computed path — pair `return_cause_memo`
         // with `return_memo` right here, at the exact key both are keyed
         // by. `check_method_body` already set `self.last_ret_cause` (or
@@ -4615,15 +4826,15 @@ impl Checker<'_> {
         ty
     }
 
-    /// Bead ita-4xy: `method_return`'s sig fallback — only ever called on
-    /// a path that already landed on `Ty::Unknown`, so this can never
-    /// steal precedence from an inferred body type. `#:` RBS sigs are a
-    /// separate, earlier-checked field (`m.sig`, line ~2891) and never
-    /// reach here. `resolve_ret_ty` itself is invariant-#1-safe: an
-    /// unresolvable name (project class not found, or a shape the
-    /// scanner doesn't recognize) stays `Ty::Unknown`, never a guess.
-    fn sig_fill(&self, m: &MethodSig) -> Ty {
-        crate::sorbet_sig::resolve_ret_ty(m.sorbet_ret.as_deref(), self.index)
+    /// Consumer types use the explicit contract; the source body is checked
+    /// independently by `check_method_body`, never against this assumed result.
+    fn sig_fill(&self, m: &MethodSig, name: &str) -> Ty {
+        self.effective_sorbet(m, name)
+            .filter(|(sig, _)| !sig.void)
+            .and_then(|(sig, nesting)| sig.ret.map(|expr| {
+                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)
+            }))
+            .unwrap_or(Ty::Unknown)
     }
 
     /// Bead ita-mv5: `last_ret_cause` writer. Exists so `method_return`'s
@@ -5239,6 +5450,85 @@ fn stmts_diverge(stmts: &ruby_prism::StatementsNode<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Return conformance is narrower than inference: closures, ensure overrides,
+/// loops and unreachable suffixes must not manufacture an E0109.
+#[derive(Default)]
+struct ReturnContractSafety {
+    uncertain: bool,
+}
+
+impl<'pr> Visit<'pr> for ReturnContractSafety {
+    fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_ensure_node(&mut self, _: &ruby_prism::EnsureNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_rescue_node(&mut self, _: &ruby_prism::RescueNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_while_node(&mut self, _: &ruby_prism::WhileNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_until_node(&mut self, _: &ruby_prism::UntilNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_for_node(&mut self, _: &ruby_prism::ForNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_def_node(&mut self, _: &DefNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        if matches!(node.predicate(), Node::TrueNode { .. } | Node::FalseNode { .. } | Node::NilNode { .. }) {
+            self.uncertain = true;
+        }
+        ruby_prism::visit_if_node(self, node);
+    }
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        if matches!(node.predicate(), Node::TrueNode { .. } | Node::FalseNode { .. } | Node::NilNode { .. }) {
+            self.uncertain = true;
+        }
+        ruby_prism::visit_unless_node(self, node);
+    }
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        let mut terminal = false;
+        for statement in &node.body() {
+            if terminal {
+                self.uncertain = true;
+            }
+            self.visit(&statement);
+            terminal = return_terminal(&statement);
+        }
+    }
+}
+
+/// Downcasts decide the shape here rather than the node discriminant: a
+/// failed downcast is a node this walk cannot read, which is not a proven
+/// terminal return — the same fail-closed answer as an unrecognized node.
+fn return_terminal(node: &Node<'_>) -> bool {
+    if matches!(node, Node::ReturnNode { .. }) {
+        return true;
+    }
+    if let Some(statements) = node.as_statements_node() {
+        return statements.body().iter().last().is_some_and(|n| return_terminal(&n));
+    }
+    if let Some(else_node) = node.as_else_node() {
+        return else_node.statements().is_some_and(|n| return_terminal(&n.as_node()));
+    }
+    if let Some(if_node) = node.as_if_node() {
+        return if_node.statements().is_some_and(|n| return_terminal(&n.as_node()))
+            && if_node.subsequent().is_some_and(|n| return_terminal(&n));
+    }
+    if let Some(call) = node.as_call_node() {
+        return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+    }
+    false
 }
 
 /// Pessimistic widening: pattern matching etc. may rebind anything.

@@ -275,16 +275,12 @@ pub struct MethodDef {
     pub kwrest: bool,
     pub block: bool,
     pub sig: Option<RbsSig>,
-    /// Raw text of a preceding sorbet `sig { ... }`'s `.returns(...)`
-    /// argument (bead ita-uh1) — e.g. `"T.nilable(String)"`. `None` for
-    /// `.void`, for no sig at all, and for any sig shape `index.rs`'s
-    /// `extract_sig_return` doesn't recognize. Deliberately separate from
-    /// `sig` above (which comes from this project's own `#:` RBS
-    /// comments and drives arity checking): a Tapioca-rendered RBI sig
-    /// can go stale relative to the gem actually installed, so this
-    /// field NEVER feeds arity — only `sorbet_sig::sorbet_ret_ty` ever
-    /// consumes it, to type the call's return, never its parameters.
-    pub sorbet_ret: Option<String>,
+    /// Named Sorbet contract; never inferred from a declaration's empty body.
+    pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
+    /// An unsupported/overloaded inline sig still blocks an RBI fallback.
+    pub sorbet_annotated: bool,
+    /// Ruby positional names, only for an unambiguous parameter layout.
+    pub positional_names: Option<Vec<String>>,
     /// If true, arity/args are unchecked (synthetic: `define_method`, alias).
     pub arity_unknown: bool,
     /// The def body contains `raise NotImplementedError` — an abstract
@@ -308,7 +304,9 @@ impl MethodDef {
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_ret: None,
+            sorbet_sig: None,
+            sorbet_annotated: false,
+            positional_names: Some(Vec::new()),
             arity_unknown: false,
             abstract_stub: false,
             name_span: span,
@@ -597,7 +595,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         toplevel_consts: Vec::new(),
         qualified_writes: Vec::new(),
         const_aliases: Vec::new(),
-        pending_sorbet_ret: None,
+        pending_sorbet_sig: None,
     };
     w.walk_body("", &[], false, &parse.node());
     // ONE file-wide traversal answering both "does this shape appear
@@ -1759,14 +1757,8 @@ struct DefWalker<'a> {
     qualified_writes: Vec<(String, String)>,
     /// See `FileDefs::const_aliases`.
     const_aliases: Vec<(String, Vec<String>, String)>,
-    /// Raw `.returns(...)` text of the most recently walked `sig { ... }`
-    /// statement (bead ita-uh1), threaded from one class-body statement
-    /// to the immediately next one by `walk_stmts` so the `def` that
-    /// follows a `sig` can pick it up in `method_def`. Cleared before any
-    /// statement that is neither a `sig` call nor a `def` — only
-    /// direct-adjacency counts, matching the contract's "def vier
-    /// precedido de um sig".
-    pending_sorbet_ret: Option<String>,
+    /// See `PendingSig`. Only an immediately adjacent def consumes it.
+    pending_sorbet_sig: Option<PendingSig>,
 }
 
 impl DefWalker<'_> {
@@ -2469,15 +2461,10 @@ impl DefWalker<'_> {
     ) {
         if let Some(stmts) = node.as_statements_node() {
             for stmt in &stmts.body() {
-                // Bead ita-uh1: a `sig { ... }` immediately followed by a
-                // `def` threads its captured `.returns(...)` text into
-                // that `def` via `pending_sorbet_ret` (set in the
-                // `Node::CallNode` arm below, consumed in `method_def`).
-                // Any statement that is neither the `sig` call itself nor
-                // the `def` breaks the adjacency — clear it so an
-                // unrelated later `def` never inherits a stale sig.
+                // Adjacency is statement-local; an overloaded sig sequence
+                // is retained as poison rather than choosing its last overload.
                 if !is_sig_call_or_def(&stmt) {
-                    self.pending_sorbet_ret = None;
+                    self.pending_sorbet_sig = None;
                 }
                 self.walk_stmt(scope, nesting, frag_idx, in_singleton, &stmt);
             }
@@ -2928,21 +2915,14 @@ impl DefWalker<'_> {
                             None => self.open_class(i, OpenReason::DynamicDefineMethod),
                         }
                     } else if call.name().as_slice() == b"sig" && call.receiver().is_none() {
-                        // Sorbet `sig { ... }` (bead ita-uh1): captured
-                        // purely as data for the immediately-following
-                        // `def` (threaded through `pending_sorbet_ret` by
-                        // `walk_stmts`). Bead ita-4xy narrows the open
-                        // marking: only an UNRECOGNIZED shape still opens
-                        // — `extract_sig_return`/`sig_block_is_recognized`
-                        // share one shape check, so "recognized" here is
-                        // exactly "the text `method_return`'s fallback
-                        // could ever consume, or a `void` sig with none to
-                        // consume", never a broader guess. A `sig` call
-                        // this bead can't classify (multi-statement block,
-                        // unrecognized outermost call, ...) is exactly as
-                        // unknown as before — still opens.
-                        self.pending_sorbet_ret = extract_sig_return(self.text, &call);
-                        if !sig_block_is_recognized(&call) {
+                        let sig = crate::sorbet_sig::extract_sig(node);
+                        let recognized = sig.is_some();
+                        let stacked = self.pending_sorbet_sig.is_some();
+                        self.pending_sorbet_sig = Some(match sig {
+                            Some(parsed) if !stacked => PendingSig::Parsed(parsed),
+                            _ => PendingSig::Unusable,
+                        });
+                        if !recognized {
                             self.open_class(i, OpenReason::ClassBodyBlock);
                         }
                     } else if call.name().as_slice() == b"class_methods"
@@ -3768,8 +3748,30 @@ impl DefWalker<'_> {
             self.line_index,
             self.sig_comments,
             &mut self.sig_errors,
-            self.pending_sorbet_ret.take(),
+            self.pending_sorbet_sig.take(),
         )
+    }
+}
+
+/// What the `sig` calls sitting immediately above a `def` amount to.
+/// `Option<PendingSig>` keeps the three states apart: `None` — no `sig`
+/// was written; `Some(Unusable)` — one was, but this checker cannot use
+/// it; `Some(Parsed)` — exactly one, understood.
+pub(crate) enum PendingSig {
+    Parsed(crate::sorbet_sig::SorbetSig),
+    /// An unsupported spelling, or two `sig` blocks stacked on one
+    /// definition. The definition still counts as ANNOTATED — that is what
+    /// stops an unreadable signature from quietly falling back to body
+    /// inference and being reported as if nobody had declared anything.
+    Unusable,
+}
+
+impl PendingSig {
+    fn parsed(self) -> Option<crate::sorbet_sig::SorbetSig> {
+        match self {
+            Self::Parsed(sig) => Some(sig),
+            Self::Unusable => None,
+        }
     }
 }
 
@@ -3777,7 +3779,7 @@ impl DefWalker<'_> {
 /// def collector inside `dynamic_defs_in_body`'s scanner needs the exact
 /// same construction but holds no `DefWalker` — only the three references
 /// this function needs. The ONE deliberate difference: nested defs take
-/// no `pending_sorbet_ret` (`sig`/`def` adjacency across a block boundary
+/// no pending Sorbet sig (`sig`/`def` adjacency across a block boundary
 /// is not a thing Tapioca or a human writes) and their `#:` sig-comment
 /// lookup still runs, same as any def.
 fn build_method_def(
@@ -3786,7 +3788,7 @@ fn build_method_def(
     line_index: &LineIndex,
     sig_comments: &HashMap<u32, (usize, usize)>,
     sig_errors: &mut Vec<(usize, usize, String)>,
-    pending_sorbet_ret: Option<String>,
+    pending_sorbet_sig: Option<PendingSig>,
 ) -> MethodDef {
     let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
     let name_loc = def.name_loc();
@@ -3800,7 +3802,9 @@ fn build_method_def(
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_ret: pending_sorbet_ret,
+            sorbet_annotated: pending_sorbet_sig.is_some(),
+            sorbet_sig: pending_sorbet_sig.and_then(PendingSig::parsed),
+            positional_names: Some(Vec::new()),
             arity_unknown: false,
             abstract_stub: false,
             name_span: (name_loc.start_offset(), name_loc.end_offset()),
@@ -3809,6 +3813,17 @@ fn build_method_def(
 
         if let Some(params) = def.parameters() {
             fill_def_params(&mut md, &params);
+        }
+        // Do not turn Sorbet's named params into a guessed positional zip.
+        if let Some(sig) = &md.sorbet_sig {
+            let matches = md.positional_names.as_ref().is_some_and(|names| {
+                sig.params.iter().all(|(name, _)| {
+                        names.contains(name) || md.keywords.iter().any(|(kw, _)| kw == name)
+                    })
+            });
+            if !matches {
+                md.sorbet_sig = None;
+            }
         }
 
         // `#:` sig on the line right above the def.
@@ -3863,6 +3878,17 @@ fn fill_def_params(md: &mut MethodDef, params: &ruby_prism::ParametersNode<'_>) 
     }
     md.kwrest = params.keyword_rest().is_some();
     md.block = params.block().is_some();
+    md.positional_names = if md.rest || md.kwrest || md.block || params.posts().iter().next().is_some() {
+        None
+    } else {
+        params.requireds().iter().map(|p| {
+            p.as_required_parameter_node()
+                .map(|p| String::from_utf8_lossy(p.name().as_slice()).into_owned())
+        }).chain(params.optionals().iter().map(|p| {
+            p.as_optional_parameter_node()
+                .map(|p| String::from_utf8_lossy(p.name().as_slice()).into_owned())
+        })).collect()
+    };
 }
 
 fn span_of(node: &Node<'_>) -> (usize, usize) {
@@ -3870,13 +3896,7 @@ fn span_of(node: &Node<'_>) -> (usize, usize) {
     (loc.start_offset(), loc.end_offset())
 }
 
-/// True for a `def`, or for a bare `sig { ... }` call — the two shapes
-/// `walk_stmts`' adjacency check (bead ita-uh1) never clears
-/// `pending_sorbet_ret` for. Deliberately loose about whether the `sig`
-/// call's block is actually a recognized return-type shape: even an
-/// unrecognized `sig` still legitimately precedes the `def` it types
-/// (with `sorbet_ret` staying `None`), so it must not be treated as an
-/// unrelated statement that breaks adjacency.
+/// A sig, including an unsupported one, remains adjacent to its def.
 fn is_sig_call_or_def(node: &Node<'_>) -> bool {
     node.as_def_node().is_some()
         || node.as_call_node().is_some_and(|c| {
@@ -3884,27 +3904,6 @@ fn is_sig_call_or_def(node: &Node<'_>) -> bool {
         })
 }
 
-/// Shared block-unwrapping for a `sig { ... }` call: the block's single
-/// statement, or `None` for a call with no block, a block whose body
-/// isn't exactly one statement, or an empty block. Factored out so
-/// `extract_sig_return` (the `.returns(X)` text extractor) and
-/// `sig_block_is_recognized` (bead ita-4xy's open-class carve-out) share
-/// one shape check instead of two.
-fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
-    let block = call.block()?.as_block_node()?;
-    let body = block.body()?;
-    match body.as_statements_node() {
-        Some(stmts) => {
-            let mut iter = stmts.body().iter();
-            let first = iter.next()?;
-            if iter.next().is_some() {
-                return None;
-            }
-            Some(first)
-        }
-        None => Some(body),
-    }
-}
 
 /// Every call name `body_def_reason` can react to. Used ONLY as a cheap
 /// substring prefilter over a `def`'s own source span before the AST
@@ -4285,58 +4284,6 @@ fn body_def_reason_named(name: &[u8], args: &[Node<'_>]) -> Option<OpenReason> {
     }
 }
 
-/// Raw text of a `sig { ... }` call's `.returns(...)` argument (bead
-/// ita-uh1). Recognizes exactly the shapes Tapioca actually emits in
-/// gem RBIs: `sig { returns(X) }`, `sig { void }`, `sig {
-/// params(...).returns(X) }`, `sig { params(...).void }`, and any of
-/// those with a leading `override.`/`abstract.` (`sig(:final)`'s own
-/// argument is irrelevant here — only the block body matters). The block
-/// body must be exactly one statement whose OUTERMOST call is `returns`
-/// with exactly one positional argument; `void`, more than one
-/// statement, more than one `returns` argument, or any other shape all
-/// return `None` — never a guess, matching every other `None` this
-/// walker produces.
-fn extract_sig_return(text: &str, call: &ruby_prism::CallNode<'_>) -> Option<String> {
-    let stmt = sig_block_stmt(call)?;
-    let outer = stmt.as_call_node()?;
-    if outer.name().as_slice() != b"returns" {
-        return None;
-    }
-    let args = outer.arguments()?;
-    let mut arg_iter = args.arguments().iter();
-    let arg = arg_iter.next()?;
-    if arg_iter.next().is_some() {
-        return None;
-    }
-    let (s, e) = span_of(&arg);
-    Some(text[s..e].trim().to_string())
-}
-
-/// Bead ita-4xy: does `call`'s block classify as a RECOGNIZED sig shape
-/// — same `sig_block_stmt` shape check `extract_sig_return` uses, outer
-/// call named `returns` (exactly one positional argument, exactly like
-/// `extract_sig_return` requires before it slices the text) OR bare
-/// `void` (zero return-type text to consume, but still a real,
-/// classified sig — see `extract_sig_return`'s own doc comment: `void`
-/// legitimately returns `None` there without being "unrecognized").
-/// `false` for anything `extract_sig_return` would also refuse to guess
-/// at: multi-statement block, no block at all, or an outermost call
-/// that's neither `returns` nor `void`. The `Node::CallNode` arm above
-/// is the only caller — this decides whether the class-body `sig` call
-/// opens the class, never anything about the type it maps to.
-fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
-    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
-        return false;
-    };
-    match outer.name().as_slice() {
-        b"returns" => outer.arguments().is_some_and(|args| {
-            let mut iter = args.arguments().iter();
-            iter.next().is_some() && iter.next().is_none()
-        }),
-        b"void" => true,
-        _ => false,
-    }
-}
 
 fn join_path(scope: &str, name: &str) -> String {
     if scope.is_empty() || name.starts_with("::") {
@@ -4648,13 +4595,11 @@ pub struct MethodSig {
     pub keywords: Vec<(String, bool)>,
     pub kwrest: bool,
     pub sig: Option<RbsSig>,
-    /// Bead ita-4xy: raw text of a preceding sorbet `sig { ... }`'s
-    /// `.returns(...)` argument, copied verbatim from `MethodDef::sorbet_ret`
-    /// (see that field's doc comment — same text, same "arity never reads
-    /// this" rule). `None` for `#:` RBS methods, `.void` sigs, and plain
-    /// unsigned defs alike; `method_return` in `check.rs` only consults it
-    /// when body inference itself lands on `Ty::Unknown`.
-    pub sorbet_ret: Option<String>,
+    pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
+    pub sorbet_annotated: bool,
+    pub positional_names: Option<Vec<String>>,
+    /// Definition-site lexical scope, not the caller's Module.nesting.
+    pub nesting: Vec<String>,
     pub arity_unknown: bool,
     /// Copied from `MethodDef::abstract_stub`: the def body raises
     /// `NotImplementedError`. `check.rs` skips arity on a shadowed stub —
@@ -5179,6 +5124,9 @@ fn merge_file_fragments(
     index: &mut ProjectIndex,
     qualified_writes: &mut Vec<(String, String)>,
 ) {
+    if file.path(db).extension().is_some_and(|ext| ext == "rbi") {
+        return;
+    }
     let defs = file_defs(db, file);
     merge_file_accumulators(index, defs);
     qualified_writes.extend(defs.qualified_writes.iter().cloned());
@@ -5214,12 +5162,10 @@ fn merge_file_fragments(
         class.extends.extend(frag.extends.iter().cloned());
         class.consts.extend(frag.consts.iter().cloned());
         for md in &frag.methods {
-            class.methods.insert(md.name.clone(), method_sig(md, file));
+            merge_source_method(&mut class.methods, md, file, &frag.nesting);
         }
         for md in &frag.singleton_methods {
-            class
-                .singleton_methods
-                .insert(md.name.clone(), method_sig(md, file));
+            merge_source_method(&mut class.singleton_methods, md, file, &frag.nesting);
         }
         merge_hook_installs(class, frag, file);
     }
@@ -5704,7 +5650,10 @@ fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
         keywords: Vec::new(),
         kwrest: false,
         sig: None,
-        sorbet_ret: None,
+        sorbet_sig: None,
+        sorbet_annotated: false,
+        positional_names: None,
+        nesting: Vec::new(),
         arity_unknown: true,
         abstract_stub: false,
         file,
@@ -6060,7 +6009,7 @@ fn apply_singleton_patches(index: &mut ProjectIndex) {
             class
                 .singleton_methods
                 .entry(md.name.clone())
-                .or_insert_with(|| method_sig(md, file));
+                .or_insert_with(|| method_sig(md, file, &frag.nesting));
         }
         if frag.open {
             class.open = true;
@@ -6798,24 +6747,38 @@ pub fn rbi_ancestor_declares<S: std::hash::BuildHasher>(
         .any(|s| rbi_ancestor_closure(s, rbi_map).contains(simple))
 }
 
-/// Instance method names, then SINGLETON method names, that a start
-/// name's RBI ancestry declares — mapped to the RAW `.returns(...)`
-/// source text of the method's `.rbi` sig (bead ita-uh1's
-/// `MethodDef::sorbet_ret`), `None` for a method with no sig. Text, not
-/// `Ty` (bead ita-tjr): the memo below is keyed on the start name alone
-/// and shared by every call site, so it cannot depend on any one call's
-/// `ProjectIndex` — resolving a PROJECT class name inside the sig
-/// (`sig { returns(::Package) }` in a DSL RBI) needs that index, so the
-/// text-to-`Ty` conversion (`sorbet_sig::resolve_ret_ty`) happens at the
-/// lookup call site instead, where the index is in hand. A hit is still
-/// a hit whether or not the text resolves to something other than
-/// `Ty::Unknown` (see `rbi_method_lookup`/`dsl_method_lookup`). The
-/// order is load-bearing: `extend` and `mixes_in_class_methods` move a
-/// module's *instance* methods into the singleton slot (that is how
-/// `Model.where` exists), so swapping the two silently turns every
-/// class-method hit into an instance-method hit. `Arc` because the memo
-/// hands the same maps to many call sites.
-type RbiMethodSets = std::sync::Arc<(HashMap<String, Option<String>>, HashMap<String, Option<String>>)>;
+/// RBI provenance stays separate from source methods: a declaration carries
+/// the Ruby layout and lexical scope, but its empty body is never inferred.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RbiMethod {
+    pub definition: MethodDef,
+    pub nesting: Vec<String>,
+    pub owner: String,
+}
+
+impl RbiMethod {
+    pub fn return_ty(&self, index: &ProjectIndex) -> Ty {
+        self.definition.sorbet_sig.as_ref()
+            .filter(|sig| !sig.void)
+            .and_then(|sig| sig.ret.as_deref())
+            .map_or(Ty::Unknown, |expr| {
+                crate::sorbet_sig::resolve_sig_ty(expr, index, &self.nesting)
+            })
+    }
+
+    /// A stale declaration never lends types to a different source layout.
+    pub fn matches_source(&self, source: &MethodSig) -> bool {
+        let md = &self.definition;
+        !source.arity_unknown && !md.arity_unknown
+            && source.positional_names.is_some()
+            && source.positional_names == md.positional_names
+            && source.required == md.required && source.optional == md.optional
+            && source.keywords == md.keywords
+            && !source.rest && !source.kwrest && !md.block
+    }
+}
+
+type RbiMethodSets = std::sync::Arc<(HashMap<String, RbiMethod>, HashMap<String, RbiMethod>)>;
 
 /// One BFS work item: the RBI name to resolve next, which method-
 /// dispatch track it travels on, and — when it names an edge queued
@@ -7051,9 +7014,9 @@ fn resolve_method_node<S: std::hash::BuildHasher>(
 fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
     start: &str,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> (HashMap<String, Option<String>>, HashMap<String, Option<String>>) {
-    let mut instance: HashMap<String, Option<String>> = HashMap::new();
-    let mut singleton: HashMap<String, Option<String>> = HashMap::new();
+) -> (HashMap<String, RbiMethod>, HashMap<String, RbiMethod>) {
+    let mut instance = HashMap::new();
+    let mut singleton = HashMap::new();
     let mut visited: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
     let mut work: Vec<MethodWorkItem> = vec![MethodWorkItem {
         node: start.to_string(),
@@ -7083,27 +7046,60 @@ fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
 }
 
 
-/// Rules 1/2/4: a node's own `def self.x` always lands in `singleton`,
-/// while its INSTANCE methods land in whichever map the track that
-/// reached it selects. First visit wins (`or_insert_with`) because the
-/// walk already runs in MRO order — the nearest ancestor is the one that
-/// really answers at runtime. Values are the raw `.returns(...)` sig
-/// text (`MethodDef::sorbet_ret`), `None` for an unsigned method — see
-/// `RbiMethodSets`'s doc comment for why the `Ty` conversion is deferred
-/// to the lookup call site.
+/// Name hits survive conflicting declarations; their contracts do not.
+/// The RBI walk is not proof of which runtime redefinition won.
 fn harvest_frag_methods(
     frag: &ClassFragment,
     on_singleton_track: bool,
-    instance: &mut HashMap<String, Option<String>>,
-    singleton: &mut HashMap<String, Option<String>>,
+    instance: &mut HashMap<String, RbiMethod>,
+    singleton: &mut HashMap<String, RbiMethod>,
 ) {
     for m in &frag.singleton_methods {
-        singleton.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+        harvest_rbi_method(singleton, frag, m);
     }
     let target = if on_singleton_track { singleton } else { instance };
     for m in &frag.methods {
-        target.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+        harvest_rbi_method(target, frag, m);
     }
+}
+
+fn harvest_rbi_method(target: &mut HashMap<String, RbiMethod>, frag: &ClassFragment, m: &MethodDef) {
+    let mut declaration = RbiMethod {
+        definition: m.clone(),
+        nesting: frag.nesting.clone(),
+        owner: frag.path.clone(),
+    };
+    if frag.open {
+        declaration.definition.sorbet_sig = None;
+    }
+    match target.entry(m.name.clone()) {
+        std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(declaration); }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            let old = entry.get_mut();
+            if old.definition.sorbet_sig != declaration.definition.sorbet_sig
+                || old.definition.positional_names != declaration.definition.positional_names
+                || old.definition.keywords != declaration.definition.keywords
+                || old.definition.required != declaration.definition.required
+                || old.definition.optional != declaration.definition.optional
+                || old.nesting != declaration.nesting
+            {
+                old.definition.sorbet_sig = None;
+            }
+        }
+    }
+}
+
+/// Exact owner and track only. No inherited RBI contract is attached to a
+/// source override, and no RBI body replaces the real Ruby implementation.
+pub(crate) fn source_rbi_method<S: std::hash::BuildHasher>(
+    path: &str,
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<RbiMethod> {
+    let (instance, singleton_methods) = &*rbi_method_closure(path, rbi_map);
+    let methods = if singleton { singleton_methods } else { instance };
+    methods.get(method).filter(|m| m.owner == path).cloned()
 }
 
 /// Rules 1/2/3: `superclass`/`include`/`prepend` keep the current track;
@@ -7139,26 +7135,28 @@ fn queue_method_edges(
     }
 }
 
-/// Shared walk for `rbi_method_lookup`/`dsl_method_lookup` (bead
-/// ita-tjr): try each start name's RBI method closure in order, and on
-/// the first name that DECLARES `method` (instance or singleton side per
-/// `singleton`), convert its raw sig text to `Ty` via
-/// `sorbet_sig::resolve_ret_ty` — the conversion needs `index` (to
-/// resolve a project class name inside the sig), which `rbi_method_closure`'s
-/// memo deliberately does not carry (see `RbiMethodSets`'s doc comment).
+/// The declaration carries named parameters as well as the return expression.
 fn method_lookup_via_starts<S: std::hash::BuildHasher>(
     starts: &[String],
     method: &str,
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-    index: &ProjectIndex,
-) -> Option<Ty> {
-    starts.iter().find_map(|start| {
+) -> Option<RbiMethod> {
+    let mut found: Option<RbiMethod> = None;
+    for start in starts {
         let (instance, singleton_methods) = &*rbi_method_closure(start, rbi_map);
         let map = if singleton { singleton_methods } else { instance };
-        map.get(method)
-            .map(|raw| crate::sorbet_sig::resolve_ret_ty(raw.as_deref(), index))
-    })
+        if let Some(declaration) = map.get(method) {
+            if let Some(old) = &mut found {
+                if old != declaration {
+                    old.definition.sorbet_sig = None;
+                }
+            } else {
+                found = Some(declaration.clone());
+            }
+        }
+    }
+    found
 }
 
 /// Does some EXTERNAL ancestor of `id` — a name the project's own index
@@ -7197,7 +7195,17 @@ pub fn rbi_method_lookup<S: std::hash::BuildHasher>(
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
 ) -> Option<Ty> {
-    method_lookup_via_starts(&index.external_ancestor_starts(id), method, singleton, rbi_map, index)
+    rbi_method_contract(index, id, method, singleton, rbi_map).map(|m| m.return_ty(index))
+}
+
+pub(crate) fn rbi_method_contract<S: std::hash::BuildHasher>(
+    index: &ProjectIndex,
+    id: ClassId,
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<RbiMethod> {
+    method_lookup_via_starts(&index.external_ancestor_starts(id), method, singleton, rbi_map)
 }
 
 /// Does the client's Tapioca DSL RBI for `id` ITSELF — or for a PROJECT
@@ -7222,7 +7230,41 @@ pub fn dsl_method_lookup<S: std::hash::BuildHasher>(
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
 ) -> Option<Ty> {
-    method_lookup_via_starts(&index.project_ancestor_starts(id), method, singleton, rbi_map, index)
+    dsl_method_contract(index, id, method, singleton, rbi_map).map(|m| m.return_ty(index))
+}
+
+pub(crate) fn dsl_method_contract<S: std::hash::BuildHasher>(
+    index: &ProjectIndex,
+    id: ClassId,
+    method: &str,
+    singleton: bool,
+    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
+) -> Option<RbiMethod> {
+    method_lookup_via_starts(&index.project_ancestor_starts(id), method, singleton, rbi_map)
+}
+
+/// A declaration never certifies a dynamically open source receiver. New
+/// argument checks require one external dispatch edge, or a direct DSL owner,
+/// and no source implementation that the RBI could accidentally shadow.
+pub(crate) fn rbi_contract_dispatch_eligible(
+    index: &ProjectIndex,
+    class: ClassId,
+    name: &str,
+    singleton: bool,
+    declaration: &RbiMethod,
+) -> bool {
+    let (ancestors, _) = index.ancestors(class);
+    if ancestors.iter().any(|id| {
+        let cd = index.class(*id);
+        let methods = if singleton { &cd.singleton_methods } else { &cd.methods };
+        (cd.open && cd.open_reason != Some(OpenReason::DeclaredExternal))
+            || methods.contains_key(name)
+    }) {
+        return false;
+    }
+    let starts = index.external_ancestor_starts(class);
+    (starts.len() == 1 && starts[0] == declaration.owner)
+        || (starts.is_empty() && index.class(class).path == declaration.owner)
 }
 
 /// Instance method names each fragment set declares per core namespace —
@@ -7271,7 +7313,7 @@ pub fn rbi_core_methods(
     out
 }
 
-fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
+fn method_sig(md: &MethodDef, file: SourceFile, nesting: &[String]) -> MethodSig {
     MethodSig {
         required: md.required,
         optional: md.optional,
@@ -7279,7 +7321,10 @@ fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
         keywords: md.keywords.clone(),
         kwrest: md.kwrest,
         sig: md.sig.clone(),
-        sorbet_ret: md.sorbet_ret.clone(),
+        sorbet_sig: md.sorbet_sig.clone(),
+        sorbet_annotated: md.sorbet_annotated,
+        positional_names: md.positional_names.clone(),
+        nesting: nesting.to_vec(),
         arity_unknown: md.arity_unknown,
         abstract_stub: md.abstract_stub,
         file,
@@ -7287,6 +7332,22 @@ fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
         name_span: md.name_span,
         schema_col_type: None,
     }
+}
+
+fn merge_source_method(
+    methods: &mut FxHashMap<String, MethodSig>,
+    definition: &MethodDef,
+    file: SourceFile,
+    nesting: &[String],
+) {
+    let mut method = method_sig(definition, file, nesting);
+    if methods.contains_key(&definition.name) {
+        // The index's historical last-body policy is not evidence of runtime
+        // load order. Preserve inference, but never pick a Sorbet contract.
+        method.sorbet_sig = None;
+        method.sorbet_annotated = true;
+    }
+    methods.insert(definition.name.clone(), method);
 }
 
 /// Result of a method lookup on a project class.

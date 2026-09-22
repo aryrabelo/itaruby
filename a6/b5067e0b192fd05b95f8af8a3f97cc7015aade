@@ -1,0 +1,18 @@
+AGENTS.md
+  h_b156936c57c455 538-574
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 763-787
+docs/CHANGELOG.md
+  h_b156936c57c455 204-206,211-219
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "a6b5067e0b192fd05b95f8af8a3f97cc7015aade",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

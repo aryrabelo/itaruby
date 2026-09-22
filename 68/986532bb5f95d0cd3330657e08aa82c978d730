@@ -1,0 +1,18 @@
+AGENTS.md
+  h_b156936c57c455 335-341
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 187-197
+scripts/mutant-anchors
+  h_b156936c57c455 1-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "68986532bb5f95d0cd3330657e08aa82c978d730",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

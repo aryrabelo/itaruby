@@ -1,5 +1,6 @@
-//! End-to-end shared CLI/LSP checker contracts. Mutation probes live beside
-//! this instrument: `python3 crates/itaruby_semantic/tests/sorbet_contracts_mutants.py`.
+//! End-to-end shared CLI/LSP checker contracts. Mutation probes for this
+//! instrument: `python3 scripts/sorbet-contracts-mutants.py` (`--anchors`
+//! counts every needle without building).
 //! No Sorbet runtime, generated RBI refresh, or private corpus is required.
 
 use itaruby_semantic::{check_file, ClosedWorld, Db, Diagnostic, ProjectFiles, RbiProject, SourceFile};
@@ -60,7 +61,17 @@ ContractKeywords.new.build(2, label: "good")
 ContractKeywords.new.build(label: 3)
 ContractKeywords.new.build(*["unknown position"], label: "good")
 ContractKeywords.new.build(label: "ignored", label: "last")
+class ContractSplatPair
+  extend T::Sig
+  sig { params(count: Integer, label: String).returns(String) }
+  def pair(count, label)
+    label
+  end
+end
+ContractSplatPair.new.pair(*[1], "good")
 "#, None);
+    // After a splat no later positional is proven to land on any name:
+    // `"good"` is really `label` here, never `count`.
     assert_eq!(diags.len(), 1, "{diags:?}");
     assert_eq!(diags[0].code, "E0103");
     assert!(diags[0].message.contains("label"), "{diags:?}");
@@ -277,12 +288,15 @@ end
     assert!(diags.is_empty(), "{diags:?}");
 }
 
+/// The body returns an Integer against the stale RBI's `returns(String)`:
+/// were the renamed layout accepted, E0109 would accuse it. Returning the
+/// untyped parameter instead would stay silent either way and prove nothing.
 #[test]
 fn stale_rbi_layout_does_not_type_source_or_calls() {
     let diags = check("stale", r"
 class ContractStale
   def echo(actual)
-    actual
+    1
   end
 end
 ContractStale.new.echo(1)
@@ -471,5 +485,99 @@ class ContractDuplicate
 end
 ContractDuplicate.new.echo(nil)
 ", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A subclass that redefines the method takes the parent's signature off
+/// every call that could dispatch to either body: the sig is no longer
+/// proven to govern the call, so neither the argument nor the parent body
+/// is judged by it. The control — the same parent without the override —
+/// keeps this a contract rather than a blind spot.
+#[test]
+fn descendant_override_keeps_the_parent_contract_off_the_call() {
+    const PARENT: &str = r#"
+class ContractOverrideParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractOverrideParent.new.echo("bad")
+"#;
+    let overridden = format!("{PARENT}class ContractOverrideChild < ContractOverrideParent\n  def echo(value)\n    value\n  end\nend\n");
+    let diags = check("descendant-override", &overridden, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("descendant-override-control", PARENT, None);
+    assert_eq!(contract_codes(&control), ["E0109", "E0103"], "control must accuse without the override: {control:?}");
+}
+
+/// An RBI contract belongs to the exact owner it is written on. A method
+/// the RBI declares on the parent is not the child's source override,
+/// even though the RBI closure of the child reaches it.
+#[test]
+fn inherited_rbi_contract_never_attaches_to_a_source_override() {
+    let diags = check("inherited-rbi", r#"
+class ContractRbiParent
+end
+class ContractRbiChild < ContractRbiParent
+  def echo(value)
+    "wrong"
+  end
+end
+ContractRbiChild.new.echo("bad")
+"#, Some(r"
+class ContractRbiParent
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); end
+end
+class ContractRbiChild < ContractRbiParent
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A sig whose `params` names a parameter the def does not have is not a
+/// contract for that def: nothing it says is guessed onto the remaining
+/// names, so neither the argument nor the body is accused.
+#[test]
+fn sig_naming_an_absent_parameter_is_not_a_contract() {
+    let diags = check("absent-param", r#"
+class ContractAbsentParam
+  extend T::Sig
+  sig { params(value: Integer, extra: String).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractAbsentParam.new.echo("bad")
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// An inline sig this checker cannot use still means somebody annotated
+/// the definition, so a client RBI must not step in with its own contract.
+/// Stacked sigs are the unusable spelling that reaches this decision: an
+/// unrecognized spelling such as `sig(:abstract)` already opens the owner,
+/// which takes every contract off it before the RBI is consulted.
+#[test]
+fn unusable_inline_sig_still_blocks_the_rbi_contract() {
+    let diags = check("unusable-inline", r#"
+class ContractUnusableInline
+  extend T::Sig
+  sig { params(value: String).returns(String) }
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractUnusableInline.new.echo("bad")
+"#, Some(r"
+class ContractUnusableInline
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); end
+end
+"));
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }

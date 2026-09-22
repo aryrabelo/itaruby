@@ -22,6 +22,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver's diagnostic silence with the same typo on a closed receiver.
 
 ### Added
+- Sorbet `sig` and RBI contracts (2026-09-22). A project method's own
+  recognized `sig { ... }` is now checked, not only read. The declared
+  return types the consumer. The body is checked against that declaration
+  on its own, with no call site needed. A proven return that contradicts it
+  is **E0109** (new code, Error), reported at the method name. Explicit
+  `return`s and implicit branch values are both checked. `void`,
+  `abstract`, `T.untyped` or Unknown bodies, an `ensure` that overrides the
+  value, code after a `return`, and an `if false` branch never accuse.
+  Declared params bind the body's locals. A call argument that contradicts
+  a declared param is **E0103**, reported at the argument and naming the
+  param. Params match the `def` by name, not by order, across positional,
+  keyword and default layouts. A splatted argument leaves positions
+  unproven, so it stays silent. The contract follows the definition onto
+  subclass receivers and onto the `def self.` track. Nominal types resolve
+  in the definition's lexical scope. `::X` stays absolute. A dynamically
+  shadowed prefix or a `type_member` resolves to Unknown and never falls
+  back to a same-named global class. `T.nilable`, `T.any`, `T::Array` and
+  `T::Hash` map when every member is known. An unsupported but well-formed
+  element such as a shape or a `T.proc` keeps the collection's category with
+  an Unknown member. A malformed expression is Unknown.
+  A client RBI supplies the same contracts only when it matches the source
+  definition exactly: owner, dispatch track and Ruby parameter layout. The
+  RBI informs calls and checks the source body's return. It does not replace
+  any check the Ruby source already earned (arity keeps firing beside it).
+  A declaration-only RBI body is never checked. An RBI method on an
+  RBI-only superclass checks params on a single proven edge.
+  Every shape the checker cannot prove resolves to `Ty::Unknown` and
+  diagnoses nothing. That covers generics (`type_parameters`), `bind`,
+  duplicate or dynamic clauses, overloads (stacked sigs), post-optional,
+  rest and block parameter layouts, duplicate source definitions, open
+  classes (Ruby checks such as E0108 still apply there), conflicting RBI
+  declarations and stale RBI layouts. Inline `#:` RBS keeps precedence over
+  both the `sig` and the RBI, and an inline `sig` wins over an RBI.
+  Recognized-sig fixtures declare `extend T::Sig`. This is not Sorbet
+  parity: it checks what the named suites prove and nothing more. Focused
+  proof: `sorbet_contracts`, `sorbet_contract_parser` and `project_sigs`,
+  plus mutants in `scripts/sorbet-contracts-mutants.py`.
 - Reconcile conflicting superclass headers after project indexing instead of
   selecting the first filesystem entry. Inherited methods and constants
   become inconclusive, including navigation and global-name collisions;
@@ -788,6 +825,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays open.
 
 ### Changed
+- A project method's `sig { returns(X) }` now wins over its inferred body.
+  Before, it was a fallback (bead ita-4xy): it was consulted only when body
+  inference reached Unknown, so an inferred type such as `Ty::Str` beat the
+  declaration and the consumer went silent. Now the declaration types the
+  consumer, and a body that disagrees is accused as E0109 instead of quietly
+  winning. `project_sigs`' precedence test (b) asserts both halves by name.
 - Public-corpus baselines regenerated for the attributed-mixin family: rails
   1100 → 940 lines (166 → 6 errors, **0 new**), mastodon and discourse
   byte-identical — their files do not appear in the diff at all, which is the

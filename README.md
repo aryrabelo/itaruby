@@ -52,11 +52,16 @@ every would-be accusation on the three public corpora until the residue
 was 8 records across rails/mastodon/discourse, each read and proven to
 raise under MRI.
 
-This alpha is not a replacement for Sorbet in annotated projects. Support
-for existing Sorbet `sig`s and RBI files is partial, including extraction
-of some return types. Full contract checking of parameters and returns,
-and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
-alongside itaruby to preserve your existing Sorbet checks.
+This alpha is not a replacement for Sorbet in annotated projects. A
+project method's own recognized `sig { ... }` is checked as a contract.
+Its declared return types the caller, and the method body is checked
+against it (E0109). Its params are checked at each call's arguments, by
+name (E0103). A client RBI supplies the same contracts only when it matches
+the Ruby definition exactly: owner, instance or class-method track, and
+parameter layout. Everything else stays silent rather than guessed:
+generics, procs, overloads, rest and block parameters, duplicate
+definitions, open classes, and stale or conflicting RBIs. Keep running
+`srb tc` alongside itaruby to preserve your existing Sorbet checks.
 
 ## Quick start
 
@@ -84,12 +89,13 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig |
+| E0103 | Error | argument type incompatible with an inline RBS sig, a Sorbet `sig` param, or an exactly matching RBI param |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |
 | E0107 | Warning | a local's inferred usage contradicts every candidate type |
 | E0108 | Error | operator operand pairing MRI raises `TypeError` on, both operands proven from literals in one scope |
+| E0109 | Error | a method's proven return value contradicts its own Sorbet `sig` (or exactly matching RBI) return type |
 | E0001 | Error | syntax error (prism, error-tolerant) |
 
 itaruby reads whatever else exists for free: Tapioca RBIs (`sorbet/rbi/`,

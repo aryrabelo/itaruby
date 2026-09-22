@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""Two-sided Sorbet sig/RBI contract probes. Builds only a temporary source copy, never the checkout.
+
+Run: python3 scripts/sorbet-contracts-mutants.py            (full family)
+     python3 scripts/sorbet-contracts-mutants.py --anchors  (count every needle, build nothing)
+
+Each mutant removes ONE contract decision and must be accused by a NAMED test.
+Needles are literal and counted with `src.count(needle)` against the source
+BEFORE anything builds, so a dead anchor is an INVALID-anchor in milliseconds
+instead of a blind mutant half an hour in. The baseline and each mutant run the
+contract suites; invalid/no-op mutations, compiler failures, and failures of
+the wrong test are distinct verdicts.
+"""
+from pathlib import Path
+import filecmp
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = Path("crates/itaruby_semantic/src")
+CHECK = SRC / "check.rs"
+INDEX = SRC / "index.rs"
+TESTS = ("sorbet_contracts", "sorbet_contract_parser", "project_sigs", "sorbet_sig")
+
+# (label, file, needle, replacement, named test(s) that must FAIL)
+MUTATIONS = [
+    # -- eligibility: which definition a written signature is proven to govern
+    ("open owner governs its sig", CHECK,
+     "        if class.open {\n            return None;\n        }\n        let name = if name == \"new\"",
+     "        let name = if name == \"new\"",
+     "open_source_keeps_existing_ruby_checks_without_contract_accusations"),
+    ("descendant override ignored", CHECK,
+     "(!self.index.descendant_defines(owner, name, singleton)).then_some((name, singleton))",
+     "Some((name, singleton))",
+     "descendant_override_keeps_the_parent_contract_off_the_call"),
+    ("duplicate source picks the last sig", INDEX,
+     "        method.sorbet_sig = None;\n        method.sorbet_annotated = true;\n",
+     "",
+     "duplicate_source_definitions_do_not_pick_a_signature"),
+    # -- RBI: exact owner, track and layout
+    ("stale RBI layout accepted", CHECK,
+     "        if !declaration.matches_source(method) {\n            return None;\n        }\n",
+     "",
+     "stale_rbi_layout_does_not_type_source_or_calls"),
+    ("RBI positional names ignored", INDEX,
+     "            && source.positional_names == md.positional_names\n",
+     "",
+     "stale_rbi_layout_does_not_type_source_or_calls"),
+    ("conflicting RBI declarations pick one", INDEX,
+     "                || old.nesting != declaration.nesting\n            {\n                old.definition.sorbet_sig = None;",
+     "                || old.nesting != declaration.nesting\n            {\n                let _ = ();",
+     "conflicting_rbi_declarations_do_not_choose_a_contract"),
+    ("inherited RBI owner lends its contract", INDEX,
+     "methods.get(method).filter(|m| m.owner == path).cloned()",
+     "methods.get(method).cloned()",
+     "inherited_rbi_contract_never_attaches_to_a_source_override"),
+    # -- instance / singleton separation
+    ("source track forced to instance", CHECK,
+     "        let singleton = class.singleton_methods.get(name).is_some_and(|m| {\n            m.file == method.file && m.def_span == method.def_span\n        });",
+     "        let singleton = false;",
+     "rbi_singleton_contract_matches_source_track"),
+    ("RBI track forced to instance", INDEX,
+     "    let methods = if singleton { singleton_methods } else { instance };\n    methods.get(method).filter",
+     "    let methods = instance;\n    methods.get(method).filter",
+     "rbi_singleton_contract_matches_source_track"),
+    # -- E0109: the body answers to its own signature
+    ("body never checked against sig", CHECK,
+     "            self.check_sorbet_return(def, contract, nesting, &last, &returns);",
+     "            let _ = (contract, nesting);",
+     ("incompatible_source_return_accuses_without_a_call",
+      "explicit_returns_and_implicit_branches_are_checked")),
+    ("explicit returns not inspected", CHECK,
+     "        let actual = returns.iter().find(|ty| !compatible(ty, &expected, self.index))\n            .or_else(",
+     "        let actual = None\n            .or_else(",
+     "explicit_returns_and_implicit_branches_are_checked"),
+    ("uncertain return paths accused", CHECK,
+     "        if safety.uncertain {\n            return;\n        }\n",
+     "",
+     "void_unknown_and_uncertain_return_paths_stay_silent"),
+    # `void` and `returns` share one clause bit, so a void sig never carries
+    # `ret`: deleting the `contract.void` guard alone is an equivalent mutant
+    # (measured BLIND). The observable failure of this decision is reading
+    # `void` as a promise of `nil`, so the mutant drops the guard AND does that.
+    ("void sig treated as a return type", CHECK,
+     "        if self.silent || contract.void {\n            return;\n        }\n"
+     "        let (Some(expr), Some(body)) = (contract.ret.as_deref(), def.body()) else { return };",
+     "        if self.silent {\n            return;\n        }\n"
+     "        let (Some(expr), Some(body)) = (contract.ret.as_deref()"
+     ".or(contract.void.then_some(\"NilClass\")), def.body()) else { return };",
+     "void_unknown_and_uncertain_return_paths_stay_silent"),
+    # -- E0103: parameters correspond by NAME, never by position
+    ("params zipped by sig order", CHECK,
+     "        for (name, (ty, span, _)) in positional_names.iter().zip(args.positional) {",
+     "        for (name, (ty, span, _)) in sig.params.iter().map(|(n, _)| n).zip(args.positional) {",
+     "named_positional_params_accuse_at_argument"),
+    ("keyword args never checked", CHECK,
+     "        for (name, ty, span) in keyword_args {\n            self.check_sorbet_argument(",
+     "        for (name, ty, span) in keyword_args.iter().take(0) {\n            self.check_sorbet_argument(",
+     "keywords_and_defaults_keep_named_correspondence"),
+    ("splat keeps positional correspondence", CHECK,
+     "                        exact_arity = false;\n                        sorbet_args_known = false;\n                        self.infer_expr(&a, env, self_ty, scope);",
+     "                        exact_arity = false;\n                        self.infer_expr(&a, env, self_ty, scope);",
+     "keywords_and_defaults_keep_named_correspondence"),
+    ("unmatched sig names guessed", INDEX,
+     "            if !matches {\n                md.sorbet_sig = None;\n            }",
+     "            if !matches {\n                let _ = ();\n            }",
+     "sig_naming_an_absent_parameter_is_not_a_contract"),
+    # -- PendingSig::Unusable: unreadable or stacked sigs still count as ANNOTATED
+    ("stacked sigs pick the last overload", INDEX,
+     "                            Some(parsed) if !stacked => PendingSig::Parsed(parsed),",
+     "                            Some(parsed) => PendingSig::Parsed(parsed),",
+     "overloads_and_unsupported_layouts_do_not_invent_correspondence"),
+    ("unusable sig counts as unannotated", INDEX,
+     "            sorbet_annotated: pending_sorbet_sig.is_some(),",
+     "            sorbet_annotated: matches!(pending_sorbet_sig, Some(PendingSig::Parsed(_))),",
+     "unusable_inline_sig_still_blocks_the_rbi_contract"),
+]
+
+
+def verdict(build_code, run_code, output, expected):
+    if build_code != 0:
+        return "INVALID-build"
+    if run_code == 0:
+        return "BLIND" if expected else "PASS"
+    if expected:
+        names = (expected,) if isinstance(expected, str) else expected
+        if all(re.search(rf"^test {re.escape(name)} \.\.\. FAILED$", output, re.M) for name in names):
+            return "CAUGHT"
+    return "WRONG-check"
+
+
+def run(copy, *args):
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(copy / "target")
+    tests = [argument for test in TESTS for argument in ("--test", test)]
+    result = subprocess.run(
+        ["cargo", "test", "--locked", "--no-fail-fast", "-p", "itaruby_semantic", *tests, *args],
+        cwd=copy, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        check=False,
+    )
+    print(result.stdout, end="", flush=True)
+    return result
+
+
+def exercise(copy, path, original, content, expected):
+    target = copy / path
+    target.write_text(content)
+    try:
+        if expected and filecmp.cmp(original, target, shallow=False):
+            return "INVALID-cmp", None
+        built = run(copy, "--no-run")
+        if built.returncode != 0:
+            return "INVALID-build", (built.returncode, None, built.stdout)
+        tested = run(copy, "--", "--test-threads=1")
+        evidence = (built.returncode, tested.returncode, tested.stdout)
+        return verdict(*evidence, expected), evidence
+    finally:
+        # Every mutant starts from the shipped source, byte-identical.
+        shutil.copyfile(original, target)
+        if not filecmp.cmp(original, target, shallow=False):
+            raise SystemExit(f"RESTORE-FAILED {path}")
+
+
+def require(actual, expected, label):
+    print(f"{label}: {actual}", flush=True)
+    if actual != expected:
+        raise SystemExit(f"{label}: expected {expected}, got {actual}")
+
+
+def count_anchors(sources):
+    broken = []
+    for label, path, needle, _after, _expected in MUTATIONS:
+        n = sources[path].count(needle)
+        if n != 1:
+            broken.append(f"INVALID-anchor {label}: needle matches {n} times in {path}")
+    for line in broken:
+        print(line)
+    print(f"{len(MUTATIONS)} anchors checked in {len({m[1] for m in MUTATIONS})} files")
+    return not broken
+
+
+def main():
+    sources = {path: (ROOT / path).read_text() for path in {m[1] for m in MUTATIONS}}
+    if not count_anchors(sources):
+        raise SystemExit(1)
+    if "--anchors" in sys.argv[1:]:
+        print("PASS every anchor matches exactly once")
+        return
+    with tempfile.TemporaryDirectory(prefix="ita-sorbet-mutants-") as temporary:
+        copy = Path(temporary)
+        for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]:
+            shutil.copy2(ROOT / name, copy / name)
+        shutil.copytree(ROOT / "crates", copy / "crates", ignore=shutil.ignore_patterns("target"))
+        # Cargo builds this semantic-crate bin for integration tests too.
+        # Copy its public source explicitly, never the scripts directory
+        # (which may contain machine-local corpus configuration).
+        (copy / "scripts").mkdir()
+        generator = Path("scripts/gen-activerecord-inventory.rs")
+        shutil.copy2(ROOT / generator, copy / generator)
+        originals = {}
+        for path, text in sources.items():
+            original = copy / f"original-{path.name}"
+            original.write_text(text)
+            originals[path] = original
+
+        first = next(iter(sources))
+        result, _ = exercise(copy, first, originals[first], sources[first], None)
+        require(result, "PASS", "positive control")
+        result, _ = exercise(copy, CHECK, originals[CHECK], sources[CHECK], MUTATIONS[0][4])
+        require(result, "INVALID-cmp", "no-op guard")
+        result, _ = exercise(copy, CHECK, originals[CHECK], sources[CHECK] + "\nnot valid Rust;\n", MUTATIONS[0][4])
+        require(result, "INVALID-build", "compiler guard")
+
+        for label, path, needle, after, expected in MUTATIONS:
+            mutant = sources[path].replace(needle, after, 1)
+            result, evidence = exercise(copy, path, originals[path], mutant, expected)
+            require(result, "CAUGHT", label)
+            require(verdict(*evidence, "this_test_does_not_exist"), "WRONG-check", f"named-check guard: {label}")
+
+        result, _ = exercise(copy, first, originals[first], sources[first], None)
+        require(result, "PASS", "restored positive control")
+    print(f"PASS: {len(MUTATIONS)} sorbet contract mutants and all four evidence guards")
+
+
+if __name__ == "__main__":
+    main()

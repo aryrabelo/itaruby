@@ -100,6 +100,15 @@ jobs:
       - name: Ancestry and alias source mutants (isolated public-source copy)
         run: python3 scripts/conflicting-superclasses-mutants.py
 
+  sorbet-contracts-mutants:
+    name: mutants (sorbet-contracts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Sorbet sig/RBI contract source mutants (isolated public-source copy)
+        run: python3 scripts/sorbet-contracts-mutants.py
+
   # Gate c2b/c2c: the evidence producers and the reporters, two-sided.
   instruments:
     runs-on: ubuntu-latest

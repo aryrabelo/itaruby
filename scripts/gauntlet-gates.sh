@@ -210,6 +210,12 @@ if python3 "$ROOT/scripts/conflicting-superclasses-mutants.py" >"$ART/conflictin
 else
   bad 'conflicting-superclasses mutants (see target/gauntlet/conflicting-superclasses-mutants.txt)'
 fi
+# Sorbet sig/RBI contracts: same shape, same isolated public-source copy.
+if python3 "$ROOT/scripts/sorbet-contracts-mutants.py" >"$ART/sorbet-contracts-mutants.txt" 2>&1; then
+  ok 'sorbet-contracts mutants (each decision accused, isolated source copy)'
+else
+  bad 'sorbet-contracts mutants (see target/gauntlet/sorbet-contracts-mutants.txt)'
+fi
 # Those scripts leave $ROOT/target holding a binary built from the LAST
 # mutant they injected only if they died mid-run; on success they rebuild
 # the shipped source. Rebuild anyway: the gates below measure this binary,

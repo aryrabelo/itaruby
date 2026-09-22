@@ -1,0 +1,28 @@
+AGENTS.md
+  h_b156936c57c455 347,576-613
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 13-14,3708-3757,3896-3897
+crates/itaruby_semantic/src/core.rs
+  h_b156936c57c455 658-736
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 375-383,499-500,511,536-561,609-625,665-691,696,761-771,890-897,915-916,923-1182,1184-1336,2692-2715,2846-2850,2943,3246-3492
+crates/itaruby_semantic/tests/core_conclusive.rs
+  h_b156936c57c455 220-416
+crates/itaruby_semantic/tests/operand_types.rs
+  h_b156936c57c455 479-490,492,494-501,504-505,509-515,517-523,811-818,856-876,1156-1160,1162,1165,1204-1678
+docs/CHANGELOG.md
+  h_b156936c57c455 11-65,264-266
+scripts/operand-types-mutants.sh
+  h_b156936c57c455 9-15,25-32,49,52,62-63,73-78,122,138-140,145-147,203,213-216,223,229,236,243,249,263,269,276,283,289,293-295,305-318,322-475,480,488,491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "cde988f84c462f6a87a627f9a8619025fbc4eaa7",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

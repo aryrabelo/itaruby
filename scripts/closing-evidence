@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Close a change: run every gate, write the closing report, seal it, ask Jev.
 
-Run: scripts/closing-evidence        (from a clean tree at the commit being closed)
+Run: ops exec typesafe-api-key -- scripts/closing-evidence   (clean tree, at the commit being closed)
 
 Why this exists (AGENTS.md, closing gate): "the gates passed" was a sentence in
 a hand-off, and a sentence is what the software factory refuses to trust. This
@@ -184,8 +184,16 @@ def main():
     if subprocess.run(["sf", "seal", "closing"], cwd=ROOT, check=False).returncode != 0:
         print("closing-evidence: sf seal closing failed")
         return 2
+    # The verdict comes from TypeSafe's own endpoint, never a local proxy: a
+    # machine-wide TYPESAFE_BASE_URL (this fleet points it at an OpenRouter
+    # shim for other tools) is dropped so the judge uses its default,
+    # https://api.typesafe.ai. Run under `ops exec typesafe-api-key --`.
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("closing-evidence: TYPESAFE_API_KEY is not set — run: ops exec typesafe-api-key -- scripts/closing-evidence")
+        return 2
+    judge_env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_BASE_URL"}
     judged = subprocess.run([sys.executable, "scripts/claim-judge-gate", "--expect", "relation=supports",
-                             "--min-confidence", "0.8"], cwd=ROOT, check=False)
+                             "--min-confidence", "0.8"], cwd=ROOT, env=judge_env, check=False)
     if judged.returncode != 0:
         print("closing-evidence: Jev did not accept the claim against this evidence")
         return judged.returncode

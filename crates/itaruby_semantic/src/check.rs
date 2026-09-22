@@ -3297,12 +3297,21 @@ impl Checker<'_> {
                                         (loc.start_offset(), loc.end_offset()),
                                     ));
                                 } else {
+                                    // A string, constant or interpolated key: no
+                                    // named binding, but both sides are still
+                                    // code whose own diagnostics must fire.
                                     sorbet_args_known = false;
-                                    self.infer_expr(&element, env, self_ty, scope);
+                                    self.infer_expr(&assoc.key(), env, self_ty, scope);
+                                    self.infer_expr(&assoc.value(), env, self_ty, scope);
                                 }
                             } else {
                                 sorbet_args_known = false;
-                                self.infer_expr(&element, env, self_ty, scope);
+                                // `infer_expr` has no arm for a bare
+                                // AssocSplatNode; walk the splatted value.
+                                match element.as_assoc_splat_node().and_then(|s| s.value()) {
+                                    Some(value) => { self.infer_expr(&value, env, self_ty, scope); }
+                                    None => { self.infer_expr(&element, env, self_ty, scope); }
+                                }
                             }
                         }
                     }

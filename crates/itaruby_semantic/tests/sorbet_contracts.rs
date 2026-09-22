@@ -1723,3 +1723,33 @@ ContractErasedGenerics.new.update("not a hash")
     assert_eq!(&source[diags[0].start..diags[0].end], "lookup", "{diags:?}");
     assert!(diags[1].message.contains("data"), "{diags:?}");
 }
+
+/// The keyword loop that binds Sorbet params by name must still WALK every
+/// element it cannot bind. A string or constant key, and a `**splat`, used to
+/// reach `infer_expr` as a bare assoc node that no arm reads, so every
+/// diagnostic inside them vanished (measured 2026-09-22 against main: three
+/// E0104 and one E0101 lost, and 4 public-corpus lines gone with them).
+#[test]
+fn unbindable_keyword_elements_are_still_checked() {
+    let diags = check("keyword-walk", r"
+class ContractKeywordWalk
+  def self.real; end
+end
+class ContractKeywordTaker
+  def take(*args, **opts); end
+end
+ContractKeywordTaker.new.take('str' => NoSuchConstB)
+ContractKeywordTaker.new.take(NoSuchConstC => 1)
+ContractKeywordTaker.new.take(**NoSuchConstF)
+ContractKeywordTaker.new.take('str' => ContractKeywordWalk.nonexistent_class_method)
+ContractKeywordTaker.new.take(sym: NoSuchConstS)
+", None);
+    let found: Vec<(&str, &str)> = diags.iter()
+        .map(|d| (d.code, d.message.as_str()))
+        .collect();
+    for (code, needle) in [("E0104", "NoSuchConstB"), ("E0104", "NoSuchConstC"), ("E0104", "NoSuchConstF"),
+                           ("E0101", "nonexistent_class_method"), ("E0104", "NoSuchConstS")] {
+        assert!(found.iter().any(|(c, m)| *c == code && m.contains(needle)), "missing {code} {needle}: {diags:?}");
+    }
+    assert_eq!(diags.len(), 5, "{diags:?}");
+}

@@ -276,6 +276,15 @@ MUTATIONS = [
      "    !compatible(&erase_type_arguments(&proven), expected, index)",
      "    !compatible(&proven, expected, index)",
      "collection_type_arguments_are_erased_but_the_category_still_accuses"),
+    # -- the keyword loop still WALKS what it cannot bind by name
+    ("non-symbol keyword pair left unwalked", CHECK,
+     "                                    self.infer_expr(&assoc.key(), env, self_ty, scope);\n                                    self.infer_expr(&assoc.value(), env, self_ty, scope);\n",
+     "                                    self.infer_expr(&element, env, self_ty, scope);\n",
+     "unbindable_keyword_elements_are_still_checked"),
+    ("keyword splat left unwalked", CHECK,
+     "                                    Some(value) => { self.infer_expr(&value, env, self_ty, scope); }",
+     "                                    Some(_) => { self.infer_expr(&element, env, self_ty, scope); }",
+     "unbindable_keyword_elements_are_still_checked"),
 ]
 
 

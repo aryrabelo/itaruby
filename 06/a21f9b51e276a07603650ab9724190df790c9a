@@ -1,0 +1,26 @@
+AGENTS.md
+  h_b156936c57c455 582-589
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 4461-4474,4503
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 245-283
+docs/CHANGELOG.md
+  h_b156936c57c455 11-28
+scripts/singleton-mutants.sh
+  h_b156936c57c455 387-393
+testdata/dark_singleton/census_host_a.rb
+  h_b156936c57c455 1-6
+testdata/dark_singleton/census_host_b.rb
+  h_b156936c57c455 1-14
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "06a21f9b51e276a07603650ab9724190df790c9a",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

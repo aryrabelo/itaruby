@@ -185,11 +185,12 @@ PY
 # An unset root would make the path guard below a bare `*` — permissive,
 # and silently so. Refuse instead.
 : "${LAB_DF_ROOT:?lab df: LAB_DF_ROOT unset}"
+root=${LAB_DF_ROOT%/}
 for a in "$@"; do
   case $a in
     -P | -k | -Pk | -kP) ;;
     -*) echo "df: invalid option -- '${a#-}'" >&2; exit 1 ;;
-    "$LAB_DF_ROOT"*) ;;
+    "$root" | "$root"/*) ;;
     *) echo "df: $a: No such file or directory" >&2; exit 1 ;;
   esac
 done
@@ -205,6 +206,61 @@ run_replay() { # DIR TAG
       bash "$1/scripts/bug-replay/replay.sh" --repos rails --limit 1 --skip-srb \
       >>"$1/log.txt" 2>&1 )
 }
+
+# Probe the generated df itself: the resource is fake, but the path/option
+# contract must still reject Linux-incompatible calls and sibling prefixes.
+say 'case replay-df-paths — normalized root, children, never sibling prefixes'
+df_lab=$LAB/df-contract
+mk_replay "$df_lab" "$ROOT/scripts/bug-replay/replay.sh"
+df_probe() { # PROGRAM ROOT PATH -> transcript; return actual df status
+  LAB_DF_ROOT="$2" "$1" -Pk "$3" 2>&1
+}
+for root in "$LAB" "$LAB/"; do
+  for path in "$LAB" "$LAB/child"; do
+    text=$(df_probe "$df_lab/fakebin/df" "$root" "$path"); rc=$?
+    if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+      ok 'df accepts lab root and descendants with either root spelling'
+    else bad "df rejects valid lab path $path (root $root)"; fi
+  done
+done
+text=$(df_probe "$df_lab/fakebin/df" "$LAB" "${LAB}-sibling"); rc=$?
+if (( rc != 0 )) && [[ $text == *'No such file or directory'* ]]; then
+  ok 'df rejects sibling prefix'
+else bad 'df accepted sibling prefix'; fi
+text=$(LAB_DF_ROOT="$LAB" "$df_lab/fakebin/df" -g "$LAB" 2>&1); rc=$?
+if (( rc != 0 )) && [[ $text == *'invalid option'* ]]; then
+  ok 'df rejects BSD-only option'
+else bad 'df accepted BSD-only option'; fi
+
+for name in raw-root sibling-prefix; do
+  case $name in
+    raw-root) needle='root=${LAB_DF_ROOT%/}'; replacement='root=$LAB_DF_ROOT' ;;
+    sibling-prefix) needle='"$root" | "$root"/*)'; replacement='"$root"*)' ;;
+  esac
+  mutant=$df_lab/df-$name
+  if ! mutate "$df_lab/fakebin/df" "$mutant" "$needle" "$replacement" ||
+      cmp -s "$df_lab/fakebin/df" "$mutant"; then
+    bad "INVALIDO-cmp: df $name"; continue
+  fi
+  if ! sh -n "$mutant"; then bad "INVALIDO-parse: df $name"; continue; fi
+  chmod +x "$mutant"
+  case $name in
+    raw-root)
+      text=$(df_probe "$mutant" "$LAB/" "$LAB"); rc=$?
+      if (( rc != 0 )) && [[ $text == *'No such file or directory'* ]]; then
+        ok 'df raw-root mutant falsely rejects normalized ancestor'
+      else bad 'df raw-root mutant did NOT reproduce'; fi ;;
+    sibling-prefix)
+      text=$(df_probe "$mutant" "$LAB" "${LAB}-sibling"); rc=$?
+      if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+        ok 'df sibling-prefix mutant accepts outside path'
+      else bad 'df sibling-prefix mutant did NOT reproduce'; fi ;;
+  esac
+  text=$(df_probe "$mutant" "$LAB" "$LAB/child"); rc=$?
+  if (( rc == 0 )) && [[ $text == *'Filesystem 1024-blocks'* ]]; then
+    ok "df $name mutant preserves valid descendant"
+  else bad "df $name mutation breaks valid descendant"; fi
+done
 
 # ---------- case 2: replay run isolation ----------
 say 'case replay-run-isolation — two invocations must never share one results file'

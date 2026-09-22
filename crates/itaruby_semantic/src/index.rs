@@ -2632,16 +2632,23 @@ impl DefWalker<'_> {
                     loc.start_offset(),
                     loc.end_offset(),
                 ));
-                // Bead ita-54k: RHS itself a literal constant path is an
-                // alias (`X = Y`) — followed by `const_exists` only, via
-                // `ProjectIndex::resolve_const_via_alias`. `resolve_const`
-                // itself never consults this (invariant #1: widening it
-                // could manufacture a type where none was proven).
+                // Literal aliases are followed by the scoped constant-path
+                // resolver. Only a proven target becomes a type; uncertain
+                // ancestry remains suppression-only in `const_exists`.
+                //
+                // The RHS keeps its cbase marker (`X = ::Target`). Trimming
+                // it turned an ABSOLUTE reference into a relative one, and
+                // the resolver then re-evaluated it in the write scope — so
+                // an enclosing class with conflicting superclasses made a
+                // target Ruby resolves unconditionally at top level come
+                // back Ambiguous, silently dropping the alias's arity check
+                // and navigation. `resolve_const_path`/`find_const_alias`
+                // both branch on this prefix; the LHS key stays unprefixed.
                 if let Some(target) = const_path_str(&cw.value()) {
                     self.const_aliases.push((
                         join_path(scope, &name),
                         nesting.to_vec(),
-                        target.trim_start_matches("::").to_string(),
+                        target,
                     ));
                 }
             }
@@ -2680,12 +2687,13 @@ impl DefWalker<'_> {
                         }
                         // Bead ita-54k: same alias contract as the simple
                         // write arm above, for the qualified LHS shape
-                        // (`A::B = C::D`).
+                        // (`A::B = C::D`) — including keeping the RHS's
+                        // cbase marker, for the reason recorded there.
                         if let Some(target) = const_path_str(&cpw.value()) {
                             self.const_aliases.push((
                                 full,
                                 nesting.to_vec(),
-                                target.trim_start_matches("::").to_string(),
+                                target,
                             ));
                         }
                     }
@@ -4456,11 +4464,10 @@ pub struct MethodSig {
 pub struct ClassDef {
     pub path: String,
     /// Real lexical `Module.nesting` chain for this class (bead ita-519,
-    /// see `ClassFragment::nesting`) — first fragment merged wins, same
-    /// "first wins" rule as `superclass` below. Empty only for a class
-    /// never seen with a real project/declared fragment (superclass and
-    /// includes/prepends are then necessarily empty too, so nothing ever
-    /// tries to resolve through an empty chain).
+    /// see `ClassFragment::nesting`) — first fragment merged wins for
+    /// mixin edges. Superclass headers are reconciled separately, in each
+    /// declaration's own nesting. Empty only for a class never seen with a
+    /// real fragment (its mixin edges are necessarily empty too).
     pub nesting: Vec<String>,
     pub is_module: bool,
     pub open: bool,
@@ -4491,6 +4498,18 @@ pub struct ClassDef {
 pub struct ProjectIndex {
     pub classes: Vec<ClassDef>,
     pub by_path: FxHashMap<String, ClassId>,
+    /// Superclass headers retain their own lexical context until all
+    /// fragments exist. A reopening without `< Base` contributes no edge.
+    superclass_declarations: FxHashMap<ClassId, Vec<(String, Vec<String>)>>,
+    /// Only populated when the first written superclass came from a later
+    /// reopening with a different lexical context than the class's first body.
+    superclass_nesting: FxHashMap<ClassId, Vec<String>>,
+    /// Incompatible superclass declarations have no winning edge. Kept
+    /// separate from `open`: a known local method still exists, but an
+    /// inherited lookup (including constants/navigation) cannot conclude.
+    /// Transitive conflict dependencies, computed at merge time so constant
+    /// resolution never recursively calls linearization to ask this question.
+    ambiguous_ancestry: FxHashSet<ClassId>,
     /// Bead B of onda 2, staging: `run_load_hooks(:sym, Base)` bases as
     /// `(path as written, nesting at the call site)`, resolved to real
     /// `ClassId`s by `apply_load_hook_openness` once every fragment has
@@ -4594,11 +4613,10 @@ pub struct ProjectIndex {
     /// ALIAS's OWN scope, not the reference site's — matching real Ruby,
     /// where the assignment's right-hand side is evaluated once, at
     /// definition time. First write wins (`entry(...).or_insert_with`),
-    /// mirroring every other merge-time map here. Consulted ONLY from
-    /// `const_exists` (`resolve_const_via_alias`), strictly suppression-
-    /// only: `resolve_const` itself never chases an alias (see its own
-    /// doc comment — widening it could manufacture a false E0101/E0102/
-    /// E0103, invariant #1).
+    /// mirroring every other merge-time map here. `const_resolution`
+    /// follows aliases for both class resolution and existence checks;
+    /// only its `Resolved` outcome may produce a type. The lower-level
+    /// `resolve_const` remains lexical-only and never chases an alias.
     pub const_aliases: FxHashMap<String, (Vec<String>, String)>,
     /// Bead ita-o8l.1: raw `(track, name, nesting)` entries collected
     /// from every merged file's `FileDefs::dynamic_mixin_targets`, not
@@ -4667,7 +4685,6 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
         for &file in project.files(db) {
             merge_file_fragments(db, file, &mut index, &mut qualified_writes);
         }
-        merge_schema_declarations(db, project, &mut index);
     }
     // bead ita-3gs: curated external gem declarations, embedded in the
     // binary — merged last, and only into names the project itself never
@@ -4676,6 +4693,12 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // wiring, and real project code always wins over a declaration.
     for frag in &crate::declarations::declared_fragments() {
         merge_declared_fragment(&mut index, frag);
+    }
+    reconcile_superclasses(&mut index);
+    // Schema synthesis consumes superclass edges too: it must not install
+    // attributes from whichever incompatible base happened to arrive first.
+    if let Some(project) = ProjectFiles::try_get(db) {
+        merge_schema_declarations(db, project, &mut index);
     }
     // Bead ita-547: generalizes mechanism B (bead ita-h6l) past the
     // curated set above — a gem this project's own `Gemfile.lock` names
@@ -4939,6 +4962,7 @@ fn merge_file_fragments(
             continue;
         }
         let id = index.intern(&frag.path);
+        merge_superclass_header(index, id, frag);
         let class = &mut index.classes[id.0 as usize];
         class.is_module |= frag.is_module;
         class.open |= frag.open;
@@ -4952,9 +4976,6 @@ fn merge_file_fragments(
         }
         if class.nesting.is_empty() {
             class.nesting.clone_from(&frag.nesting);
-        }
-        if class.superclass.is_none() {
-            class.superclass.clone_from(&frag.superclass);
         }
         if class.table_name.is_none() {
             class.table_name.clone_from(&frag.table_name);
@@ -4973,6 +4994,89 @@ fn merge_file_fragments(
         }
         merge_hook_installs(class, frag, file);
     }
+}
+
+/// Keep the header's scope independent of whichever reopening supplied the
+/// class body first. All written headers remain available for reconciliation.
+fn merge_superclass_header(index: &mut ProjectIndex, id: ClassId, frag: &ClassFragment) {
+    let Some(superclass) = &frag.superclass else { return };
+    index.superclass_declarations.entry(id).or_default()
+        .push((superclass.clone(), frag.nesting.clone()));
+    let class = &mut index.classes[id.0 as usize];
+    if class.superclass.is_none() {
+        class.superclass = Some(superclass.clone());
+        if !class.nesting.is_empty() && class.nesting != frag.nesting {
+            index.superclass_nesting.insert(id, frag.nesting.clone());
+        }
+    }
+}
+
+/// A missing external base is not a contradiction. Disagreeing identities,
+/// or a header whose lookup crosses an enclosing conflict, are ambiguous.
+fn superclass_headers_are_ambiguous(
+    index: &ProjectIndex,
+    id: ClassId,
+    headers: &[(String, Vec<String>)],
+) -> bool {
+    if headers.iter().any(|(name, nesting)| index.superclass_header_is_ambiguous(id, nesting, name)) {
+        return true;
+    }
+    if headers.len() == 1 {
+        return false;
+    }
+    let (first_name, first_nesting) = &headers[0];
+    let first = index.resolve_superclass_header(id, first_nesting, first_name);
+    headers.iter().skip(1).any(|(name, nesting)| {
+        if name == first_name && nesting == first_nesting {
+            return false;
+        }
+        let other = index.resolve_superclass_header(id, nesting, name);
+        first.is_none() || first != other
+    })
+}
+
+/// Resolve headers against the complete index, not filesystem order. Compare
+/// identities rather than spellings (`Base` and `::Outer::Base` may agree).
+/// Remove disagreements in batches: an enclosing conflict can make another
+/// header inconclusive on the next pass, never restore a discarded edge.
+fn reconcile_superclasses(index: &mut ProjectIndex) {
+    let declarations = std::mem::take(&mut index.superclass_declarations);
+    let mut conflicts_seen = FxHashSet::default();
+    loop {
+        let conflicts: Vec<ClassId> = declarations.iter().filter_map(|(&id, headers)| {
+            if conflicts_seen.contains(&id) {
+                return None;
+            }
+            superclass_headers_are_ambiguous(index, id, headers).then_some(id)
+        }).collect();
+        let unchanged = conflicts.is_empty();
+        for id in conflicts {
+            conflicts_seen.insert(id);
+            index.ambiguous_ancestry.insert(id);
+            index.classes[id.0 as usize].superclass = None;
+        }
+        if !propagate_ancestry_conflicts(index) && unchanged {
+            break;
+        }
+    }
+}
+
+/// Propagate only conflicts, not ordinary unknown/external bases. Batch updates
+/// keep declaration order from deciding whether an enclosing scope is usable.
+fn propagate_ancestry_conflicts(index: &mut ProjectIndex) -> bool {
+    if index.ambiguous_ancestry.is_empty() {
+        return false;
+    }
+    let affected: Vec<_> = index.by_path.values().copied().filter(|id| {
+        if index.ambiguous_ancestry.contains(id) {
+            return false;
+        }
+        let (chain, _) = index.ancestors(*id);
+        chain.iter().any(|a| index.ambiguous_ancestry.contains(a))
+    }).collect();
+    let changed = !affected.is_empty();
+    index.ambiguous_ancestry.extend(affected);
+    changed
 }
 
 /// Bead H of onda 2: carry one fragment's `def self.extended(base)`
@@ -6038,7 +6142,7 @@ const RBI_ALIAS_CHAIN_CAP: usize = 32;
 /// so this data was ALREADY harvested into `FileDefs::const_aliases`
 /// (bead ita-54k) — no consumer had ever read an RBI file's own
 /// `const_aliases` before this bead; every existing alias-chase function
-/// (`ProjectIndex::resolve_const_via_alias`,
+/// (`ProjectIndex::const_resolution`,
 /// `expand_unresolved_alias_target`) only ever walks the PROJECT's
 /// merged `const_aliases`, built exclusively from project files.
 /// `owner`'s own candidate files are found the same bare-nesting-aware
@@ -6826,6 +6930,23 @@ pub enum MethodLookup<'a> {
     Inconclusive,
 }
 
+/// Only `Resolved` may become a type/navigation target. `Missing` means this
+/// walk found no class/alias answer; plain value-constant membership remains
+/// a separate question in `const_exists`. `Ambiguous` must never accuse.
+#[derive(Clone, Copy)]
+enum ConstResolution {
+    Resolved(ClassId),
+    Ambiguous,
+    Missing,
+}
+
+/// One path traversal shares a hop budget across every segment and RHS.
+/// Active RHS states are borrowed from the index: no cloned names/scopes.
+struct ConstAliasWalk<'a> {
+    remaining: usize,
+    active: Vec<&'a (Vec<String>, String)>,
+}
+
 impl ProjectIndex {
     fn intern(&mut self, path: &str) -> ClassId {
         if let Some(&id) = self.by_path.get(path) {
@@ -6904,6 +7025,9 @@ impl ProjectIndex {
                 }
             }
         }
+        if self.conflicting_const_scope(nesting) {
+            return None;
+        }
         self.by_path.get(name).copied()
     }
 
@@ -6929,8 +7053,23 @@ impl ProjectIndex {
     /// already treats that as leaving the ancestry open (invariant #1:
     /// never a false E0101 from a superclass this index can't pin down).
     fn resolve_superclass_const(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
+        let nesting = self.superclass_nesting.get(&id).map_or(nesting, Vec::as_slice);
+        self.resolve_superclass_header(id, nesting, name)
+    }
+
+    fn resolve_superclass_header(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
         self.resolve_superclass_lexical(id, nesting, name)
             .or_else(|| self.resolve_superclass_fallback(id, nesting, name))
+    }
+
+    /// The header cannot choose an inherited name from an enclosing class
+    /// whose ancestry conflicts. Absolute and lexically proven bases do not
+    /// depend on that chain. Remove the uncertain edge before other passes
+    /// (schema synthesis, external-ancestor collection) consume its spelling.
+    fn superclass_header_is_ambiguous(&self, id: ClassId, nesting: &[String], name: &str) -> bool {
+        !name.starts_with("::")
+            && self.conflicting_const_scope(&nesting[..nesting.len().saturating_sub(1)])
+            && self.resolve_superclass_lexical(id, nesting, name).is_none()
     }
 
     /// Lexical half of `resolve_superclass_const`: same per-level walk as
@@ -6970,6 +7109,9 @@ impl ProjectIndex {
     /// `name`. Only once no real ancestor answers does a bare top-level
     /// constant get a look — mirroring `Object` being the final, least
     /// specific link in every ancestor chain in real Ruby.
+    /// Conflict-dependent headers are removed by reconciliation before
+    /// consumers walk these edges; suppressing resolution alone would leave
+    /// the raw spelling available to schema/RBI consumers.
     fn resolve_superclass_fallback(&self, id: ClassId, nesting: &[String], name: &str) -> Option<ClassId> {
         if let Some(found) = self.resolve_superclass_ancestor(id, nesting, name) {
             return Some(found);
@@ -7107,6 +7249,7 @@ impl ProjectIndex {
             return; // cycle or diamond: first occurrence wins
         }
         let class = self.class(id);
+        *complete &= !self.ambiguous_ancestry.contains(&id);
         let nesting = &class.nesting;
         for name in class.prepends.iter().rev() {
             match self.resolve_const(nesting, name) {
@@ -7368,6 +7511,11 @@ impl ProjectIndex {
     /// nothing: the builtin core surface is the inventory's business, not
     /// this consult's (bead ita-asx).
     fn core_object_instance_surface(&self, id: ClassId, name: &str) -> Option<MethodLookup<'_>> {
+        // An unknown superclass may override this fallback. All proven
+        // nearer singleton surfaces have already been searched by the caller.
+        if self.ambiguous_ancestry.contains(&id) {
+            return Some(MethodLookup::Inconclusive);
+        }
         let object_class: &[&str] = if self.class(id).is_module {
             &["Module", "Class"]
         } else {
@@ -7444,17 +7592,11 @@ impl ProjectIndex {
             if let Some(m) = class.singleton_methods.get(name) {
                 return MethodLookup::Found(m, a);
             }
-            for ext in &class.extends {
-                if let Some(mid) = self.resolve_const(&class.nesting, ext) {
-                    if let Some(m) = self.class(mid).methods.get(name) {
-                        return MethodLookup::Found(m, mid);
-                    }
-                } else {
-                    return MethodLookup::Inconclusive;
-                }
+            if let Some(found) = self.extended_module_surface(class, name) {
+                return found;
             }
         }
-        if self.descendant_defines(id, name, true) {
+        if self.ambiguous_ancestry.contains(&id) || self.descendant_defines(id, name, true) {
             MethodLookup::Inconclusive
         } else {
             MethodLookup::NotFound
@@ -7793,18 +7935,36 @@ impl ProjectIndex {
     /// candidate generation (innermost nesting level outward, then the
     /// bare name) so a bare alias reference resolves from the SAME
     /// candidate scopes a real class reference would — just looked up in
-    /// `const_aliases` instead of `by_path`. Suppression-only:
-    /// `resolve_const` itself never calls this, and never will (widening
-    /// it could manufacture a false type per invariant #1).
+    /// `const_aliases` instead of `by_path`. Both class resolution and
+    /// existence use this lookup at every hop. A level that declares the
+    /// name as a literal alias is followed; a level that declares it as any
+    /// OTHER value (`Known = Object.const_get(...)`) shadows outer scopes
+    /// exactly as `resolve_const` treats it, so the search stops there
+    /// rather than resurrecting an outer/global alias for a name Ruby would
+    /// resolve to that dynamic value. Only after no lexical level declares
+    /// the name at all does the conflict barrier, then a global alias, apply.
     fn find_const_alias(&self, nesting: &[String], name: &str) -> Option<&(Vec<String>, String)> {
         if let Some(rest) = name.strip_prefix("::") {
             return self.const_aliases.get(rest);
         }
+        let single_segment = !name.contains("::");
         for level in nesting.iter().rev() {
             let candidate = format!("{level}::{name}");
             if let Some(alias) = self.const_aliases.get(&candidate) {
                 return Some(alias);
             }
+            // A non-alias declaration of this name here shadows any outer
+            // alias: stop, exactly as `resolve_const`'s own shadow rule does.
+            if single_segment {
+                if let Some(&sid) = self.by_path.get(level) {
+                    if self.class(sid).consts.iter().any(|c| c == name) {
+                        return None;
+                    }
+                }
+            }
+        }
+        if self.conflicting_const_scope(nesting) {
+            return None;
         }
         self.const_aliases.get(name)
     }
@@ -7814,122 +7974,89 @@ impl ProjectIndex {
     /// real fixture needs more.
     const CONST_ALIAS_CHAIN_CAP: usize = 32;
 
-    /// Bead ita-54k: does `name` resolve to a real project class by
-    /// following one or more constant-alias hops (`X = Y`, `Y = Z`, ...)?
-    /// Each hop resolves the RHS from ITS OWN write-site lexical scope
-    /// (`find_const_alias`'s stored nesting), not the original
-    /// reference's — matching real Ruby, where an assignment's
-    /// right-hand side is evaluated once, at definition time, in
-    /// whatever scope wrote it. `visited` guards a cycle (`X = Y; Y =
-    /// X`); `CONST_ALIAS_CHAIN_CAP` guards a pathologically long chain.
-    /// Either exit degrades to `None` — a silent miss, never a panic or
-    /// an infinite loop — because this is consulted only as a fallback
-    /// inside `const_exists`, which only ever SUPPRESSES E0104 on a hit
-    /// (invariant #1: a wrong miss here costs a warning, never a false
-    /// diagnostic).
-    fn resolve_const_via_alias(&self, nesting: &[String], name: &str) -> Option<ClassId> {
-        let mut cur_nesting = nesting.to_vec();
-        let mut cur_name = name.to_string();
-        let mut visited = std::collections::HashSet::new();
-        for _ in 0..Self::CONST_ALIAS_CHAIN_CAP {
-            if !visited.insert(cur_name.clone()) {
-                return None; // cycle
-            }
-            let (next_nesting, target) = self.find_const_alias(&cur_nesting, &cur_name)?.clone();
-            if let Some(id) = self.resolve_const(&next_nesting, &target) {
-                return Some(id);
-            }
-            cur_nesting = next_nesting;
-            cur_name = target;
+    /// Resolve literal aliases at every path segment. Each RHS is evaluated
+    /// in its recorded write-site scope; a missing inherited name cannot
+    /// fall through to an unrelated global class or alias. Only proven
+    /// identities become types; uncertainty remains suppression-only.
+    pub fn resolve_const_through_aliases(&self, nesting: &[String], name: &str) -> Option<ClassId> {
+        match self.const_resolution(nesting, name) {
+            ConstResolution::Resolved(id) => Some(id),
+            ConstResolution::Ambiguous | ConstResolution::Missing => None,
         }
-        None
     }
 
-    /// Bead ita-47y: resolve a constant path through literal-alias hops
-    /// at ANY `::`-segment, not only the last-but-one
-    /// `resolve_const_via_alias` chases. The measured ruby-lsp shape
-    /// (`Interface = LanguageServer::Protocol::Interface`, then
-    /// `Interface::CompletionItemKind::FIELD` — TWO segments past the
-    /// alias, not one) never resolved through `const_exists`'s qualified
-    /// branch: that branch only ever tries an alias on the text
-    /// immediately left of the FINAL `::`, so a reference two-or-more
-    /// segments past the alias always fell through to
-    /// `toplevel_consts`/`stdlib_declares` and warned a false E0104 even
-    /// though the alias itself, and a one-segment-nested reference
-    /// through it, already resolved.
-    ///
-    /// Unlike `resolve_const_via_alias` (suppression-only, `const_exists`'s
-    /// private fallback, never returns a type), this returns a real
-    /// `ClassId` — the SAME class a direct reference to the alias's
-    /// target would resolve to — so a caller (`check.rs::infer_const`)
-    /// can type the reference `Ty::Class(id)` exactly as if the alias had
-    /// never been in the way. That is what both kills the false E0104 AND
-    /// legitimately unlocks E0101/E0103 for a bogus member reached
-    /// through the alias (a class this checker now knows is closed can
-    /// diagnose a wrong method call on it, same as any other resolved
-    /// class) — the anti-suppression half of invariant #1 still holds:
-    /// only a segment that genuinely resolves ever produces a `ClassId`,
-    /// so a wrong member past a real alias keeps accusing exactly like a
-    /// wrong member past a real class would.
-    ///
-    /// Ruby only ever lexically searches the FIRST segment of a constant
-    /// path expression from the reference site's nesting; every later
-    /// segment is a literal child lookup of whatever the previous segment
-    /// resolved to (never re-searched lexically) — so only the first
-    /// segment tries `resolve_const`'s nesting walk (falling back to
-    /// `resolve_const_via_alias` for that one segment, exactly
-    /// `const_exists`'s existing single-hop behavior), and every
-    /// following segment is looked up as an EXACT qualified path
-    /// (`resolve_alias_segment`), itself falling back to
-    /// `resolve_const_via_alias` keyed by that exact qualified name for
-    /// an interior alias hop (`Owner::Seg = ...`).
-    ///
-    /// Still literal-path-only (ita-exc): every hop chased here was
-    /// already recorded by `const_aliases`, which only ever records a
-    /// RHS that parsed as a bare/qualified constant path — nothing here
-    /// widens WHAT counts as an alias, only how many `::`-segments past
-    /// one a caller may walk. `resolve_const` itself stays untouched and
-    /// lexical-only, per its own doc comment. A miss at any segment
-    /// degrades to `None` — a silent miss, never a panic — the same
-    /// failure mode `resolve_const`/`resolve_const_via_alias` already
-    /// have.
-    pub fn resolve_const_through_aliases(&self, nesting: &[String], name: &str) -> Option<ClassId> {
+    fn const_resolution(&self, nesting: &[String], name: &str) -> ConstResolution {
+        let mut walk = ConstAliasWalk { remaining: Self::CONST_ALIAS_CHAIN_CAP, active: Vec::new() };
+        self.resolve_const_path(nesting, name, &mut walk)
+    }
+
+    fn resolve_const_path<'a>(
+        &'a self,
+        nesting: &[String],
+        name: &str,
+        walk: &mut ConstAliasWalk<'a>,
+    ) -> ConstResolution {
         if let Some(id) = self.resolve_const(nesting, name) {
-            return Some(id);
+            return ConstResolution::Resolved(id);
         }
-        let (first_nesting, first) = match name.strip_prefix("::") {
+        let (scope, path) = match name.strip_prefix("::") {
             Some(rest) => (&[][..], rest),
             None => (nesting, name),
         };
-        let mut segments = first.split("::");
-        let first_seg = segments.next()?;
-        let mut owner = self
-            .resolve_const(first_nesting, first_seg)
-            .or_else(|| self.resolve_const_via_alias(first_nesting, first_seg))?;
-        for seg in segments {
-            owner = self.resolve_alias_segment(owner, seg)?;
+        let mut segments = path.split("::");
+        let Some(first) = segments.next() else { return ConstResolution::Missing };
+        let mut found = self.resolve_const_segment(scope, first, None, walk);
+        for segment in segments {
+            let ConstResolution::Resolved(owner) = found else { return found };
+            let qualified = format!("::{}::{segment}", self.class(owner).path);
+            found = self.resolve_const_segment(&[], &qualified, Some(owner), walk);
         }
-        Some(owner)
+        found
     }
 
-    /// One interior `::`-segment step past an already-resolved `owner`
-    /// (bead ita-47y): a plain child lookup (`by_path`), or — if the
-    /// exact qualified name is itself a literal-path alias write —
-    /// chased via `resolve_const_via_alias` keyed by that exact qualified
-    /// path. No lexical search: see
-    /// `resolve_const_through_aliases`'s doc comment for why only the
-    /// FIRST segment of a path expression is ever lexically searched.
-    fn resolve_alias_segment(&self, owner: ClassId, seg: &str) -> Option<ClassId> {
-        let qualified = format!("{}::{seg}", self.class(owner).path);
-        if let Some(&id) = self.by_path.get(&qualified) {
-            return Some(id);
+    /// Proven lexical declarations/aliases precede the ancestry barrier;
+    /// `find_const_alias` applies that barrier before its global fallback.
+    fn resolve_const_segment<'a>(
+        &'a self,
+        nesting: &[String],
+        name: &str,
+        owner: Option<ClassId>,
+        walk: &mut ConstAliasWalk<'a>,
+    ) -> ConstResolution {
+        if let Some(id) = self.resolve_const(nesting, name) {
+            return ConstResolution::Resolved(id);
         }
-        self.resolve_const_via_alias(&[], &format!("::{qualified}"))
+        if let Some(alias) = self.find_const_alias(nesting, name) {
+            return self.follow_const_alias(alias, walk);
+        }
+        let ambiguous = match owner {
+            Some(id) => self.ambiguous_ancestry.contains(&id),
+            None => self.conflicting_const_scope(nesting),
+        };
+        if ambiguous { ConstResolution::Ambiguous } else { ConstResolution::Missing }
+    }
+
+    fn follow_const_alias<'a>(
+        &'a self,
+        alias: &'a (Vec<String>, String),
+        walk: &mut ConstAliasWalk<'a>,
+    ) -> ConstResolution {
+        if walk.active.contains(&alias) {
+            return ConstResolution::Ambiguous; // a cycle cannot prove a target or absence
+        }
+        if walk.remaining == 0 {
+            return ConstResolution::Ambiguous; // a finite budget cannot prove absence
+        }
+        walk.remaining -= 1;
+        walk.active.push(alias);
+        let found = self.resolve_const_path(&alias.0, &alias.1, walk);
+        let _ = walk.active.pop();
+        found
     }
 
     /// Bead ita-47y (RBI-target extension): fully chase a literal-alias
     /// chain and return the FINAL target TEXT — unlike
-    /// `resolve_const_via_alias` (`Option<ClassId>`, a silent miss the
+    /// `resolve_const_through_aliases` (`Option<ClassId>`, a silent miss the
     /// moment a target never resolves to a project `ClassId`), this
     /// keeps going until it finds a leaf that is NOT itself a further
     /// alias, and hands that leaf's raw spelling back so a caller can
@@ -7955,7 +8082,11 @@ impl ProjectIndex {
                 return None; // resolves in-project after all: not this fallback's job
             }
             if self.find_const_alias(&next_nesting, &target).is_none() {
-                return Some(target); // leaf: no further alias hop past this target
+                // Leaf. The stored RHS keeps its cbase marker for the
+                // RESOLUTION path; this is the TEXT path, whose callers
+                // rejoin segments and match unprefixed `by_path` keys, so
+                // the marker is normalized away exactly here.
+                return Some(target.trim_start_matches("::").to_string());
             }
             cur_nesting = next_nesting;
             cur_name = target;
@@ -8017,17 +8148,13 @@ impl ProjectIndex {
     /// because widening *it* would turn `Ty::Unknown` into `Ty::Class`
     /// and could manufacture a new E0101/E0102/E0103 (invariant #1).
     ///
-    /// Bead ita-54k: when the qualified branch's prefix fails to resolve
-    /// via `resolve_const`, it also tries `resolve_const_via_alias` — the
-    /// prefix itself may be a constant alias (`X = Y`) rather than a real
-    /// class, and a reference through it (`X::Something`) must resolve
-    /// exactly as `Y::Something` would. Bead ita-47y widens this to
-    /// `resolve_const_through_aliases`, which also chases a prefix that is
-    /// itself MULTIPLE segments past the alias (`X::Y::Something`, not
-    /// only `X::Something`) — see that function's doc comment.
+    /// Literal aliases share the same scoped traversal as class resolution.
+    /// Plain value constants still use the membership checks below: failing
+    /// to produce a `ClassId` does not mean a declared value is absent.
     pub fn const_exists(&self, nesting: &[String], name: &str) -> bool {
-        if self.resolve_const_through_aliases(nesting, name).is_some() {
-            return true;
+        match self.const_resolution(nesting, name) {
+            ConstResolution::Resolved(_) | ConstResolution::Ambiguous => return true,
+            ConstResolution::Missing => {}
         }
         // Plain constants: check simple-name membership in the owning class
         // of each lexical candidate scope.
@@ -8103,17 +8230,26 @@ impl ProjectIndex {
             self.toplevel_consts.contains(name) || stdlib_declares(&self.requires, nesting, name)
         }
     }
-    /// Does `simple` name a constant on `id` or any of its ancestors —
-    /// either a `CONST = ...` assignment or a nested class/module? MRO
-    /// incompleteness is irrelevant: only a positive hit is used, and it
-    /// only ever silences a warning.
+    /// Does `simple` exist, or might conflicting ancestry provide it?
+    /// This suppression-only answer never gives a type/navigation target.
     fn const_in_ancestors(&self, id: ClassId, simple: &str) -> bool {
         let (chain, _complete) = self.ancestors(id);
         chain.into_iter().any(|a| {
             let c = self.class(a);
+            if self.ambiguous_ancestry.contains(&a) {
+                return true;
+            }
             c.consts.iter().any(|k| k == simple)
                 || self.by_path.contains_key(&format!("{}::{simple}", c.path))
         })
+    }
+
+    /// Lexical declarations win before ancestry is consulted. Once lookup
+    /// reaches an ambiguous ancestor, however, it cannot fall through to an
+    /// unrelated global constant with the same name.
+    fn conflicting_const_scope(&self, nesting: &[String]) -> bool {
+        nesting.last().and_then(|scope| self.by_path.get(scope))
+            .is_some_and(|id| self.ambiguous_ancestry.contains(id))
     }
 
     /// (external-ancestry start namespaces, simple name) for a failed

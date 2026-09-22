@@ -89,6 +89,17 @@ jobs:
         if: always()
         run: git status --porcelain && test -z "$(git status --porcelain)"
 
+  # Gate c1's Python family owns its temporary source tree and anchor checks;
+  # the shell-family discovery above intentionally remains unchanged.
+  ancestry-mutants:
+    name: mutants (conflicting-superclasses)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: Swatinem/rust-cache@v2
+      - name: Ancestry and alias source mutants (isolated public-source copy)
+        run: python3 scripts/conflicting-superclasses-mutants.py
+
   # Gate c2b/c2c: the evidence producers and the reporters, two-sided.
   instruments:
     runs-on: ubuntu-latest
@@ -111,6 +122,8 @@ jobs:
         run: ./scripts/gate-triage-selftest.sh
       - name: public-gate selftest
         run: ./scripts/public-gate-selftest.sh
+      - name: public drift attribution selftest
+        run: ./scripts/public-drift-attrib-selftest.sh
 
   # Gate c3: the loose column, asked for explicitly. Keying off $CI is the
   # trap AGENTS.md names; a copied ceiling is a fabricated measurement.
@@ -156,13 +169,14 @@ jobs:
   # Gate f: the four public Rails apps, each at its pinned sha, cloned
   # shallow and cached by the declaration's hash. The script never clones
   # here (PUBLIC_GATE_CLONE unset): a missing clone is this job's bug, not
-  # a skip. The time ceilings in scripts/public-corpora.txt are dev-machine
-  # numbers; a red on time alone here is a measurement to record as a CI
-  # column, never a reason to raise the dev ceiling.
+  # a skip. PUBLIC_COLUMN selects measured hosted-runner ceilings explicitly;
+  # the dev-machine ratchet remains untouched. Only the declared missing
+  # GitLab baseline is an accepted incomplete result, never another SKIP.
   public:
     runs-on: ubuntu-latest
     env:
       PUBLIC_CORPORA_ROOT: ${{ github.workspace }}/../public-corpora
+      PUBLIC_COLUMN: ci
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
@@ -170,13 +184,14 @@ jobs:
         id: corpora
         with:
           path: ${{ env.PUBLIC_CORPORA_ROOT }}
-          key: public-corpora-${{ hashFiles('scripts/public-corpora.txt') }}
+          key: public-corpora-${{ hashFiles('scripts/public-corpora.txt', 'scripts/public-baseline/*.jsonl') }}
       - name: Shallow-clone each declared repo at its pinned sha
         if: steps.corpora.outputs.cache-hit != 'true'
         run: |
           mkdir -p "$PUBLIC_CORPORA_ROOT"
           grep -v '^#' scripts/public-corpora.txt | while read -r id url sha ceiling clone_dir; do
             [ -n "$id" ] || continue
+            [ -s "scripts/public-baseline/$id.jsonl" ] || continue
             dir="$PUBLIC_CORPORA_ROOT/${clone_dir:-$id}"
             git init -q "$dir"
             git -C "$dir" remote add origin "$url"
@@ -185,7 +200,16 @@ jobs:
             echo "$id @ $(git -C "$dir" rev-parse --short HEAD)"
           done
       - run: cargo build --release
-      - run: ./scripts/public-gate.sh
+      - name: Public corpus gate (only GitLab baseline may be absent)
+        run: |
+          mkdir -p target/gauntlet
+          if ./scripts/public-gate.sh | tee target/gauntlet/public-verdict.txt; then
+            exit 0
+          else
+            rc=$?
+          fi
+          [ "$rc" -eq 2 ] &&
+            grep -Fxq 'public corpus gate skipped (not judged on this machine): public corpus (gitlab-foss)' target/gauntlet/public-verdict.txt
       # The verdict names target/gauntlet/public-<id>-drift.txt; without
       # this the runner deletes it and a red reads as "3 gone" with no
       # way to see which three (measured 2026-09-22: two red runs, zero

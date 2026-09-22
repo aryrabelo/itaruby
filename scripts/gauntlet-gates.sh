@@ -203,6 +203,12 @@ for m in const-missing operand-types singleton mixin-attribution \
     bad "$m mutants (see target/gauntlet/$m-mutants.txt)"
   fi
 done
+# This family mutates an isolated public-source copy, not the checkout.
+if python3 "$ROOT/scripts/conflicting-superclasses-mutants.py" >"$ART/conflicting-superclasses-mutants.txt" 2>&1; then
+  ok 'conflicting-superclasses mutants (each decision accused, isolated source copy)'
+else
+  bad 'conflicting-superclasses mutants (see target/gauntlet/conflicting-superclasses-mutants.txt)'
+fi
 # Those scripts leave $ROOT/target holding a binary built from the LAST
 # mutant they injected only if they died mid-run; on success they rebuild
 # the shipped source. Rebuild anyway: the gates below measure this binary,

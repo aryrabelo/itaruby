@@ -110,6 +110,27 @@ production Rails code lives, it never looks inside a method body. itaruby
 infers first and only speaks when it's sure (Invariant #1), so it finds
 bugs in code that has never seen a sig.
 
+The annotation-free bench (`scripts/inference-bench.jsonl`, judged by
+`scripts/inference-gate.sh`) asks a different question from the corpus
+rounds: on twelve self-contained, gem-free fixtures, does itaruby find
+real bugs with **zero annotations**, and does it stay silent on dynamic
+code that is correct at runtime? MRI is the judge — every accusation must
+really raise on the blamed line, every silence must really exit 0 — and
+the ledger publishes both directions. **Sorbet wins two rows**,
+`extend_singleton_typo` and `included_hook_class_method_typo`: singleton
+and hook shapes where the annotated leg proves a certain `NoMethodError`
+and itaruby stays silent. They sit in the ledger as first-class rows,
+next to the measured reason a blanket fix was reverted (216/0/12 false
+positives on rails/mastodon/discourse) and the named populations that
+must be indexed first (`mattr_accessor`/`cattr_accessor`,
+`class << self` `attr_*`, stdlib module functions). Conversely, on the
+three rows where Sorbet needs an annotation, the only claim is the
+narrow one — itaruby does not false-positive there; each such silence
+carries a positive control with a certain typo planted, so silence is
+never claimed as understanding. The bench also caught a live Invariant
+#1 violation once — `const_missing_namespace`, an E0104 on a namespace
+defining `self.const_missing` — fixed the day it was found.
+
 ## Ruby LSP addon
 
 `scripts/ruby-lsp-itaruby` plugs itaruby into a running

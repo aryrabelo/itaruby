@@ -1,19 +1,19 @@
 //! The dark singleton census: what the class-object track WOULD accuse.
 //!
-//! The `Ty::Class` `MethodLookup::NotFound`/`Inconclusive` arms are silent on
-//! purpose (the known extend/concern gaps, `singleton_lookup.rs`). This suite
-//! pins the census that measures that silence two-sidedly:
+//! Since 2026-09-21 the `Ty::Class` `MethodLookup::NotFound` arm EMITS
+//! E0101. Singleton lookup already excludes open/incomplete ancestry;
+//! the RBI wrapper only softens that verdict. The census stays on
+//! as the instrument that would show the next population arriving. This
+//! suite pins both sides:
 //!
-//! * the two gap fixtures must bucket `closed_notfound` — the residue, i.e.
-//!   exactly what a class-object E0101 fires on if the track ever arms;
-//! * a receiver stood down by a dynamic-definer mark must bucket `open` —
-//!   the test a bucketing mutant fails (one that ignores the blocker and
-//!   labels every `NotFound` closed would flip `open_receiver_typo.rb`);
+//! * the two gap fixtures must bucket `closed_notfound` and emit E0101;
+//! * a receiver stood down by a dynamic-definer mark stays silent and
+//!   buckets `open`; removing the singleton lookup's open-ancestor guard
+//!   must produce a false E0101, not merely change a census label;
 //! * resolved calls and non-project receivers record nothing at all.
 //!
-//! The census reads nothing the walk does not already read, so every
-//! assertion here doubles as the zero-diagnostic-change proof for these
-//! fixtures: `diags` is asserted empty alongside the buckets.
+//! Diagnostics are checked alongside the census labels: an open receiver
+//! must stay silent, while a closed receiver with the same typo must accuse.
 
 use itaruby_semantic::{check_file_dark, Db, LineIndex, ProjectFiles, SourceFile};
 
@@ -53,9 +53,13 @@ fn dark_fixture(name: &str) -> (Vec<String>, Vec<String>) {
 /// buckets `open(inconclusive_no_blocker)`: the missing Class/Module tail —
 /// measured here first.)
 #[test]
-fn extend_typo_is_closed_notfound_and_still_silent() {
+fn extend_typo_accuses_on_the_class_object_track() {
     let (diags, recs) = dark_fixture("extend_typo.rb");
-    assert!(diags.is_empty(), "gap changed: {diags:?}");
+    assert_eq!(
+        diags,
+        vec!["19:6:E0101 undefined method `find_by_slog` for class `Page`".to_string()],
+        "the residue bucket is exactly what the armed track accuses"
+    );
     assert!(
         recs.iter().any(|r| r == "Page find_by_slog closed_notfound"),
         "the extend typo must be the residue bucket: {recs:?}"
@@ -70,9 +74,15 @@ fn extend_typo_is_closed_notfound_and_still_silent() {
 /// GAP 2: the concern-backbone typo, same expectation. (`Record.include`
 /// buckets `open(inconclusive_no_blocker)` like gap 1's `extend`.)
 #[test]
-fn included_hook_typo_is_closed_notfound_and_still_silent() {
+fn included_hook_typo_accuses_on_the_class_object_track() {
     let (diags, recs) = dark_fixture("included_hook_typo.rb");
-    assert!(diags.is_empty(), "gap changed: {diags:?}");
+    assert_eq!(
+        diags,
+        vec![
+            "19:8:E0101 undefined method `default_scope_nmae` for class `Record`".to_string()
+        ],
+        "the residue bucket is exactly what the armed track accuses"
+    );
     assert!(
         recs.iter()
             .any(|r| r == "Record default_scope_nmae closed_notfound"),
@@ -85,9 +95,10 @@ fn included_hook_typo_is_closed_notfound_and_still_silent() {
     );
 }
 
-/// THE bucketing guard: an unrecognized class-body call stands the receiver
-/// down, so the typo buckets `open`, never `closed_notfound`. A mutant that
-/// ignores the blocker labels every `NotFound` closed and fails here.
+/// CO-R: the unknown class-body call makes singleton lookup Inconclusive
+/// before emission. Removing that lookup guard must fail the diagnostic
+/// assertion, not just the census labels. The same typo without the DSL
+/// must still accuse, so blanket singleton silence cannot pass.
 #[test]
 fn unrecognized_class_body_call_keeps_the_receiver_open() {
     let (diags, recs) = dark_fixture("open_receiver_typo.rb");
@@ -102,6 +113,13 @@ fn unrecognized_class_body_call_keeps_the_receiver_open() {
         recs.iter().all(|r| !r.ends_with("closed_notfound")),
         "an open receiver never reaches the residue bucket: {recs:?}"
     );
+    let (closed_diags, closed_recs) = dark_fixture("closed_receiver_typo.rb");
+    assert_eq!(
+        closed_diags,
+        vec!["9:8:E0101 undefined method `load_nmae` for class `Widget`".to_string()],
+        "without the unknown DSL, the same typo must accuse"
+    );
+    assert_eq!(closed_recs, vec!["Widget load_nmae closed_notfound"]);
 }
 
 /// Resolved calls never enter the residue bucket. (`Page.extend` itself
@@ -146,8 +164,9 @@ fn kernel_tail_raise_buckets_known_tail_and_still_silent() {
 }
 
 /// The rest of the measured tail family, same expectation, one assertion
-/// per name: `rand`/`caller`/`Array`/`URI`/`puts`/`sleep`/`block_given?`/`require_relative`
-/// all bucket `known_tail` (the exact names the census histogram carried).
+/// per name: `rand`/`caller`/`Array`/`URI`/`puts`/`sleep`/`block_given?`/
+/// `require_relative` all bucket `known_tail` (the exact names the census
+/// histogram carried).
 #[test]
 fn kernel_tail_family_buckets_known_tail() {
     let (diags, recs) = dark_fixture("kernel_tail_bare_call_family_silent.rb");
@@ -207,13 +226,21 @@ fn project_defined_raise_resolves_and_records_nothing() {
     );
 }
 
-/// The accusation survives the tail: a TYPO inside a `def self.` body is
-/// not a tail name, stays silent today, and remains the residue — exactly
-/// what a class-object E0101 fires on once the track arms.
+/// The typo inside a `def self.` body is conclusive until proven otherwise.
+/// Before the flip (bead ita-sgl closes the gap), a TYPO inside a `def self.`
+/// body on a singleton-mixin receiver like `Job` would stay silent. After the
+/// flip, the typo is a certain `NoMethodError` — the receiver's resolved
+/// singleton ancestry includes the three installed names, not this typo, and
+/// the class-object track reports it. The name must be one of the three
+/// installed names for the softening to apply; a typo fails the gate.
 #[test]
-fn singleton_tail_typo_stays_closed_notfound() {
+fn singleton_tail_typo_accuses_after_the_flip() {
     let (diags, recs) = dark_fixture("singleton_tail_typo_still_closed.rb");
-    assert!(diags.is_empty(), "the track is still not armed: {diags:?}");
+    assert_eq!(
+        diags.len(),
+        1,
+        "a non-tail typo is the residue, and the armed track accuses it: {diags:?}"
+    );
     assert!(
         recs.iter().any(|r| r == "Job performm closed_notfound"),
         "a non-tail typo must stay in the residue bucket: {recs:?}"
@@ -267,7 +294,11 @@ fn census_foreign_body_walk_records_nothing_in_the_host() {
     let (a_diags, a_recs) = check_file_dark(&db, a);
     let (b_diags, b_recs) = check_file_dark(&db, b);
     assert!(a_diags.is_empty(), "calling into b stays silent: {a_diags:?}");
-    assert!(b_diags.is_empty(), "the residue stays silent: {b_diags:?}");
+    assert_eq!(
+        b_diags.len(),
+        1,
+        "the residue is exactly one armed accusation, in its OWN file: {b_diags:?}"
+    );
     assert!(
         a_recs.is_empty(),
         "the host file must record nothing from the foreign body walk: {a_recs:?}"

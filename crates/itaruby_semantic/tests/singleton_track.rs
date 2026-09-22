@@ -675,16 +675,21 @@ fn sclass_call_attr_reader_arity_is_checked() {
     assert_eq!(diags("sclass_call_attr_arity_accuses.rb"), vec!["7:8:E0102"]);
 }
 
-/// The ground-truth side of the typo: MRI raises `NoMethodError` on
-/// `Config.endpointt` (line 5). The checker stays silent — the
-/// singleton `NotFound` arm is characterized in
-/// `singleton_lookup.rs` — but the fixture pins WHY a filed name
-/// matters: without the filing this call site is indistinguishable
-/// from the typo by the index.
+/// The armed side of the typo: MRI raises `NoMethodError` on
+/// `Config.endpointt` (line 5), because `endpoint` is filed on the
+/// singleton surface by `singleton_class.attr_accessor :endpoint`
+/// (line 2). Before the class-object flip this was census residue and
+/// the checker stayed silent; after it, the receiver is conclusively
+/// closed and the misspelling is E0101 at the call — the same win as
+/// the two Sorbet rows. The filing is what makes the receiver closed
+/// rather than inconclusive; without it this site would be an
+/// unprovable `NotFound`, not a diagnostic.
 #[test]
-fn sclass_call_attr_typo_stays_characterized_silent() {
-    let d = diags("sclass_call_attr_typo_would_be_not_found.rb");
-    assert!(d.is_empty(), "expected characterized silence, got {d:?}");
+fn sclass_call_attr_typo_accuses_after_the_flip() {
+    assert_eq!(
+        diags("sclass_call_attr_typo_would_be_not_found.rb"),
+        vec!["5:8:E0101"]
+    );
 }
 
 /// The concern edge is the gate: a module that calls `class_methods do`
@@ -919,6 +924,20 @@ fn mri_ground_truth_is_executed() {
         ("nested_def_self_in_instance_body_opens.rb", Mri::Clean),
         ("nested_plain_def_files_instance_track.rb", Mri::Clean),
         ("thread_mattr_accessor_resolves_silently.rb", Mri::Clean),
+        ("core_ext_object_reopening_resolves.rb", Mri::Clean),
+        ("core_ext_object_reopening_arity_accuses.rb", Mri::Raises("ArgumentError", 15)),
+        ("core_ext_kernel_reopening_resolves.rb", Mri::Clean),
+        ("extend_module_include_resolves.rb", Mri::Clean),
+        ("extend_module_include_arity_accuses.rb", Mri::Raises("ArgumentError", 19)),
+        ("extend_open_module_stays_inconclusive.rb", Mri::Clean),
+        ("singleton_mixin_instance_resolves.rb", Mri::Clean),
+        ("singleton_mixin_typo_stays_closed.rb", Mri::Raises("NoMethodError", 19)),
+        ("block_nested_class_is_its_own_receiver.rb", Mri::Clean),
+        ("sclass_include_resolves.rb", Mri::Clean),
+        ("sclass_include_arity_accuses.rb", Mri::Raises("ArgumentError", 18)),
+        ("def_body_eval_opens.rb", Mri::Clean),
+        ("string_source_stub_opens.rb", Mri::Clean),
+        ("string_source_named_class_still_accuses.rb", Mri::Clean),
     ];
     for (name, expected) in &table {
         assert_mri(name, expected);
@@ -973,4 +992,157 @@ fn core_ext_class_reopening_arity_is_checked() {
         diags("core_ext_class_reopening_arity_accuses.rb"),
         vec!["15:7:E0102"]
     );
+}
+
+/// Bead ita-obx: `Class < Module < Object < Kernel`, so a project
+/// reopening of `Object` defines a method every CLASS OBJECT answers —
+/// the exact shape activesupport's `core_ext/object/inclusion.rb` (`in?`)
+/// and `core_ext/object/with.rb` (`with`) ship, and 10 of rails' 33
+/// census residue records. The chain used to stop at `Class`/`Module`.
+#[test]
+fn core_ext_object_reopening_resolves_on_the_class_object_track() {
+    let d = diags("core_ext_object_reopening_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// Same chain one link further: `Object` includes `Kernel`, so a project
+/// `module Kernel` reopening is on the class object's dispatch too.
+#[test]
+fn core_ext_kernel_reopening_resolves_on_the_class_object_track() {
+    let d = diags("core_ext_kernel_reopening_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// The `Object` reopening carries a REAL signature, so resolving through
+/// it is checkable knowledge and not merely silence: the zero-argument
+/// call on a one-argument `obx_with` is an E0102 MRI really raises.
+#[test]
+fn core_ext_object_reopening_arity_is_checked() {
+    assert_eq!(
+        diags("core_ext_object_reopening_arity_accuses.rb"),
+        vec!["15:8:E0102"]
+    );
+}
+
+/// Bead ita-xta: `extend M` lifts M's WHOLE ancestry onto the class
+/// object, not just M's own method map. `class Person::Gender; extend
+/// ActiveModel::Translation; end` (rails) reaches `model_name` only
+/// through `Translation`'s `include Naming`.
+#[test]
+fn extend_module_include_resolves_transitively() {
+    let d = diags("extend_module_include_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// And the transitively extended method keeps its signature: wrong arity
+/// is an E0102 MRI really raises.
+#[test]
+fn extend_module_include_arity_is_checked() {
+    assert_eq!(
+        diags("extend_module_include_arity_accuses.rb"),
+        vec!["19:16:E0102"]
+    );
+}
+
+/// Bead ita-xta, fail-closed half: an OPEN module anywhere in the
+/// extended module's ancestry makes the class object's surface
+/// unreadable, never empty — a name nothing literally defines stays
+/// silent because the dynamic definer really defines it at runtime.
+#[test]
+fn extend_open_module_never_accuses() {
+    let d = diags("extend_open_module_stays_inconclusive.rb");
+    assert!(d.is_empty(), "invariant #1: expected silence, got {d:?}");
+}
+
+/// Bead ita-sgl: `include Singleton` extends the includer's class object
+/// with `Singleton::SingletonClassMethods`, so `instance` is a real class
+/// method no project fragment holds. Doubly keyed — the receiver's own
+/// resolved ancestry must contain `Singleton`, and the name must be one
+/// of the three that mixin installs.
+#[test]
+fn singleton_mixin_instance_never_accuses() {
+    let d = diags("singleton_mixin_instance_resolves.rb");
+    assert!(d.is_empty(), "invariant #1: expected silence, got {d:?}");
+}
+
+/// The control that keeps that softening honest: a MISSPELLING of
+/// `instance` is not one of the three installed names, so the
+/// class-object track still concludes on it (today as census residue,
+/// after the flip as E0101 — `dark_singleton.rs` pins the verdict).
+#[test]
+fn singleton_mixin_typo_accuses_after_the_flip() {
+    let (_, _, open) = facts("singleton_mixin_typo_stays_closed.rb", "SglTypoTracker");
+    assert!(!open, "the receiver must stay closed or the control proves nothing");
+    assert_eq!(diags("singleton_mixin_typo_stays_closed.rb"), vec!["19:16:E0101"]);
+}
+
+/// Bead ita-blk: the `class` keyword inside a class-body block defines
+/// `BlkHost::BlkFoo`, not the unrelated top-level `BlkFoo`. Registering
+/// it fixes receiver IDENTITY; the fragment is born open because this
+/// walk never read its body.
+#[test]
+fn block_nested_class_registers_at_its_lexical_path() {
+    let (db, file, _) = fixture("block_nested_class_is_its_own_receiver.rb");
+    let _ = file;
+    let index = project_index(&db);
+    assert!(
+        index.by_path.contains_key("BlkHost::BlkFoo"),
+        "the block-nested class must be indexed at its lexical path"
+    );
+    let (_, _, open) = facts("block_nested_class_is_its_own_receiver.rb", "BlkHost::BlkFoo");
+    assert!(
+        open,
+        "a body this walk never read is not a surface anyone may conclude from"
+    );
+    let d = diags("block_nested_class_is_its_own_receiver.rb");
+    assert!(d.is_empty(), "invariant #1: expected silence, got {d:?}");
+}
+
+
+/// Bead ita-scl: `class << self; include M` puts M's instance methods on
+/// the receiver's SINGLETON ancestry — mastodon's
+/// `app/lib/delivery_failure_tracker.rb:50`. Filing it as an instance
+/// include both missed that surface and claimed one the code never gets.
+#[test]
+fn sclass_include_resolves_on_the_class_object_track() {
+    let d = diags("sclass_include_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// And it is real knowledge, not just silence: the singleton-included
+/// method keeps its signature, so wrong arity is an E0102 MRI raises.
+#[test]
+fn sclass_include_arity_is_checked() {
+    assert_eq!(diags("sclass_include_arity_accuses.rb"), vec!["18:17:E0102"]);
+}
+
+/// Bead ita-evb: a bare `eval(<string>)` inside a METHOD body can define
+/// anything on the enclosing class, so that class's surface is unknown.
+/// Only the class-BODY spelling opened its class before.
+#[test]
+fn def_body_eval_opens_the_enclosing_class() {
+    let (_, _, open) = facts("def_body_eval_opens.rb", "EvbCache");
+    assert!(open, "the def-body eval must open the enclosing class");
+    let d = diags("def_body_eval_opens.rb");
+    assert!(d.is_empty(), "invariant #1: expected silence, got {d:?}");
+}
+
+/// Bead ita-src: a BARE STUB whose name the project also writes as a
+/// class definition inside a string literal is not the class the call
+/// reaches — rails' `app_file "...", <<-RUBY class Foo ... RUBY` shape.
+#[test]
+fn string_source_definition_opens_a_bare_stub() {
+    let (_, _, open) = facts("string_source_stub_opens.rb", "SrcFoo");
+    assert!(open, "the generated-source name must open its bare stub");
+    let d = diags("string_source_stub_opens.rb");
+    assert!(d.is_empty(), "invariant #1: expected silence, got {d:?}");
+}
+
+/// The control that keeps that conjunction honest: a class carrying real
+/// methods of its own is NOT a bare stub, so a same-named class written
+/// in a template string leaves its surface fully checkable.
+#[test]
+fn string_source_definition_never_opens_a_real_class() {
+    let (_, _, open) = facts("string_source_named_class_still_accuses.rb", "SrcNamed");
+    assert!(!open, "a class with its own methods must stay closed");
 }

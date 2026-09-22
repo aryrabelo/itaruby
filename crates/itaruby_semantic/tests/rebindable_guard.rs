@@ -80,3 +80,15 @@ fn self_send_inside_a_lexical_block_still_accuses() {
         "expected the missing method named, got: {d}"
     );
 }
+
+/// Bead ita-slf: an EXPLICIT `self` receiver inside a rebindable block is
+/// the same call in a different spelling — `self` IS the rebound object.
+/// Both measured discourse shapes (`base.define_method(...) { self.x = v }`
+/// and `Class.new(Cmd) do self.description = "..." end`) were census
+/// residue records on receivers that never see the call. A NAMED receiver
+/// is untouched — `explicit_receiver_in_rebindable_block_accuses.rb`
+/// pins that, and rebinding `self` does not move a local.
+#[test]
+fn self_receiver_in_a_rebindable_block_is_never_accused() {
+    silent("self_receiver_in_rebindable_block_silent.rb");
+}

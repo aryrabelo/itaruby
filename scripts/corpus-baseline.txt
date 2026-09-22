@@ -2,7 +2,7 @@
 #
 # WHY HASHES, NOT TEXT: an `err` line from `ita check` contains a client's
 # file path (and sometimes a client class/method name). This file is public
-# git history (see AGENTS.md — repo is private with intent to open). So no
+# git history (see AGENTS.md — the repository is public). So no
 # error line is ever written here in the clear: each declared corpus lists
 # the SHA-256 (first 16 hex chars) of its expected error lines, normalized
 # by stripping the corpus's mapped path (see scripts/corpora-local.txt,
@@ -124,9 +124,16 @@
 # this field exists to prevent. The 71-commit / 158-.rb-file drift between
 # those two revisions is why gate d was red on 2026-09-18 with zero
 # detection change (see AGENTS.md's Rules of proof).
+# Re-audited 2026-09-22 on work at checker fa6dd22, same corpus revision.
+# The old df454e7f1dccfb54 site was removed before this pin; its original
+# diagnostic was recovered and re-hashed, and Git history confirms removal.
+# The pin had moved without correcting that stale error-set entry.
+# New 99eef7d0416dd48f is a distinct, source-audited E0101: a singleton
+# call remained after its implementation moved to the instance surface.
+# This is not a message/column substitution. The E0102 hash is unchanged.
 corpus corpus-a warn_ceiling=251
 err corpus-a 639b38e1e239db52
-err corpus-a df454e7f1dccfb54
+err corpus-a 99eef7d0416dd48f
 
 # measured 2026-08-21 @ 315 .rb files
 # 103 -> 92 (bead ita-exc): 11 occurrences over 2 roots were a real FP — a
@@ -173,7 +180,12 @@ corpus corpus-b warn_ceiling=48
 # ceiling). Recorded 2026-09-18 from that run, not from a fresh measurement;
 # the corpus working tree carried 3 uncommitted files at that run, so a future
 # unexplained delta of that size is the first thing to check.
-corpus corpus-c warn_ceiling=179
+# 179 -> 170 (2026-09-22, checker fa6dd22): fresh local gate, all four
+# error hashes unchanged. Same tracked revision; the live tree still has
+# three untracked files without .rb/.rbi extensions, not a pristine snapshot.
+# Their names do not match dependency manifests or ignore configuration.
+# Record the measured tree honestly and remove the observed slack.
+corpus corpus-c warn_ceiling=170
 err corpus-c b183a1b03e93cb09
 err corpus-c cd39871949cd29b2
 # 3rd err added 2026-08-21 (bead ita-4xy): surfaced by the sig{} carve-out

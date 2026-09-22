@@ -122,3 +122,16 @@ fn unmapped_gem_reopen_still_covered_by_undeclared_namespace_fallback() {
     let diags = check_fixture("control_unmapped_gem_still_warns.rb");
     assert!(diags.is_empty(), "expected silence, got {diags:?}");
 }
+
+/// Bead ita-qcn: `queue_classic` -> `QC`, the second kind of exception
+/// this table exists for — lock name and constant share no letters at
+/// all, so `gem_namespace_key` can never pair them. Read out of the gem's
+/// own source (`lib/queue_classic.rb:5`, version 4.0.0, the version this
+/// directory's `Gemfile.lock` declares), never inferred from the rails
+/// reopening it silences (`activejob/test/support/queue_classic/
+/// inline.rb:4`, 2 census residue records).
+#[test]
+fn queue_classic_reopen_needs_the_exception_table_and_stays_silent() {
+    let d = check_fixture("silent_queue_classic_reopen.rb");
+    assert!(d.is_empty(), "`QC` is a lockfile gem namespace: {d:?}");
+}

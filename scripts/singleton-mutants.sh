@@ -210,15 +210,16 @@ mutant MUT-D "$DIS" \
   'the camelize key degrades to exact equality: lock `rspec` never equals code `RSpec`'
 
 mutant MUT-E "$IDX" \
-  '        if singleton && self.mock_singleton_methods.iter().any(|m| m == name) {
-            return MethodLookup::Inconclusive;
+  '        if self.mock_singleton_methods.iter().any(|m| m == name) {
+            return true;
         }' \
   '' \
   any_instance_softens_when_a_mock_gem_is_locked \
   'the any_instance softening branch is cut: the locked project keeps conclusive NotFound'
 
 mutant MUT-F "$IDX" \
-  'const BODY_DEF_NAMES: [&str; 12] = [
+  'const BODY_DEF_NAMES: [&str; 13] = [
+    "eval",
     "define_method",
     "define_singleton_method",
     "alias_method",
@@ -232,7 +233,8 @@ mutant MUT-F "$IDX" \
     "class_exec",
     "module_exec",
 ];' \
-  'const BODY_DEF_NAMES: [&str; 9] = [
+  'const BODY_DEF_NAMES: [&str; 10] = [
+    "eval",
     "define_method",
     "define_singleton_method",
     "alias_method",

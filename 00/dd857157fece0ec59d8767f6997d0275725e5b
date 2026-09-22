@@ -1,0 +1,20 @@
+.github/workflows/gauntlet.yml
+  h_b156936c57c455 41,44,58,74,96,98-104,120,131,145,167,169
+.github/workflows/software-factory.yml
+  h_b156936c57c455 15,34,53,57,73,93
+.software-factory/locks/factory.lock.json
+  h_b156936c57c455 6
+scripts/inference-bench-selftest.sh
+  h_b156936c57c455 27-31,112,127,155
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "00dd857157fece0ec59d8767f6997d0275725e5b",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

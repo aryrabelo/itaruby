@@ -1,0 +1,18 @@
+.gitignore
+  h_b156936c57c455 29-33
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 225-247
+scripts/instrument-mutants.sh
+  h_b156936c57c455 103-110,112,117
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "6ea814b9ec958e99eae0f20b4fd08c4c536bc6da",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

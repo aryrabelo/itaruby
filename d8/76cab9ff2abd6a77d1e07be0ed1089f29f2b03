@@ -1,0 +1,24 @@
+crates/itaruby_semantic/declarations/gems.rbi
+  h_b156936c57c455 229-285
+crates/itaruby_semantic/tests/declarations.rs
+  h_b156936c57c455 319-359
+docs/CHANGELOG.md
+  h_b156936c57c455 12-42
+scripts/corpus-baseline.txt
+  h_b156936c57c455 113-127,142-148
+testdata/external_gem_decls/wave14_nested.rb
+  h_b156936c57c455 1-31
+testdata/external_gem_decls/wave14_nested_control.rb
+  h_b156936c57c455 1-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d876cab9ff2abd6a77d1e07be0ed1089f29f2b03",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

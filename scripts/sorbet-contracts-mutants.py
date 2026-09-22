@@ -271,6 +271,11 @@ MUTATIONS = [
      "        (Ty::Instance(a), _) if index.class(*a).is_module => true,\n",
      "",
      "module_self_is_never_proof_against_an_includer"),
+    # -- collection type arguments are erased at runtime; only the category binds
+    ("type arguments held as a contract", CHECK,
+     "    !compatible(&erase_type_arguments(&proven), expected, index)",
+     "    !compatible(&proven, expected, index)",
+     "collection_type_arguments_are_erased_but_the_category_still_accuses"),
 ]
 
 

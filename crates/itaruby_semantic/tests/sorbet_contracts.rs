@@ -1136,7 +1136,13 @@ class ContractFlatten
   def flat(x)
     x.flatten
   end
-  sig { params(x: T::Array[T::Array[Integer]]).returns(T::Array[String]) }
+  # The element survives flatten: `first` is an Integer, so `abs` resolves.
+  sig { params(x: T::Array[T::Array[Integer]]).returns(Integer) }
+  def head(x)
+    x.flatten.first.abs
+  end
+  # Type arguments are erased for contracts, so the control is a category.
+  sig { params(x: T::Array[T::Array[Integer]]).returns(String) }
   def wrong(x)
     x.flatten
   end
@@ -1677,4 +1683,43 @@ end
 
     let control = check_files("descendant-include-time-control", &[&FAMILY.replace("INCLUSION", ""), hook]);
     assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
+}
+
+/// sorbet-runtime checks that a value IS an Array or a Hash, never what it
+/// holds, so a contract can only hold a value to its collection category.
+/// Symbol-keyed literals under `T::Hash[String, ...]` were measured as false
+/// E0103/E0109 on correct code (corpus-c, 2026-09-22). The control is the
+/// shape the same audit proved a true positive: a Hash returned where the
+/// sig promises a String, which sorbet-runtime rejects on every call.
+#[test]
+fn collection_type_arguments_are_erased_but_the_category_still_accuses() {
+    let source = r#"
+class ContractErasedGenerics
+  extend T::Sig
+  sig { returns(T::Hash[String, T.untyped]) }
+  def payload
+    { user: 1 }
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def request
+    { "user" => 1 }
+  end
+  sig { returns(T::Array[Integer]) }
+  def ids
+    ["a"]
+  end
+  sig { params(data: T::Hash[String, T.untyped]).void }
+  def update(data); end
+  sig { returns(String) }
+  def lookup
+    { plants: "plants" }
+  end
+end
+ContractErasedGenerics.new.update({ meta: { "k" => 1 } })
+ContractErasedGenerics.new.update("not a hash")
+"#;
+    let diags = check("erased-generics", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109", "E0103"], "{diags:?}");
+    assert_eq!(&source[diags[0].start..diags[0].end], "lookup", "{diags:?}");
+    assert!(diags[1].message.contains("data"), "{diags:?}");
 }

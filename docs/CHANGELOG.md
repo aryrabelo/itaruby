@@ -70,7 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   back to a same-named global class. `T.nilable`, `T.any`, `T::Array` and
   `T::Hash` map when every member is known. An unsupported but well-formed
   element such as a shape or a `T.proc` keeps the collection's category with
-  an Unknown member. A malformed expression is Unknown.
+  an Unknown member. A malformed expression is Unknown. A contract holds a
+  value to its collection CATEGORY only: sorbet-runtime erases type
+  arguments, so `{a: 1}` under `returns(T::Hash[String, T.untyped])` runs and
+  is not accused, while a Hash returned under `returns(String)` is.
   A client RBI supplies the same contracts only when it matches the source
   definition exactly: owner, dispatch track and Ruby parameter layout. The
   RBI informs calls and checks the source body's return. It does not replace

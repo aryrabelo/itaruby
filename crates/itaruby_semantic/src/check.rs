@@ -5276,7 +5276,22 @@ fn contract_accuses(actual: &Ty, expected: &Ty, literal_nil: bool, index: &Proje
         }
     }
     let proven = if literal_nil && *actual == Ty::Nil { Ty::Nil } else { unprove_nil(actual) };
-    !compatible(&proven, expected, index)
+    !compatible(&erase_type_arguments(&proven), expected, index)
+}
+
+/// Sorbet's generics are erased at runtime: sorbet-runtime checks that a
+/// value IS an Array or a Hash, never what it holds, so `{a: 1}` returned
+/// under `returns(T::Hash[String, T.untyped])` runs. Symbol-vs-String keys
+/// were 8 of corpus-c's new contract errors on correct code (measured
+/// 2026-09-22). Only the collection category is a contract this checker
+/// can hold a value to; its type arguments become Unknown.
+fn erase_type_arguments(t: &Ty) -> Ty {
+    match t {
+        Ty::Array(_) => Ty::Array(Box::new(Ty::Unknown)),
+        Ty::Hash(_, _) => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+        Ty::Union(parts) => Ty::Union(parts.iter().map(erase_type_arguments).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Short type rendering shared by diagnostics, hover, and the CLI: `nil`,

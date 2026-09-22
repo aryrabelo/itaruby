@@ -1,0 +1,18 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 348-350,352-356,403,467-475,480-481,487,506-512,533,540-546,549,571,587-597,599-601,603-612,615-669,2002-2005,2007-2011,2143,2232,2498-2519,4165
+crates/itaruby_semantic/tests/operand_types.rs
+  h_b156936c57c455 657-795,814-817
+docs/CHANGELOG.md
+  h_b156936c57c455 106-112,116-129
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "d78008b13d44afb03937b3e7183d8817ed830d84",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

@@ -54,7 +54,10 @@ raise under MRI.
 
 This alpha is not a replacement for Sorbet in annotated projects. A
 project method's own recognized `sig { ... }` is checked as a contract.
-Its declared return types the caller. The contract accuses only values
+Its declared return types the caller, a collection by its category only
+(`returns(T::Array[String])` is `Array[untyped]` to the caller, and a
+declared param binds the body the same way): sorbet-runtime never checks
+type arguments. The contract accuses only values
 WRITTEN as literals (strings, symbols, numbers, `nil`, `true`/`false`,
 Array/Hash literals, ranges, regexps, `__FILE__`/`__LINE__`): a literal
 the body returns that contradicts the declared return (E0109), and a
@@ -62,8 +65,7 @@ literal argument that contradicts a declared param, matched by name
 (E0103). A variable, `self`, a constant or any call is never judged, so a
 contradiction carried by an inferred value is a known false negative. A
 sig accuses and types callers only where sorbet-runtime provably enforces
-it; otherwise it is inert (no E0103/E0109, no declared type for callers,
-no RBI stand-in). Inert everywhere in a project that sets
+it; otherwise it is inert (no E0103/E0109, no declared type for callers). Inert everywhere in a project that sets
 `T::Configuration.default_checked_level` to anything but a literal
 `:always`, assigns any `T::Configuration.*_handler`, or whose visible
 `Gemfile.lock` names `sorbet-runtime-stub` or never names
@@ -72,13 +74,15 @@ no RBI stand-in). Inert everywhere in a project that sets
 extended by the class or a superclass (or included into every class via
 `Object`/`Module`/`Class`), when a homemade `def self.sig` answers first,
 or when the class or an ancestor defines a `method_added`/
-`singleton_method_added` that never calls `super`. A client RBI supplies the same contracts only
-when it matches the Ruby definition exactly: owner, instance or
-class-method track, and parameter layout. Everything else stays silent
-rather than guessed:
+`singleton_method_added` that never calls `super`. An RBI is never
+checked at runtime, so it is never a contract: no RBI accuses, and no RBI
+types the callers of a method the project source defines. A method that
+exists only in an RBI (a gem, a Tapioca DSL file) still types its callers
+with its declared return, type arguments erased, and its params are never
+judged. Everything else stays silent rather than guessed:
 generics, procs, overloads, rest and block parameters, duplicate
 definitions or any other redefinition (a `class << X` patch, a hook, a
-`class_eval`), open classes, and stale or conflicting RBIs. Two known
+`class_eval`), and open classes. Two known
 gaps follow from that: `Foo.new(...)` is not checked against
 `initialize`'s `sig`, and a method with a `*rest`, `**kwrest`, `&block` or
 post parameter loses its whole contract, the return type included. Keep running
@@ -110,13 +114,13 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (or an exactly matching RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`) |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`) |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |
 | E0107 | Warning | a local's inferred usage contradicts every candidate type |
 | E0108 | Error | operator operand pairing MRI raises `TypeError` on, both operands proven from literals in one scope |
-| E0109 | Error | a literal a method returns (an explicit `return <literal>`, or a tail whose every branch is a literal and none fits) contradicts its own Sorbet `sig` (or exactly matching RBI) return type; same runtime-enforcement gates as E0103 |
+| E0109 | Error | a literal a method returns (an explicit `return <literal>`, or a tail whose every branch is a literal and none fits) contradicts its own Sorbet `sig` return type (never an RBI's); same runtime-enforcement gates as E0103 |
 | E0001 | Error | syntax error (prism, error-tolerant) |
 
 itaruby reads whatever else exists for free: Tapioca RBIs (`sorbet/rbi/`,

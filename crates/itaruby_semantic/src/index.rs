@@ -302,8 +302,6 @@ pub struct MethodDef {
     pub sig: Option<RbsSig>,
     /// Named Sorbet contract; never inferred from a declaration's empty body.
     pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
-    /// An unsupported/overloaded inline sig still blocks an RBI fallback.
-    pub sorbet_annotated: bool,
     /// Ruby positional names, only for an unambiguous parameter layout.
     pub positional_names: Option<Vec<String>>,
     /// If true, arity/args are unchecked (synthetic: `define_method`, alias).
@@ -330,7 +328,6 @@ impl MethodDef {
             block: false,
             sig: None,
             sorbet_sig: None,
-            sorbet_annotated: false,
             positional_names: Some(Vec::new()),
             arity_unknown: false,
             abstract_stub: false,
@@ -4066,9 +4063,7 @@ impl<'pr> Visit<'pr> for SuperCallScan {
 pub(crate) enum PendingSig {
     Parsed(crate::sorbet_sig::SorbetSig),
     /// An unsupported spelling, or two `sig` blocks stacked on one
-    /// definition. The definition still counts as ANNOTATED — that is what
-    /// stops an unreadable signature from quietly falling back to body
-    /// inference and being reported as if nobody had declared anything.
+    /// definition: never a contract, and a third `sig` still stacks on it.
     Unusable,
 }
 
@@ -4108,7 +4103,6 @@ fn build_method_def(
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_annotated: pending_sorbet_sig.is_some(),
             sorbet_sig: pending_sorbet_sig.and_then(PendingSig::parsed),
             positional_names: Some(Vec::new()),
             arity_unknown: false,
@@ -4902,7 +4896,6 @@ pub struct MethodSig {
     pub kwrest: bool,
     pub sig: Option<RbsSig>,
     pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
-    pub sorbet_annotated: bool,
     pub positional_names: Option<Vec<String>>,
     /// Definition-site lexical scope, not the caller's Module.nesting.
     pub nesting: Vec<String>,
@@ -6104,7 +6097,6 @@ fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
         kwrest: false,
         sig: None,
         sorbet_sig: None,
-        sorbet_annotated: false,
         positional_names: None,
         nesting: Vec::new(),
         arity_unknown: true,
@@ -7218,38 +7210,22 @@ pub fn rbi_ancestor_declares<S: std::hash::BuildHasher>(
         .any(|s| rbi_ancestor_closure(s, rbi_map).contains(simple))
 }
 
-/// RBI provenance stays separate from source methods: a declaration carries
-/// the Ruby layout and lexical scope, but its empty body is never inferred.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RbiMethod {
-    pub definition: MethodDef,
-    pub nesting: Vec<String>,
-    pub owner: String,
-}
-
-impl RbiMethod {
-    pub fn return_ty(&self, index: &ProjectIndex) -> Ty {
-        self.definition.sorbet_sig.as_ref()
-            .filter(|sig| !sig.void)
-            .and_then(|sig| sig.ret.as_deref())
-            .map_or(Ty::Unknown, |expr| {
-                crate::sorbet_sig::resolve_sig_ty(expr, index, &self.nesting)
-            })
-    }
-
-    /// A stale declaration never lends types to a different source layout.
-    pub fn matches_source(&self, source: &MethodSig) -> bool {
-        let md = &self.definition;
-        !source.arity_unknown && !md.arity_unknown
-            && source.positional_names.is_some()
-            && source.positional_names == md.positional_names
-            && source.required == md.required && source.optional == md.optional
-            && source.keywords == md.keywords
-            && !source.rest && !source.kwrest && !md.block
-    }
-}
-
-type RbiMethodSets = std::sync::Arc<(HashMap<String, RbiMethod>, HashMap<String, RbiMethod>)>;
+/// Instance method names, then SINGLETON method names, that a start
+/// name's RBI ancestry declares — mapped to the RAW `.returns(...)`
+/// source text of the method's `.rbi` sig, `None` for a method with no
+/// usable sig or a `void` one. Text, not `Ty` (bead ita-tjr): the memo
+/// below is keyed on the start name alone and shared by every call site,
+/// so it cannot depend on any one call's `ProjectIndex`; the text-to-`Ty`
+/// conversion (`sorbet_sig::resolve_ret_ty`) happens at the lookup call
+/// site instead. An RBI is never checked at runtime, so this text only
+/// ever TYPES the consumer of a method no project source defines — it is
+/// never a contract (no E0103/E0109) and never reaches a source method.
+/// The order is load-bearing: `extend` and `mixes_in_class_methods` move a
+/// module's *instance* methods into the singleton slot (that is how
+/// `Model.where` exists), so swapping the two silently turns every
+/// class-method hit into an instance-method hit. `Arc` because the memo
+/// hands the same maps to many call sites.
+type RbiMethodSets = std::sync::Arc<(HashMap<String, Option<String>>, HashMap<String, Option<String>>)>;
 
 /// One BFS work item: the RBI name to resolve next, which method-
 /// dispatch track it travels on, and — when it names an edge queued
@@ -7485,7 +7461,7 @@ fn resolve_method_node<S: std::hash::BuildHasher>(
 fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
     start: &str,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> (HashMap<String, RbiMethod>, HashMap<String, RbiMethod>) {
+) -> (HashMap<String, Option<String>>, HashMap<String, Option<String>>) {
     let mut instance = HashMap::new();
     let mut singleton = HashMap::new();
     let mut visited: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
@@ -7517,60 +7493,31 @@ fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
 }
 
 
-/// Name hits survive conflicting declarations; their contracts do not.
-/// The RBI walk is not proof of which runtime redefinition won.
+/// Rules 1/2/4: a node's own `def self.x` always lands in `singleton`,
+/// while its INSTANCE methods land in whichever map the track that
+/// reached it selects. First visit wins (`or_insert_with`) because the
+/// walk already runs in MRO order — the nearest ancestor is the one that
+/// really answers at runtime. Values are the raw `.returns(...)` sig text
+/// (`rbi_ret`) — see `RbiMethodSets`'s doc comment for why the `Ty`
+/// conversion is deferred to the lookup call site.
 fn harvest_frag_methods(
     frag: &ClassFragment,
     on_singleton_track: bool,
-    instance: &mut HashMap<String, RbiMethod>,
-    singleton: &mut HashMap<String, RbiMethod>,
+    instance: &mut HashMap<String, Option<String>>,
+    singleton: &mut HashMap<String, Option<String>>,
 ) {
     for m in &frag.singleton_methods {
-        harvest_rbi_method(singleton, frag, m);
+        singleton.entry(m.name.clone()).or_insert_with(|| rbi_ret(m));
     }
     let target = if on_singleton_track { singleton } else { instance };
     for m in &frag.methods {
-        harvest_rbi_method(target, frag, m);
+        target.entry(m.name.clone()).or_insert_with(|| rbi_ret(m));
     }
 }
 
-fn harvest_rbi_method(target: &mut HashMap<String, RbiMethod>, frag: &ClassFragment, m: &MethodDef) {
-    let mut declaration = RbiMethod {
-        definition: m.clone(),
-        nesting: frag.nesting.clone(),
-        owner: frag.path.clone(),
-    };
-    if frag.open {
-        declaration.definition.sorbet_sig = None;
-    }
-    match target.entry(m.name.clone()) {
-        std::collections::hash_map::Entry::Vacant(entry) => { entry.insert(declaration); }
-        std::collections::hash_map::Entry::Occupied(mut entry) => {
-            let old = entry.get_mut();
-            if old.definition.sorbet_sig != declaration.definition.sorbet_sig
-                || old.definition.positional_names != declaration.definition.positional_names
-                || old.definition.keywords != declaration.definition.keywords
-                || old.definition.required != declaration.definition.required
-                || old.definition.optional != declaration.definition.optional
-                || old.nesting != declaration.nesting
-            {
-                old.definition.sorbet_sig = None;
-            }
-        }
-    }
-}
-
-/// Exact owner and track only. No inherited RBI contract is attached to a
-/// source override, and no RBI body replaces the real Ruby implementation.
-pub(crate) fn source_rbi_method<S: std::hash::BuildHasher>(
-    path: &str,
-    method: &str,
-    singleton: bool,
-    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> Option<RbiMethod> {
-    let (instance, singleton_methods) = &*rbi_method_closure(path, rbi_map);
-    let methods = if singleton { singleton_methods } else { instance };
-    methods.get(method).filter(|m| m.owner == path).cloned()
+/// The `.returns(...)` text of a declaration's sig; `void` has none.
+fn rbi_ret(m: &MethodDef) -> Option<String> {
+    m.sorbet_sig.as_ref().filter(|sig| !sig.void).and_then(|sig| sig.ret.clone())
 }
 
 /// Rules 1/2/3: `superclass`/`include`/`prepend` keep the current track;
@@ -7606,28 +7553,26 @@ fn queue_method_edges(
     }
 }
 
-/// The declaration carries named parameters as well as the return expression.
+/// Shared walk for `rbi_method_lookup`/`dsl_method_lookup` (bead
+/// ita-tjr): try each start name's RBI method closure in order, and on
+/// the first name that DECLARES `method` (instance or singleton side per
+/// `singleton`), convert its raw sig text to `Ty` via
+/// `sorbet_sig::resolve_ret_ty` — the conversion needs `index` (to
+/// resolve a project class name inside the sig), which `rbi_method_closure`'s
+/// memo deliberately does not carry (see `RbiMethodSets`'s doc comment).
 fn method_lookup_via_starts<S: std::hash::BuildHasher>(
     starts: &[String],
     method: &str,
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> Option<RbiMethod> {
-    let mut found: Option<RbiMethod> = None;
-    for start in starts {
+    index: &ProjectIndex,
+) -> Option<Ty> {
+    starts.iter().find_map(|start| {
         let (instance, singleton_methods) = &*rbi_method_closure(start, rbi_map);
         let map = if singleton { singleton_methods } else { instance };
-        if let Some(declaration) = map.get(method) {
-            if let Some(old) = &mut found {
-                if old != declaration {
-                    old.definition.sorbet_sig = None;
-                }
-            } else {
-                found = Some(declaration.clone());
-            }
-        }
-    }
-    found
+        map.get(method)
+            .map(|raw| crate::sorbet_sig::resolve_ret_ty(raw.as_deref(), index))
+    })
 }
 
 /// Does some EXTERNAL ancestor of `id` — a name the project's own index
@@ -7666,17 +7611,7 @@ pub fn rbi_method_lookup<S: std::hash::BuildHasher>(
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
 ) -> Option<Ty> {
-    rbi_method_contract(index, id, method, singleton, rbi_map).map(|m| m.return_ty(index))
-}
-
-pub(crate) fn rbi_method_contract<S: std::hash::BuildHasher>(
-    index: &ProjectIndex,
-    id: ClassId,
-    method: &str,
-    singleton: bool,
-    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> Option<RbiMethod> {
-    method_lookup_via_starts(&index.external_ancestor_starts(id), method, singleton, rbi_map)
+    method_lookup_via_starts(&index.external_ancestor_starts(id), method, singleton, rbi_map, index)
 }
 
 /// Does the client's Tapioca DSL RBI for `id` ITSELF — or for a PROJECT
@@ -7701,41 +7636,7 @@ pub fn dsl_method_lookup<S: std::hash::BuildHasher>(
     singleton: bool,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
 ) -> Option<Ty> {
-    dsl_method_contract(index, id, method, singleton, rbi_map).map(|m| m.return_ty(index))
-}
-
-pub(crate) fn dsl_method_contract<S: std::hash::BuildHasher>(
-    index: &ProjectIndex,
-    id: ClassId,
-    method: &str,
-    singleton: bool,
-    rbi_map: &HashMap<String, Vec<PathBuf>, S>,
-) -> Option<RbiMethod> {
-    method_lookup_via_starts(&index.project_ancestor_starts(id), method, singleton, rbi_map)
-}
-
-/// A declaration never certifies a dynamically open source receiver. New
-/// argument checks require one external dispatch edge, or a direct DSL owner,
-/// and no source implementation that the RBI could accidentally shadow.
-pub(crate) fn rbi_contract_dispatch_eligible(
-    index: &ProjectIndex,
-    class: ClassId,
-    name: &str,
-    singleton: bool,
-    declaration: &RbiMethod,
-) -> bool {
-    let (ancestors, _) = index.ancestors(class);
-    if ancestors.iter().any(|id| {
-        let cd = index.class(*id);
-        let methods = if singleton { &cd.singleton_methods } else { &cd.methods };
-        (cd.open && cd.open_reason != Some(OpenReason::DeclaredExternal))
-            || methods.contains_key(name)
-    }) {
-        return false;
-    }
-    let starts = index.external_ancestor_starts(class);
-    (starts.len() == 1 && starts[0] == declaration.owner)
-        || (starts.is_empty() && index.class(class).path == declaration.owner)
+    method_lookup_via_starts(&index.project_ancestor_starts(id), method, singleton, rbi_map, index)
 }
 
 /// Instance method names each fragment set declares per core namespace —
@@ -7793,7 +7694,6 @@ fn method_sig(md: &MethodDef, file: SourceFile, nesting: &[String]) -> MethodSig
         kwrest: md.kwrest,
         sig: md.sig.clone(),
         sorbet_sig: md.sorbet_sig.clone(),
-        sorbet_annotated: md.sorbet_annotated,
         positional_names: md.positional_names.clone(),
         nesting: nesting.to_vec(),
         arity_unknown: md.arity_unknown,
@@ -7816,17 +7716,14 @@ fn merge_source_method(
         // The index's historical last-body policy is not evidence of runtime
         // load order. Preserve inference, but never pick a Sorbet contract.
         method.sorbet_sig = None;
-        method.sorbet_annotated = true;
     }
     methods.insert(definition.name.clone(), method);
 }
 
 /// A redefinition the merge cannot order keeps a body for inference but
-/// never a Sorbet contract, inline or RBI (`sorbet_annotated` blocks the
-/// RBI lookup the same way a written but unusable `sig` does).
+/// never a Sorbet contract.
 fn poison_contract(method: &mut MethodSig) {
     method.sorbet_sig = None;
-    method.sorbet_annotated = true;
 }
 
 /// Name-keyed redefinitions written from outside the class body
@@ -7960,8 +7857,8 @@ fn poison_ambiguous_mixin_contracts(index: &mut ProjectIndex) {
 /// Every contract of a class fails that proof when the class's `sig` is
 /// not provably `T::Sig`'s (`sorbet_sig_reaches`), or when the class or
 /// an ancestor defines a hook that can swallow the attachment
-/// (`FileDefs::sig_hook_swallowers`). Such a sig is inert: annotated, so
-/// no RBI stands in for it, but never a contract.
+/// (`FileDefs::sig_hook_swallowers`). Such a sig is inert: never a
+/// contract, and never a declared type for a consumer.
 fn poison_runtime_inert_contracts(index: &mut ProjectIndex) {
     let t_sig = index.by_path.get("T::Sig").copied();
     let hit: Vec<ClassId> = (0..index.classes.len())

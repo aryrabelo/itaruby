@@ -1604,12 +1604,12 @@ impl Checker<'_> {
         m.and_then(|m| m.sig.clone())
     }
 
-    /// Inline metadata wins, including an unsupported inline signature.
-    /// An RBI is eligible only for this exact source definition's owner,
-    /// dispatch track and Ruby parameter layout. A project whose runtime
-    /// is not proven to raise on a broken sig
-    /// (`ProjectIndex::sorbet_runtime_unchecked`) has no contract here at
-    /// all: nothing is accused, and no declared type reaches a consumer.
+    /// Only the definition's own inline `sig` is a contract. An RBI is
+    /// never checked at runtime, so a client `.rbi` declaring this source
+    /// method neither accuses nor types anything here — source inference
+    /// governs. A project whose runtime is not proven to raise on a broken
+    /// sig (`ProjectIndex::sorbet_runtime_unchecked`) has no contract here
+    /// at all: nothing is accused, and no declared type reaches a consumer.
     fn effective_sorbet(
         &self,
         method: &MethodSig,
@@ -1621,9 +1621,7 @@ impl Checker<'_> {
         if self.index.sorbet_runtime_unchecked {
             return None;
         }
-        if method.sorbet_sig.is_none() && (method.sorbet_annotated || self.rbi_map.is_none()) {
-            return None;
-        }
+        let sig = method.sorbet_sig.as_ref()?;
         // Every call to the method asks, and the answer is fixed by the
         // definition while the index is.
         let key = (method.file, method.def_span, name.to_owned());
@@ -1631,7 +1629,7 @@ impl Checker<'_> {
             return hit.clone();
         }
         note_contract_work(|w| w.contract_resolutions += 1);
-        let contract = self.resolve_contract(method, name);
+        let contract = self.resolve_contract(method, sig, name);
         self.contract_memo.borrow_mut().insert(key, contract.clone());
         contract
     }
@@ -1640,23 +1638,13 @@ impl Checker<'_> {
     fn resolve_contract(
         &self,
         method: &MethodSig,
+        sig: &crate::sorbet_sig::SorbetSig,
         name: &str,
     ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
         let path = method.nesting.last()?;
         let (owner, name, singleton) = self.dispatching_name(method, name, path)?;
-        // Cheap first: most unsigned methods have no RBI declaration, and
-        // the dispatch walk below visits a whole family.
-        let contract = if method.sorbet_annotated {
-            method.sorbet_sig.clone().map(|sig| (sig, method.nesting.clone()))
-        } else {
-            let declaration = crate::index::source_rbi_method(path, name, singleton, self.rbi_map?)?;
-            if !declaration.matches_source(method) {
-                return None;
-            }
-            declaration.definition.sorbet_sig.map(|sig| (sig, declaration.nesting))
-        }?;
         let diverges = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);
-        (!diverges).then_some(contract)
+        (!diverges).then(|| (sig.clone(), method.nesting.clone()))
     }
 
     /// The owner, name and dispatch track this exact definition answers
@@ -1812,9 +1800,11 @@ impl Checker<'_> {
                 }
             }
         }
+        // sorbet-runtime checks a generic's category, never its type
+        // arguments, so a declared collection binds as `Array[untyped]`.
         if let Some((contract, nesting)) = &sorbet {
             for (name, expr) in &contract.params {
-                let ty = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));
                 if ty != Ty::Unknown && env.contains_key(name) {
                     env.insert(name.clone(), ty);
                 }
@@ -3657,7 +3647,7 @@ impl Checker<'_> {
                     );
                     Ty::Unknown
                 },
-                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false, &typed_args) {
+                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false) {
                     ty
                 } else {
                     let blocker = self.index.inconclusive_reason(c, false);
@@ -3821,7 +3811,7 @@ impl Checker<'_> {
                             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                         }
                         MethodLookup::Inconclusive => {
-                            if self.rbi_escalate(c, "initialize", false, &typed_args).is_none() {
+                            if self.rbi_escalate(c, "initialize", false).is_none() {
                                 let blocker = self.index.inconclusive_reason(c, true);
                                 self.tally_inconclusive(blocker);
                                 self.tally_ar_base(blocker, c);
@@ -3852,7 +3842,7 @@ impl Checker<'_> {
                     }
                     // Class objects have a large builtin surface (name,
                     // ancestors, ...): never unknown-method here.
-                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true, &typed_args) {
+                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true) {
                         ty
                     } else {
                         let blocker = self.index.inconclusive_reason(c, true);
@@ -4296,15 +4286,24 @@ impl Checker<'_> {
     /// function: step (3) needs no RBI and must still run, which is the
     /// entire point of shipping a curated inventory instead of only
     /// widening the RBI walk.
-    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool, args: &CallTypeArgs<'_>) -> Option<Ty> {
+    ///
+    /// An RBI is never checked at runtime: its sig is never a contract
+    /// here (no argument is judged against it), and the declared return's
+    /// type arguments never reach the consumer — `T::Array[String]` types
+    /// it `Array[untyped]` (`erase_type_arguments`).
+    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {
+        if self.silent {
+            return None;
+        }
         if let Some(map) = self.rbi_map {
-            if let Some(declaration) = crate::index::dsl_method_contract(self.index, c, name, singleton, map) {
-                self.tally(Bucket::DslMethod);
-                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
-            }
-            if let Some(declaration) = crate::index::rbi_method_contract(self.index, c, name, singleton, map) {
-                self.tally(Bucket::RbiMethod);
-                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
+            let hit = crate::index::dsl_method_lookup(self.index, c, name, singleton, map)
+                .map(|ty| (Bucket::DslMethod, ty))
+                .or_else(|| {
+                    crate::index::rbi_method_lookup(self.index, c, name, singleton, map).map(|ty| (Bucket::RbiMethod, ty))
+                });
+            if let Some((bucket, ty)) = hit {
+                self.tally(bucket);
+                return Some(erase_type_arguments(&ty));
             }
         }
         if self.index.declared_by(c, "ActiveRecord::Base") {
@@ -4319,22 +4318,6 @@ impl Checker<'_> {
             }
         }
         None
-    }
-
-    fn rbi_contract_call(
-        &mut self,
-        class: ClassId,
-        name: &str,
-        singleton: bool,
-        declaration: &crate::index::RbiMethod,
-        args: &CallTypeArgs<'_>,
-    ) -> Ty {
-        if crate::index::rbi_contract_dispatch_eligible(self.index, class, name, singleton, declaration) {
-            if let (Some(sig), Some(names)) = (&declaration.definition.sorbet_sig, &declaration.definition.positional_names) {
-                self.check_sorbet_args(sig, &declaration.nesting, names, &declaration.definition.keywords, name, args);
-            }
-        }
-        declaration.return_ty(self.index)
     }
 
     /// Bead ita-dqo, deliverable 1 (E0107 constraint contradiction):
@@ -5077,12 +5060,14 @@ impl Checker<'_> {
 
     /// Consumer types use the explicit contract; the source body is checked
     /// independently by `check_method_body`, never against this assumed result.
+    /// sorbet-runtime checks only a returned collection's category, so its
+    /// declared type arguments never reach the consumer.
     fn sig_fill(&self, m: &MethodSig, name: &str) -> Ty {
         note_contract_work(|w| w.return_probes += 1);
         self.effective_sorbet(m, name)
             .filter(|(sig, _)| !sig.void)
             .and_then(|(sig, nesting)| sig.ret.map(|expr| {
-                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)
+                erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting))
             }))
             .unwrap_or(Ty::Unknown)
     }

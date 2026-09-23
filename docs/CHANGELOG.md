@@ -8,10 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- An RBI is never checked at runtime, so a `.rbi` declaration is never a
+  contract: no E0103 or E0109 comes from an RBI anywhere, and an RBI never
+  types the consumers of a method the project source defines (source
+  inference governs, as before Sorbet contracts). A method that exists only
+  in an external RBI (a gem ancestor, a Tapioca DSL file) keeps exactly the
+  return typing its consumers had before Sorbet contracts, minus the
+  declared type arguments below; its params are never judged. Measured
+  against `main` at 05a282e on the same fixture: the same E0101s, except
+  the one an erased element type no longer proves.
+- A declared collection's type arguments never type a consumer:
+  sorbet-runtime checks a generic's category, not its elements. A
+  `returns(T::Array[String])` result is `Array[untyped]` to its caller, a
+  `params(xs: T::Hash[Symbol, Integer])` param binds as `Hash[untyped,
+  untyped]` in the body, and an RBI-only return is erased the same way.
+  `T.nilable`/`T.any` keep each member's category (`T.nilable(T::Array[X])`
+  is `Array[untyped] | nil`).
 - A Sorbet `sig` accuses (E0103/E0109) and types its callers only where
   sorbet-runtime provably enforces it; anywhere else it is inert: no
-  accusation, no declared return or param type for any consumer, and no
-  RBI stands in for it. Inert project-wide when a file sets
+  accusation, and no declared return or param type for any consumer. Inert project-wide when a file sets
   `T::Configuration.default_checked_level` to anything but a literal
   `:always` (`:tests` and expressions included; the literal `:never` gate
   now also stops typing), assigns any `T::Configuration.*_handler` (a
@@ -25,13 +40,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   homemade `def self.sig` on that chain), or when the class or an
   ancestor defines a `method_added`/`singleton_method_added` whose body
   never calls `super`. RBI-only declarations (no source definition) are
-  still not accused under the project-wide gates, but keep typing their
-  callers.
+  never accused, and keep their pre-contract return typing.
 - `__LINE__` is an Integer, no longer a String, for every consumer; a
   rational (`3r`) or imaginary (`2i`) literal is Unknown to inference
   instead of a Float (no modeled type is a `Rational` or a `Complex`).
 - A Sorbet contract no longer outlives a redefinition of its method. The
-  `sig` (inline or RBI) is dropped, and the body kept for inference, when
+  `sig` is dropped, and the body kept for inference, when
   the method is redefined by an out-of-line `class << X` body, by a
   `self.extended(base)` hook install, by a named-receiver
   `class_eval`/`instance_eval`/`define_method`/`alias_method`/`send` (a
@@ -131,10 +145,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver's diagnostic silence with the same typo on a closed receiver.
 
 ### Added
-- Sorbet `sig` and RBI contracts (2026-09-22; literal-only since
-  2026-09-23). A project method's own recognized `sig { ... }` is now
-  checked, not only read. The declared return types the consumer, exactly
-  as sorbet-runtime enforces it. A contract ACCUSES only a value written as
+- Sorbet `sig` contracts (2026-09-22; literal-only since 2026-09-23). A
+  project method's own recognized `sig { ... }` is now checked, not only
+  read. The declared return types the consumer, exactly as far as
+  sorbet-runtime enforces it: a collection by its category only. A contract ACCUSES only a value written as
   a LITERAL, the same rule E0108 follows: a string or symbol (plain or
   interpolated), an Integer, Float, rational or imaginary number, `nil`,
   `true`/`false`, an Array or Hash literal (whatever it holds), a range, a
@@ -169,7 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   multi-argument `include A, B` (or `prepend`/`extend`), or in one of its
   ancestors, is dropped: the index linearizes that call in reverse of
   Ruby's order (a known ancestry bug, fixed separately), so which module
-  answers is unproven. Declared params bind the body's locals. The
+  answers is unproven. Declared params bind the body's locals (a
+  collection by its category only). The
   contract follows the definition onto subclass receivers and onto the
   `def self.` track. Nominal types resolve in the definition's lexical
   scope. `::X` stays absolute. A dynamically shadowed prefix or a
@@ -197,19 +212,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   complete, no ancestor is open and no `sorbet/rbi` file declares an
   ancestor (`class SafeStr < String` IS a String), and a module-typed
   param or a module's `self` never accuses.
-  A client RBI supplies the same contracts only when it matches the source
-  definition exactly: owner, dispatch track and Ruby parameter layout. The
-  RBI informs calls and checks the source body's return. It does not replace
-  any check the Ruby source already earned (arity keeps firing beside it).
-  A declaration-only RBI body is never checked. An RBI method on an
-  RBI-only superclass checks params on a single proven edge.
+  A client RBI is never a contract (it is never checked at runtime): it
+  neither accuses nor types a source method's consumers.
   Every shape the checker cannot prove resolves to `Ty::Unknown` and
   diagnoses nothing. That covers generics (`type_parameters`), `bind`,
   duplicate or dynamic clauses, overloads (stacked sigs), post-optional,
   rest and block parameter layouts, duplicate source definitions, open
-  classes (Ruby checks such as E0108 still apply there), conflicting RBI
-  declarations and stale RBI layouts. Inline `#:` RBS keeps precedence over
-  both the `sig` and the RBI, and an inline `sig` wins over an RBI.
+  classes (Ruby checks such as E0108 still apply there). Inline `#:` RBS
+  keeps precedence over the `sig`.
   Recognized-sig fixtures declare `extend T::Sig`. This is not Sorbet
   parity: it checks what the named suites prove and nothing more. Focused
   proof: `sorbet_contracts`, `sorbet_contract_parser` and `project_sigs`,

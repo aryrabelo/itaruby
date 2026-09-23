@@ -214,92 +214,119 @@ end
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }
 
-/// An RBI informs the call without replacing the checks the Ruby source
-/// already earned: the arity check on `plain` survives beside the two new
-/// contract diagnostics.
-///
-/// `absent_ruby_method` is deliberately NOT asserted here. A `.rbi` naming
-/// a class the project also defines is read as a gem reopening
-/// (`soften_not_found`'s `gem_reopens`, bead ita-oaq), so the project's
-/// view of that class is provably partial and `NotFound` softens to
-/// `Inconclusive`. Measured 2026-09-22 against `origin/main` at 6d04dc7,
-/// with zero signature code in the tree: the same source plus the same
-/// `.rbi` already lost that E0101 there, and the layout does not change it
-/// (`sorbet/rbi`, `gems/`, `dsl/` and `shims/` all soften alike). Narrowing
-/// that defense to win this one line would trade a measured false-positive
-/// guard for a synthetic diagnostic — the wrong direction under invariant
-/// #1.
-///
-/// The control below is what keeps that a CONTRACT rather than a blind
-/// spot: without the `.rbi`, the very same call must still accuse.
+/// F6: an RBI is never checked at runtime, so a client `.rbi` declaring a
+/// method the project source defines is never its contract: neither the
+/// argument nor the body is judged, and the Ruby check the source earned
+/// (the arity of `plain`) stays. The control writes the same signature
+/// inline, where sorbet-runtime enforces it, and still accuses both.
 #[test]
-fn rbi_contract_checks_source_without_replacing_ruby_checks() {
+fn rbi_declaration_never_contracts_a_source_method() {
     const SOURCE: &str = r#"
 class ContractSourceRbi
-  def amount(count)
+  extend T::Sig
+SIG  def amount(count)
     "wrong"
   end
   def plain; 1; end
 end
 ContractSourceRbi.new.amount("bad")
 ContractSourceRbi.new.plain(1)
-ContractSourceRbi.new.absent_ruby_method
 "#;
-    let diags = check("source-rbi", SOURCE, Some(r"
+    let diags = check("source-rbi", &SOURCE.replace("SIG", ""), Some(r"
 class ContractSourceRbi
   sig { params(count: Integer).returns(Integer) }
   def amount(count); end
 end
 "));
-    assert_eq!(contract_codes(&diags), ["E0109", "E0103"], "{diags:?}");
-    assert!(diags.iter().any(|d| d.code == "E0102" && d.message.contains("plain")), "{diags:?}");
-    assert_eq!(diags.len(), 3, "{diags:?}");
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    assert_eq!(codes(&diags), ["E0102"], "{diags:?}");
 
-    let control = check("source-rbi-control", SOURCE, None);
-    assert!(
-        control.iter().any(|d| d.code == "E0101" && d.message.contains("absent_ruby_method")),
-        "control must still accuse the absent method without the rbi: {control:?}"
-    );
+    let inline = SOURCE.replace("SIG", "  sig { params(count: Integer).returns(Integer) }\n");
+    let control = check("source-rbi-control", &inline, None);
+    assert_eq!(contract_codes(&control), ["E0109", "E0103"], "control must accuse the inline sig: {control:?}");
 }
 
+/// F6: nor does a stale `.rbi` type the consumers of a source method —
+/// source inference governs (`make` returns its argument, `nil` here). The
+/// control declares the same return inline and types the consumer.
 #[test]
-fn rbi_return_informs_consumers_and_never_checks_empty_declaration() {
-    let diags = check("rbi-return", r"
+fn rbi_return_never_types_a_source_method() {
+    const SOURCE: &str = r"
 class ContractRbiResult
 end
 class ContractRbiFactory
-  def make(input)
+  extend T::Sig
+SIG  def make(input)
     input
   end
 end
 ContractRbiFactory.new.make(nil).absent_result_method
-", Some(r"
+";
+    let diags = check("rbi-return", &SOURCE.replace("SIG", ""), Some(r"
 class ContractRbiFactory
   sig { params(input: T.untyped).returns(ContractRbiResult) }
   def make(input); end
 end
 "));
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, "E0101");
-    assert!(diags[0].message.contains("absent_result_method"), "{diags:?}");
+    assert!(!diags.iter().any(|d| d.message.contains("absent_result_method")), "{diags:?}");
+
+    let inline = SOURCE.replace("SIG", "  sig { params(input: T.untyped).returns(ContractRbiResult) }\n");
+    let control = check("rbi-return-control", &inline, None);
+    assert_eq!(codes(&control), ["E0101"], "{control:?}");
+    assert!(control[0].message.contains("absent_result_method"), "{control:?}");
 }
 
+/// F6: a method that exists only in an external RBI (a gem ancestor) keeps
+/// exactly the consumer typing `main` (05a282e) gave it and nothing more.
+/// Its return still types the consumer (`absent_on_result`, and the Array
+/// category of `names`); its params never accuse a literal; the declared
+/// element type never reaches a consumer (`names.first` is untyped); and a
+/// source method whose own return is inferred through the RBI call stays
+/// untyped (`wrap`), as on `main`. The control is the same shape written
+/// as a source sig, which does accuse the literal argument.
 #[test]
-fn external_rbi_params_are_checked_on_a_single_proven_edge() {
+fn external_rbi_types_only_its_consumer() {
     let diags = check("external-rbi", r#"
+class ContractExternalResult
+end
 class ContractExternalSite < ContractExternalBase
   def initialize; end
 end
+class ContractExternalWrapper
+  def wrap
+    ContractExternalSite.new.accept(1)
+  end
+end
 ContractExternalSite.new.accept("bad")
-ContractExternalSite.new.accept(1)
+ContractExternalSite.new.accept(1).absent_on_result
+ContractExternalSite.new.names.absent_on_array
+ContractExternalSite.new.names.first.absent_on_element
+ContractExternalWrapper.new.wrap.absent_through_wrapper
 "#, Some(r"
 class ContractExternalBase
-  sig { params(value: Integer).returns(String) }
+  sig { params(value: Integer).returns(ContractExternalResult) }
   def accept(value); end
+  sig { returns(T::Array[ContractExternalResult]) }
+  def names; end
 end
 "));
-    assert_eq!(contract_codes(&diags), ["E0103"], "{diags:?}");
-    assert!(!diags.iter().any(|d| d.code == "E0109"), "{diags:?}");
+    let absent: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.code == "E0101")
+        .filter_map(|d| d.message.split('`').nth(1))
+        .collect();
+    assert_eq!(absent, ["absent_on_result", "absent_on_array"], "{diags:?}");
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("external-rbi-control", r#"
+class ContractExternalSource
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def accept(value); value; end
+end
+ContractExternalSource.new.accept("bad")
+"#, None);
+    assert_eq!(contract_codes(&control), ["E0103"], "{control:?}");
 }
 
 #[test]
@@ -323,8 +350,8 @@ end
 }
 
 /// The body returns an Integer against the stale RBI's `returns(String)`:
-/// were the renamed layout accepted, E0109 would accuse it. Returning the
-/// untyped parameter instead would stay silent either way and prove nothing.
+/// were an RBI ever a source method's contract, E0109 would accuse it. No
+/// RBI is (F6), whatever its layout.
 #[test]
 fn stale_rbi_layout_does_not_type_source_or_calls() {
     let diags = check("stale", r"
@@ -446,21 +473,35 @@ ContractTrackChild.parse(1)
     assert_eq!(contract_codes(&diags), ["E0103", "E0103"], "{diags:?}");
 }
 
+/// A singleton declaration in an RBI accuses nothing (F6); the same sig
+/// written inline on `def self.parse` is the contract of the singleton
+/// track and accuses there. A subclass overriding the INSTANCE `parse`
+/// cannot dispatch the class method, so it leaves that contract alone.
 #[test]
-fn rbi_singleton_contract_matches_source_track() {
-    let diags = check("rbi-singleton", r#"
+fn rbi_singleton_declaration_is_silent_and_the_source_track_accuses() {
+    const SOURCE: &str = r#"
 class ContractRbiSingleton
-  def self.parse(value); value; end
+  extend T::Sig
+SIG  def self.parse(value); value; end
+  def parse(value); value; end
+end
+class ContractRbiSingletonChild < ContractRbiSingleton
+  def parse(value); value; end
 end
 ContractRbiSingleton.parse("bad")
 ContractRbiSingleton.parse(1)
-"#, Some(r"
+"#;
+    let diags = check("rbi-singleton", &SOURCE.replace("SIG", ""), Some(r"
 class ContractRbiSingleton
   sig { params(value: Integer).returns(Integer) }
   def self.parse(value); end
 end
 "));
-    assert_eq!(contract_codes(&diags), ["E0103"], "{diags:?}");
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let inline = SOURCE.replace("SIG", "  sig { params(value: Integer).returns(Integer) }\n");
+    let control = check("rbi-singleton-control", &inline, None);
+    assert_eq!(contract_codes(&control), ["E0103"], "{control:?}");
 }
 
 #[test]
@@ -553,9 +594,8 @@ ContractOverrideParent.new.echo("bad")
     assert_eq!(contract_codes(&control), ["E0109", "E0103"], "control must accuse without the override: {control:?}");
 }
 
-/// An RBI contract belongs to the exact owner it is written on. A method
-/// the RBI declares on the parent is not the child's source override,
-/// even though the RBI closure of the child reaches it.
+/// A method the RBI declares on the parent is not the child's source
+/// override, and no RBI is a source method's contract anyway (F6).
 #[test]
 fn inherited_rbi_contract_never_attaches_to_a_source_override() {
     let diags = check("inherited-rbi", r#"
@@ -596,11 +636,8 @@ ContractAbsentParam.new.echo("bad")
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }
 
-/// An inline sig this checker cannot use still means somebody annotated
-/// the definition, so a client RBI must not step in with its own contract.
-/// Stacked sigs are the unusable spelling that reaches this decision: an
-/// unrecognized spelling such as `sig(:abstract)` already opens the owner,
-/// which takes every contract off it before the RBI is consulted.
+/// Stacked inline sigs are no contract, and a client RBI never steps in
+/// with its own (F6).
 #[test]
 fn unusable_inline_sig_still_blocks_the_rbi_contract() {
     let diags = check("unusable-inline", r#"
@@ -1164,30 +1201,27 @@ end
     ]);
 }
 
+/// A sig's declared element type never reaches the body (sorbet-runtime
+/// checks only the category), so the receivers here are literals, whose
+/// elements are proven where they are written.
 #[test]
 fn array_count_argument_returns_an_array() {
     let source = r"
 class ContractArrayCount
-  extend T::Sig
-  sig { params(x: T::Array[Integer]).returns(T::Array[Integer]) }
-  def head(x)
-    x.first(2)
+  def head
+    [1, 2].first(2)
   end
-  sig { params(x: T::Array[Integer]).returns(T::Array[Integer]) }
-  def top(x)
-    x.max(2)
+  def top
+    [1, 2].max(2)
   end
-  sig { params(x: T::Array[Integer]).returns(T.untyped) }
-  def pairs(x)
-    x.pop(2).each_slice(2)
+  def pairs
+    [1, 2].pop(2).each_slice(2)
   end
-  sig { params(x: T::Array[Integer], counts: T::Array[Integer]).returns(T::Array[Integer]) }
-  def splatted(x, counts)
-    x.last(*counts)
+  def splatted(counts)
+    [1, 2].last(*counts)
   end
-  sig { params(x: T::Array[Integer]).returns(String) }
-  def one(x)
-    x.first
+  def one
+    [1, 2].first
   end
 end
 ";
@@ -1205,20 +1239,13 @@ end
 fn flatten_drops_the_nesting() {
     let source = r"
 class ContractFlatten
-  extend T::Sig
-  sig { params(x: T::Array[T::Array[Integer]]).returns(T::Array[Integer]) }
-  def flat(x)
-    x.flatten
+  def flat
+    [[1], [2]].flatten
   end
   # The inner arrays are shared by reference, so what they hold is
   # unproven after flatten: `first` is Unknown and `abs` stays silent.
-  sig { params(x: T::Array[T::Array[Integer]]).returns(Integer) }
-  def head(x)
-    x.flatten.first.abs
-  end
-  sig { params(x: T::Array[T::Array[Integer]]).returns(String) }
-  def wrong(x)
-    x.flatten
+  def head
+    [[1], [2]].flatten.first.abs
   end
 end
 ";
@@ -3503,9 +3530,9 @@ fn checked_never_or_tests_sig_is_inert() {
 /// F2: `default_checked_level` set to anything but a literal `:always`
 /// — `:never`, `:tests`, or an expression this checker does not evaluate
 /// — leaves every sig possibly unchecked. The sig then neither accuses
-/// nor types its consumers; an RBI-only declaration's arguments are not
-/// accused either. The controls — no assignment, or a literal `:always`
-/// — still accuse and type.
+/// nor types its consumers. An RBI-only declaration's arguments are never
+/// accused, at any level (F6). The controls — no assignment, or a literal
+/// `:always` — still accuse and type.
 #[test]
 fn default_checked_level_other_than_always_makes_sigs_inert() {
     let rbi = "class ContractGateGem\n  sig { params(value: Integer).returns(String) }\n  def accept(value); end\nend\n";
@@ -3518,7 +3545,7 @@ fn default_checked_level_other_than_always_makes_sigs_inert() {
     for (i, prelude) in ["", "T::Configuration.default_checked_level = :always"].iter().enumerate() {
         let source = runtime_gate(prelude, "", "extend T::Sig", "");
         let diags = check(&format!("level-enforced-{i}"), &format!("{source}{external}"), Some(rbi));
-        assert_eq!(gate_codes(&diags), ["E0101", "E0103", "E0103", "E0109"], "{prelude}: {diags:?}");
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
     }
 }
 
@@ -3647,4 +3674,53 @@ fn lockfile_without_real_sorbet_runtime_makes_sigs_inert() {
     let real = lock("    sorbet-runtime (0.5.11934)\n", "  sorbet-runtime\n");
     let diags = run("real", &real);
     assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// F4: sorbet-runtime checks a generic's category, never its type
+/// arguments (`T::Array[String]` accepts `[1]` at run time), so a declared
+/// element, key or value type never types a consumer — not through the
+/// return, and not through a parameter bound into the body. The category
+/// survives, and `T.nilable` keeps its member's: `names.absent_on_array`
+/// and `items.absent_on_param_array` are still accused.
+#[test]
+fn declared_type_arguments_never_type_consumers() {
+    let source = r"
+class ContractErasedItem
+end
+class ContractErased
+  extend T::Sig
+  sig { returns(T::Array[String]) }
+  def names; []; end
+  sig { returns(T.nilable(T::Hash[Symbol, Integer])) }
+  def table; nil; end
+  # Read only through `first`, `items` stays a trusted local: only the
+  # binding decides what its elements are.
+  sig { params(items: T::Array[ContractErasedItem]).returns(Integer) }
+  def count(items)
+    items.first
+    1
+  end
+  sig { params(items: T::Array[ContractErasedItem]).returns(Integer) }
+  def probe(items)
+    items.absent_on_param_array
+    1
+  end
+end
+ContractErased.new.names.first
+ContractErased.new.table
+ContractErased.new.names.absent_on_array
+";
+    let diags = check("erased", source, None);
+    let absent: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.code == "E0101")
+        .filter_map(|d| d.message.split('`').nth(1))
+        .collect();
+    assert_eq!(absent, ["absent_on_param_array", "absent_on_array"], "{diags:?}");
+    assert_types("erased", source, &[
+        ("ContractErased.new.names.first", "names", Some("Array[untyped]")),
+        ("ContractErased.new.names.first", "first", None),
+        ("ContractErased.new.table", "table", Some("Hash[untyped, untyped] | nil")),
+        ("    items.first", "first", None),
+    ]);
 }

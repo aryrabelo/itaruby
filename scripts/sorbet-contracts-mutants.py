@@ -42,35 +42,37 @@ MUTATIONS = [
      "        let diverges = false;\n",
      "descendant_override_keeps_the_parent_contract_off_the_call"),
     ("duplicate source picks the last sig", INDEX,
-     "        method.sorbet_sig = None;\n        method.sorbet_annotated = true;\n",
-     "",
+     "        method.sorbet_sig = None;\n    }\n    methods.insert(definition.name.clone(), method);",
+     "    }\n    methods.insert(definition.name.clone(), method);",
      "duplicate_source_definitions_do_not_pick_a_signature"),
-    # -- RBI: exact owner, track and layout
-    ("stale RBI layout accepted", CHECK,
-     "            if !declaration.matches_source(method) {\n                return None;\n            }\n",
-     "",
-     "stale_rbi_layout_does_not_type_source_or_calls"),
-    ("RBI positional names ignored", INDEX,
-     "            && source.positional_names == md.positional_names\n",
-     "",
-     "stale_rbi_layout_does_not_type_source_or_calls"),
-    ("conflicting RBI declarations pick one", INDEX,
-     "                || old.nesting != declaration.nesting\n            {\n                old.definition.sorbet_sig = None;",
-     "                || old.nesting != declaration.nesting\n            {\n                let _ = ();",
-     "conflicting_rbi_declarations_do_not_choose_a_contract"),
-    ("inherited RBI owner lends its contract", INDEX,
-     "methods.get(method).filter(|m| m.owner == path).cloned()",
-     "methods.get(method).cloned()",
-     "inherited_rbi_contract_never_attaches_to_a_source_override"),
+    # -- RBI: never checked at runtime, so never a contract (F6)
+    # removed: stale RBI layout accepted — F6: no RBI is ever a source method's contract, so there is no layout match left to skip
+    # removed: RBI positional names ignored — F6: `RbiMethod::matches_source` is gone with the RBI contract path
+    # removed: conflicting RBI declarations pick one — F6: an RBI declaration carries only its return text again, first visit wins as on main
+    # removed: inherited RBI owner lends its contract — F6: `source_rbi_method` and its owner filter are gone with the RBI contract path
+    # removed: RBI track forced to instance — F6: the source-track RBI lookup is gone; the RBI walk's own tracks are main's
+    ("RBI return keeps its type arguments", CHECK,
+     "                return Some(erase_type_arguments(&ty));",
+     "                return Some(ty);",
+     "external_rbi_types_only_its_consumer"),
+    ("RBI typing in a silent walk", CHECK,
+     "    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {\n        if self.silent {\n            return None;\n        }\n",
+     "    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {\n",
+     "external_rbi_types_only_its_consumer"),
+    # -- F4: a declared type argument never types a consumer
+    ("sig return keeps its type arguments", CHECK,
+     "                erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting))",
+     "                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)",
+     "declared_type_arguments_never_type_consumers"),
+    ("sig param keeps its type arguments", CHECK,
+     "                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));",
+     "                let ty = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);",
+     "declared_type_arguments_never_type_consumers"),
     # -- instance / singleton separation
     ("source track forced to instance", CHECK,
      "        let singleton = class.singleton_methods.get(name).is_some_and(same);",
      "        let singleton = false;",
-     "rbi_singleton_contract_matches_source_track"),
-    ("RBI track forced to instance", INDEX,
-     "    let methods = if singleton { singleton_methods } else { instance };\n    methods.get(method).filter",
-     "    let methods = instance;\n    methods.get(method).filter",
-     "rbi_singleton_contract_matches_source_track"),
+     "rbi_singleton_declaration_is_silent_and_the_source_track_accuses"),
     # -- E0109: the body answers to its own signature
     ("body never checked against sig", CHECK,
      "            self.check_sorbet_return(def, contract, nesting);",
@@ -115,15 +117,12 @@ MUTATIONS = [
      "            if !matches {\n                md.sorbet_sig = None;\n            }",
      "            if !matches {\n                let _ = ();\n            }",
      "sig_naming_an_absent_parameter_is_not_a_contract"),
-    # -- PendingSig::Unusable: unreadable or stacked sigs still count as ANNOTATED
+    # -- PendingSig::Unusable: unreadable or stacked sigs are never a contract
     ("stacked sigs pick the last overload", INDEX,
      "                            Some(parsed) if !stacked && !parsed.unchecked => PendingSig::Parsed(parsed),",
      "                            Some(parsed) if !parsed.unchecked => PendingSig::Parsed(parsed),",
      "overloads_and_unsupported_layouts_do_not_invent_correspondence"),
-    ("unusable sig counts as unannotated", INDEX,
-     "            sorbet_annotated: pending_sorbet_sig.is_some(),",
-     "            sorbet_annotated: matches!(pending_sorbet_sig, Some(PendingSig::Parsed(_))),",
-     "unusable_inline_sig_still_blocks_the_rbi_contract"),
+    # removed: unusable sig counts as unannotated — F6: `sorbet_annotated` only ever blocked the RBI contract fallback, which is gone
     # -- nil is proven only where it is written (invariant #1)
     # removed: union member nil excuses the union — literal-only: every nil a contract sees is a written leaf, judged like any other; the nil filter is gone
     # removed: nil read from a variable counts as proven — literal-only: no variable is ever read, so the `literal_nil` gate is gone
@@ -384,9 +383,13 @@ MUTATIONS = [
      "",
      "contract_work_is_per_definition_not_per_call"),
     ("family walked before the contract", CHECK,
-     "        let (owner, name, singleton) = self.dispatching_name(method, name, path)?;\n",
-     "        let (owner, name, singleton) = self.dispatching_name(method, name, path)?;\n"
-     "        let _ = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);\n",
+     "        let sig = method.sorbet_sig.as_ref()?;\n",
+     "        if let Some((owner, name, singleton)) = method.nesting.last()\n"
+     "            .and_then(|path| self.dispatching_name(method, name, path))\n"
+     "        {\n"
+     "            let _ = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);\n"
+     "        }\n"
+     "        let sig = method.sorbet_sig.as_ref()?;\n",
      "contract_work_is_per_definition_not_per_call"),
     ("return memo read after sig_fill", CHECK,
      "        // A memo entry is only ever written after `sig_fill` answered\n",

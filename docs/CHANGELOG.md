@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A Sorbet `sig` accuses (E0103/E0109) and types its callers only where
+  sorbet-runtime provably enforces it; anywhere else it is inert: no
+  accusation, no declared return or param type for any consumer, and no
+  RBI stands in for it. Inert project-wide when a file sets
+  `T::Configuration.default_checked_level` to anything but a literal
+  `:always` (`:tests` and expressions included; the literal `:never` gate
+  now also stops typing), assigns any `T::Configuration.*_handler` (a
+  handler may log instead of raising), or when the project's visible
+  `Gemfile.lock` names `sorbet-runtime-stub` or does not name
+  `sorbet-runtime` (with no lock found, sigs are judged from source as
+  before). Inert per sig with `.checked(:never)` or `.checked(:tests)`.
+  Inert per class when its `sig` is not provably `T::Sig`'s (no `extend
+  T::Sig` or `class << self; include T::Sig` on the class or a superclass,
+  no `include T::Sig` into `Object`/`Module`/`Class` or at top level, or a
+  homemade `def self.sig` on that chain), or when the class or an
+  ancestor defines a `method_added`/`singleton_method_added` whose body
+  never calls `super`. RBI-only declarations (no source definition) are
+  still not accused under the project-wide gates, but keep typing their
+  callers.
 - `__LINE__` is an Integer, no longer a String, for every consumer; a
   rational (`3r`) or imaginary (`2i`) literal is Unknown to inference
   instead of a Float (no modeled type is a `Rational` or a `Complex`).

@@ -69,9 +69,21 @@ found, and the launch bar is winning on both.
   ternaries in argument position, a literal behind a `#: as` cast. Three
   review rounds found 24 false positives, all an inferred type held to a
   sig — do not reintroduce inferred evidence. Known false negatives: every
-  contradiction carried by an inferred value. A literal
-  `T::Configuration.default_checked_level = :never` anywhere turns every
-  contract accusation off; a module named by a multi-argument
+  contradiction carried by an inferred value. A sig accuses AND types
+  consumers only where sorbet-runtime provably enforces it (2026-09-23,
+  binding); otherwise it is inert: no E0103/E0109, no declared type for
+  consumers, no RBI fallback (`poison_contract`/`PendingSig::Unusable`).
+  Project-wide inert (`sorbet_runtime_unchecked`, gated in
+  `effective_sorbet` and `contract_breaks`): `default_checked_level` set to
+  anything but a literal `:always`, any `T::Configuration.*_handler=`, or a
+  visible `Gemfile.lock` naming `sorbet-runtime-stub` or not naming
+  `sorbet-runtime` (no lock: source decides). Per sig: `.checked(:never)`
+  or `.checked(:tests)`. Per class (`poison_runtime_inert_contracts`): no
+  `T::Sig` extended by the class or a superclass and no `include T::Sig`
+  into `Object`/`Module`/`Class`; a homemade `def self.sig` on that chain;
+  a `method_added`/`singleton_method_added` without `super` on the class or
+  an ancestor. RBI-only declarations still type their consumers under the
+  project-wide gates (open). A module named by a multi-argument
   `include A, B` (or `prepend`/`extend`), and its ancestors, lose their
   contracts until the reversed linearization of that call is fixed. A client RBI supplies the same contracts
   only on an exact match of owner, dispatch track and Ruby parameter layout.

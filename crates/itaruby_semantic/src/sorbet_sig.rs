@@ -14,11 +14,15 @@ use crate::types::{ClassId, Ty};
 
 /// A single, unambiguous Sorbet contract. Parameter names are Ruby names, never
 /// positional guesses. `void` discards the result; it does not promise `nil`.
+/// `unchecked` records a written `.checked(:never)` / `.checked(:tests)`:
+/// sorbet-runtime does not raise on that sig in the running program, so the
+/// index never lets it accuse or type anything (`PendingSig::Unusable`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SorbetSig {
     pub params: Vec<(String, String)>,
     pub ret: Option<String>,
     pub void: bool,
+    pub unchecked: bool,
 }
 
 /// Extract a bare `sig` / `sig(:final)` block with one builder call chain.
@@ -47,6 +51,7 @@ pub fn extract_sig(node: &Node<'_>) -> Option<SorbetSig> {
         params: Vec::new(),
         ret: None,
         void: false,
+        unchecked: false,
     };
     walk_clause_chain(current, &mut sig)?;
     (sig.ret.is_some() || sig.void).then_some(sig)
@@ -101,7 +106,10 @@ fn extract_clause(call: &CallNode<'_>, sig: &mut SorbetSig) -> Option<u8> {
         b"override" if no_args(call) => Some(8),
         b"overridable" if no_args(call) => Some(16),
         b"final" if no_args(call) => Some(32),
-        b"checked" if symbol_arg_is(call, &[b"always", b"tests", b"never"]) => Some(64),
+        b"checked" if symbol_arg_is(call, &[b"always", b"tests", b"never"]) => {
+            sig.unchecked = !symbol_arg_is(call, &[b"always"]);
+            Some(64)
+        }
         _ => None,
     }
 }

@@ -1606,13 +1606,19 @@ impl Checker<'_> {
 
     /// Inline metadata wins, including an unsupported inline signature.
     /// An RBI is eligible only for this exact source definition's owner,
-    /// dispatch track and Ruby parameter layout.
+    /// dispatch track and Ruby parameter layout. A project whose runtime
+    /// is not proven to raise on a broken sig
+    /// (`ProjectIndex::sorbet_runtime_unchecked`) has no contract here at
+    /// all: nothing is accused, and no declared type reaches a consumer.
     fn effective_sorbet(
         &self,
         method: &MethodSig,
         name: &str,
     ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
         if method.sig.is_some() || method.arity_unknown || method.abstract_stub {
+            return None;
+        }
+        if self.index.sorbet_runtime_unchecked {
             return None;
         }
         if method.sorbet_sig.is_none() && (method.sorbet_annotated || self.rbi_map.is_none()) {
@@ -4903,9 +4909,11 @@ impl Checker<'_> {
     /// `expected`? A literal is judged by the class it is written as, so
     /// the only doubt left is which leaf runs: a union of branch leaves is
     /// accused only when NO leaf fits, because this checker cannot tell a
-    /// dead branch from a live one. A project that turns runtime checking
-    /// off (`T::Configuration.default_checked_level = :never`) enforces no
-    /// sig, so nothing is accused there.
+    /// dead branch from a live one. A project whose runtime is not proven
+    /// to raise on a broken sig (`ProjectIndex::sorbet_runtime_unchecked`)
+    /// accuses nothing: source contracts never get here
+    /// (`effective_sorbet`), and this also holds an RBI-only declaration's
+    /// arguments.
     fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
         !self.index.sorbet_runtime_unchecked
             && !leaves.is_empty()

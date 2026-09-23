@@ -80,6 +80,7 @@ pub fn wire_declaration_sources(db: &mut Db, roots: &[PathBuf]) -> DiscoveredSou
 
     if let Some(lock) = roots.iter().find_map(|r| find_upward_bare_file(r, "Gemfile.lock")) {
         wire_gemfile_lock_namespaces(db, &lock);
+        wire_sorbet_runtime_lock(db, &lock);
     }
 
     DiscoveredSources {
@@ -157,6 +158,37 @@ fn wire_gemfile_lock_namespaces(db: &Db, lock_path: &Path) {
     if !namespaces.is_empty() {
         GemfileLockNamespaces::new(db, namespaces);
     }
+}
+
+/// Singleton input: whether the project's visible `Gemfile.lock` installs
+/// the real sorbet-runtime — it names `sorbet-runtime` and does not name
+/// `sorbet-runtime-stub` (whose `sig` records nothing and checks nothing).
+/// `enforced == false` makes every Sorbet sig inert project-wide
+/// (`ProjectIndex::sorbet_runtime_unchecked`). Wired whenever a lock is
+/// found, however it reads; NO lock found wires nothing, and the checker
+/// keeps judging sigs from the source alone (a lone script or a gem
+/// checked without its lock is not evidence that the runtime is absent).
+#[salsa::input(singleton)]
+pub struct SorbetRuntimeLock {
+    pub enforced: bool,
+}
+
+fn wire_sorbet_runtime_lock(db: &Db, lock_path: &Path) {
+    let Ok(text) = std::fs::read_to_string(lock_path) else {
+        return;
+    };
+    SorbetRuntimeLock::new(db, sorbet_runtime_locked(&text));
+}
+
+/// A gem is NAMED by a lock when some line's first token is exactly it:
+/// a spec (`    sorbet-runtime (0.5.1)`) in any `GEM`/`PATH`/`GIT`
+/// section, a dependency constraint under one, or a `DEPENDENCIES` entry
+/// (`  sorbet-runtime!`).
+pub fn sorbet_runtime_locked(lock: &str) -> bool {
+    let names = |gem: &str| {
+        lock.lines().any(|line| line.split_whitespace().next().is_some_and(|t| t.trim_end_matches('!') == gem))
+    };
+    names("sorbet-runtime") && !names("sorbet-runtime-stub")
 }
 
 /// Distinct gem names from a `Gemfile.lock`'s `GEM`/`specs:` blocks — the

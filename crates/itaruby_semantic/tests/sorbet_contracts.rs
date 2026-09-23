@@ -3349,8 +3349,9 @@ end
 
 /// A project that sets `T::Configuration.default_checked_level = :never`
 /// runs no sig check at all, so no Sorbet contract accuses anything there.
-/// The controls: the same project without that line, or with any other
-/// level, still accuses.
+/// The controls: the same project without that line, or with a literal
+/// `:always`, still accuses (`:tests` and expressions are inert too — see
+/// `default_checked_level_other_than_always_makes_sigs_inert`).
 #[test]
 fn default_checked_level_never_turns_contract_accusations_off() {
     const SOURCE: &str = r#"
@@ -3371,7 +3372,7 @@ ContractUnchecked.new.echo("bad")
     let diags = check_files("checked-never-elsewhere", &[&SOURCE.replace("LEVEL", ""), config]);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 
-    for (i, level) in ["", "T::Configuration.default_checked_level = :always", "T::Configuration.default_checked_level = :tests"]
+    for (i, level) in ["", "T::Configuration.default_checked_level = :always"]
         .iter()
         .enumerate()
     {
@@ -3437,4 +3438,213 @@ end
         "return of `lookup` expects String, got Hash",
         "return of `list` expects Integer, got Array",
     ], "{diags:?}");
+}
+
+/// One signed class for the runtime-enforcement gates: `echo` breaks its
+/// contract with a literal on both sides (E0109, E0103), and `pass`
+/// returns its untyped argument, so only its DECLARED return can type the
+/// consumer that calls an absent method on the result (E0101). A sig
+/// sorbet-runtime does not enforce is inert: all three stay silent.
+/// `PRELUDE` goes before the class, `BODY` first inside it, and
+/// `CHECKED` after each builder chain.
+const RUNTIME_GATE: &str = r#"
+PRELUDE
+class ContractGateResult
+end
+class ContractGate < ContractGateBase
+  BODY
+  sig { params(n: Integer).returns(Integer)CHECKED }
+  def echo(n)
+    "wrong"
+  end
+  sig { params(n: T.untyped).returns(ContractGateResult)CHECKED }
+  def pass(n) = n
+end
+ContractGate.new.echo("bad")
+ContractGate.new.pass(nil).absent_gate_result
+"#;
+
+/// `RUNTIME_GATE` with its three holes filled, and the base class
+/// `ContractGate` inherits from written first with `base` as its body.
+fn runtime_gate(prelude: &str, base: &str, body: &str, checked: &str) -> String {
+    let prelude = format!("{prelude}\nclass ContractGateBase\n  {base}\nend");
+    RUNTIME_GATE.replace("PRELUDE", &prelude).replace("BODY", body).replace("CHECKED", checked)
+}
+
+/// The contract codes a gate fixture produces, sorted, with E0101 only for
+/// the typed consumer (a class with no `sig` method at all is a separate,
+/// true E0101 on the `sig` call itself).
+fn gate_codes(diags: &[Diagnostic]) -> Vec<&str> {
+    let typed = |d: &Diagnostic| d.code == "E0101" && d.message.contains("absent_gate_result");
+    let mut codes: Vec<&str> =
+        diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109") || typed(d)).map(|d| d.code).collect();
+    codes.sort_unstable();
+    codes
+}
+
+const ENFORCED: [&str; 3] = ["E0101", "E0103", "E0109"];
+
+/// F1: `.checked(:never)` and `.checked(:tests)` are sigs sorbet-runtime
+/// does not check in the running program (measured, sorbet-runtime
+/// 0.6.13036: the call returns the wrong value unraised). The controls —
+/// no `checked`, or `.checked(:always)` — still accuse and type.
+#[test]
+fn checked_never_or_tests_sig_is_inert() {
+    for (i, checked) in [".checked(:never)", ".checked(:tests)"].iter().enumerate() {
+        let diags = check(&format!("checked-inert-{i}"), &runtime_gate("", "", "extend T::Sig", checked), None);
+        assert!(gate_codes(&diags).is_empty(), "{checked}: {diags:?}");
+    }
+    for (i, checked) in ["", ".checked(:always)"].iter().enumerate() {
+        let diags = check(&format!("checked-enforced-{i}"), &runtime_gate("", "", "extend T::Sig", checked), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{checked}: {diags:?}");
+    }
+}
+
+/// F2: `default_checked_level` set to anything but a literal `:always`
+/// — `:never`, `:tests`, or an expression this checker does not evaluate
+/// — leaves every sig possibly unchecked. The sig then neither accuses
+/// nor types its consumers; an RBI-only declaration's arguments are not
+/// accused either. The controls — no assignment, or a literal `:always`
+/// — still accuse and type.
+#[test]
+fn default_checked_level_other_than_always_makes_sigs_inert() {
+    let rbi = "class ContractGateGem\n  sig { params(value: Integer).returns(String) }\n  def accept(value); end\nend\n";
+    let external = "class ContractGateSite < ContractGateGem\n  def initialize; end\nend\nContractGateSite.new.accept(\"bad\")\n";
+    for (i, level) in [":never", ":tests", "ENV[\"STRICT\"] ? :always : :never"].iter().enumerate() {
+        let source = runtime_gate(&format!("T::Configuration.default_checked_level = {level}"), "", "extend T::Sig", "");
+        let diags = check(&format!("level-inert-{i}"), &format!("{source}{external}"), Some(rbi));
+        assert!(gate_codes(&diags).is_empty(), "{level}: {diags:?}");
+    }
+    for (i, prelude) in ["", "T::Configuration.default_checked_level = :always"].iter().enumerate() {
+        let source = runtime_gate(prelude, "", "extend T::Sig", "");
+        let diags = check(&format!("level-enforced-{i}"), &format!("{source}{external}"), Some(rbi));
+        assert_eq!(gate_codes(&diags), ["E0101", "E0103", "E0103", "E0109"], "{prelude}: {diags:?}");
+    }
+}
+
+/// F3: any `T::Configuration.*_handler` assignment may log instead of
+/// raising (measured: a `call_validation_error_handler` lambda lets the
+/// broken call run to its end), so no sig is proven enforced. The
+/// controls — another `T::Configuration` setting, or a `*_handler=` on a
+/// receiver that is not `T::Configuration` — still accuse and type.
+#[test]
+fn soft_runtime_error_handler_makes_sigs_inert() {
+    for (i, handler) in ["call_validation_error_handler", "sig_validation_error_handler", "inline_type_error_handler"]
+        .iter()
+        .enumerate()
+    {
+        let prelude = format!("::T::Configuration.{handler} = lambda {{ |*args| args }}");
+        let diags = check(&format!("handler-inert-{i}"), &runtime_gate(&prelude, "", "extend T::Sig", ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{handler}: {diags:?}");
+    }
+    for (i, prelude) in [
+        "T::Configuration.enable_final_checks_on_hooks",
+        "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("handler-enforced-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
+    }
+}
+
+/// F7: a bare `sig` is sorbet-runtime's only when `T::Sig` is on the
+/// class object: extended by the class or a superclass, or included into
+/// every class (`class Module; include T::Sig; end`,
+/// `Module.include(T::Sig)`). With no `T::Sig` (a homemade `def
+/// self.sig`, or an instance-side `include T::Sig`), or a homemade `def
+/// self.sig` that answers before an extended `T::Sig`, the sig is inert.
+#[test]
+fn sig_not_provided_by_t_sig_is_inert() {
+    for (i, (prelude, base, body)) in [
+        ("", "", ""),
+        ("", "", "include T::Sig"),
+        ("", "", "def self.sig(*args) = args"),
+        ("", "", "extend T::Sig\n  def self.sig(*args) = args"),
+        ("", "extend T::Sig\n  def self.sig(*args) = args", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("tsig-inert-{i}"), &runtime_gate(prelude, base, body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{base}|{body}: {diags:?}");
+    }
+    for (i, (prelude, base, body)) in [
+        ("", "", "extend T::Sig"),
+        ("", "extend T::Sig", ""),
+        ("", "", "class << self\n    include T::Sig\n  end"),
+        ("class Module\n  include T::Sig\nend", "", ""),
+        ("Module.include(T::Sig)", "", ""),
+        ("include T::Sig", "", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("tsig-enforced-{i}"), &runtime_gate(prelude, base, body, ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}|{base}|{body}: {diags:?}");
+    }
+}
+
+/// F8: sorbet-runtime attaches a sig to its def from the class's
+/// `method_added` hook; a project `self.method_added` that never calls
+/// `super` swallows it (measured: the broken call runs unraised). The
+/// class's own hook, or one on an ancestor, makes every sig of the class
+/// inert. The controls — a hook that calls `super`, bare or explicit —
+/// still accuse and type.
+#[test]
+fn method_added_hook_without_super_makes_sigs_inert() {
+    for (i, (base, body)) in [
+        ("", "extend T::Sig\n  def self.method_added(name); end"),
+        ("", "extend T::Sig\n  class << self\n    def singleton_method_added(name) = name\n  end"),
+        ("def self.method_added(name); end", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("hook-inert-{i}"), &runtime_gate("", base, body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{base}|{body}: {diags:?}");
+    }
+    for (i, (base, body)) in [
+        ("", "extend T::Sig\n  def self.method_added(name)\n    super\n  end"),
+        ("def self.method_added(name)\n    super(name)\n  end", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("hook-enforced-{i}"), &runtime_gate("", base, body, ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{base}|{body}: {diags:?}");
+    }
+}
+
+/// F7, lockfile half: a `Gemfile.lock` visible to the project that does
+/// not install the real sorbet-runtime — it names `sorbet-runtime-stub`,
+/// or never names `sorbet-runtime` — makes every sig inert. The control
+/// lock names `sorbet-runtime` and still accuses and types; a project with
+/// no lock at all keeps judging from source (every other test here).
+#[test]
+fn lockfile_without_real_sorbet_runtime_makes_sigs_inert() {
+    let run = |name: &str, lock: &str| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-lock-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Gemfile.lock"), lock).unwrap();
+        let mut db = Db::default();
+        itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&dir));
+        let file = SourceFile::new(&db, dir.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+        ProjectFiles::new(&db, vec![file]);
+        ClosedWorld::new(&db, true);
+        check_file(&db, file).clone()
+    };
+    let lock = |specs: &str, deps: &str| {
+        format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n{deps}\n")
+    };
+    let stub = lock("    sorbet-runtime-stub (0.2.0)\n", "  sorbet-runtime-stub\n");
+    let absent = lock("    rake (13.0.6)\n", "  rake\n");
+    for (name, text) in [("stub", &stub), ("absent", &absent)] {
+        let diags = run(name, text);
+        assert!(gate_codes(&diags).is_empty(), "{name}: {diags:?}");
+    }
+    let real = lock("    sorbet-runtime (0.5.11934)\n", "  sorbet-runtime\n");
+    let diags = run("real", &real);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
 }

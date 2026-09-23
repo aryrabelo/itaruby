@@ -1,0 +1,35 @@
+AGENTS.md
+  s_12be3cd9892e59::t_3ed0cc00e000b1 72-86
+README.md
+  s_12be3cd9892e59::t_3a80cbebf96f83 64-75,113,119
+crates/itaruby_semantic/src/check.rs
+  s_12be3cd9892e59::t_5d6605b6e59199 1609-1612,1621-1623,4912-4916
+crates/itaruby_semantic/src/discovery.rs
+  s_12be3cd9892e59::t_e190b1eedbccb2 83,163-193
+crates/itaruby_semantic/src/index.rs
+  s_12be3cd9892e59::t_b589dd4603fe01 587-590,592-599,681-682,708-709,928-929,1049,1132-1138,1142-1143,1145,1153-1193,3206-3208,3210,4038-4061,5069-5075,5077-5082,5235-5240,5326,5534-5535,7958-8013
+crates/itaruby_semantic/src/sorbet_sig.rs
+  s_12be3cd9892e59::t_398189d2949ad0 17-19,25,54,109-112
+crates/itaruby_semantic/tests/sorbet_contracts.rs
+  s_12be3cd9892e59::t_860429f7c6710b 3352-3354,3375,3442-3650
+docs/CHANGELOG.md
+  s_12be3cd9892e59::t_471a5e17280f42 11-29
+scripts/sorbet-contracts-mutants.py
+  s_12be3cd9892e59::t_1e48535b29aa00 30,120-121,169,498-542
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b031508936fd2a0b55c4d0295c25e8e3de2a8c95",
+  "prompts": {},
+  "sessions": {
+    "s_12be3cd9892e59": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ca90c1ea-5986-415e-a5ce-7cecb3f99d59",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

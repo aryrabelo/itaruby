@@ -60,13 +60,27 @@ found, and the launch bar is winning on both.
 - A project's Sorbet `sig { ... }` is a contract, not a hint (learned
   2026-09-22, binding). The declared return types the consumer. Accusations
   are LITERAL-ONLY (2026-09-23, binding, the E0108 rule): E0109 (at the
-  method name) only for an explicit `return <literal>` (bare `return` is a
-  written `nil`), judged alone, or an implicit tail whose every
-  `if`/`unless`/`case`/`begin`/parentheses leaf is a literal and none fits;
+  method name) only when EVERY return point is a literal and none fits
+  (review F9) — each reachable explicit `return` (bare `return` is a
+  written `nil`) and each `if`/`unless`/`case`/`begin`/parentheses leaf of
+  the reachable implicit tail (`tail_points`); one non-literal point or one
+  fitting literal silences the body. A statement after one that always
+  leaves (`return_terminal`: `return`, receiverless `raise`/`fail`, a
+  statement list with such a statement, an `if`/`unless … else`/`case …
+  else` whose every branch leaves) is unreachable and holds no point;
   E0103 (at the argument, by param name, across positional, keyword and
   default layouts) only for an argument node that is itself a literal.
   Never judged: variables, `self`, constants, calls (`X.new` included),
-  ternaries in argument position, a literal behind a `#: as` cast. Three
+  ternaries in argument position, a literal behind a `#: as` cast. A
+  receiver no flow walk follows is `Unknown`, so it dispatches to no
+  contract and misses no method (review F10, E0103 and E0101 alike): a
+  `for` index, every local of a nested/splatted multi-assignment, of a
+  `=>`/`in` pattern and of a named regexp capture (`target_locals`,
+  `match_targets`), and EVERY local of a scope (`opaque_local_scope`,
+  whole scope, blocks included, def/class/module gates respected) holding a
+  string `eval` (`eval`, or `instance_eval`/`class_eval`/`module_eval`
+  without a block), a `binding` call, a `local_variable_set`, or a
+  `def l.m`/`class << l` on a local. Three
   review rounds found 24 false positives, all an inferred type held to a
   sig — do not reintroduce inferred evidence. Known false negatives: every
   contradiction carried by an inferred value. A sig accuses AND types

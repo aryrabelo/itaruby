@@ -60,9 +60,10 @@ declared param binds the body the same way): sorbet-runtime never checks
 type arguments. The contract accuses only values
 WRITTEN as literals (strings, symbols, numbers, `nil`, `true`/`false`,
 Array/Hash literals, ranges, regexps, `__FILE__`/`__LINE__`): a literal
-the body returns that contradicts the declared return (E0109), and a
-literal argument that contradicts a declared param, matched by name
-(E0103). A variable, `self`, a constant or any call is never judged, so a
+the body returns contradicts the declared return (E0109) only when every
+return point (each reachable explicit `return` and each leaf of the
+reachable implicit tail) is a literal and none fits; a literal argument
+that contradicts a declared param, matched by name, is E0103. A variable, `self`, a constant or any call is never judged, so a
 contradiction carried by an inferred value is a known false negative. A
 sig accuses and types callers only where sorbet-runtime provably enforces
 it; otherwise it is inert (no E0103/E0109, no declared type for callers). Inert everywhere in a project that sets
@@ -121,13 +122,13 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class) |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class); the receiver must be typed, and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |
 | E0107 | Warning | a local's inferred usage contradicts every candidate type |
 | E0108 | Error | operator operand pairing MRI raises `TypeError` on, both operands proven from literals in one scope |
-| E0109 | Error | a literal a method returns (an explicit `return <literal>`, or a tail whose every branch is a literal and none fits) contradicts its own Sorbet `sig` return type (never an RBI's); same runtime-enforcement gates as E0103 |
+| E0109 | Error | EVERY return point of a method (each reachable explicit `return`, a bare one being `nil`, and each leaf of its reachable implicit tail) is a literal and none fits its own Sorbet `sig` return type (never an RBI's); one non-literal point or one fitting literal keeps it silent, and code after a `return`/`raise` or an `if`/`unless`/`case … else` whose every branch leaves is no return point; same runtime-enforcement gates as E0103 |
 | E0001 | Error | syntax error (prism, error-tolerant) |
 
 itaruby reads whatever else exists for free: Tapioca RBIs (`sorbet/rbi/`,

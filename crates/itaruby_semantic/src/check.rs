@@ -311,6 +311,7 @@ fn check_file_inner(
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
         trusted_collections: FxHashSet::default(),
+        opaque_locals: false,
         ivar_hidden_memo: FxHashMap::default(),
         ancestors_memo: FxHashMap::default(),
         own_ancestry_memo: FxHashMap::default(),
@@ -320,6 +321,7 @@ fn check_file_inner(
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
     checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
+    checker.opaque_locals = opaque_local_scope(None, Some(&parse.node()));
     checker.dark = dark;
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let dark_recs = std::mem::take(&mut checker.dark_recs);
@@ -648,6 +650,7 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
         trusted_collections: FxHashSet::default(),
+        opaque_locals: false,
         ivar_hidden_memo: FxHashMap::default(),
         ancestors_memo: FxHashMap::default(),
         own_ancestry_memo: FxHashMap::default(),
@@ -657,6 +660,7 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
     checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
+    checker.opaque_locals = opaque_local_scope(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.stats
 }
@@ -721,6 +725,7 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
         trusted_collections: FxHashSet::default(),
+        opaque_locals: false,
         ivar_hidden_memo: FxHashMap::default(),
         ancestors_memo: FxHashMap::default(),
         own_ancestry_memo: FxHashMap::default(),
@@ -730,6 +735,7 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
     checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
+    checker.opaque_locals = opaque_local_scope(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.goto_found
 }
@@ -822,6 +828,7 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
         trusted_collections: FxHashSet::default(),
+        opaque_locals: false,
         ivar_hidden_memo: FxHashMap::default(),
         ancestors_memo: FxHashMap::default(),
         own_ancestry_memo: FxHashMap::default(),
@@ -831,6 +838,7 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
     checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
+    checker.opaque_locals = opaque_local_scope(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let ty = checker
         .hover_ty
@@ -903,6 +911,7 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
         trusted_collections: FxHashSet::default(),
+        opaque_locals: false,
         ivar_hidden_memo: FxHashMap::default(),
         ancestors_memo: FxHashMap::default(),
         own_ancestry_memo: FxHashMap::default(),
@@ -912,6 +921,7 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
     checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
+    checker.opaque_locals = opaque_local_scope(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.constraint_outcomes
 }
@@ -1256,6 +1266,11 @@ struct Checker<'db> {
     /// silent ones included — a silent walk infers the method returns
     /// that contracts are checked against.
     trusted_collections: FxHashSet<String>,
+    /// The scope being walked can rebind its locals, or change what one
+    /// of them dispatches to, in a way no flow walk follows (see
+    /// `opaque_local_scope`): every local read in it is `Unknown`. Rebuilt
+    /// and restored with `trusted_collections`.
+    opaque_locals: bool,
     /// `ivar_writes_hidden`'s SETTLED answers, per class and ivar name.
     /// The index never changes during one check, so an answer computed
     /// with no class walk in progress is final; one that met an
@@ -1546,7 +1561,9 @@ impl Checker<'_> {
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
                     let trusted = trusted_collection_locals(None, Some(&body));
                     let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
+                    let saved_opaque = std::mem::replace(&mut self.opaque_locals, opaque_local_scope(None, Some(&body)));
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.opaque_locals = saved_opaque;
                     self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
@@ -1567,7 +1584,9 @@ impl Checker<'_> {
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
                     let trusted = trusted_collection_locals(None, Some(&body));
                     let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
+                    let saved_opaque = std::mem::replace(&mut self.opaque_locals, opaque_local_scope(None, Some(&body)));
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.opaque_locals = saved_opaque;
                     self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
@@ -1579,10 +1598,12 @@ impl Checker<'_> {
                         // `class << self` opens a fresh local scope; the
                         // walk still shares `env`, so its locals are
                         // proven by their own scan, never the outer one.
+                        let saved_opaque = std::mem::replace(&mut self.opaque_locals, opaque_local_scope(None, Some(&body)));
                         let trusted = trusted_collection_locals(None, Some(&body));
                         let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                         self.walk_scope(scope, class, true, &body, env);
                         self.trusted_collections = saved_trusted;
+                        self.opaque_locals = saved_opaque;
                     }
                 }
             }
@@ -1838,6 +1859,8 @@ impl Checker<'_> {
             def.body().as_ref(),
         );
         let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
+        let opaque = opaque_local_scope(def.parameters().map(|p| p.as_node()).as_ref(), def.body().as_ref());
+        let saved_opaque = std::mem::replace(&mut self.opaque_locals, opaque);
         let saved_returns = std::mem::take(&mut self.returns);
         let saved_name = self
             .current_method_name
@@ -1930,13 +1953,17 @@ impl Checker<'_> {
         self.rebindable_block_depth = saved_block_depth;
         self.operand_locals = saved_operands;
         self.trusted_collections = saved_trusted;
+        self.opaque_locals = saved_opaque;
         folded
     }
 
-    /// E0109, literal-only: the body is accused only for a value it WRITES
-    /// as a literal — an explicit `return <literal>` (a bare `return` is a
-    /// written `nil`), judged on its own, or an implicit tail whose every
-    /// leaf is one. Anything else the body returns is never judged.
+    /// E0109, literal-only and whole-body: every return point is collected
+    /// — each explicit `return` (a bare `return` is a written `nil`) and
+    /// each leaf of the reachable implicit tail — and the body is accused
+    /// only when EVERY return point is written as a literal and NONE of
+    /// them fits. One return point that is not a literal, or one literal
+    /// that fits, is a way the method returns what it promised, and the
+    /// body stays silent.
     fn check_sorbet_return(&mut self, def: &DefNode<'_>, contract: &crate::sorbet_sig::SorbetSig, nesting: &[String]) {
         if self.silent || contract.void {
             return;
@@ -1948,15 +1975,10 @@ impl Checker<'_> {
             return;
         }
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
-        let explicit = safety.returns.iter().flatten()
-            .find(|literal| self.contract_breaks(std::slice::from_ref(*literal), &expected))
-            .map(|literal| vec![literal.clone()]);
-        let actual = explicit.or_else(|| {
-            let mut leaves = Vec::new();
-            (!return_terminal(&body) && tail_literals(&body, &mut leaves) && self.contract_breaks(&leaves, &expected))
-                .then_some(leaves)
-        });
-        if let Some(actual) = actual {
+        let mut points = safety.returns;
+        tail_points(&body, &mut points);
+        let Some(actual) = points.into_iter().collect::<Option<Vec<LiteralClass>>>() else { return };
+        if self.contract_breaks(&actual, &expected) {
             let mut names: Vec<String> = Vec::new();
             for name in actual.iter().map(|leaf| leaf.name(self.index)) {
                 if !names.contains(&name) {
@@ -2142,6 +2164,9 @@ impl Checker<'_> {
             Node::LocalVariableReadNode { .. } => {
                 let n = node.as_local_variable_read_node().unwrap();
                 let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
+                if self.opaque_locals {
+                    return Ty::Unknown;
+                }
                 let ty = env.get(&name).cloned().unwrap_or(Ty::Unknown);
                 // A collection this scope may change in place (or hand to
                 // code that can) holds unproven elements on EVERY read.
@@ -2503,6 +2528,13 @@ impl Checker<'_> {
                 let n = node.as_for_node().unwrap();
                 self.infer_expr(&n.collection(), env, self_ty, scope);
                 let mut body_env = env.clone();
+                // `for item in xs` assigns `item` (and every local of a
+                // destructuring index) on each pass, and leaves it bound
+                // after the loop: its value is an element nobody proved.
+                for name in target_locals([n.index()]) {
+                    self.kill_constraint(&name);
+                    body_env.insert(name, Ty::Unknown);
+                }
                 if let Some(s) = n.statements() {
                     self.infer_stmts(&s, &mut body_env, self_ty, scope);
                 }
@@ -2722,12 +2754,9 @@ impl Checker<'_> {
             Node::MultiWriteNode { .. } => {
                 let n = node.as_multi_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
-                for t in n.lefts().iter().chain(n.rights().iter()) {
-                    if let Some(lv) = t.as_local_variable_target_node() {
-                        let name = String::from_utf8_lossy(lv.name().as_slice()).into_owned();
-                        self.kill_constraint(&name);
-                        env.insert(name, Ty::Unknown);
-                    }
+                for name in target_locals(n.lefts().iter().chain(n.rest()).chain(n.rights().iter())) {
+                    self.kill_constraint(&name);
+                    env.insert(name, Ty::Unknown);
                 }
                 Ty::Unknown
             }
@@ -2745,6 +2774,16 @@ impl Checker<'_> {
                 Ty::Unknown
             }
             Node::DefNode { .. } => Ty::Sym,
+            // A pattern capture (`value => l`, `value in [l]`) or a named
+            // regexp capture (`/(?<l>.)/ =~ s`) assigns a local whatever
+            // matched: nothing this walk proved.
+            Node::MatchRequiredNode { .. } | Node::MatchPredicateNode { .. } | Node::MatchWriteNode { .. } => {
+                for name in target_locals(match_targets(node)) {
+                    self.kill_constraint(&name);
+                    env.insert(name, Ty::Unknown);
+                }
+                Ty::Unknown
+            }
 
             _ => Ty::Unknown,
         }
@@ -6195,13 +6234,15 @@ fn stmts_diverge(stmts: &ruby_prism::StatementsNode<'_>) -> bool {
     }
 }
 
-/// Return conformance is narrower than inference: closures, ensure overrides,
-/// loops and unreachable suffixes must not manufacture an E0109.
+/// Return conformance is narrower than inference: closures, ensure overrides
+/// and loops must not manufacture an E0109. A statement after one that
+/// always leaves the method (`return_terminal`) never runs, so it holds no
+/// return point and is not walked.
 #[derive(Default)]
 struct ReturnContractSafety {
     uncertain: bool,
-    /// Every explicit `return`, as the literal it returns or `None` when
-    /// its value is not written as one (never judged).
+    /// Every reachable explicit `return`, as the literal it returns or
+    /// `None` when its value is not written as one.
     returns: Vec<Option<LiteralClass>>,
 }
 
@@ -6258,13 +6299,11 @@ impl<'pr> Visit<'pr> for ReturnContractSafety {
         ruby_prism::visit_unless_node(self, node);
     }
     fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
-        let mut terminal = false;
         for statement in &node.body() {
-            if terminal {
-                self.uncertain = true;
-            }
             self.visit(&statement);
-            terminal = return_terminal(&statement);
+            if return_terminal(&statement) {
+                break;
+            }
         }
     }
 }
@@ -6328,95 +6367,120 @@ fn scalar_literal_ty(node: &Node<'_>) -> Option<Ty> {
     })
 }
 
-/// Collect the leaves an implicit tail can evaluate to — through a
-/// statement list's last statement, `if`/`unless`/ternary and `case`/`when`
-/// branches (a missing branch is a written `nil`), a plain `begin` and
-/// parentheses — and answer whether EVERY leaf is a literal. A leaf that
-/// is not (a variable, a call, a `return`, a `raise`) makes the whole
-/// tail unjudged, so a union is never accused on the literal half of it.
-fn tail_literals(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> bool {
-    if let Some(every_leaf) = tail_branches(node, leaves) {
-        return every_leaf;
+/// Collect the return points of an implicit tail: the leaves it can
+/// evaluate to through a statement list's last statement, `if`/`unless`/
+/// ternary and `case`/`when` branches (a missing branch is a written
+/// `nil`), a plain `begin` and parentheses — each as the literal it is, or
+/// `None` when it is not written as one (a variable, a call). A leaf that
+/// always leaves the method (`return_terminal`: a `return`, whose value
+/// the explicit returns already hold, or a `raise`) returns nothing here.
+fn tail_points(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) {
+    if return_terminal(node) {
+        return;
     }
-    match literal_class(node) {
-        Some(literal) => {
-            leaves.push(literal);
-            true
-        }
-        None => false,
+    if !tail_branches(node, points) {
+        points.push(literal_class(node));
     }
 }
 
-/// `tail_literals` through a node that picks among values, or `None` when
+/// `tail_points` through a node that picks among values; `false` when
 /// `node` is not one.
-fn tail_branches(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+fn tail_branches(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) -> bool {
     if let Some(statements) = node.as_statements_node() {
-        return Some(tail_branch(statements.body().iter().last(), leaves));
+        tail_branch(statements.body().iter().last(), points);
+    } else if let Some(else_node) = node.as_else_node() {
+        tail_branch(else_node.statements().map(|s| s.as_node()), points);
+    } else if let Some(parentheses) = node.as_parentheses_node() {
+        tail_branch(parentheses.body(), points);
+    } else {
+        return conditional_points(node, points) || case_or_begin_points(node, points);
     }
-    if let Some(else_node) = node.as_else_node() {
-        return Some(tail_branch(else_node.statements().map(|s| s.as_node()), leaves));
-    }
-    if let Some(parentheses) = node.as_parentheses_node() {
-        return Some(tail_branch(parentheses.body(), leaves));
-    }
-    conditional_leaves(node, leaves).or_else(|| case_or_begin_leaves(node, leaves))
-}
-
-/// Both arms of an `if`/ternary/`unless` (a missing one is a written `nil`).
-fn conditional_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
-    if let Some(if_node) = node.as_if_node() {
-        let then = tail_branch(if_node.statements().map(|s| s.as_node()), leaves);
-        return Some(then && tail_branch(if_node.subsequent(), leaves));
-    }
-    let unless = node.as_unless_node()?;
-    let then = tail_branch(unless.statements().map(|s| s.as_node()), leaves);
-    Some(then && tail_branch(unless.else_clause().map(|e| e.as_node()), leaves))
-}
-
-/// Every `when` and the `else` of a `case`, or the body of a `begin` that
-/// has no `rescue`, `else` or `ensure` clause.
-fn case_or_begin_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
-    if let Some(case) = node.as_case_node() {
-        let whens = case.conditions().iter().all(|condition| {
-            condition.as_when_node().is_some_and(|when| tail_branch(when.statements().map(|s| s.as_node()), leaves))
-        });
-        return Some(whens && tail_branch(case.else_clause().map(|e| e.as_node()), leaves));
-    }
-    let begin = node.as_begin_node()?;
-    let plain = begin.rescue_clause().is_none() && begin.else_clause().is_none() && begin.ensure_clause().is_none();
-    Some(plain && tail_branch(begin.statements().map(|s| s.as_node()), leaves))
-}
-
-fn tail_branch(node: Option<Node<'_>>, leaves: &mut Vec<LiteralClass>) -> bool {
-    if let Some(node) = node {
-        return tail_literals(&node, leaves);
-    }
-    // A branch that is not written evaluates to `nil`.
-    leaves.push(LiteralClass::Modeled(Ty::Nil));
     true
 }
 
-/// Downcasts decide the shape here rather than the node discriminant: a
-/// failed downcast is a node this walk cannot read, which is not a proven
-/// terminal return — the same fail-closed answer as an unrecognized node.
+/// Both arms of an `if`/ternary/`unless` (a missing one is a written `nil`).
+fn conditional_points(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) -> bool {
+    if let Some(if_node) = node.as_if_node() {
+        tail_branch(if_node.statements().map(|s| s.as_node()), points);
+        tail_branch(if_node.subsequent(), points);
+        return true;
+    }
+    let Some(unless) = node.as_unless_node() else { return false };
+    tail_branch(unless.statements().map(|s| s.as_node()), points);
+    tail_branch(unless.else_clause().map(|e| e.as_node()), points);
+    true
+}
+
+/// Every `when` and the `else` of a `case`, or the body of a `begin` that
+/// has no `rescue`, `else` or `ensure` clause (any other `begin` is one
+/// point that is not a literal).
+fn case_or_begin_points(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) -> bool {
+    if let Some(case) = node.as_case_node() {
+        for condition in &case.conditions() {
+            match condition.as_when_node() {
+                Some(when) => tail_branch(when.statements().map(|s| s.as_node()), points),
+                None => points.push(None),
+            }
+        }
+        tail_branch(case.else_clause().map(|e| e.as_node()), points);
+        return true;
+    }
+    let Some(begin) = node.as_begin_node() else { return false };
+    if begin.rescue_clause().is_none() && begin.else_clause().is_none() && begin.ensure_clause().is_none() {
+        tail_branch(begin.statements().map(|s| s.as_node()), points);
+    } else {
+        points.push(None);
+    }
+    true
+}
+
+fn tail_branch(node: Option<Node<'_>>, points: &mut Vec<Option<LiteralClass>>) {
+    match node {
+        Some(node) => tail_points(&node, points),
+        // A branch that is not written evaluates to `nil`.
+        None => points.push(Some(LiteralClass::Modeled(Ty::Nil))),
+    }
+}
+
+/// Does `node` always leave the method — a `return`, a receiverless
+/// `raise`/`fail`, a statement list any of whose statements does, or an
+/// `if`/`unless`/`case` every branch of which does (a `case` only with an
+/// `else`: without one it falls through as `nil`)? Downcasts decide the
+/// shape here rather than the node discriminant: a failed downcast is a
+/// node this walk cannot read, which is not a proven terminal — the same
+/// fail-closed answer as an unrecognized node.
 fn return_terminal(node: &Node<'_>) -> bool {
     if matches!(node, Node::ReturnNode { .. }) {
         return true;
     }
     if let Some(statements) = node.as_statements_node() {
-        return statements.body().iter().last().is_some_and(|n| return_terminal(&n));
+        return statements.body().iter().any(|n| return_terminal(&n));
     }
     if let Some(else_node) = node.as_else_node() {
         return else_node.statements().is_some_and(|n| return_terminal(&n.as_node()));
     }
+    if let Some(call) = node.as_call_node() {
+        return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+    }
+    branches_terminal(node)
+}
+
+/// `return_terminal` for an `if`, `unless` or `case`: every branch leaves,
+/// and none is missing (a missing branch falls through as `nil`).
+fn branches_terminal(node: &Node<'_>) -> bool {
     if let Some(if_node) = node.as_if_node() {
         return if_node.statements().is_some_and(|n| return_terminal(&n.as_node()))
             && if_node.subsequent().is_some_and(|n| return_terminal(&n));
     }
-    if let Some(call) = node.as_call_node() {
-        return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+    if let Some(unless) = node.as_unless_node() {
+        return unless.statements().is_some_and(|n| return_terminal(&n.as_node()))
+            && unless.else_clause().is_some_and(|n| return_terminal(&n.as_node()));
     }
-    false
+    let Some(case) = node.as_case_node() else { return false };
+    let whens = case.conditions().iter().all(|condition| {
+        condition.as_when_node().and_then(|when| when.statements()).is_some_and(|n| return_terminal(&n.as_node()))
+    });
+    whens && case.else_clause().is_some_and(|n| return_terminal(&n.as_node()))
 }
 
 /// Pessimistic widening: pattern matching etc. may rebind anything.
@@ -6760,6 +6824,86 @@ impl<'pr> Visit<'pr> for OperandLocalScan {
     fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
 
     fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+}
+
+/// Every local the binding targets in `targets` write: a plain target and
+/// each one nested in a destructuring target or a splat (`a, (b, *c)`).
+fn target_locals<'pr>(targets: impl IntoIterator<Item = Node<'pr>>) -> Vec<String> {
+    #[derive(Default)]
+    struct Targets(Vec<String>);
+    impl<'pr> Visit<'pr> for Targets {
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.0.push(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+        }
+    }
+    let mut found = Targets::default();
+    for target in targets {
+        found.visit(&target);
+    }
+    found.0
+}
+
+/// The binding targets of a rightward pattern (`=>`), a pattern test
+/// (`in`) or a named regexp capture; nothing for any other node.
+fn match_targets<'pr>(node: &Node<'pr>) -> Vec<Node<'pr>> {
+    if let Some(required) = node.as_match_required_node() {
+        return vec![required.pattern()];
+    }
+    if let Some(predicate) = node.as_match_predicate_node() {
+        return vec![predicate.pattern()];
+    }
+    node.as_match_write_node().map(|write| write.targets().iter().collect()).unwrap_or_default()
+}
+
+/// Can ONE Ruby scope rebind its locals, or change what one of them
+/// dispatches to, in a way no flow walk follows? A string `eval`
+/// (`eval`, or `instance_eval`/`class_eval`/`module_eval` without a
+/// block), a `binding` escaping (`binding.local_variable_set`,
+/// `binding.eval`, `binding.pry`) or a `local_variable_set` rewrites any
+/// local; a singleton method defined on a local (`def l.m`,
+/// `class << l`) changes what that object — and every alias of it —
+/// answers. The whole scope is opaque, not only what follows the call: a
+/// loop or a closure reaches the reads above it again afterwards. The
+/// scope gates are respected as in `prove_operand_locals`; blocks and
+/// lambdas share the scope and are walked.
+fn opaque_local_scope(params: Option<&Node<'_>>, body: Option<&Node<'_>>) -> bool {
+    let mut scan = OpaqueLocalScan::default();
+    for node in params.into_iter().chain(body) {
+        scan.visit(node);
+    }
+    scan.opaque
+}
+
+#[derive(Default)]
+struct OpaqueLocalScan {
+    opaque: bool,
+}
+
+impl<'pr> Visit<'pr> for OpaqueLocalScan {
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let string_eval = matches!(node.name().as_slice(), b"eval" | b"instance_eval" | b"class_eval" | b"module_eval")
+            && node.block().is_none();
+        if string_eval || matches!(node.name().as_slice(), b"binding" | b"local_variable_set") {
+            self.opaque = true;
+        }
+        ruby_prism::visit_call_node(self, node);
+    }
+
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        if node.receiver().is_some_and(|r| r.as_local_variable_read_node().is_some()) {
+            self.opaque = true;
+        }
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        if node.expression().as_local_variable_read_node().is_some() {
+            self.opaque = true;
+        }
+    }
+
+    fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+
+    fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
 }
 
 /// Which locals of ONE Ruby scope keep their collection type arguments

@@ -143,10 +143,11 @@ end
     assert_eq!(&source[diags[0].start..diags[0].end], "amount");
 }
 
-/// Each explicit `return` is judged on its own; the implicit branches fold
-/// into one union, which accuses only when no member fits (see
-/// `union_with_one_compatible_member_stays_silent`) — so the implicit
-/// control mismatches in BOTH branches.
+/// Every return point — each explicit `return`, each implicit branch — is
+/// judged together, and the body accuses only when no point fits (see
+/// `every_return_point_must_be_a_mismatching_literal`), so each control
+/// mismatches on EVERY path. `mixed` returns an explicit mismatch from one
+/// branch and a mismatching implicit leaf from the other.
 #[test]
 fn explicit_returns_and_implicit_branches_are_checked() {
     let diags = check("branches", r#"
@@ -157,7 +158,7 @@ class ContractBranches
     if flag
       return "wrong"
     else
-      return 1
+      return :wrong
     end
   end
   sig { params(flag: T.untyped).returns(Integer) }
@@ -168,9 +169,25 @@ class ContractBranches
       :wrong
     end
   end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def mixed(flag)
+    if flag
+      return "wrong"
+    else
+      :wrong
+    end
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def one_point_fits(flag)
+    if flag
+      return "wrong"
+    else
+      1
+    end
+  end
 end
 "#, None);
-    assert_eq!(contract_codes(&diags), ["E0109", "E0109"], "{diags:?}");
+    assert_eq!(contract_codes(&diags), ["E0109", "E0109", "E0109"], "{diags:?}");
 }
 
 #[test]
@@ -910,7 +927,7 @@ class ContractNilLiteral
   sig { params(flag: T.untyped).returns(Integer) }
   def return_nil(flag)
     return nil if flag
-    1
+    :one
   end
   sig { params(flag: T.untyped).returns(Integer) }
   def mixed_union(flag)
@@ -2026,12 +2043,12 @@ ContractUnionMembers.new.take([1, "a"].first)
 
 /// The controls that keep the union rule a contract: literal leaves that ALL
 /// mismatch still accuse — in a tail (a missing branch is a written `nil`),
-/// an explicit `return` and an argument — and so does a single mismatched
+/// an explicit `return` beside a mismatching tail, and an argument — and so does a single mismatched
 /// literal. The same shapes built from a sig-typed union are inferred, never
 /// written, and stay silent.
 #[test]
 fn union_with_no_compatible_member_still_accuses() {
-    let source = r#"
+    let source = r"
 class ContractUnionMismatch
   extend T::Sig
   sig { params(label: String).returns(String) }
@@ -2049,7 +2066,7 @@ class ContractUnionMismatch
   sig { params(flag: T.untyped).returns(String) }
   def explicit_union(flag)
     return 1 if flag
-    "ok"
+    2.5
   end
   sig { returns(String) }
   def argument
@@ -2060,7 +2077,7 @@ class ContractUnionMismatch
     1
   end
 end
-"#;
+";
     let diags = check("union-mismatch", source, None);
     assert_eq!(contract_names(source, &diags), ["tail_union", "missing_branch", "explicit_union", "1", "single"], "{diags:?}");
 
@@ -3066,7 +3083,7 @@ class ContractLiteralReturns
   sig { params(flag: T.untyped).returns(String) }
   def explicit_return(flag)
     return 1 if flag
-    "fits"
+    :s
   end
   sig { params(flag: T.untyped).returns(String) }
   def every_branch(flag)
@@ -3109,8 +3126,8 @@ ContractLiteralArgs.new.str(a: 1)
 
 /// Values that are not literals are never judged, however precisely they
 /// infer. Each shape below contradicts its signature by inference alone;
-/// the last two mix a literal with a non-literal, where the literal is not
-/// the whole story.
+/// `mixed_tail` and `mixed_return` pair a mismatching literal with a return
+/// point that is not one, where the literal is not the whole story.
 const NON_LITERAL_VALUES: &str = r#"
 class ContractPlainThing
 end
@@ -3164,7 +3181,7 @@ class ContractNonLiteral
   sig { params(flag: T.untyped, text: String).returns(Integer) }
   def mixed_return(flag, text)
     return text if flag
-    1
+    :s
   end
   sig { params(s: String).void }
   def take(s); end
@@ -3913,4 +3930,139 @@ ContractTypeTest.new.take(:sym)
     let source = format!("class String\n  def shout\n    upcase\n  end\nend\n{TAKE}");
     let control = check("type-test-control", &source, None);
     assert_eq!(contract_names(&source, &control), ["text", "\"text\"", ":sym"], "control: {control:?}");
+}
+
+/// F9: a body is accused only when EVERY return point — each reachable
+/// explicit `return` and each leaf of the reachable implicit tail — is a
+/// literal and none of them fits. Each silent method below runs under
+/// sorbet-runtime: a non-literal point (`x`), or one fitting literal, is how
+/// it keeps its promise. A statement after one that always leaves the
+/// method (`return`, `raise`, an `unless … else …` or a `case … else`
+/// whose every branch does) never runs, so it is no return point.
+#[test]
+fn every_return_point_must_be_a_mismatching_literal() {
+    let source = r#"
+class ContractReachability
+  extend T::Sig
+  sig { params(x: String).returns(String) }
+  def guarded(x) = (return nil unless x; x)
+  sig { params(k: Symbol).returns(String) }
+  def case_raises(k)
+    case k when :a then return "A" else raise ArgumentError end
+    nil
+  end
+  sig { params(ok: T.untyped).returns(String) }
+  def unless_else(ok)
+    unless ok then return "n" else return "y" end
+    nil
+  end
+  sig { returns(String) }
+  def version_guard
+    return nil if RUBY_VERSION < "3.0"
+    "modern"
+  end
+  sig { params(k: Symbol).returns(String) }
+  def case_falls_through(k)
+    case k when :a then return 1 end
+    "fits"
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def every_point_mismatches(flag)
+    return nil if flag
+    :s
+  end
+  sig { params(ok: T.untyped).returns(String) }
+  def unless_else_unreached_tail(ok)
+    unless ok then return 1 else return 2 end
+    "unreached"
+  end
+  sig { params(k: Symbol).returns(String) }
+  def case_else_raise_unreached_tail(k)
+    case k when :a then return 1 else raise ArgumentError end
+    "unreached"
+  end
+  sig { returns(String) }
+  def return_then_unreached_tail
+    return 1
+    "unreached"
+  end
+  sig { returns(String) }
+  def return_then_unreached_return
+    return 1
+    return "unreached"
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def raise_leaf(flag)
+    if flag then 1 else raise "no" end
+  end
+end
+"#;
+    let diags = check("reachability", source, None);
+    assert_eq!(contract_names(source, &diags), [
+        "every_point_mismatches",
+        "unless_else_unreached_tail",
+        "case_else_raise_unreached_tail",
+        "return_then_unreached_tail",
+        "return_then_unreached_return",
+        "raise_leaf",
+    ], "{diags:?}");
+    assert!(diags.iter().all(|d| d.code == "E0109"), "{diags:?}");
+    let every = diags.iter().find(|d| &source[d.start..d.end] == "every_point_mismatches").unwrap();
+    assert!(every.message.contains("got nil | Symbol"), "{every:?}");
+}
+
+const REBOUND_TARGETS: &str = r"
+class ContractReboundA
+  extend T::Sig
+  sig { params(x: Integer).void }
+  def take(x); end
+end
+class ContractReboundB
+  def take(x); end
+  def only_b; end
+end
+";
+
+/// F10: a local whose value no flow walk follows types no receiver, so no
+/// signature governs a call on it and no method is missing from it (E0103
+/// and E0101 alike): a `for` index, a nested or splatted multi-assignment
+/// target, a pattern or named regexp capture, a scope with a string `eval`, an escaping `binding` or a
+/// `local_variable_set` (the whole scope — a loop or a closure reaches
+/// the reads above it again), and a local given a singleton method. Each
+/// control keeps the same receiver readable and still accuses.
+#[test]
+fn rebound_receivers_are_unknown() {
+    let silent = [
+        "item = ContractReboundA.new\n    for item in [ContractReboundB.new]\n      item.take(\"s\")\n      item.only_b\n    end\n    item.take(\"s\")",
+        "l = ContractReboundA.new\n    (l, y), z = [[ContractReboundB.new, 1], 2]\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    a, *l = [1, ContractReboundB.new]\n    l.take(\"s\")",
+        "l = ContractReboundA.new\n    ContractReboundB.new => l\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    [ContractReboundB.new] in [l]\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    /(?<l>x)/ =~ \"x\"\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    binding.local_variable_set(:l, ContractReboundB.new)\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    [1, 2].each do\n      l.take(\"s\")\n      binding.local_variable_set(:l, ContractReboundB.new)\n    end",
+        "l = ContractReboundA.new\n    instance_eval(\"l = ContractReboundB.new\")\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    eval(\"l = ContractReboundB.new\")\n    l.only_b",
+        "l = ContractReboundA.new\n    def l.only_b; end\n    l.only_b",
+        "l = ContractReboundA.new\n    class << l\n      def only_b; end\n    end\n    l.only_b",
+    ];
+    for (i, body) in silent.iter().enumerate() {
+        let source = format!("{REBOUND_TARGETS}class ContractReboundUse\n  def run\n    {body}\n  end\nend\n");
+        let diags = check(&format!("rebound-{i}"), &source, None);
+        assert!(!diags.iter().any(|d| matches!(d.code, "E0101" | "E0103")), "{body}: {diags:?}");
+    }
+
+    let controls = [
+        "item = ContractReboundA.new\n    for other in [ContractReboundB.new]\n      item.take(\"s\")\n      item.only_b\n    end",
+        "l = ContractReboundA.new\n    ContractReboundB.class_eval do\n    end\n    l.take(\"s\")\n    l.only_b",
+        // Opacity is per scope: the next method's locals are its own.
+        "l = ContractReboundA.new\n    l.take(\"s\")\n    l.only_b\n  end\n  def patched\n    o = ContractReboundA.new\n    def o.helper; end\n    binding.local_variable_set(:o, 1)",
+    ];
+    let expected: [&[&str]; 3] = [&["E0103", "E0101"], &["E0103", "E0101"], &["E0103", "E0101"]];
+    for (i, (body, codes)) in controls.iter().zip(expected).enumerate() {
+        let source = format!("{REBOUND_TARGETS}class ContractReboundUse\n  def run\n    {body}\n  end\nend\n");
+        let diags = check(&format!("rebound-control-{i}"), &source, None);
+        let got: Vec<&str> = diags.iter().filter(|d| matches!(d.code, "E0101" | "E0103")).map(|d| d.code).collect();
+        assert_eq!(got, codes, "control: {body}: {diags:?}");
+    }
 }

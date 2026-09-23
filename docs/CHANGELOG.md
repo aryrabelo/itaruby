@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- E0109 judges the whole body (review F9): it accuses only when EVERY
+  return point — each reachable explicit `return` (a bare `return` is
+  `nil`) and each leaf of the reachable implicit tail — is a literal and
+  none fits the declared return. One non-literal point (`return nil unless
+  x; x`) or one fitting literal (`return nil if RUBY_VERSION < "3.0";
+  "modern"`) keeps the body silent; before, each explicit `return` and the
+  tail were judged apart. A statement after one that always leaves the
+  method is no return point: `return`, a receiverless `raise`/`fail`, and
+  now an `unless … else …` or a `case … else` whose every branch leaves
+  (a `case` without `else` falls through). A body whose every return point
+  is a mismatching literal still accuses, naming them all.
+- A receiver no flow walk follows is `Unknown` (review F10), so it
+  dispatches to no Sorbet contract (E0103) and misses no method (E0101): a
+  `for` index (`item = A.new; for item in [B.new]` no longer keeps `A`),
+  every target of a nested or splatted multi-assignment (`(l, y), z = …`,
+  `a, *l = …`), a pattern capture (`v => l`, `v in [l]`) or a named
+  regexp capture (`/(?<l>.)/ =~ s`), and every local of a scope — blocks included, since a loop
+  or closure reaches earlier reads again — holding a string `eval` (`eval`,
+  or `instance_eval`/`class_eval`/`module_eval` without a block), a
+  `binding` call (`binding.local_variable_set`, `binding.eval`,
+  `binding.pry`), a `local_variable_set`, or a singleton method defined on
+  a local (`def l.m`, `class << l`). The same shapes lose their E0101 on
+  the rebound local.
 - A method defined through a receiver no constant names takes its name's
   contracts off everywhere (review F5): `k.class_eval { def m }`,
   `k.class_exec`/`k.module_eval`/`k.module_exec`/`k.instance_eval` blocks,

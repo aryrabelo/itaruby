@@ -2,6 +2,7 @@
 //! receivers/arguments never produce diagnostics.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -240,11 +241,16 @@ fn check_file_inner(
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.dark = dark;
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let dark_recs = std::mem::take(&mut checker.dark_recs);
@@ -572,11 +578,16 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.stats
 }
@@ -640,11 +651,16 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.goto_found
 }
@@ -736,11 +752,16 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let ty = checker
         .hover_ty
@@ -812,11 +833,16 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.constraint_outcomes
 }
@@ -1154,6 +1180,26 @@ struct Checker<'db> {
     /// nothing else can rebind it (see `prove_operand_locals`); empty on
     /// every `silent` walk, which emits nothing anyway.
     operand_locals: FxHashMap<String, Ty>,
+    /// The locals of the scope being walked whose collection type
+    /// arguments are proven (see `trusted_collection_locals`): every
+    /// other local read of an Array or Hash drops its element types.
+    /// Rebuilt and restored with `operand_locals`, but on EVERY walk,
+    /// silent ones included — a silent walk infers the method returns
+    /// that contracts are checked against.
+    trusted_collections: FxHashSet<String>,
+    /// `ivar_writes_hidden`'s SETTLED answers, per class and ivar name.
+    /// The index never changes during one check, so an answer computed
+    /// with no class walk in progress is final; one that met an
+    /// in-progress walk (the fixpoint fallback) is never stored.
+    ivar_hidden_memo: FxHashMap<ClassId, FxHashMap<String, bool>>,
+    /// `ProjectIndex::ancestors` per class for this check (the index is
+    /// immutable during it): `ivar_writes_hidden` reads the ancestry of
+    /// every class of a hierarchy, and a deep one must linearize each
+    /// class once, not once per ivar read per descendant.
+    ancestors_memo: FxHashMap<ClassId, Rc<(Vec<ClassId>, bool)>>,
+    /// Per (class, superclass) edge: how much of the class's ancestry is
+    /// its OWN (see `Checker::own_ancestry_len`).
+    own_ancestry_memo: FxHashMap<(ClassId, ClassId), usize>,
 }
 
 impl Checker<'_> {
@@ -1429,7 +1475,10 @@ impl Checker<'_> {
                     let mut class_env = Env::default();
                     let proven = self.scope_operand_locals(None, Some(&body));
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+                    let trusted = trusted_collection_locals(None, Some(&body));
+                    let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
             }
@@ -1447,7 +1496,10 @@ impl Checker<'_> {
                     let mut class_env = Env::default();
                     let proven = self.scope_operand_locals(None, Some(&body));
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+                    let trusted = trusted_collection_locals(None, Some(&body));
+                    let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
             }
@@ -1455,7 +1507,13 @@ impl Checker<'_> {
                 let sc = node.as_singleton_class_node().unwrap();
                 if sc.expression().as_self_node().is_some() {
                     if let Some(body) = sc.body() {
+                        // `class << self` opens a fresh local scope; the
+                        // walk still shares `env`, so its locals are
+                        // proven by their own scan, never the outer one.
+                        let trusted = trusted_collection_locals(None, Some(&body));
+                        let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                         self.walk_scope(scope, class, true, &body, env);
+                        self.trusted_collections = saved_trusted;
                     }
                 }
             }
@@ -1710,6 +1768,11 @@ impl Checker<'_> {
             def.body().as_ref(),
         );
         let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+        let trusted = trusted_collection_locals(
+            def.parameters().map(|p| p.as_node()).as_ref(),
+            def.body().as_ref(),
+        );
+        let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
         let saved_returns = std::mem::take(&mut self.returns);
         let saved_name = self
             .current_method_name
@@ -1801,6 +1864,7 @@ impl Checker<'_> {
         self.method_params = saved_method_params;
         self.rebindable_block_depth = saved_block_depth;
         self.operand_locals = saved_operands;
+        self.trusted_collections = saved_trusted;
         folded
     }
 
@@ -2019,7 +2083,10 @@ impl Checker<'_> {
             Node::LocalVariableReadNode { .. } => {
                 let n = node.as_local_variable_read_node().unwrap();
                 let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                env.get(&name).cloned().unwrap_or(Ty::Unknown)
+                let ty = env.get(&name).cloned().unwrap_or(Ty::Unknown);
+                // A collection this scope may change in place (or hand to
+                // code that can) holds unproven elements on EVERY read.
+                if self.trusted_collections.contains(&name) { ty } else { erase_type_arguments(&ty) }
             }
             Node::LocalVariableWriteNode { .. } => {
                 let n = node.as_local_variable_write_node().unwrap();
@@ -2090,9 +2157,14 @@ impl Checker<'_> {
                     return Ty::Unknown;
                 };
                 match self_ty {
+                    // An ivar collection is reachable from every method
+                    // of the object (and through any reader it exposes),
+                    // so an in-place change anywhere (`@items << x`) is
+                    // invisible to the write fold: its elements are never
+                    // proven.
                     SelfTy::Instance(c) => {
                         let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                        self.ivar_ty(c, &name)
+                        erase_type_arguments(&self.ivar_ty(c, &name))
                     }
                     _ => Ty::Unknown,
                 }
@@ -3815,6 +3887,7 @@ impl Checker<'_> {
                     let shape = CoreCallShape {
                         args: exact_arity.then_some(args.as_slice()),
                         int_literal: first_int_literal(call),
+                        block: call.block().is_some(),
                     };
                     let ret = core_call_ret(cc, &name, cm.ret, t, &shape);
                     if ret == Ty::Unknown {
@@ -5035,23 +5108,113 @@ impl Checker<'_> {
     ///   the descendants, or an ancestry that cannot rule one out;
     /// - a write to the same name in any ancestor's or descendant's own
     ///   instance methods, which run on this same object.
+    ///
+    /// Asked on every ivar read, so the settled answer is memoized per
+    /// (class, name) and every ancestry comes from `cached_ancestors`: a
+    /// deep hierarchy used to re-linearize each descendant on each read.
     fn ivar_writes_hidden(&mut self, class: ClassId, name: &str) -> bool {
         if self.index.hidden_ivar_writes_any || self.index.hidden_ivar_writes.contains(name) {
             return true;
         }
+        if let Some(&hidden) = self.ivar_hidden_memo.get(&class).and_then(|memo| memo.get(name)) {
+            return hidden;
+        }
+        let subtree = subclass_edges(self.index, class);
         let writer = format!("{}=", name.trim_start_matches('@'));
-        if !matches!(self.index.lookup_method(class, &writer), MethodLookup::NotFound)
-            || self.index.descendant_defines(class, &writer, false)
-        {
+        let (hidden, settled) = if self.ivar_writer_may_exist(class, &writer, &subtree) {
+            (true, true)
+        } else {
+            self.family_writes_ivar(class, name, &subtree)
+        };
+        if settled {
+            self.ivar_hidden_memo.entry(class).or_default().insert(name.to_owned(), hidden);
+        }
+        hidden
+    }
+
+    /// Does any ancestor or descendant of `class` write `name` in its own
+    /// instance methods? `(answer, settled)`: a member whose walk is in
+    /// progress answers `true` unsettled — the fixpoint fallback, never
+    /// memoized.
+    fn family_writes_ivar(&mut self, class: ClassId, name: &str, subtree: &[(ClassId, ClassId)]) -> (bool, bool) {
+        let ancestors = self.cached_ancestors(class);
+        let family = ancestors.0.iter().copied().chain(subtree.iter().map(|&(kid, _)| kid)).filter(|&c| c != class);
+        for member in family {
+            if !self.ensure_ivar_walk(member) {
+                return (true, false);
+            }
+            if self.ivar_class_memo.get(&member).is_some_and(|map| map.contains_key(name)) {
+                return (true, true);
+            }
+        }
+        (false, true)
+    }
+
+    /// `lookup_method(class, writer)` is not `NotFound`, or
+    /// `descendant_defines(class, writer, false)`: the same answer, read
+    /// off memoized ancestries. `subtree` is `class`'s descendants as
+    /// (class, superclass) edges.
+    ///
+    /// Past the ancestor walk and `descendant_defines`, every descendant
+    /// is closed and none defines the writer, which is where
+    /// `abstract_family_defines` then looks: a descendant answering every
+    /// name (`method_missing`/`respond_to_missing?`), an incomplete
+    /// ancestry, or an ancestry member defining the writer or open for a
+    /// reason other than `AbstractRaise`. Only a descendant's OWN part of
+    /// its ancestry is read (`own_ancestry_len`): the rest is exactly its
+    /// superclass's, which is `class` (read above) or another descendant
+    /// (read in its own turn).
+    fn ivar_writer_may_exist(&mut self, class: ClassId, writer: &str, subtree: &[(ClassId, ClassId)]) -> bool {
+        let index = self.index;
+        let supplies = |a: ClassId| {
+            let c = index.class(a);
+            (c.open && c.open_reason != Some(OpenReason::AbstractRaise)) || c.methods.contains_key(writer)
+        };
+        let ancestors = self.cached_ancestors(class);
+        if ancestors.0.iter().any(|&a| supplies(a)) || !ancestors.1 || index.class(class).is_module {
             return true;
         }
-        let (ancestors, _) = self.index.ancestors(class);
-        let family: Vec<ClassId> =
-            ancestors.into_iter().chain(descendants_of(self.index, class)).filter(|&c| c != class).collect();
-        family.into_iter().any(|member| {
-            !self.ensure_ivar_walk(member)
-                || self.ivar_class_memo.get(&member).is_some_and(|map| map.contains_key(name))
-        })
+        if subtree.iter().any(|&(kid, _)| index.class(kid).open || index.class(kid).methods.contains_key(writer)) {
+            return true;
+        }
+        for &(kid, parent) in subtree {
+            let methods = &index.class(kid).methods;
+            if methods.contains_key("method_missing") || methods.contains_key("respond_to_missing?") {
+                return true;
+            }
+            let chain = self.cached_ancestors(kid);
+            let own = self.own_ancestry_len(kid, parent);
+            if !chain.1 || chain.0[..own].iter().any(|&a| supplies(a)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `index.ancestors(id)`, linearized once per class per check.
+    fn cached_ancestors(&mut self, id: ClassId) -> Rc<(Vec<ClassId>, bool)> {
+        let index = self.index;
+        Rc::clone(self.ancestors_memo.entry(id).or_insert_with(|| Rc::new(index.ancestors(id))))
+    }
+
+    /// How long a prefix of `kid`'s ancestry is its own: when the rest is
+    /// EXACTLY `parent`'s ancestry (the linearization appends the
+    /// superclass chain after the class's prepends, itself and its
+    /// includes), the prefix before it; otherwise the whole ancestry.
+    fn own_ancestry_len(&mut self, kid: ClassId, parent: ClassId) -> usize {
+        if let Some(&len) = self.own_ancestry_memo.get(&(kid, parent)) {
+            return len;
+        }
+        let chain = self.cached_ancestors(kid);
+        let above = self.cached_ancestors(parent);
+        let len = chain
+            .0
+            .len()
+            .checked_sub(above.0.len())
+            .filter(|&start| chain.0[start..] == above.0[..])
+            .unwrap_or(chain.0.len());
+        self.own_ancestry_memo.insert((kid, parent), len);
+        len
     }
 
     /// Side channel for `ivar_ty`'s silent re-walk: record one write's type
@@ -5160,14 +5323,16 @@ impl Checker<'_> {
 }
 
 /// Every transitive subclass of `id` (the runtime classes an instance
-/// method of `id` can run on).
-fn descendants_of(index: &ProjectIndex, id: ClassId) -> Vec<ClassId> {
+/// method of `id` can run on), each with the superclass it was reached
+/// from, in depth-first discovery order.
+fn subclass_edges(index: &ProjectIndex, id: ClassId) -> Vec<(ClassId, ClassId)> {
     let mut out = Vec::new();
+    let mut seen = FxHashSet::default();
     let mut stack = vec![id];
     while let Some(cur) = stack.pop() {
         for &kid in index.subclasses.get(&cur).into_iter().flatten() {
-            if !out.contains(&kid) {
-                out.push(kid);
+            if seen.insert(kid) {
+                out.push((kid, cur));
                 stack.push(kid);
             }
         }
@@ -5407,11 +5572,13 @@ fn arity_str(m: &MethodSig) -> String {
 
 /// What a core call site proves about its arguments: `args` is the
 /// positional argument types when the call shape is exact (no splat, no
-/// keyword hash, no `...`), and `int_literal` the value of a first
-/// argument written as a plain Integer literal.
+/// keyword hash, no `...`), `int_literal` the value of a first
+/// argument written as a plain Integer literal, and `block` whether the
+/// call passes a block (a literal one or `&blk`).
 struct CoreCallShape<'a> {
     args: Option<&'a [Ty]>,
     int_literal: Option<i64>,
+    block: bool,
 }
 
 /// The first positional argument's value when it is written as an
@@ -5430,7 +5597,13 @@ fn first_int_literal(call: &CallNode<'_>) -> Option<i64> {
 /// types make the result trivially provable and is `Ty::Unknown`
 /// otherwise (invariant #1: a wrong precise type here becomes an E0101,
 /// E0103 or E0109 accusation downstream).
+///
+/// The block decides first: a table return describes one block shape
+/// only, so a call in the other shape is `Unknown` (`core_ret_holds_for_block`).
 fn core_call_ret(cc: CoreClass, name: &str, ret: CoreRet, recv: &Ty, shape: &CoreCallShape<'_>) -> Ty {
+    if !core_ret_holds_for_block(cc, name, shape.block) {
+        return Ty::Unknown;
+    }
     let Some(args) = shape.args else {
         return if core_ret_depends_on_args(cc, name) { Ty::Unknown } else { core_ret_to_ty(ret, recv) };
     };
@@ -5438,9 +5611,40 @@ fn core_call_ret(cc: CoreClass, name: &str, ret: CoreRet, recv: &Ty, shape: &Cor
         CoreClass::Integer => integer_call_ret(name, args, shape.int_literal),
         CoreClass::Float => float_call_ret(name, args, shape.int_literal),
         CoreClass::Array => array_call_ret(name, args, recv),
+        CoreClass::Hash => hash_call_ret(name, args, recv),
+        CoreClass::Str => str_call_ret(name, args, shape.block),
         _ => None,
     };
     answer.unwrap_or_else(|| core_ret_to_ty(ret, recv))
+}
+
+/// Does the table's return describe a call in this block shape? Two
+/// families of core methods answer something else entirely depending on
+/// the block, so the other shape is never proven:
+///
+/// - an ITERATOR called without a block answers an `Enumerator`, never
+///   the receiver or its elements (`[3, 1].each_with_index`,
+///   `{a: 1}.each`, `[1].sort_by`, `3.times`);
+/// - a method that BUILDS its result from the block answers what the
+///   block returned (`{a: 1}.to_h { |k, v| [k.to_s, v.to_s] }`,
+///   `a.merge(b) { |key, old, new| ... }`), and `String#split`/`#chars`
+///   with a block answer the receiver string instead of an Array.
+fn core_ret_holds_for_block(cc: CoreClass, name: &str, block: bool) -> bool {
+    if block {
+        return !matches!(
+            (cc, name),
+            (CoreClass::Hash, "to_h" | "merge") | (CoreClass::Str, "split" | "chars")
+        );
+    }
+    !matches!(
+        (cc, name),
+        (
+            CoreClass::Array,
+            "each" | "each_with_index" | "map" | "collect" | "select" | "filter" | "reject"
+                | "flat_map" | "sort_by" | "find_index"
+        ) | (CoreClass::Hash, "each" | "each_pair" | "map")
+            | (CoreClass::Integer, "times")
+    )
 }
 
 /// `Integer` methods whose return follows the arguments; `None` means
@@ -5514,8 +5718,59 @@ fn array_call_ret(name: &str, args: &[Ty], recv: &Ty) -> Option<Ty> {
             _ => Some(Ty::Unknown),
         },
         "flatten" => Some(flatten_ret(recv, args.is_empty())),
+        // The result holds the receiver's elements AND the arguments'
+        // (`[1] + ["a"]`, `[1].concat(["s"])`, `[1] << "s"`): the union of
+        // both sides when every side is known, else Unknown elements.
+        // An argument to `+`/`concat` that is not a proven Array (an
+        // object answering `to_ary`) has unknown elements.
+        "+" | "concat" => {
+            let parts = args.iter().map(|a| match a {
+                Ty::Array(e) => (**e).clone(),
+                _ => Ty::Unknown,
+            });
+            Some(Ty::Array(Box::new(union_with_elements(recv, parts))))
+        }
+        "<<" | "push" => Some(Ty::Array(Box::new(union_with_elements(recv, args.iter().cloned())))),
         _ => None,
     }
+}
+
+/// The receiver Array's element type unioned with `more` — `Unknown` as
+/// soon as any side is (`Ty::union` never absorbs an unknown member).
+fn union_with_elements(recv: &Ty, more: impl Iterator<Item = Ty>) -> Ty {
+    let Ty::Array(elem) = recv else { return Ty::Unknown };
+    more.fold((**elem).clone(), Ty::union)
+}
+
+/// `Hash` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn hash_call_ret(name: &str, args: &[Ty], recv: &Ty) -> Option<Ty> {
+    match name {
+        // `merge` holds the receiver's pairs AND every argument's
+        // (`{a: 1}.merge({b: "x"})`): unions when every side is a proven
+        // Hash, Unknown pairs otherwise.
+        "merge" => {
+            let Ty::Hash(k, v) = recv else { return Some(Ty::Unknown) };
+            let (mut key, mut val) = ((**k).clone(), (**v).clone());
+            for a in args {
+                let (ak, av) = match a {
+                    Ty::Hash(ak, av) => ((**ak).clone(), (**av).clone()),
+                    _ => (Ty::Unknown, Ty::Unknown),
+                };
+                key = Ty::union(key, ak);
+                val = Ty::union(val, av);
+            }
+            Some(Ty::Hash(Box::new(key), Box::new(val)))
+        }
+        _ => None,
+    }
+}
+
+/// `String` methods whose return follows the arguments; `None` means the
+/// table's own return applies. `gsub(pattern)` with no replacement and no
+/// block answers an `Enumerator`.
+fn str_call_ret(name: &str, args: &[Ty], block: bool) -> Option<Ty> {
+    (name == "gsub" && args.len() == 1 && !block).then_some(Ty::Unknown)
 }
 
 /// Does `core_call_ret` read the arguments for this method? Those answer
@@ -5525,17 +5780,22 @@ fn core_ret_depends_on_args(cc: CoreClass, name: &str) -> bool {
     match cc {
         CoreClass::Integer => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "clamp"),
         CoreClass::Float => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "round" | "floor" | "ceil"),
-        CoreClass::Array => {
-            matches!(name, "first" | "last" | "min" | "max" | "pop" | "shift" | "flatten")
-        }
+        CoreClass::Array => matches!(
+            name,
+            "first" | "last" | "min" | "max" | "pop" | "shift" | "flatten" | "+" | "concat" | "<<" | "push"
+        ),
+        CoreClass::Hash => name == "merge",
+        CoreClass::Str => name == "gsub",
         _ => false,
     }
 }
 
 /// `Array#flatten`: the receiver's type only when its elements cannot
-/// be flattened at all (a core scalar), the innermost element type for
-/// a full flatten of nested arrays of scalars; anything that may respond
-/// to `to_ary` (a project instance, an unknown, a union) is unproven.
+/// be flattened at all (a core scalar); a full flatten of nested arrays
+/// of scalars is an Array of what the INNER arrays hold, and those are
+/// shared by reference (see `CoreRet::Elem`), so its elements are
+/// unproven; anything that may respond to `to_ary` (a project instance,
+/// an unknown, a union) is unproven.
 fn flatten_ret(recv: &Ty, full: bool) -> Ty {
     fn scalar(t: &Ty) -> bool {
         matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool | Ty::Nil | Ty::Hash(_, _))
@@ -5551,7 +5811,7 @@ fn flatten_ret(recv: &Ty, full: bool) -> Ty {
     while let Ty::Array(e) = inner {
         inner = e;
     }
-    if scalar(inner) { Ty::Array(Box::new(inner.clone())) } else { Ty::Unknown }
+    if scalar(inner) { Ty::Array(Box::new(Ty::Unknown)) } else { Ty::Unknown }
 }
 
 fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {
@@ -5563,16 +5823,20 @@ fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {
         CoreRet::Bool => Ty::Bool,
         CoreRet::Nil => Ty::Nil,
         CoreRet::SelfSame => recv.clone(),
+        // An element that is itself a collection is shared by reference:
+        // `outer.first << "s"` changes what `outer` holds without writing
+        // `outer`, so a collection taken out of a collection never keeps
+        // its own type arguments.
         CoreRet::Elem => match recv {
-            Ty::Array(e) => (**e).clone(),
+            Ty::Array(e) => erase_type_arguments(e),
             _ => Ty::Unknown,
         },
         CoreRet::KeyArray => match recv {
-            Ty::Hash(k, _) => Ty::Array(k.clone()),
+            Ty::Hash(k, _) => Ty::Array(Box::new(erase_type_arguments(k))),
             _ => Ty::Unknown,
         },
         CoreRet::ValArray => match recv {
-            Ty::Hash(_, v) => Ty::Array(v.clone()),
+            Ty::Hash(_, v) => Ty::Array(Box::new(erase_type_arguments(v))),
             _ => Ty::Unknown,
         },
         CoreRet::StrArray => Ty::Array(Box::new(Ty::Str)),
@@ -6304,6 +6568,146 @@ impl<'pr> Visit<'pr> for OperandLocalScan {
     // The four scope gates below: a local written inside one of these is
     // never the local read outside it (Ruby opens a fresh local scope
     // there), so descending would poison names provably untouched.
+    fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+
+    fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+
+    fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+
+    fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+}
+
+/// Which locals of ONE Ruby scope keep their collection type arguments
+/// when read? An Array or Hash changes what it holds without its local
+/// ever being written — `arr << "s"`, `arr.map!`, `h[:k] = v`,
+/// `arr.clear.push(x)`, `mutate(arr)`, `b = arr; b << x` — and the flow
+/// walk tracks writes only. So the proof is an allowlist, not a list of
+/// mutators: a local is trusted only when EVERY read of it anywhere in
+/// the scope (blocks and lambdas included, the scope gates excluded, as
+/// in `prove_operand_locals`) is the receiver of a call that neither
+/// changes the receiver nor hands it out (`collection_read_keeps_elements`),
+/// or an iteration statement whose value is discarded
+/// (`discarded_iteration`). Any other read — an argument, an assignment's
+/// right-hand side, an element of a literal, a `return`, a condition, a
+/// receiver of any other method — makes every read of that name in the
+/// scope drop its element types. A string `eval` (or `binding`) can
+/// rewrite any local, so none is trusted.
+fn trusted_collection_locals(params: Option<&Node<'_>>, body: Option<&Node<'_>>) -> FxHashSet<String> {
+    let mut scan = CollectionReadScan::default();
+    if let Some(params) = params {
+        scan.visit(params);
+    }
+    if let Some(body) = body {
+        scan.visit(body);
+    }
+    if scan.bail {
+        return FxHashSet::default();
+    }
+    let CollectionReadScan { mut safe, escaped, .. } = scan;
+    safe.retain(|name| !escaped.contains(name));
+    safe
+}
+
+/// Calls that leave their receiver's contents alone and never return the
+/// receiver itself: queries, element reads, and methods that build a NEW
+/// collection. `each`, `to_a`, `to_h`, `itself`, `tap`, `freeze` and
+/// every bang or setter method are absent on purpose — they either
+/// change the receiver or answer it, and the answer is then an alias the
+/// scan cannot follow.
+fn collection_read_keeps_elements(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"first" | b"last" | b"size" | b"length" | b"count" | b"empty?" | b"any?" | b"all?"
+            | b"none?" | b"one?" | b"include?" | b"member?" | b"key?" | b"has_key?"
+            | b"value?" | b"has_value?" | b"min" | b"max" | b"sum" | b"join" | b"index"
+            | b"find_index" | b"rindex" | b"[]" | b"at" | b"dig" | b"fetch" | b"values_at"
+            | b"keys" | b"values" | b"map" | b"collect" | b"flat_map" | b"filter_map"
+            | b"select" | b"filter" | b"reject" | b"find" | b"detect" | b"find_all"
+            | b"sort" | b"sort_by" | b"min_by" | b"max_by" | b"group_by" | b"partition"
+            | b"uniq" | b"compact" | b"flatten" | b"reverse" | b"take" | b"drop"
+            | b"take_while" | b"drop_while" | b"zip" | b"reduce" | b"inject" | b"+" | b"-"
+            | b"&" | b"|" | b"==" | b"!=" | b"nil?" | b"is_a?" | b"kind_of?"
+            | b"instance_of?" | b"frozen?" | b"to_s" | b"inspect" | b"hash" | b"dup"
+            | b"transform_values" | b"transform_keys" | b"merge" | b"each_with_object"
+            | b"tally" | b"sample"
+    )
+}
+
+/// `arr.each { ... }` as a statement whose value nobody reads: the call
+/// answers the receiver, but the answer is dropped, so it leaks no alias.
+/// The last statement of a body is its value and never counts.
+fn discarded_iteration(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"each" | b"each_with_index" | b"each_pair" | b"each_key" | b"each_value"
+            | b"reverse_each" | b"each_index"
+    )
+}
+
+/// The scan behind `trusted_collection_locals`: `safe` holds names read
+/// through an allowlisted call, `escaped` every name read any other way.
+#[derive(Default)]
+struct CollectionReadScan {
+    safe: FxHashSet<String>,
+    escaped: FxHashSet<String>,
+    bail: bool,
+}
+
+impl CollectionReadScan {
+    /// When `call`'s receiver is a local read and `allowed` holds, record
+    /// it as a safe read and walk the rest of the call; `false` leaves
+    /// the call for the ordinary walk.
+    fn safe_receiver_read(&mut self, call: &CallNode<'_>, allowed: bool) -> bool {
+        let Some(local) = call.receiver().and_then(|r| r.as_local_variable_read_node().map(|l| l.name())) else {
+            return false;
+        };
+        if !allowed {
+            return false;
+        }
+        self.safe.insert(String::from_utf8_lossy(local.as_slice()).into_owned());
+        if let Some(args) = call.arguments() {
+            self.visit_arguments_node(&args);
+        }
+        if let Some(block) = call.block() {
+            self.visit(&block);
+        }
+        true
+    }
+}
+
+impl<'pr> Visit<'pr> for CollectionReadScan {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.escaped.insert(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+    }
+
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        let body: Vec<Node<'pr>> = node.body().iter().collect();
+        let value = body.len().saturating_sub(1);
+        for (i, statement) in body.iter().enumerate() {
+            if i < value {
+                if let Some(call) = statement.as_call_node() {
+                    if self.safe_receiver_read(&call, discarded_iteration(call.name().as_slice())) {
+                        continue;
+                    }
+                }
+            }
+            self.visit(statement);
+        }
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if matches!(
+            node.name().as_slice(),
+            b"eval" | b"instance_eval" | b"class_eval" | b"module_eval" | b"binding" | b"local_variable_set"
+        ) {
+            self.bail = true;
+        }
+        if !self.safe_receiver_read(node, collection_read_keeps_elements(node.name().as_slice())) {
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+
+    // Scope gates, exactly as `OperandLocalScan`'s.
     fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
 
     fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}

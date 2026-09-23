@@ -51,6 +51,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Release binary on a synthetic 1500-subclass project with `sorbet/rbi`
   present: CPU user 0.83s -> 0.06s (4 calls per subclass), 13.72s -> 5.43s (40 calls per subclass; ~4.9s of it is present without sorbet/rbi too), 8.29s -> 0.32s (same, base methods signed); median of 3 runs, 2026-09-22. A counter-based test
   (`contract_work_is_per_definition_not_per_call`) bounds the work.
+- The core model no longer hands a contract a collection it did not
+  prove. `+`, `concat`, `<<` and `push` answer an Array of the union of
+  the receiver's and the arguments' elements, and `merge` a Hash of the
+  union of both sides' pairs, when every side is a known collection;
+  otherwise the elements are Unknown (`([1] + ["a"]).last`,
+  `{a: 1}.merge(b: "x").values.last`). An iterator called without a block
+  (`each`, `each_with_index`, `map`, `select`, `sort_by`, `find_index`,
+  `Hash#each`/`#each_pair`/`#map`, `Integer#times`, `String#gsub` with only
+  a pattern) is an `Enumerator`, so its result is Unknown, never the
+  receiver. A method that builds its result from a block (`Hash#to_h`,
+  `Hash#merge`) and `String#split`/`#chars` with a block are Unknown. A
+  collection taken out of a collection (`first`, `last`, `pop`, `min`, a
+  full `flatten` of nested arrays) never keeps its own type arguments,
+  because it is shared by reference and `outer.first << x` changes it
+  without a write. A local collection keeps its element types only when
+  EVERY read of it in its scope is the receiver of a call that neither
+  changes nor returns it (`first`, `size`, `map`, `select`, `+`, ...) or an
+  `each` statement whose value is dropped; `arr << x`, `arr.map!`,
+  `h[:k] = v`, `arr.clear.push(x)`, passing `arr` to any method, `b = arr`,
+  returning it, or a string `eval`/`binding` in the scope erases its
+  element types on every read there, before and after. An ivar collection
+  never keeps its element types, since any method of the object (or any
+  caller of a reader) can change it in place. The category still binds:
+  an Array returned under `returns(String)` is accused. The trade-off is a
+  false negative: an element read of a collection that is also iterated
+  for its value, passed along or held in an ivar is no longer typed, and
+  `x.flatten.first` on nested arrays no longer resolves.
+- Ivar proofs cost one ancestry walk per class, not one per descendant per
+  read. The hidden-writer answer is memoized per class and ivar name once
+  no class walk is in progress, and every ancestry it reads is linearized
+  once per check; a descendant's inherited part of its ancestry is read
+  only through its superclass, so the answer is unchanged. Release binary
+  on a synthetic single-file chain where every class writes and reads its
+  own ivar: CPU user N=400 1.80s -> 0.20s, N=800 14.13s -> 0.72s, N=3000
+  826s wall -> 12.97s (the pre-regression binary measures 0.20s, 0.75s
+  and 12.86s; what remains is re-parsing the file once per class walk).
+  A counter-based test (`deep_hierarchy_ivar_reads_linearize_each_class_once`)
+  bounds the linearizations to two per class.
 - Known false negatives, documented rather than guessed. `.new` on a class
   with `extend T::Sig` does not check the arguments against `initialize`'s
   `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or

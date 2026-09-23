@@ -6842,6 +6842,18 @@ pub fn rbi_alias_expand<S: std::hash::BuildHasher>(qualified: &str, rbi_map: &Ha
     None
 }
 
+thread_local! {
+    static ANCESTOR_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times `ProjectIndex::ancestors` has linearized a class on
+/// this thread so far — a deterministic cost probe: a regression test
+/// bounds how many linearizations one check of a deep hierarchy may do
+/// (a wall-clock bound would be flaky across machines).
+pub fn ancestor_walks() -> u64 {
+    ANCESTOR_WALKS.with(std::cell::Cell::get)
+}
+
 /// Distinct `.rbi` files `rbi_declares` has actually read and parsed so
 /// far in this process — bead ita-vto's acceptance evidence that phase 2
 /// stays lazy (nowhere close to every file `RbiProject`'s phase-1 scan
@@ -7984,6 +7996,7 @@ impl ProjectIndex {
     /// when any named superclass/mixin failed to resolve in the index —
     /// callers must then treat lookups as Inconclusive.
     pub fn ancestors(&self, id: ClassId) -> (Vec<ClassId>, bool) {
+        ANCESTOR_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut out = Vec::new();
         let mut complete = true;
         let mut visited = std::collections::HashSet::new();

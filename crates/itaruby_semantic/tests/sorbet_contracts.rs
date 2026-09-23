@@ -1141,7 +1141,8 @@ class ContractFlatten
   def flat(x)
     x.flatten
   end
-  # The element survives flatten: `first` is an Integer, so `abs` resolves.
+  # The inner arrays are shared by reference, so what they hold is
+  # unproven after flatten: `first` is Unknown and `abs` stays silent.
   sig { params(x: T::Array[T::Array[Integer]]).returns(Integer) }
   def head(x)
     x.flatten.first.abs
@@ -1154,7 +1155,8 @@ class ContractFlatten
 end
 ", None);
     assert_eq!(codes(&diags), ["E0109"], "{diags:?}");
-    assert!(diags[0].message.contains("got Array[Integer]"), "{diags:?}");
+    // One flat Array, never the nested receiver type.
+    assert!(diags[0].message.contains("got Array[untyped]"), "{diags:?}");
 }
 
 #[test]
@@ -2352,4 +2354,402 @@ end
 
     let control = check_files("outside-family-control", &[&FAMILY.replace("CHILD", ""), hook]);
     assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the redefinition: {control:?}");
+}
+
+/// `+`, `concat`, `<<`, `push` and `merge` answer a collection holding BOTH
+/// sides: the union of the element types when every side is known, Unknown
+/// elements otherwise — never the receiver's type alone.
+#[test]
+fn combinators_hold_both_sides_elements() {
+    let diags = check("combinators", r#"
+class ContractCombine
+  extend T::Sig
+  sig { returns(String) }
+  def plus
+    ([1] + ["a"]).last
+  end
+  sig { returns(String) }
+  def concat
+    [1].concat(["s"]).last
+  end
+  sig { returns(String) }
+  def shovel
+    ([1] << "s").last
+  end
+  sig { returns(String) }
+  def push
+    [1].push("s").last
+  end
+  sig { returns(String) }
+  def merge
+    {a: 1}.merge({b: "x"}).values.last
+  end
+  sig { returns(String) }
+  def merge_keywords
+    {a: 1}.merge(b: "x").values.last
+  end
+  sig { params(other: T.untyped).returns(String) }
+  def unknown_side(other)
+    ([1] + other).last
+  end
+end
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("combinators-control", r"
+class ContractCombineControl
+  extend T::Sig
+  sig { returns(String) }
+  def plus
+    ([1] + [2]).last
+  end
+  sig { returns(String) }
+  def concat
+    [1].concat([2]).last
+  end
+  sig { returns(String) }
+  def shovel
+    ([1] << 2).last
+  end
+  sig { returns(String) }
+  def push
+    [1].push(2).last
+  end
+  sig { returns(String) }
+  def merge
+    {a: 1}.merge({b: 2}).values.last
+  end
+end
+", None);
+    assert_eq!(contract_codes(&control), ["E0109"; 5], "{control:?}");
+}
+
+/// An iterator called without a block answers an `Enumerator`, never the
+/// receiver: `Enumerator#to_a`/`#with_index` exist, `Array#with_index`
+/// and `String#to_a` do not.
+#[test]
+fn blockless_iterators_answer_an_enumerator() {
+    let diags = check("blockless", r#"
+class ContractBlockless
+  extend T::Sig
+  sig { params(pair: T::Array[Integer]).returns(Integer) }
+  def take(pair)
+    1
+  end
+  def calls
+    take([3, 1].each_with_index.to_a.last)
+    [1].sort_by.with_index { |x, i| i }
+    {a: 1}.each.with_index { |pair, i| i }
+    "abc".gsub(/b/).to_a
+  end
+end
+"#, None);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    let control = check("blockless-control", r"
+class ContractBlocklessControl
+  extend T::Sig
+  sig { params(pair: T::Array[Integer]).returns(Integer) }
+  def take(pair)
+    1
+  end
+  def calls
+    take([3, 1].each_with_index { |x, i| x }.last)
+    {a: 1}.each { |k, v| k }.with_index
+  end
+end
+", None);
+    assert_eq!(codes(&control), ["E0103", "E0101"], "{control:?}");
+}
+
+/// A method that builds its result from the block answers what the block
+/// returned; `split`/`chars` with a block answer the receiver string.
+#[test]
+fn block_built_core_results_are_unproven() {
+    const SOURCE: &str = r#"
+class ContractBlockBuilt
+  extend T::Sig
+  sig { params(s: String).returns(Integer) }
+  def take(s)
+    1
+  end
+  def calls
+    take({a: 1}.to_h BLOCK_TO_H.values.last)
+    take({a: 1}.merge({a: 2}) BLOCK_MERGE.values.last)
+    take("a b".split(" ") BLOCK_SPLIT)
+  end
+end
+"#;
+    let built = SOURCE
+        .replace("BLOCK_TO_H", "{ |k, v| [k.to_s, v.to_s] }")
+        .replace("BLOCK_MERGE", "{ |k, x, y| \"s\" }")
+        .replace("BLOCK_SPLIT", "{ |w| w }");
+    let diags = check("block-built", &built, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let plain = SOURCE.replace("BLOCK_TO_H", "").replace("BLOCK_MERGE", "").replace("BLOCK_SPLIT", "");
+    let control = check("block-built-control", &plain, None);
+    assert_eq!(contract_codes(&control), ["E0103"; 3], "{control:?}");
+}
+
+/// A local collection changed in place, or handed to anything that can
+/// change it, holds unproven elements on every read in its scope.
+#[test]
+fn in_place_changes_unprove_a_local_collection() {
+    let diags = check("in-place", r#"
+class ContractInPlace
+  extend T::Sig
+  sig { returns(String) }
+  def shovel
+    arr = [1]
+    arr << "s"
+    arr.last
+  end
+  sig { returns(String) }
+  def map_bang
+    arr = [1]
+    arr.map!(&:to_s)
+    arr.last
+  end
+  sig { returns(String) }
+  def replace
+    arr = [1]
+    arr.replace(["s"])
+    arr.last
+  end
+  sig { returns(String) }
+  def unshift
+    arr = [1]
+    arr.unshift("s")
+    arr.first
+  end
+  sig { returns(String) }
+  def fill
+    arr = [1]
+    arr.fill("s")
+    arr.last
+  end
+  sig { returns(String) }
+  def clear_push
+    arr = [1]
+    arr.clear.push("s")
+    arr.last
+  end
+  sig { returns(String) }
+  def helper
+    arr = [1]
+    mutate(arr)
+    arr.last
+  end
+  sig { returns(String) }
+  def alias_write
+    arr = [1]
+    other = arr
+    other << "s"
+    arr.last
+  end
+  sig { returns(String) }
+  def store
+    h = {a: 1}
+    h[:b] = "s"
+    h.values.last
+  end
+  sig { returns(String) }
+  def iteration_value
+    arr = [1]
+    other = (arr.each(&:to_s))
+    other << "s"
+    arr.last
+  end
+  def mutate(a)
+    a << "s"
+  end
+end
+class ContractInPlaceScopes
+  list = [1]
+  list.size
+  class << self
+    list = [1]
+    list << "s"
+    list.last.upcase
+  end
+end
+"#, None);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // A string `eval` can rewrite any local of its scope.
+    let evaled = check("in-place-eval", r#"
+class ContractInPlaceSink
+  extend T::Sig
+  sig { params(s: String).returns(String) }
+  def take(s)
+    s
+  end
+end
+arr = [1]
+eval("arr << 's'")
+ContractInPlaceSink.new.take(arr.last)
+"#, None);
+    assert!(evaled.is_empty(), "{evaled:?}");
+
+    // Reads that neither change nor hand out the collection keep it: a
+    // query, and an iteration whose value is dropped.
+    let control = check("in-place-control", r"
+class ContractInPlaceControl
+  extend T::Sig
+  sig { returns(String) }
+  def reads
+    arr = [1]
+    arr.size
+    arr.each(&:to_s)
+    arr.last
+  end
+end
+", None);
+    assert_eq!(contract_codes(&control), ["E0109"], "{control:?}");
+}
+
+/// A collection inside a collection is shared by reference: changing it
+/// through one path changes what the outer one holds.
+#[test]
+fn a_collection_inside_a_collection_is_shared() {
+    let diags = check("nested", r#"
+class ContractNested
+  extend T::Sig
+  sig { returns(String) }
+  def first_inner
+    outer = [[1]]
+    outer.first << "s"
+    outer.first.last
+  end
+  sig { returns(String) }
+  def hash_values
+    outer = {a: [1]}
+    outer[:a] << "s"
+    outer.values.first.last
+  end
+  sig { returns(String) }
+  def flattened
+    outer = [[1]]
+    outer.first << "s"
+    outer.flatten.last
+  end
+end
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    // The category of the inner collection is still proven.
+    let control = check("nested-control", r"
+class ContractNestedControl
+  extend T::Sig
+  sig { returns(String) }
+  def first_inner
+    outer = [[1]]
+    outer.first
+  end
+end
+", None);
+    assert_eq!(contract_codes(&control), ["E0109"], "{control:?}");
+}
+
+/// An ivar collection can be changed in place by any method of the object;
+/// the write fold never sees it, so its elements are unproven.
+#[test]
+fn ivar_collections_hold_unproven_elements() {
+    let diags = check("ivar-collection", r"
+class ContractIvarCollection
+  extend T::Sig
+  def initialize
+    @items = [1]
+  end
+  def add(item)
+    @items << item
+  end
+  sig { returns(String) }
+  def newest
+    @items.last
+  end
+end
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("ivar-collection-control", r"
+class ContractIvarCollectionControl
+  extend T::Sig
+  def initialize
+    @items = [1]
+  end
+  sig { returns(String) }
+  def all
+    @items
+  end
+end
+", None);
+    assert_eq!(contract_codes(&control), ["E0109"], "{control:?}");
+}
+
+/// The memoized writer lookup behind ivar proofs still sees what a
+/// descendant brings along: a module it includes that defines the writer,
+/// or a `method_missing` (here a literal `alias_method`, which leaves the
+/// class closed) that answers any name.
+#[test]
+fn ivar_writer_supplied_below_the_reader_is_unproven() {
+    const SOURCE: &str = r"
+module ContractIvarNamed
+  attr_writer :name
+end
+class ContractIvarModBase
+  extend T::Sig
+  def initialize
+    @name = :anon
+  end
+  sig { returns(String) }
+  def label
+    @name
+  end
+end
+class ContractIvarModChild < ContractIvarModBase
+  MIXIN
+end
+class ContractIvarGhostBase
+  extend T::Sig
+  def initialize
+    @name = :anon
+  end
+  sig { returns(String) }
+  def label
+    @name
+  end
+end
+class ContractIvarGhostChild < ContractIvarGhostBase
+  GHOST
+end
+";
+    let supplied = SOURCE
+        .replace("MIXIN", "include ContractIvarNamed")
+        .replace("GHOST", "def ghost(name, *args)\n    nil\n  end\n  alias_method :method_missing, :ghost");
+    let diags = check("ivar-writer-below", &supplied, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("ivar-writer-below-control", &SOURCE.replace("MIXIN", "").replace("GHOST", ""), None);
+    assert_eq!(contract_codes(&control), ["E0109"; 2], "{control:?}");
+}
+
+/// Every class of a deep hierarchy reads an ivar it writes: whether some
+/// other writer hides it is settled once per (class, ivar) on memoized
+/// ancestries, so the check linearizes each class a bounded number of
+/// times instead of once per descendant per read.
+#[test]
+fn deep_hierarchy_ivar_reads_linearize_each_class_once() {
+    const DEPTH: u64 = 150;
+    let chain: Vec<String> = (1..DEPTH)
+        .map(|i| format!("class Deep{i} < Deep{}\n  def w{i}\n    @b{i} = 1\n    @b{i}.abs\n  end\nend\n", i - 1))
+        .collect();
+    let source = format!("class Deep0\n  def initialize\n    @a = 1\n  end\n  def r0\n    @a.abs\n  end\nend\n{}", chain.concat());
+    let before = itaruby_semantic::ancestor_walks();
+    let diags = check("deep-hierarchy", &source, None);
+    let walks = itaruby_semantic::ancestor_walks() - before;
+    assert!(diags.is_empty(), "{diags:?}");
+    // Once per class; the old per-read walk did ~DEPTH^2 / 2.
+    assert!(walks <= 2 * DEPTH, "{walks} linearizations for {DEPTH} classes");
 }

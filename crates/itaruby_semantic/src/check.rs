@@ -68,6 +68,18 @@ impl LiteralClass {
         }
     }
 
+    /// Every core class and module a value of this literal's class
+    /// answers methods from (`core_pollution_names`).
+    fn core_ancestry(&self) -> &'static [&'static str] {
+        match self {
+            LiteralClass::Modeled(ty) => core_class_of(ty).map_or(&["Object", "Kernel"], core_pollution_names),
+            LiteralClass::Other("Range") => &["Range", "Enumerable", "Object", "Kernel"],
+            LiteralClass::Other("Rational") => &["Rational", "Numeric", "Comparable", "Object", "Kernel"],
+            LiteralClass::Other("Complex") => &["Complex", "Numeric", "Comparable", "Object", "Kernel"],
+            LiteralClass::Other(_) => &["Regexp", "Object", "Kernel"],
+        }
+    }
+
     /// The class the contract compared, and nothing it did not: a
     /// collection literal is named by its category alone, because its type
     /// arguments were never part of the verdict.
@@ -4900,7 +4912,24 @@ impl Checker<'_> {
     fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
         !self.index.sorbet_runtime_unchecked
             && !leaves.is_empty()
-            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map))
+            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))
+    }
+
+    /// sorbet-runtime decides a value's fit with `is_a?`: a project that
+    /// defines `is_a?`, `kind_of?` or `instance_of?` anywhere on a
+    /// literal's core ancestry — its reopen, a module it includes, a
+    /// definer or eval block aimed at it, or `Object`/`Kernel` — decides
+    /// what that literal satisfies, so it never accuses. Only a readable
+    /// definition counts: a body nobody can read (an unresolved gem
+    /// module mixed into `Object`, `include T::Sig` at top level among
+    /// them) is not taken as one, or every such project would lose every
+    /// literal contract.
+    fn type_test_unpatched(&self, leaf: &LiteralClass) -> bool {
+        let keys = crate::index::TYPE_TEST_NAMES;
+        !keys.iter().any(|k| self.index.polluted_any_class.contains(*k))
+            && !leaf.core_ancestry().iter().any(|class| {
+                self.index.polluted_methods.get(*class).is_some_and(|defined| keys.iter().any(|k| defined.contains(*k)))
+            })
     }
 
     /// E0106 (bead ita-yho): literal-argument-only, cast-is-provably-

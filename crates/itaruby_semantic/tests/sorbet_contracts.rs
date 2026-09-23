@@ -3724,3 +3724,193 @@ ContractErased.new.names.absent_on_array
         ("    items.first", "first", None),
     ]);
 }
+
+// -- redefinition through a receiver no constant names (review F5, F11) --
+
+/// `SCALED`'s two signed methods, called once more with an Integer: hover
+/// on each call tells whether the sig still types its consumer.
+const SCALED_CONSUMERS: &str = "ContractScaleCfg.scale(1)\nContractScaleCfg.new.grow(1)\n";
+
+/// The accusations left, and whether each signed method still types its
+/// consumer, when `outside` is added to a `SCALED` project.
+fn hidden_outcome(name: &str, outside: &str) -> (Vec<String>, [Option<String>; 2]) {
+    let base = scaled("");
+    let with_strings = format!("{STRING_SCALE}{outside}");
+    let sources = [base.as_str(), with_strings.as_str()];
+    let accused = scaled_accusations(&check_files(name, &sources), &sources);
+    let typed = |at: &str| ty_in(&format!("{name}-{at}"), &[SCALED_CONSUMERS, &base, &with_strings], at, at);
+    (accused, [typed("scale"), typed("grow")])
+}
+
+/// Wraps `body` in a method whose parameters (`k`, `name`) no constant names.
+fn hidden_patch(body: &str) -> String {
+    format!("module ContractHiddenPatch\n  def self.patch(k, name)\n    {body}\n  end\nend\n")
+}
+
+/// A method defined through a receiver the index cannot name may land on
+/// ANY class, so every contract of that name — both tracks — comes off,
+/// and the sig no longer types its consumer. A name nobody can read, a
+/// string body, or a module nobody can enumerate takes every contract off.
+#[test]
+fn redefinition_through_an_unnamed_receiver_poisons_by_name() {
+    let grow_def = "do\n      def grow(x)\n        x.to_s\n      end\n    end";
+    let scale_def = "do\n      def scale(x)\n        x.to_s\n      end\n    end";
+    let grow_only = [
+        hidden_patch(&format!("k.class_eval {grow_def}")),
+        hidden_patch(&format!("k.class_exec {grow_def}")),
+        hidden_patch(&format!("k.module_eval {grow_def}")),
+        hidden_patch(&format!("k.instance_eval {grow_def}")),
+        hidden_patch("k.define_method(:grow) { |x| x.to_s }"),
+        hidden_patch("k.send(:define_method, :grow) { |x| x.to_s }"),
+        hidden_patch("k.alias_method(:grow, :to_s)"),
+        hidden_patch("k.prepend(ContractStringGrow)"),
+        hidden_patch("k.include(ContractStringGrow)"),
+        hidden_patch("k.define_singleton_method(:grow) { |x| x.to_s }"),
+        hidden_patch("def k.grow(x)\n      x.to_s\n    end"),
+        format!("Object.const_get(:ContractScaleCfg).class_eval {grow_def}\n"),
+        format!("ObjectSpace.each_object(Class) do |k|\n  k.class_eval {grow_def}\nend\n"),
+        format!("[ContractScaleCfg, String].each do |k|\n  k.class_eval {grow_def}\nend\n"),
+        "obj = ContractScaleCfg.new\nclass << obj\n  def grow(x)\n    x.to_s\n  end\nend\n".to_owned(),
+        format!("module ContractHiddenRefine\n  refine Object.const_get(:ContractScaleCfg) {grow_def}\nend\n"),
+    ];
+    for (i, outside) in grow_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-grow-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    let scale_only = [
+        hidden_patch("k.define_singleton_method(:scale) { |x| x.to_s }"),
+        hidden_patch("class << k\n      def scale(x)\n        x.to_s\n      end\n    end"),
+        hidden_patch("k.extend(ContractStringScale)"),
+        hidden_patch("k.singleton_class.define_method(:scale) { |x| x.to_s }"),
+        hidden_patch("k.singleton_class.prepend(ContractStringScale)"),
+        hidden_patch(&format!("k.singleton_class.class_eval {scale_def}")),
+    ];
+    for (i, outside) in scale_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-scale-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+        assert_eq!(typed, [None, Some("Integer".to_owned())], "{outside}");
+    }
+    let every_name = [
+        hidden_patch("k.define_method(name) { |x| x.to_s }"),
+        hidden_patch("k.send(:define_method, name) { |x| x.to_s }"),
+        hidden_patch("k.define_singleton_method(name) { |x| x.to_s }"),
+        hidden_patch("k.class_eval(\"def grow(x) x.to_s end\")"),
+        hidden_patch("k.class_eval do\n      define_method(name) { |x| x.to_s }\n    end"),
+        hidden_patch("k.include(ContractScaleUnknown::Patch)"),
+        "eval(\"class ContractScaleCfg; def grow(x) = x.to_s; end\")\n".to_owned(),
+        // A type test decides what a literal of whatever class it lands on
+        // satisfies.
+        hidden_patch("k.define_method(:is_a?) { |_klass| true }"),
+    ];
+    for (i, outside) in every_name.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-all-{i}"), outside);
+        assert!(accused.is_empty(), "{outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "{outside}");
+    }
+
+    // Controls: an unnamed receiver that defines another name, and a named
+    // receiver defining the same name on another class, take nothing off.
+    let controls = [
+        hidden_patch("k.class_eval do\n      def unrelated(x)\n        x\n      end\n    end"),
+        hidden_patch("k.define_method(:unrelated) { |x| x }"),
+        // A `send` of a name nobody can read is a call, not a definition.
+        hidden_patch("k.send(name, 1)\n    k.public_send(name)"),
+        // An `instance_eval` DSL body calls methods; only its defs define.
+        hidden_patch("k.instance_eval do\n      setting :grow\n    end"),
+        hidden_patch("k.prepend(ContractHiddenQuiet)\n    k.extend(ContractHiddenQuiet)")
+            + "module ContractHiddenQuiet\n  def quiet; end\nend\n",
+        format!("class ContractScaleOther; end\nContractScaleOther.class_eval {grow_def}\nContractScaleOther.define_singleton_method(:scale) {{ |x| x.to_s }}\n"),
+        // A mixin hook's own receiver is the module's includers, which the
+        // include-time passes judge: a hook nobody includes redefines nothing.
+        format!("module ContractHiddenHook\n  def self.included(base)\n    base.define_method(:grow) {{ |x| x.to_s }}\n    base.class_eval {grow_def}\n  end\n  def self.extended(base)\n    base.define_singleton_method(:scale) {{ |x| x.to_s }}\n  end\nend\n"),
+    ];
+    for (i, outside) in controls.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-control-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "control: {outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), Some("Integer".to_owned())], "control: {outside}");
+    }
+}
+
+/// `Alias = Foo; class Alias; def m` reopens `Foo` itself: the second
+/// definition of a signed method is a redefinition like any other.
+#[test]
+fn reopen_through_a_constant_alias_is_a_redefinition() {
+    // Reopening a subclass through its alias overrides the parent's
+    // signed method for every instance of that subclass.
+    const FAMILY: &str = r#"
+class ContractAliasParent
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+class ContractAliasChild < ContractAliasParent
+end
+class ContractAliasUser
+  extend T::Sig
+  sig { params(parent: ContractAliasParent).void }
+  def use(parent)
+    parent.grow("text")
+  end
+end
+"#;
+    let reopens = [
+        ("ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def grow(x)\n    x.to_s\n  end\nend\n", "ContractScaleCfg.scale(\"text\")"),
+        ("ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def self.scale(x)\n    x.to_s\n  end\nend\n", "ContractScaleCfg.new.grow(\"text\")"),
+    ];
+    for (i, (outside, left)) in reopens.iter().enumerate() {
+        let (accused, _) = hidden_outcome(&format!("alias-reopen-{i}"), outside);
+        assert_eq!(accused, [*left], "{outside}");
+    }
+    let control = "ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def unrelated(x)\n    x\n  end\nend\n";
+    let (accused, _) = hidden_outcome("alias-reopen-control", control);
+    assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "control: {control}");
+
+    let reopen = "ContractAliasSpelling = ContractAliasChild\nclass ContractAliasSpelling\n  def METHOD(x)\n    x.to_s\n  end\nend\n";
+    let diags = check_files("alias-reopen-parent", &[FAMILY, &reopen.replace("METHOD", "grow")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let control = check_files("alias-reopen-parent-control", &[FAMILY, &reopen.replace("METHOD", "unrelated")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control: {control:?}");
+}
+
+/// sorbet-runtime checks a value with `is_a?`: a project that redefines
+/// `is_a?`, `kind_of?` or `instance_of?` on a core class — in its reopen,
+/// in a module it includes, or on `Object`/`Kernel` — decides what that
+/// class's literals satisfy, so none of them accuses. Other core classes
+/// still do.
+#[test]
+fn redefined_type_test_on_a_core_class_silences_its_literals() {
+    const TAKE: &str = r#"
+class ContractTypeTest
+  extend T::Sig
+  sig { params(x: Integer).void }
+  def take(x); end
+  sig { returns(Integer) }
+  def text
+    "text"
+  end
+end
+ContractTypeTest.new.take("text")
+ContractTypeTest.new.take(:sym)
+"#;
+    let patches = [
+        "class String\n  def is_a?(klass)\n    true\n  end\nend\n",
+        "class String\n  def kind_of?(klass)\n    true\n  end\nend\n",
+        "class String\n  def instance_of?(klass)\n    true\n  end\nend\n",
+        "module ContractLenient\n  def is_a?(klass)\n    true\n  end\nend\nclass String\n  include ContractLenient\nend\n",
+    ];
+    for (i, patch) in patches.iter().enumerate() {
+        let source = format!("{patch}{TAKE}");
+        let diags = check(&format!("type-test-{i}"), &source, None);
+        assert_eq!(contract_names(&source, &diags), [":sym"], "{patch}: {diags:?}");
+    }
+    let source = format!("module Kernel\n  def is_a?(klass)\n    true\n  end\nend\n{TAKE}");
+    let diags = check("type-test-kernel", &source, None);
+    assert!(contract_names(&source, &diags).is_empty(), "{diags:?}");
+
+    let source = format!("class String\n  def shout\n    upcase\n  end\nend\n{TAKE}");
+    let control = check("type-test-control", &source, None);
+    assert_eq!(contract_names(&source, &control), ["text", "\"text\"", ":sym"], "control: {control:?}");
+}

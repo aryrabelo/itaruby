@@ -82,7 +82,14 @@ with its declared return, type arguments erased, and its params are never
 judged. Everything else stays silent rather than guessed:
 generics, procs, overloads, rest and block parameters, duplicate
 definitions or any other redefinition (a `class << X` patch, a hook, a
-`class_eval`), and open classes. Two known
+`class_eval`, a reopen through a constant alias), and open classes. A
+method defined through a receiver no constant names (`k.class_eval { def
+m }`, `k.define_method(:m)`, `def k.m`, `k.prepend(M)`, a block parameter
+of `[A, B].each`) takes the contract of every method of that name off,
+everywhere; one whose name cannot be read (`define_method(name)`, a
+string body, a bare `eval`) takes every contract off. A literal of a core
+class whose `is_a?`, `kind_of?` or `instance_of?` the project redefines
+never accuses. Two known
 gaps follow from that: `Foo.new(...)` is not checked against
 `initialize`'s `sig`, and a method with a `*rest`, `**kwrest`, `&block` or
 post parameter loses its whole contract, the return type included. Keep running
@@ -114,7 +121,7 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`) |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class) |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |

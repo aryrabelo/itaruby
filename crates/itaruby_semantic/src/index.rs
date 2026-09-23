@@ -598,6 +598,10 @@ pub struct FileDefs {
     /// with more than one argument, with the lexical nesting at the call:
     /// see `ProjectIndex::ambiguous_mixins`.
     pub ambiguous_mixins: Vec<(String, Vec<String>)>,
+    /// What each definition or mixin aimed at a receiver no constant names
+    /// can put on it, with the lexical nesting at the site: see
+    /// `FileScan::note_hidden` and `poison_hidden_redefinitions`.
+    pub hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -678,6 +682,8 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         sorbet_sig_everywhere: false,
         sig_hook_swallowers: Vec::new(),
         ambiguous_mixins: Vec::new(),
+        hidden_definitions: Vec::new(),
+        hook_frames: Vec::new(),
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -705,6 +711,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         sorbet_sig_everywhere: scan.sorbet_sig_everywhere,
         sig_hook_swallowers: scan.sig_hook_swallowers,
         ambiguous_mixins: scan.ambiguous_mixins,
+        hidden_definitions: scan.hidden_definitions,
     }
 }
 
@@ -925,6 +932,11 @@ struct FileScan {
     sorbet_sig_everywhere: bool,
     sig_hook_swallowers: Vec<String>,
     ambiguous_mixins: Vec<(String, Vec<String>)>,
+    hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
+    /// One frame per `def` being walked: the receiver parameter of a
+    /// mixin hook (`def self.included(base)`) and how many block scopes
+    /// deep the walk is inside it — see `FileScan::hidden_receiver`.
+    hook_frames: Vec<(Option<String>, u32)>,
 }
 
 /// Whose instance variable an `@x` write at this point of `FileScan`'s
@@ -984,6 +996,12 @@ impl<'pr> Visit<'pr> for FileScan {
     }
 
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // `class << obj` on anything but `self` or a constant: its body
+        // defines on an object nobody can name.
+        if self.hidden_receiver(&node.expression()) {
+            let sources = statements_pollution(node.body().as_ref(), 0);
+            self.note_hidden(sources);
+        }
         self.ivar_scopes.push(IvarScope::Opaque);
         ruby_prism::visit_singleton_class_node(self, node);
         self.ivar_scopes.pop();
@@ -1042,6 +1060,7 @@ impl<'pr> Visit<'pr> for FileScan {
             let source = PollutionSource::Names(vec![name]);
             self.push_keyed(Some(target.trim_start_matches("::")), vec![PollutionSource::Singleton(Box::new(source))]);
         }
+        self.note_hidden_def(node);
         self.note_const_returning_body(node);
         self.note_swallowed_sig_hook(node);
         let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
@@ -1049,10 +1068,18 @@ impl<'pr> Visit<'pr> for FileScan {
         self.ivar_scopes.push(scope);
         self.nested += 1;
         self.def_locals.push(FxHashMap::default());
+        self.hook_frames.push((mixin_hook_param(node, in_body), 0));
         ruby_prism::visit_def_node(self, node);
+        self.hook_frames.pop();
         self.def_locals.pop();
         self.nested -= 1;
         self.ivar_scopes.pop();
+    }
+
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.enter_block_scope(1);
+        ruby_prism::visit_lambda_node(self, node);
+        self.enter_block_scope(-1);
     }
 
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
@@ -1063,7 +1090,9 @@ impl<'pr> Visit<'pr> for FileScan {
         let in_def = self.ivar_scopes.last() == Some(&IvarScope::InstanceDef);
         self.ivar_scopes.push(if lexical && in_def { IvarScope::InstanceDef } else { IvarScope::Opaque });
         self.nested += 1;
+        self.enter_block_scope(1);
         ruby_prism::visit_block_node(self, node);
+        self.enter_block_scope(-1);
         self.nested -= 1;
         self.ivar_scopes.pop();
     }
@@ -1103,6 +1132,7 @@ impl<'pr> Visit<'pr> for FileScan {
         self.note_refinement(node);
         self.note_opaque_eval(node);
         self.note_injection(node);
+        self.note_hidden_call(node);
         self.note_load_hook_base(node);
         self.note_sorbet_runtime_hazard(node);
         ruby_prism::visit_call_node(self, node);
@@ -1386,6 +1416,9 @@ impl FileScan {
             .and_then(|a| const_path_str(&a))
             .map(|p| p.trim_start_matches("::").to_string());
         let sources = block_pollution(node.block().as_ref());
+        if target.is_none() {
+            self.note_hidden(sources.clone());
+        }
         self.push_keyed(target.as_deref(), sources);
         match node
             .arguments()
@@ -1711,6 +1744,169 @@ impl FileScan {
         const_path_str(&recv).map(|p| p.trim_start_matches("::").to_string())
     }
 
+    /// A definition or mixin aimed at a receiver no constant names
+    /// (`k.class_eval { def m }`, `k.define_method(:m)`,
+    /// `Object.const_get(x).prepend(M)`, a block parameter of
+    /// `[A, B].each`): the method may land on ANY class, so what it can
+    /// define poisons contracts by name project-wide
+    /// (`poison_hidden_redefinitions`). A `Module`-level eval body is read
+    /// like a class body — an unrecognized macro there may define
+    /// anything; an `instance_eval`/`instance_exec` block is a DSL body
+    /// whose unrecognized calls are calls, so only its `def`s and literal
+    /// definers count (`instance_block_definitions`). A string body, a
+    /// block argument to a `Module`-level eval and a bare `eval` can
+    /// define anything.
+    fn note_hidden_call(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let id = node.name();
+        let name = id.as_slice();
+        let has_arg = node.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+        if name == b"eval" {
+            if has_arg {
+                self.note_hidden(vec![PollutionSource::Opaque]);
+            }
+            return;
+        }
+        // Name test before the receiver test, which allocates: this runs
+        // on every call node in every file.
+        let evals = matches!(
+            name,
+            b"class_eval" | b"module_eval" | b"class_exec" | b"module_exec" | b"instance_eval" | b"instance_exec"
+        );
+        if !evals && !is_definer_name(name) {
+            return;
+        }
+        if node.receiver().is_some_and(|recv| self.hidden_receiver(&recv)) {
+            self.note_hidden(hidden_call_sources(node, has_arg));
+        }
+    }
+
+    /// `def obj.m` on a receiver nobody can name.
+    fn note_hidden_def(&mut self, node: &ruby_prism::DefNode<'_>) {
+        if node.receiver().is_some_and(|recv| self.hidden_receiver(&recv)) {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            self.note_hidden(vec![PollutionSource::Names(vec![name])]);
+        }
+    }
+
+    /// A receiver no constant names, other than a mixin hook's own
+    /// receiver parameter read from the hook's scope: what
+    /// `def self.included(base); base.define_method(:m)` installs lands on
+    /// the module's includers, which `poison_include_time_redefinitions`
+    /// (and the extend-hook passes) already take every contract off. A
+    /// block parameter shadowing that name is a different object.
+    fn hidden_receiver(&self, recv: &Node<'_>) -> bool {
+        if !unnamed_receiver(recv) {
+            return false;
+        }
+        let hook_param = recv.as_local_variable_read_node().is_some_and(|read| {
+            self.hook_frames.last().is_some_and(|(param, blocks)| {
+                param.as_deref().is_some_and(|p| p.as_bytes() == read.name().as_slice()) && read.depth() == *blocks
+            })
+        });
+        !hook_param
+    }
+
+    /// One block or lambda scope entered (`1`) or left (`-1`) inside the
+    /// innermost `def`: see `hidden_receiver`.
+    fn enter_block_scope(&mut self, step: i32) {
+        if let Some((_, blocks)) = self.hook_frames.last_mut() {
+            *blocks = blocks.saturating_add_signed(step);
+        }
+    }
+
+    fn note_hidden(&mut self, sources: Vec<PollutionSource>) {
+        for source in sources {
+            self.hidden_definitions.push((self.nesting.clone(), source));
+        }
+    }
+}
+
+/// What one call on an unnamed receiver can define — see
+/// `FileScan::note_hidden_call`.
+fn hidden_call_sources(node: &ruby_prism::CallNode<'_>, has_arg: bool) -> Vec<PollutionSource> {
+    let id = node.name();
+    match id.as_slice() {
+        b"class_eval" | b"module_eval" | b"instance_eval" if has_arg => vec![PollutionSource::Opaque],
+        b"class_eval" | b"module_eval" | b"class_exec" | b"module_exec" => block_pollution(node.block().as_ref()),
+        b"instance_eval" | b"instance_exec" => match node.block().as_ref().and_then(Node::as_block_node) {
+            Some(block) => instance_block_definitions(block.body().as_ref(), 0),
+            None => Vec::new(),
+        },
+        name if is_definer_name(name) && singleton_class_owner(node).is_none() => hidden_definer_sources(node),
+        _ => Vec::new(),
+    }
+}
+
+/// The receiver parameter of a mixin hook (`def self.included(base)`,
+/// `extended`, `prepended`, ...) written directly in a module body.
+fn mixin_hook_param(node: &ruby_prism::DefNode<'_>, in_body: bool) -> Option<String> {
+    let hook = in_body
+        && node.receiver().is_some_and(|r| r.as_self_node().is_some())
+        && INCLUDE_HOOKS.iter().chain(EXTEND_HOOKS).any(|h| node.name().as_slice() == h.as_bytes());
+    hook.then(|| DefWalker::hook_receiver_param_name(node)).flatten()
+}
+
+/// Anything but `self` or a constant path: a receiver whose class the
+/// index cannot name.
+fn unnamed_receiver(recv: &Node<'_>) -> bool {
+    recv.as_self_node().is_none() && const_path_str(recv).is_none()
+}
+
+/// `definer_sources` for a call on an unnamed receiver, except that a
+/// `send` whose method name is not a literal is a call, not a proven
+/// definition: `record.send(attr)` is everywhere, and reading every one
+/// as "defines anything" would take every contract off every project.
+fn hidden_definer_sources(call: &ruby_prism::CallNode<'_>) -> Vec<PollutionSource> {
+    let dynamic_send = matches!(call.name().as_slice(), b"send" | b"public_send" | b"__send__")
+        && call
+            .arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .as_ref()
+            .and_then(literal_method_name)
+            .is_none();
+    if dynamic_send {
+        return Vec::new();
+    }
+    definer_sources(call)
+}
+
+/// What an `instance_eval`/`instance_exec` block can define: every
+/// `def` and `alias`, every literal definer call written receiverless,
+/// through the same transparent wrappers `statements_pollution` reads.
+/// Any other receiverless call is the receiver's own DSL method, not an
+/// unknown definer.
+fn instance_block_definitions(body: Option<&Node<'_>>, depth: usize) -> Vec<PollutionSource> {
+    let Some(body) = body else { return Vec::new() };
+    if depth > 3 {
+        return vec![PollutionSource::Opaque];
+    }
+    if let Some(stmts) = body.as_statements_node() {
+        return stmts.body().iter().flat_map(|st| instance_statement_definitions(&st, depth)).collect();
+    }
+    instance_statement_definitions(body, depth)
+}
+
+fn instance_statement_definitions(st: &Node<'_>, depth: usize) -> Vec<PollutionSource> {
+    if st.as_def_node().is_some() || st.as_alias_method_node().is_some() {
+        return statement_pollution(st, depth);
+    }
+    if let Some(call) = st.as_call_node() {
+        let mut out: Vec<PollutionSource> = call
+            .arguments()
+            .iter()
+            .flat_map(|args| args.arguments().iter())
+            .filter_map(|arg| arg.as_def_node().map(|def| String::from_utf8_lossy(def.name().as_slice()).into_owned()))
+            .map(|name| PollutionSource::Names(vec![name]))
+            .collect();
+        if call.receiver().is_none() && is_definer_name(call.name().as_slice()) {
+            out.extend(hidden_definer_sources(&call));
+        }
+        return out;
+    }
+    nested_statements(st)
+        .iter()
+        .flat_map(|inner| instance_block_definitions(Some(inner), depth + 1))
+        .collect()
 }
 
 /// What a block body can define — the `refine`/`class_eval { }`
@@ -5080,6 +5276,10 @@ pub struct ProjectIndex {
     /// modules and of their ancestors comes off
     /// (`poison_ambiguous_mixin_contracts`).
     pub ambiguous_mixins: Vec<(String, Vec<String>)>,
+    /// Every definition or mixin aimed at a receiver no constant names,
+    /// merged from `FileDefs::hidden_definitions` and consumed by
+    /// `poison_hidden_redefinitions`.
+    hidden_raw: Vec<(Vec<String>, PollutionSource)>,
     /// Distinct literal `require '<lib>'` targets across every project
     /// file (W3 require/autoload). Ruby's `require` is process-global, so
     /// the stdlib gate consults this project-wide set, never per-file:
@@ -5317,6 +5517,8 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     poison_prepend_shadowed_contracts(&mut index);
     poison_ambiguous_mixin_contracts(&mut index);
     poison_runtime_inert_contracts(&mut index);
+    poison_hidden_redefinitions(&mut index);
+    poison_alias_reopen_redefinitions(&mut index);
     build_methods_by_name(&mut index);
     index
 }
@@ -5527,6 +5729,7 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.sorbet_sig_everywhere |= defs.sorbet_sig_everywhere;
     index.sig_hook_swallowers.extend(defs.sig_hook_swallowers.iter().cloned());
     index.ambiguous_mixins.extend(defs.ambiguous_mixins.iter().cloned());
+    index.hidden_raw.extend(defs.hidden_definitions.iter().cloned());
     for name in &defs.string_source_consts {
         if !index.string_source_consts.contains(name) {
             index.string_source_consts.push(name.clone());
@@ -7875,6 +8078,85 @@ fn poison_runtime_inert_contracts(index: &mut ProjectIndex) {
     for id in hit {
         let class = &mut index.classes[id.0 as usize];
         class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
+    }
+}
+
+/// Names sorbet-runtime's type test runs on a value (`T::Types::Simple`
+/// asks `is_a?`): a project definition of one on some class decides what
+/// that class's values satisfy.
+pub const TYPE_TEST_NAMES: &[&str] = &["is_a?", "kind_of?", "instance_of?"];
+
+/// A definition or mixin aimed at a receiver no constant names
+/// (`FileScan::note_hidden_call`, `class << obj`, `def obj.m`, a
+/// refinement of an unnamed class, a bare `eval`) may land on ANY class,
+/// on either track: every contract of every name it can define comes off,
+/// everywhere. One it cannot enumerate — a dynamic name, a string body, a
+/// module whose methods are not fully known — takes every contract off,
+/// and so does one that defines a type test (`TYPE_TEST_NAMES`), which
+/// decides what a literal of whatever class it lands on satisfies.
+fn poison_hidden_redefinitions(index: &mut ProjectIndex) {
+    let mut names: FxHashSet<String> = FxHashSet::default();
+    let mut every = false;
+    for (nesting, source) in std::mem::take(&mut index.hidden_raw) {
+        match hidden_names(index, &nesting, &source) {
+            Some(defined) => names.extend(defined),
+            None => every = true,
+        }
+    }
+    every |= TYPE_TEST_NAMES.iter().any(|n| names.contains(*n));
+    if !every && names.is_empty() {
+        return;
+    }
+    for class in &mut index.classes {
+        for track in [&mut class.methods, &mut class.singleton_methods] {
+            for (name, method) in track.iter_mut() {
+                if every || names.contains(name) {
+                    poison_contract(method);
+                }
+            }
+        }
+    }
+}
+
+/// The names one hidden source can define, or `None` for any name.
+fn hidden_names(index: &ProjectIndex, nesting: &[String], source: &PollutionSource) -> Option<Vec<String>> {
+    match source {
+        PollutionSource::Names(n) => Some(n.clone()),
+        PollutionSource::Module(path) => known_mixin_names(index, nesting, path),
+        PollutionSource::Singleton(inner) => hidden_names(index, nesting, inner),
+        PollutionSource::Opaque => None,
+    }
+}
+
+/// `Alias = Foo; class Alias; def m; end; end` reopens `Foo` itself, but
+/// the index files the body under `Alias`. Each name the reopen defines
+/// is a second definition of that name on `Foo`, shadowing whatever
+/// `Foo`'s ancestors answer, so its contract comes off `Foo` and every
+/// ancestor, on the track it was written on, and off the reopen's own
+/// definition of it.
+fn poison_alias_reopen_redefinitions(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, ClassId)> = Vec::new();
+    for (alias, (nesting, target)) in &index.const_aliases {
+        let Some(&reopen) = index.by_path.get(alias) else { continue };
+        match index.resolve_const_through_aliases(nesting, target) {
+            Some(real) if real != reopen => hits.push((reopen, real)),
+            _ => {}
+        }
+    }
+    for (reopen, real) in hits {
+        let instance: Vec<String> = index.class(reopen).methods.keys().cloned().collect();
+        let singleton: Vec<String> = index.class(reopen).singleton_methods.keys().cloned().collect();
+        let mut family = index.ancestors(real).0;
+        family.push(reopen);
+        for id in family {
+            let class = &mut index.classes[id.0 as usize];
+            for name in &instance {
+                class.methods.get_mut(name).map(poison_contract);
+            }
+            for name in &singleton {
+                class.singleton_methods.get_mut(name).map(poison_contract);
+            }
+        }
     }
 }
 

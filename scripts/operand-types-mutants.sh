@@ -223,7 +223,9 @@ mutant M13 "$IDX" \
 # statement is the fragile half of every anchor here: re-count it with the
 # harness's own `src.count(needle) == 1` before a run, never after a red.
 # (2026-09-23: the literal-only Sorbet contracts added
-# `note_sorbet_runtime_hazard` as the chain's last call; re-anchored.)
+# `note_sorbet_runtime_hazard` as the chain's last call; re-anchored.
+# 2026-09-23 again: the hidden-redefinition scan added the def frame's
+# `hook_frames` push/pop to M15's span; re-anchored.)
 mutant M14 "$IDX" \
   '        self.note_sorbet_runtime_hazard(node);
         ruby_prism::visit_call_node(self, node);' \
@@ -239,10 +241,12 @@ mutant M14 "$IDX" \
 mutant M15 "$IDX" \
   '        self.nested += 1;
         self.def_locals.push(FxHashMap::default());
+        self.hook_frames.push((mixin_hook_param(node, in_body), 0));
         ruby_prism::visit_def_node(self, node);
+        self.hook_frames.pop();
         self.def_locals.pop();
         self.nested -= 1;' \
-  '        let _ = node;' \
+  '        let _ = (node, mixin_hook_param(node, in_body));' \
   a_refinement_inside_a_method_body_is_silent \
   'recursion into method bodies: `def self.install; refine Integer do ... end; end` runs'
 

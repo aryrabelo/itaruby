@@ -107,7 +107,19 @@ found, and the launch bar is winning on both.
   as a duplicate `def` does: singleton patches, extended-hook installs,
   named-receiver eval/define/alias injections, and include-time code
   (`included`/`prepended` hooks, or an open project module in the include
-  chain). A contract also stays
+  chain). A definition or mixin through a receiver no constant names
+  (`FileScan::note_hidden_call`, `class << obj`, `def obj.m`, an unnamed
+  `refine`, a bare `eval`) poisons BY NAME on every class, both tracks
+  (`poison_hidden_redefinitions`); an unreadable one (dynamic name, string
+  body, unknown module) or one defining a type test poisons every contract.
+  A dynamic `send` is not a definition; an `instance_eval` block counts only
+  defs and literal definers; a mixin hook's own receiver param is its
+  includers, left to the include-time rule. A reopen through a constant
+  alias poisons the reopened names on the target and its ancestors
+  (`poison_alias_reopen_redefinitions`). A readable project `is_a?`/
+  `kind_of?`/`instance_of?` on a literal's core ancestry
+  (`TYPE_TEST_NAMES`, `type_test_unpatched`) stops that literal accusing;
+  an unreadable body is deliberately not read as one. A contract also stays
   off any call whose receiver's family (subclasses, includers, extenders)
   can dispatch the name elsewhere (`contract_dispatch_diverges`). Contract
   work is memoized per definition and never walks a family for a method

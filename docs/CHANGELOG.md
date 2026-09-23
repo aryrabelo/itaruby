@@ -8,6 +8,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A method defined through a receiver no constant names takes its name's
+  contracts off everywhere (review F5): `k.class_eval { def m }`,
+  `k.class_exec`/`k.module_eval`/`k.module_exec`/`k.instance_eval` blocks,
+  `k.define_method(:m)`, `k.send(:define_method, :m)`,
+  `k.define_singleton_method(:m)`, `k.alias_method(:m, ...)`, `k.attr_*`,
+  `def k.m`, `class << k; def m`, a refinement of an unnamed class, and
+  `k.include(M)`/`k.extend(M)`/`k.prepend(M)` for every method `M` answers,
+  where `k` is a local, a parameter, a block parameter (`[A, B].each`,
+  `ObjectSpace.each_object`) or a call (`Object.const_get(...)`). The
+  contract comes off every class and module defining that name, on both
+  tracks, so it neither accuses nor types a consumer. A dynamic name, a
+  string body, a block argument to a `Module`-level eval, a module whose
+  methods are not fully known, a bare `eval(<string>)`, or a type test
+  (`is_a?`, `kind_of?`, `instance_of?`) defined this way takes every
+  contract in the project off. An `instance_eval`/`instance_exec` block
+  counts only its `def`s and literal definers (other calls in it are DSL
+  calls, and a block passed as `&blk` is not read: a known gap); a `send`
+  of a non-literal name is a call, not a definition; and
+  a mixin hook's own receiver (`def self.included(base); base.define_method`)
+  is the module's includers, judged by the include-time rule below.
+  Receivers written as a constant keep their per-class precision.
+- `Alias = Foo; class Alias; def m` reopens `Foo`: each name the reopen
+  defines takes the contract of that name off `Foo`, off every ancestor of
+  `Foo`, and off the reopen, on the track it was written on.
+- A project that defines `is_a?`, `kind_of?` or `instance_of?` on a core
+  class or its core ancestry (its reopen, a module it includes, a definer
+  aimed at it, `Object`, `Kernel`, `Comparable`, `Numeric`, `Enumerable`)
+  decides what that class's literals satisfy, since sorbet-runtime tests a
+  value with `is_a?`: such a literal never accuses (review F11). Only a
+  readable definition counts; a body nobody can read (an unresolved gem
+  module mixed into `Object`, `include T::Sig` at top level among them) is
+  not taken as one.
 - An RBI is never checked at runtime, so a `.rbi` declaration is never a
   contract: no E0103 or E0109 comes from an RBI anywhere, and an RBI never
   types the consumers of a method the project source defines (source

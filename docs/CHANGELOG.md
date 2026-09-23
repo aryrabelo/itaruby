@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- `__LINE__` is an Integer, no longer a String, for every consumer; a
+  rational (`3r`) or imaginary (`2i`) literal is Unknown to inference
+  instead of a Float (no modeled type is a `Rational` or a `Complex`).
 - A Sorbet contract no longer outlives a redefinition of its method. The
   `sig` (inline or RBI) is dropped, and the body kept for inference, when
   the method is redefined by an out-of-line `class << X` body, by a
@@ -51,7 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Release binary on a synthetic 1500-subclass project with `sorbet/rbi`
   present: CPU user 0.83s -> 0.06s (4 calls per subclass), 13.72s -> 5.43s (40 calls per subclass; ~4.9s of it is present without sorbet/rbi too), 8.29s -> 0.32s (same, base methods signed); median of 3 runs, 2026-09-22. A counter-based test
   (`contract_work_is_per_definition_not_per_call`) bounds the work.
-- The core model no longer hands a contract a collection it did not
+- The core model no longer types a consumer with a collection it did not
   prove. `+`, `concat`, `<<` and `push` answer an Array of the union of
   the receiver's and the arguments' elements, and `merge` a Hash of the
   union of both sides' pairs, when every side is a known collection;
@@ -73,8 +76,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   returning it, or a string `eval`/`binding` in the scope erases its
   element types on every read there, before and after. An ivar collection
   never keeps its element types, since any method of the object (or any
-  caller of a reader) can change it in place. The category still binds:
-  an Array returned under `returns(String)` is accused. The trade-off is a
+  caller of a reader) can change it in place. The category is still
+  typed (hover, E0101, RBS-comment E0103); a Sorbet contract judges
+  literals only. The trade-off is a
   false negative: an element read of a collection that is also iterated
   for its value, passed along or held in an ivar is no longer typed, and
   `x.flatten.first` on nested arrays no longer resolves.
@@ -108,54 +112,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver's diagnostic silence with the same typo on a closed receiver.
 
 ### Added
-- Sorbet `sig` and RBI contracts (2026-09-22). A project method's own
-  recognized `sig { ... }` is now checked, not only read. The declared
-  return types the consumer. The body is checked against that declaration
-  on its own, with no call site needed. A proven return that contradicts it
-  is **E0109** (new code, Error), reported at the method name. Explicit
-  `return`s and implicit branch values are both checked, each `return` on
-  its own. A union value is accused only when NO member fits the declared
-  type: the checker does not narrow through `case`/`when`, `is_a?`,
-  `kind_of?`, `instance_of?`, `===`, a guard `return`/`raise`/`or return`,
-  or a block, loop or rescue that rewrote a local, so `Integer | String`
-  under `returns(String)` runs and is not accused, while `Integer | Float`
-  there still is. The trade-off is a false negative: implicit branches
-  where one value is wrong and another is right (`flag ? "x" : 1` under
-  `returns(Integer)`) no longer accuse. An unproven `nil` member is
-  dropped from the union, neither proof nor alibi. `void`,
-  `abstract`, `T.untyped` or Unknown bodies, an `ensure` that overrides the
-  value, code after a `return`, and an `if false` branch never accuse.
-  Declared params bind the body's locals. A call argument that contradicts
-  a declared param is **E0103**, reported at the argument and naming the
-  param. Params match the `def` by name, not by order, across positional,
-  keyword and default layouts. A splatted argument leaves positions
-  unproven, so it stays silent. The contract follows the definition onto
-  subclass receivers and onto the `def self.` track. Nominal types resolve
-  in the definition's lexical scope. `::X` stays absolute. A dynamically
-  shadowed prefix or a `type_member` resolves to Unknown and never falls
-  back to a same-named global class. `T.nilable`, `T.any`, `T::Array` and
-  `T::Hash` map when every member is known. An unsupported but well-formed
-  element such as a shape or a `T.proc` keeps the collection's category with
-  an Unknown member. A malformed expression is Unknown. A contract holds a
-  value to its collection CATEGORY only: sorbet-runtime erases type
-  arguments, so `{a: 1}` under `returns(T::Hash[String, T.untyped])` runs and
-  is not accused, while a Hash returned under `returns(String)` is.
-  Nominal types fail closed in both directions. A project class is held to
-  a core scalar or collection type (`String`, `Hash`, `Array`, ...) only
-  when its ancestry is complete, no ancestor is open and no `sorbet/rbi`
-  file declares an ancestor: `class SafeStr < String`, a subclass of a
-  project `class Hash` reopen, or of a gem class the project reopens
-  without restating its superclass IS that core value under
-  sorbet-runtime, and is not accused. The trade-off is a false negative:
-  an instance of an open class (a Rails model with `validates`) is no
-  longer accused under `returns(String)`, while a closed plain class still
-  is. A MODULE-typed contract never accuses anything, since any class can
-  gain a module by reflection the index never records as an ancestor
-  (`Late.include(M)`, `Late.send(:include, M)`, `Late.class_eval { include
-  M }`, a class method calling `include`, `X.extend(M)`); the trade-off is
-  that `returns(SomeModule)` checks nothing. A class-typed contract still
-  accuses an unrelated class. These rules sit in the shared compatibility
-  check, so RBS-comment E0103 follows them too.
+- Sorbet `sig` and RBI contracts (2026-09-22; literal-only since
+  2026-09-23). A project method's own recognized `sig { ... }` is now
+  checked, not only read. The declared return types the consumer, exactly
+  as sorbet-runtime enforces it. A contract ACCUSES only a value written as
+  a LITERAL, the same rule E0108 follows: a string or symbol (plain or
+  interpolated), an Integer, Float, rational or imaginary number, `nil`,
+  `true`/`false`, an Array or Hash literal (whatever it holds), a range, a
+  regexp, `__FILE__`, `__LINE__`, or a parenthesized literal. A body whose
+  literal return contradicts the declaration is **E0109** (new code,
+  Error), reported at the method name, with no call site needed: each
+  explicit `return <literal>` on its own (a bare `return` is a written
+  `nil`), and the implicit tail when EVERY leaf it can take through
+  `if`/`unless`/ternary, `case`/`when`, a plain `begin` and parentheses is
+  a literal (a missing branch is a written `nil`). Those leaves are
+  accused only when NO leaf fits, because the checker cannot tell a dead
+  branch from a live one: `flag ? 1 : 2.5` under `returns(String)` is
+  accused, `flag ? "x" : 1` is not. A call argument written as a literal
+  that contradicts a declared param is **E0103**, reported at the argument
+  and naming the param. Params match the `def` by name, not by order,
+  across positional, keyword and default layouts; a splat leaves positions
+  unproven, and a bare keyword hash is never guessed onto a positional
+  param. Everything else is never judged, however precisely it infers: a
+  variable of any kind, `self`, a constant, any call (`X.new`, a call typed
+  by another sig, `.to_s`), a ternary or `if` in argument position, a
+  backtick command, a literal behind a `#: as` cast. Three review rounds
+  found 24 false-positive shapes, almost all an inferred type held to a
+  sig (dispatch to an override or an outside redefinition, an overridden
+  `self.new`, a declared supertype read as exact, a setter's value,
+  declared type arguments trusted as element proof, refinements); none of
+  them is a literal. `void`, `abstract`, Unknown bodies, a block, loop,
+  `rescue` or `ensure` in the body, code after a `return`, and an
+  `if false` branch never accuse. A project that sets
+  `T::Configuration.default_checked_level = :never` (a literal assignment
+  anywhere in its files) runs no sig check, so no Sorbet contract accuses
+  anything there. A contract written in a module named by a
+  multi-argument `include A, B` (or `prepend`/`extend`), or in one of its
+  ancestors, is dropped: the index linearizes that call in reverse of
+  Ruby's order (a known ancestry bug, fixed separately), so which module
+  answers is unproven. Declared params bind the body's locals. The
+  contract follows the definition onto subclass receivers and onto the
+  `def self.` track. Nominal types resolve in the definition's lexical
+  scope. `::X` stays absolute. A dynamically shadowed prefix or a
+  `type_member` resolves to Unknown and never falls back to a same-named
+  global class. `T.nilable`, `T.any`, `T::Array` and `T::Hash` map when
+  every member is known. An unsupported but well-formed element such as a
+  shape or a `T.proc` keeps the collection's category with an Unknown
+  member. A malformed expression is Unknown. A contract holds a literal to
+  its collection CATEGORY only: sorbet-runtime erases type arguments, so
+  `{a: 1}` under `returns(T::Hash[String, T.untyped])` runs and is not
+  accused, while a Hash literal returned under `returns(String)` is. A
+  `Range`, `Regexp`, `Rational` or `Complex` literal fits only a contract
+  the checker cannot read (a core name it does not model, a module) and
+  is accused against everything else. A MODULE-typed contract never
+  accuses anything, since any class can gain a module by reflection the
+  index never records as an ancestor. A class-typed contract still
+  accuses a literal. Known false negatives, by design: every
+  contradiction carried by an inferred value (`def f(n) = n` under
+  `params(n: Integer).returns(String)`, `count` typed by another sig,
+  `x = "s"; x`, `n.to_s` under `returns(Integer)`, a wrong project class
+  from `.new`) is silent.
+  The shared compatibility check keeps its nominal rules for the
+  RBS-comment E0103, which still judges inferred values: a project class
+  is held to a core scalar or collection type only when its ancestry is
+  complete, no ancestor is open and no `sorbet/rbi` file declares an
+  ancestor (`class SafeStr < String` IS a String), and a module-typed
+  param or a module's `self` never accuses.
   A client RBI supplies the same contracts only when it matches the source
   definition exactly: owner, dispatch track and Ruby parameter layout. The
   RBI informs calls and checks the source body's return. It does not replace

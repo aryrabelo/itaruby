@@ -58,11 +58,22 @@ found, and the launch bar is winning on both.
   `scripts/conflicting-superclasses-mutants.py` (gate c1 and CI); public
   baselines require a fresh measured audit after source changes.
 - A project's Sorbet `sig { ... }` is a contract, not a hint (learned
-  2026-09-22, binding). The declared return types the consumer. The body is
-  checked against the declaration on its own (E0109, at the method name), so
-  a body that disagrees is accused and never wins. Param contracts accuse
-  at the offending argument, by param name (E0103), across positional,
-  keyword and default layouts. A client RBI supplies the same contracts
+  2026-09-22, binding). The declared return types the consumer. Accusations
+  are LITERAL-ONLY (2026-09-23, binding, the E0108 rule): E0109 (at the
+  method name) only for an explicit `return <literal>` (bare `return` is a
+  written `nil`), judged alone, or an implicit tail whose every
+  `if`/`unless`/`case`/`begin`/parentheses leaf is a literal and none fits;
+  E0103 (at the argument, by param name, across positional, keyword and
+  default layouts) only for an argument node that is itself a literal.
+  Never judged: variables, `self`, constants, calls (`X.new` included),
+  ternaries in argument position, a literal behind a `#: as` cast. Three
+  review rounds found 24 false positives, all an inferred type held to a
+  sig — do not reintroduce inferred evidence. Known false negatives: every
+  contradiction carried by an inferred value. A literal
+  `T::Configuration.default_checked_level = :never` anywhere turns every
+  contract accusation off; a module named by a multi-argument
+  `include A, B` (or `prepend`/`extend`), and its ancestors, lose their
+  contracts until the reversed linearization of that call is fixed. A client RBI supplies the same contracts
   only on an exact match of owner, dispatch track and Ruby parameter layout.
   It never replaces a check the Ruby source earned. Precedence is inline
   `#:` RBS, then inline `sig`, then RBI. Every unprovable shape resolves to

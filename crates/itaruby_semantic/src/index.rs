@@ -602,6 +602,11 @@ pub struct FileDefs {
     /// can put on it, with the lexical nesting at the site: see
     /// `FileScan::note_hidden` and `poison_hidden_redefinitions`.
     pub hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
+    /// What a mixin hook installs through its own receiver parameter
+    /// (`def self.included(base); base.prepend(M)`), with the lexical
+    /// nesting of the hook — whose last entry is the hook's module: see
+    /// `poison_hook_installs`.
+    pub hook_installs: Vec<(Vec<String>, PollutionSource)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -683,7 +688,9 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         sig_hook_swallowers: Vec::new(),
         ambiguous_mixins: Vec::new(),
         hidden_definitions: Vec::new(),
+        hook_installs: Vec::new(),
         hook_frames: Vec::new(),
+        self_singleton_depths: Vec::new(),
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -712,6 +719,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         sig_hook_swallowers: scan.sig_hook_swallowers,
         ambiguous_mixins: scan.ambiguous_mixins,
         hidden_definitions: scan.hidden_definitions,
+        hook_installs: scan.hook_installs,
     }
 }
 
@@ -933,6 +941,11 @@ struct FileScan {
     sig_hook_swallowers: Vec<String>,
     ambiguous_mixins: Vec<(String, Vec<String>)>,
     hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
+    hook_installs: Vec<(Vec<String>, PollutionSource)>,
+    /// The `ivar_scopes` depth of each `class << self` body written
+    /// directly in a class or module body: a `def included(base)` there is
+    /// the module's own hook (`mixin_hook_param`).
+    self_singleton_depths: Vec<usize>,
     /// One frame per `def` being walked: the receiver parameter of a
     /// mixin hook (`def self.included(base)`) and how many block scopes
     /// deep the walk is inside it — see `FileScan::hidden_receiver`.
@@ -1002,8 +1015,15 @@ impl<'pr> Visit<'pr> for FileScan {
             let sources = statements_pollution(node.body().as_ref(), 0);
             self.note_hidden(sources);
         }
+        let own = node.expression().as_self_node().is_some() && self.ivar_scopes.last() == Some(&IvarScope::Body);
         self.ivar_scopes.push(IvarScope::Opaque);
+        if own {
+            self.self_singleton_depths.push(self.ivar_scopes.len());
+        }
         ruby_prism::visit_singleton_class_node(self, node);
+        if own {
+            self.self_singleton_depths.pop();
+        }
         self.ivar_scopes.pop();
     }
 
@@ -1064,11 +1084,12 @@ impl<'pr> Visit<'pr> for FileScan {
         self.note_const_returning_body(node);
         self.note_swallowed_sig_hook(node);
         let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
+        let in_own_singleton = self.self_singleton_depths.last() == Some(&self.ivar_scopes.len());
         let scope = if in_body && node.receiver().is_none() { IvarScope::InstanceDef } else { IvarScope::Opaque };
         self.ivar_scopes.push(scope);
         self.nested += 1;
         self.def_locals.push(FxHashMap::default());
-        self.hook_frames.push((mixin_hook_param(node, in_body), 0));
+        self.hook_frames.push((mixin_hook_param(node, in_body, in_own_singleton), 0));
         ruby_prism::visit_def_node(self, node);
         self.hook_frames.pop();
         self.def_locals.pop();
@@ -1775,8 +1796,11 @@ impl FileScan {
         if !evals && !is_definer_name(name) {
             return;
         }
-        if node.receiver().is_some_and(|recv| self.hidden_receiver(&recv)) {
+        let Some(recv) = node.receiver() else { return };
+        if self.hidden_receiver(&recv) {
             self.note_hidden(hidden_call_sources(node, has_arg));
+        } else if self.hook_param_read(&recv) {
+            self.hook_installs_push(hidden_call_sources(node, has_arg));
         }
     }
 
@@ -1789,21 +1813,34 @@ impl FileScan {
     }
 
     /// A receiver no constant names, other than a mixin hook's own
-    /// receiver parameter read from the hook's scope: what
-    /// `def self.included(base); base.define_method(:m)` installs lands on
-    /// the module's includers, which `poison_include_time_redefinitions`
-    /// (and the extend-hook passes) already take every contract off. A
-    /// block parameter shadowing that name is a different object.
+    /// receiver parameter read from the hook's scope (`hook_param_read`).
     fn hidden_receiver(&self, recv: &Node<'_>) -> bool {
         if !unnamed_receiver(recv) {
             return false;
         }
-        let hook_param = recv.as_local_variable_read_node().is_some_and(|read| {
+        let hook_param = self.hook_param_read(recv);
+        !hook_param
+    }
+
+    /// A mixin hook's own receiver parameter, read from the hook's scope:
+    /// what `def self.included(base); base.define_method(:m)` installs
+    /// lands on the module's includers and extenders alone, never on an
+    /// arbitrary class — `poison_hook_installs` for a call through it, the
+    /// include-time rule and the extend-hook harvest (`apply_extended_hooks`)
+    /// for `def base.m` and `class << base`. A block parameter shadowing
+    /// that name is a different object.
+    fn hook_param_read(&self, recv: &Node<'_>) -> bool {
+        recv.as_local_variable_read_node().is_some_and(|read| {
             self.hook_frames.last().is_some_and(|(param, blocks)| {
                 param.as_deref().is_some_and(|p| p.as_bytes() == read.name().as_slice()) && read.depth() == *blocks
             })
-        });
-        !hook_param
+        })
+    }
+
+    fn hook_installs_push(&mut self, sources: Vec<PollutionSource>) {
+        for source in sources {
+            self.hook_installs.push((self.nesting.clone(), source));
+        }
     }
 
     /// One block or lambda scope entered (`1`) or left (`-1`) inside the
@@ -1838,12 +1875,65 @@ fn hidden_call_sources(node: &ruby_prism::CallNode<'_>, has_arg: bool) -> Vec<Po
 }
 
 /// The receiver parameter of a mixin hook (`def self.included(base)`,
-/// `extended`, `prepended`, ...) written directly in a module body.
-fn mixin_hook_param(node: &ruby_prism::DefNode<'_>, in_body: bool) -> Option<String> {
-    let hook = in_body
-        && node.receiver().is_some_and(|r| r.as_self_node().is_some())
+/// `extended`, `prepended`, ...) written directly in a module body, or as
+/// `def included(base)` directly in that body's `class << self`.
+fn mixin_hook_param(node: &ruby_prism::DefNode<'_>, in_body: bool, in_own_singleton: bool) -> Option<String> {
+    let own = match node.receiver() {
+        Some(r) => in_body && r.as_self_node().is_some(),
+        None => in_own_singleton,
+    };
+    let hook = own
         && INCLUDE_HOOKS.iter().chain(EXTEND_HOOKS).any(|h| node.name().as_slice() == h.as_bytes());
-    hook.then(|| DefWalker::hook_receiver_param_name(node)).flatten()
+    let param = hook.then(|| DefWalker::hook_receiver_param_name(node)).flatten()?;
+    let rebound = node.body().is_some_and(|body| local_rebound(&body, &param));
+    (!rebound).then_some(param)
+}
+
+/// Can the hook body make `name` hold something other than the includer?
+/// Any write to it — plain, operator, `||=`/`&&=`, a multi-assignment,
+/// `for`, `rescue =>` or pattern target, a named regexp capture — and any
+/// `binding` or `local_variable_set` call, at any block depth. Such a
+/// parameter is no longer bounded by the module's mixers, so a read of it
+/// is an unnamed receiver like any other (`hidden_receiver`).
+fn local_rebound(body: &Node<'_>, name: &str) -> bool {
+    struct Writes<'a> {
+        name: &'a str,
+        hit: bool,
+    }
+    impl Writes<'_> {
+        fn note(&mut self, written: &[u8]) {
+            self.hit |= written == self.name.as_bytes();
+        }
+    }
+    impl<'pr> Visit<'pr> for Writes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_target_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.hit |= matches!(node.name().as_slice(), b"binding" | b"local_variable_set");
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut writes = Writes { name, hit: false };
+    writes.visit(body);
+    writes.hit
 }
 
 /// Anything but `self` or a constant path: a receiver whose class the
@@ -1867,7 +1957,99 @@ fn hidden_definer_sources(call: &ruby_prism::CallNode<'_>) -> Vec<PollutionSourc
     if dynamic_send {
         return Vec::new();
     }
+    if matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend") {
+        return call.arguments().iter().flat_map(|a| a.arguments().iter()).filter_map(|arg| hidden_mixin_source(&arg)).collect();
+    }
     definer_sources(call)
+}
+
+/// What one argument of `include`/`extend`/`prepend` on an unnamed
+/// receiver can define. A literal no module can be (`path.prepend("/")`,
+/// `list.prepend(1)`) makes the call `String#prepend` or `Array#prepend`
+/// — `Module#prepend` raises `TypeError` before mixing anything in — so it
+/// defines nothing. `<x>.routes.url_helpers` is the one gem-built module
+/// read by name: Rails' route helpers (`ROUTE_HELPERS`). Anything else is
+/// `mixin_sources`' reading.
+fn hidden_mixin_source(arg: &Node<'_>) -> Option<PollutionSource> {
+    if never_a_module(arg) {
+        return None;
+    }
+    if route_helpers_module(arg) {
+        return Some(PollutionSource::Names(vec![ROUTE_HELPERS.to_owned()]));
+    }
+    Some(match const_path_str(arg) {
+        Some(p) => PollutionSource::Module(p.trim_start_matches("::").to_string()),
+        None => PollutionSource::Opaque,
+    })
+}
+
+/// A literal whose value is never a `Module`.
+fn never_a_module(arg: &Node<'_>) -> bool {
+    matches!(
+        arg,
+        Node::StringNode { .. }
+            | Node::InterpolatedStringNode { .. }
+            | Node::XStringNode { .. }
+            | Node::SymbolNode { .. }
+            | Node::InterpolatedSymbolNode { .. }
+            | Node::IntegerNode { .. }
+            | Node::FloatNode { .. }
+            | Node::RationalNode { .. }
+            | Node::ImaginaryNode { .. }
+            | Node::NilNode { .. }
+            | Node::TrueNode { .. }
+            | Node::FalseNode { .. }
+            | Node::ArrayNode { .. }
+            | Node::HashNode { .. }
+            | Node::KeywordHashNode { .. }
+            | Node::RegularExpressionNode { .. }
+            | Node::InterpolatedRegularExpressionNode { .. }
+            | Node::RangeNode { .. }
+    )
+}
+
+/// `<x>.routes.url_helpers`, argument- and block-free: the module
+/// `ActionDispatch::Routing::RouteSet#url_helpers` builds.
+fn route_helpers_module(arg: &Node<'_>) -> bool {
+    let bare = |call: &ruby_prism::CallNode<'_>, name: &[u8]| {
+        call.name().as_slice() == name && call.arguments().is_none() && call.block().is_none()
+    };
+    arg.as_call_node().is_some_and(|helpers| {
+        bare(&helpers, b"url_helpers")
+            && helpers.receiver().and_then(|r| r.as_call_node()).is_some_and(|routes| bare(&routes, b"routes"))
+    })
+}
+
+/// A name no Ruby method can have, standing in a hidden source's name
+/// list for every name Rails' route-helper module can put on its
+/// includer (`route_helper_name`).
+const ROUTE_HELPERS: &str = "<route helpers>";
+
+/// What `RouteSet#url_helpers` and the `ActionDispatch::Routing::UrlFor`
+/// / `PolymorphicRoutes` modules it includes define, across Rails
+/// versions: every named route's `*_path`/`*_url`, `url_for`,
+/// `full_url_for`, `route_for`, `url_options`, `default_url_options`
+/// (and its `=`/`?`), `polymorphic_*`, `optimize_routes_generation?`,
+/// underscored plumbing (`_routes`, `_with_routes`, ...), the private
+/// `polymorphic_mapping` and `initialize`. Read wide on purpose: any name
+/// that mentions a url, a path, a route or `polymorphic`, or starts with
+/// `_`.
+fn route_helper_name(name: &str) -> bool {
+    ["url", "path", "route", "polymorphic"].iter().any(|part| name.contains(part))
+        || name.starts_with('_')
+        || name == "initialize"
+}
+
+/// Does any project class or module define `name`, on either track? A
+/// project `url_helpers` may hand `<x>.routes.url_helpers` a module of its
+/// own, whose names are then unknown (`hidden_names`).
+fn project_defines(index: &ProjectIndex, name: &str) -> bool {
+    index.classes.iter().any(|class| class.methods.contains_key(name) || class.singleton_methods.contains_key(name))
+}
+
+/// Does a hidden source's name set reach `name`?
+fn defines_name(names: &FxHashSet<String>, name: &str) -> bool {
+    names.contains(name) || (names.contains(ROUTE_HELPERS) && route_helper_name(name))
 }
 
 /// What an `instance_eval`/`instance_exec` block can define: every
@@ -5280,6 +5462,10 @@ pub struct ProjectIndex {
     /// merged from `FileDefs::hidden_definitions` and consumed by
     /// `poison_hidden_redefinitions`.
     hidden_raw: Vec<(Vec<String>, PollutionSource)>,
+    /// Every install a mixin hook makes through its receiver parameter,
+    /// merged from `FileDefs::hook_installs` and consumed by
+    /// `poison_hook_installs`.
+    hook_raw: Vec<(Vec<String>, PollutionSource)>,
     /// Distinct literal `require '<lib>'` targets across every project
     /// file (W3 require/autoload). Ruby's `require` is process-global, so
     /// the stdlib gate consults this project-wide set, never per-file:
@@ -5517,6 +5703,7 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     poison_prepend_shadowed_contracts(&mut index);
     poison_ambiguous_mixin_contracts(&mut index);
     poison_runtime_inert_contracts(&mut index);
+    poison_hook_installs(&mut index);
     poison_hidden_redefinitions(&mut index);
     poison_alias_reopen_redefinitions(&mut index);
     build_methods_by_name(&mut index);
@@ -5730,6 +5917,7 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.sig_hook_swallowers.extend(defs.sig_hook_swallowers.iter().cloned());
     index.ambiguous_mixins.extend(defs.ambiguous_mixins.iter().cloned());
     index.hidden_raw.extend(defs.hidden_definitions.iter().cloned());
+    index.hook_raw.extend(defs.hook_installs.iter().cloned());
     for name in &defs.string_source_consts {
         if !index.string_source_consts.contains(name) {
             index.string_source_consts.push(name.clone());
@@ -8094,6 +8282,14 @@ pub const TYPE_TEST_NAMES: &[&str] = &["is_a?", "kind_of?", "instance_of?"];
 /// module whose methods are not fully known — takes every contract off,
 /// and so does one that defines a type test (`TYPE_TEST_NAMES`), which
 /// decides what a literal of whatever class it lands on satisfies.
+///
+/// That global answer is kept only where the target truly cannot be
+/// bounded: a method or block parameter (`ObjectSpace.each_object`, a
+/// patch helper's `k`), a `const_get` by a computed name, a bare string
+/// `eval`. A mixin hook's own receiver parameter is bounded by the
+/// module's includers and extenders (`poison_hook_installs`); a literal
+/// that is never a module makes no mixin; Rails' route helpers define
+/// route-helper names only (`hidden_mixin_source`).
 fn poison_hidden_redefinitions(index: &mut ProjectIndex) {
     let mut names: FxHashSet<String> = FxHashSet::default();
     let mut every = false;
@@ -8110,9 +8306,56 @@ fn poison_hidden_redefinitions(index: &mut ProjectIndex) {
     for class in &mut index.classes {
         for track in [&mut class.methods, &mut class.singleton_methods] {
             for (name, method) in track.iter_mut() {
-                if every || names.contains(name) {
+                if every || defines_name(&names, name) {
                     poison_contract(method);
                 }
+            }
+        }
+    }
+}
+
+/// What a mixin hook installs through its receiver parameter
+/// (`def self.included(base); base.prepend(M)`, `def self.extended(base);
+/// base.define_method(:m)`, `class << self; def included(base)`) lands
+/// only on the classes and modules that mix the hook's module in
+/// directly, on either track (a hook deferred through a concern reaches
+/// its final includer, whose every contract the include-time rule
+/// already takes off).
+/// Each of them loses the contract of every name the install can define,
+/// or every contract when that set is unknown, and stops counting as a
+/// plain inheritor for a contract higher in its family. An install that
+/// defines a type test, or whose module cannot be found, is judged like
+/// any hidden definition (`poison_hidden_redefinitions`).
+fn poison_hook_installs(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, Option<Vec<String>>)> = Vec::new();
+    for (nesting, source) in std::mem::take(&mut index.hook_raw) {
+        let names = hidden_names(index, &nesting, &source);
+        let module = nesting.last().and_then(|path| index.by_path.get(path).copied());
+        let type_test = names.as_ref().is_some_and(|n| n.iter().any(|name| TYPE_TEST_NAMES.contains(&name.as_str())));
+        let Some(module) = module.filter(|_| !type_test) else {
+            index.hidden_raw.push((nesting, source));
+            continue;
+        };
+        for (i, class) in index.classes.iter().enumerate() {
+            let Ok(raw) = u32::try_from(i) else { continue };
+            let mixes = class
+                .includes
+                .iter()
+                .chain(&class.prepends)
+                .chain(&class.extends)
+                .any(|path| index.resolve_const(&class.nesting, path) == Some(module));
+            if mixes {
+                hits.push((ClassId(raw), names.clone()));
+            }
+        }
+    }
+    for (id, names) in hits {
+        index.include_time_code.insert(id);
+        let names: Option<FxHashSet<String>> = names.map(|n| n.into_iter().collect());
+        let class = &mut index.classes[id.0 as usize];
+        for method in class.methods.iter_mut().chain(class.singleton_methods.iter_mut()) {
+            if names.as_ref().is_none_or(|n| defines_name(n, method.0)) {
+                poison_contract(method.1);
             }
         }
     }
@@ -8121,6 +8364,7 @@ fn poison_hidden_redefinitions(index: &mut ProjectIndex) {
 /// The names one hidden source can define, or `None` for any name.
 fn hidden_names(index: &ProjectIndex, nesting: &[String], source: &PollutionSource) -> Option<Vec<String>> {
     match source {
+        PollutionSource::Names(n) if n.iter().any(|name| name == ROUTE_HELPERS) && project_defines(index, "url_helpers") => None,
         PollutionSource::Names(n) => Some(n.clone()),
         PollutionSource::Module(path) => known_mixin_names(index, nesting, path),
         PollutionSource::Singleton(inner) => hidden_names(index, nesting, inner),

@@ -127,9 +127,19 @@ found, and the launch bar is winning on both.
   (`poison_hidden_redefinitions`); an unreadable one (dynamic name, string
   body, unknown module) or one defining a type test poisons every contract.
   A dynamic `send` is not a definition; an `instance_eval` block counts only
-  defs and literal definers; a mixin hook's own receiver param is its
-  includers, left to the include-time rule. A reopen through a constant
-  alias poisons the reopened names on the target and its ancestors
+  defs and literal definers. Global poisoning is kept only where the target
+  cannot be bounded (a method/block param, `ObjectSpace` iteration, a
+  computed `const_get`, a bare string `eval`); everything else is bounded:
+  a mixin hook's own receiver param (`def self.included(base)`, also `def
+  included(base)` in the module's `class << self`) poisons only the
+  module's direct includers/extenders — the install's names, or all when
+  unknown (`poison_hook_installs`; a type test there stays global; a param
+  the hook can rebind, `local_rebound`, is unnamed again); a
+  literal no module can be (`path.prepend("/")`) makes no mixin; and
+  `<x>.routes.url_helpers` poisons only route-helper names
+  (`route_helper_name`: url/path/route/polymorphic, a leading `_`,
+  `initialize`). A reopen through a constant alias poisons the reopened
+  names on the target and its ancestors
   (`poison_alias_reopen_redefinitions`). A readable project `is_a?`/
   `kind_of?`/`instance_of?` on a literal's core ancestry
   (`TYPE_TEST_NAMES`, `type_test_unpatched`) stops that literal accusing;

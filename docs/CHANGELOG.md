@@ -8,6 +8,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A hidden definition no longer takes every contract in the project off
+  where its reach can be bounded (r4). What a mixin hook installs through
+  its receiver parameter (`def self.included(base)`, `def
+  self.extended(base)`, and now `def included(base)` in the module's own
+  `class << self`) lands only on the module's direct includers and
+  extenders: each loses the contract of every name the install defines,
+  or every contract when that set is unknown, and stops counting as a
+  plain inheritor — so `def self.extended(base); base.prepend(M)` now
+  takes `M`'s names off every class that `extend`s the module, which it
+  did not before. A hook install that defines a type test is still judged
+  project-wide. `k.prepend("/")`, `k.prepend(1)` and any other argument no
+  module can be is `String#prepend`/`Array#prepend` (`Module#prepend`
+  raises `TypeError` first), so it defines nothing. `<x>.routes.url_helpers`
+  mixed into an unnamed receiver takes off only the names a Rails route
+  helper can have (containing `url`, `path`, `route` or `polymorphic`,
+  starting with `_`, or `initialize`); with an argument, or
+  `mounted_helpers`, it stays unreadable. Every contract still comes off for a hidden definition whose
+  names cannot be read on a target that cannot be bounded: a method or
+  block parameter (`ObjectSpace.each_object`), a `const_get` by a computed
+  name, a bare string `eval`, and a hook parameter the hook body can
+  rebind (any write to it, `binding`, `local_variable_set`), which no
+  longer names the includer.
 - E0109 judges the whole body (review F9): it accuses only when EVERY
   return point — each reachable explicit `return` (a bare `return` is
   `nil`) and each leaf of the reachable implicit tail — is a literal and

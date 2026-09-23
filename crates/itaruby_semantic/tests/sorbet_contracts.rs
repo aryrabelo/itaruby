@@ -4066,3 +4066,180 @@ fn rebound_receivers_are_unknown() {
         assert_eq!(got, codes, "control: {body}: {diags:?}");
     }
 }
+
+// -- a hidden definition is bounded wherever its target can be (r4) --
+
+/// Both accusations and both consumer types of a `SCALED` project: what
+/// `outside` adds takes nothing off.
+fn assert_hidden_untouched(name: &str, outside: &str) {
+    let (accused, typed) = hidden_outcome(name, outside);
+    assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+    assert_eq!(typed, [Some("Integer".to_owned()), Some("Integer".to_owned())], "{outside}");
+}
+
+/// `path.prepend("/")` and `list.prepend(1)` are `String#prepend` and
+/// `Array#prepend`: `Module#prepend` raises `TypeError` on an argument no
+/// module can be, before it mixes anything in. Such a call defines nothing.
+/// An argument that may be a module still takes every contract off.
+#[test]
+fn literal_argument_to_an_unnamed_mixin_is_no_mixin() {
+    let calls = [
+        hidden_patch("k.prepend(\"/\")"),
+        hidden_patch("k.prepend(\"#{name}/\")\n    k.prepend(:x, 1, 2.0, nil, true, [name], { a: 1 })"),
+        hidden_patch("k.include(/x/)\n    k.extend(1..2)"),
+    ];
+    for (i, outside) in calls.iter().enumerate() {
+        assert_hidden_untouched(&format!("hidden-literal-{i}"), outside);
+    }
+    // Controls: a value that may be a module is still unreadable.
+    for (i, outside) in [hidden_patch("k.prepend(name)"), hidden_patch("k.prepend(\"/\", name)")].iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-literal-control-{i}"), outside);
+        assert!(accused.is_empty(), "control: {outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "control: {outside}");
+    }
+}
+
+/// `x.routes.url_helpers` is Rails' route-helper module: mixed into a
+/// receiver no constant names, it takes off every contract whose name a
+/// route helper can have (`*_path`, `*_url`, `url_for`, `_routes`, the
+/// private `polymorphic_mapping`, ...), never the rest. Another module
+/// built by a call stays unreadable.
+#[test]
+fn route_helpers_on_an_unnamed_receiver_take_route_names_off() {
+    const ROUTED: &str = r#"
+class ContractRouted
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def home_path(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def polymorphic_mapping(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+ContractRouted.new.home_path("text")
+ContractRouted.new.polymorphic_mapping("text")
+ContractRouted.new.grow("text")
+"#;
+    let accused = |name: &str, outside: &str| -> Vec<String> {
+        let diags = check_files(name, &[ROUTED, outside]);
+        contract_names(ROUTED, &diags).into_iter().map(str::to_owned).collect()
+    };
+    let routed = [
+        "Gem.helper_host(:x).include Rails.application.routes.url_helpers\n".to_owned(),
+        hidden_patch("k.include(Rails.application.routes.url_helpers)"),
+        hidden_patch("k.extend(MyEngine::Engine.routes.url_helpers)"),
+    ];
+    for (i, outside) in routed.iter().enumerate() {
+        assert_eq!(accused(&format!("hidden-routes-{i}"), outside), ["\"text\""], "{outside}");
+        let diags = check_files(&format!("hidden-routes-left-{i}"), &[ROUTED, outside]);
+        let line = diags.iter().find(|d| d.code == "E0103").map(|d| &ROUTED[..d.start]);
+        assert!(line.is_some_and(|l| l.ends_with("ContractRouted.new.grow(")), "{outside}: {diags:?}");
+    }
+    // Controls: a helper module with an argument, or another built module,
+    // may hold any name.
+    // A project `url_helpers` may hand back a module of its own.
+    let unreadable = [
+        hidden_patch("k.include(Rails.application.routes.url_helpers(false))"),
+        hidden_patch("k.include(Rails.application.routes.mounted_helpers)"),
+        hidden_patch("k.include(Rails.application.routes.url_helpers)")
+            + "class ContractOwnRoutes\n  def url_helpers\n    ContractStringGrow\n  end\nend\n",
+    ];
+    for (i, outside) in unreadable.iter().enumerate() {
+        assert!(accused(&format!("hidden-routes-control-{i}"), outside).is_empty(), "control: {outside}");
+    }
+    let quiet = hidden_patch("k.define_method(:unrelated) { |x| x }");
+    assert_eq!(accused("hidden-routes-quiet", &quiet), ["\"text\"", "\"text\"", "\"text\""], "control: {quiet}");
+}
+
+/// What a mixin hook installs through its receiver parameter lands on the
+/// module's own includers and extenders, not on every class: each of them
+/// loses the contracts of the names the install defines (every contract
+/// when those are unknown). `class << self; def extended(base)` is the
+/// same hook. A hook that defines a type test is judged like any hidden
+/// definition, wherever its module is mixed in.
+#[test]
+fn hook_installs_land_on_the_modules_mixers() {
+    let hook = |def: &str, install: &str| format!("module ContractHookInstall\n  {def}\n    {install}\n  end\nend\n");
+    let singleton = |install: &str| {
+        format!("module ContractHookInstall\n  class << self\n    def extended(base)\n      {install}\n    end\n  end\nend\n")
+    };
+    let extender = "class ContractScaleCfg\n  extend ContractHookInstall\nend\n";
+    let grow_only = [
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)") + extender,
+        singleton("base.prepend(ContractStringGrow)") + extender,
+        hook("def self.extended(base)", "base.class_eval do\n      def grow(x) = x.to_s\n    end") + extender,
+    ];
+    for (i, outside) in grow_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-grow-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    let scale_only = [
+        hook("def self.extended(base)", "def base.scale(x)\n      x.to_s\n    end") + extender,
+    ];
+    for (i, outside) in scale_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-scale-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+        assert_eq!(typed, [None, Some("Integer".to_owned())], "{outside}");
+    }
+    let every = [
+        hook("def self.extended(base)", "base.extend(ContractHookUnknown)") + extender,
+        singleton("base.define_method(name) { |x| x.to_s }") + extender,
+        // A type test decides what a literal satisfies wherever it lands.
+        hook("def self.included(base)", "base.define_method(:is_a?) { |_klass| true }"),
+    ];
+    for (i, outside) in every.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-every-{i}"), outside);
+        assert!(accused.is_empty(), "{outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "{outside}");
+    }
+    // Controls: a hook nobody mixes in, and a mixer of another module,
+    // take nothing off.
+    let controls = [
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)"),
+        singleton("base.prepend(ContractStringGrow)"),
+        singleton("base.define_method(:grow) { |x| x.to_s }\n      base.extend(ContractHookUnknown)"),
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)")
+            + "module ContractHookOther\nend\nclass ContractScaleCfg\n  extend ContractHookOther\nend\n",
+    ];
+    for (i, outside) in controls.iter().enumerate() {
+        assert_hidden_untouched(&format!("hook-control-{i}"), outside);
+    }
+}
+
+/// A hook parameter the hook body can rebind (`base = base.superclass`, a
+/// multi-assignment, `binding.local_variable_set`) no longer names the
+/// includer: what is installed through it may land anywhere, so it is an
+/// unnamed receiver and takes its names off every class. A hook that only
+/// reads it stays bounded by the module's mixers.
+#[test]
+fn a_rebound_hook_param_is_an_unnamed_receiver() {
+    let hook = |body: &str| {
+        format!(
+            "module ContractHookRebound\n  def self.included(base)\n    {body}\n    base.prepend(ContractStringGrow)\n  end\nend\nclass ContractHookHost\n  include ContractHookRebound\nend\n"
+        )
+    };
+    let rebound = [
+        hook("base = base.superclass"),
+        hook("base, _ = base.superclass, 1"),
+        hook("base ||= nil"),
+        hook("[1].each { |x| base = base.superclass }"),
+        hook("binding.local_variable_set(:base, base.superclass)"),
+    ];
+    for (i, outside) in rebound.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-rebound-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    // Controls: reading the parameter, or writing another local, leaves
+    // the install on the module's own includer.
+    for (i, outside) in [hook("base.name"), hook("other = base.name")].iter().enumerate() {
+        assert_hidden_untouched(&format!("hook-rebound-control-{i}"), outside);
+    }
+}

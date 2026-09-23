@@ -2,6 +2,7 @@
 //! receivers/arguments never produce diagnostics.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -23,10 +24,78 @@ use crate::types::{
     ClassId, ConstraintCall, ConstraintProof, Diagnostic, Severity, Suggestion, Ty,
     E0001_SYNTAX_ERROR, E0101_UNKNOWN_METHOD, E0102_WRONG_ARITY, E0103_ARG_TYPE_MISMATCH,
     E0104_UNRESOLVED_CONSTANT, E0105_INVALID_RBS_COMMENT, E0106_IMPOSSIBLE_CAST,
-    E0107_CONSTRAINT_CONTRADICTION, E0108_OPERAND_TYPE_MISMATCH,
+    E0107_CONSTRAINT_CONTRADICTION, E0108_OPERAND_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH,
 };
 
 type Env = FxHashMap<String, Ty>;
+type KeywordArg = (String, Ty, (usize, usize));
+type PositionalArg = (Ty, (usize, usize), Option<String>);
+
+struct CallTypeArgs<'a> {
+    positional: &'a [PositionalArg],
+    /// None means splats/forwarding/blocks made named binding unprovable.
+    keywords: Option<&'a [KeywordArg]>,
+    /// The arguments WRITTEN as a literal, by span, with the class that
+    /// literal is at runtime — the only argument values a Sorbet contract
+    /// may accuse (see `literal_class`).
+    literals: &'a [((usize, usize), LiteralClass)],
+}
+
+/// The runtime class of an expression WRITTEN as a literal: the only
+/// evidence a Sorbet contract (E0103/E0109) accepts. Three review rounds
+/// found 24 false-positive shapes, almost all an imprecise INFERRED type
+/// held to a signature (dispatch to an override or a redefinition, an
+/// overridden `.new`, a declared supertype read as exact, a setter's
+/// value, declared type arguments, refinements); a literal's class is
+/// none of those.
+#[derive(Clone, Debug, PartialEq)]
+enum LiteralClass {
+    /// A class this checker models, as the type a contract compares:
+    /// collections carry no type arguments (sorbet-runtime checks only
+    /// the category, never what an Array or a Hash holds).
+    Modeled(Ty),
+    /// A core class no modeled type names (`Range`, `Regexp`, `Rational`,
+    /// `Complex`): it fits only a contract this checker cannot read, or a
+    /// module one.
+    Other(&'static str),
+}
+
+impl LiteralClass {
+    fn fits(&self, expected: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+        match self {
+            LiteralClass::Modeled(ty) => compatible(ty, expected, index, rbi),
+            LiteralClass::Other(_) => other_core_fits(expected, index),
+        }
+    }
+
+    /// The class the contract compared, and nothing it did not: a
+    /// collection literal is named by its category alone, because its type
+    /// arguments were never part of the verdict.
+    fn name(&self, index: &ProjectIndex) -> String {
+        match self {
+            LiteralClass::Modeled(Ty::Array(_)) => "Array".to_owned(),
+            LiteralClass::Modeled(Ty::Hash(_, _)) => "Hash".to_owned(),
+            LiteralClass::Modeled(ty) => ty_name(ty, index),
+            LiteralClass::Other(name) => (*name).to_owned(),
+        }
+    }
+}
+
+/// Could a `Range`/`Regexp`/`Rational`/`Complex` value satisfy `expected`?
+/// A sig name resolves to a modeled scalar or collection, a project class,
+/// a project module or `Unknown` (every core constant it does not model,
+/// `Range` itself and a project reopen of it included). Such a value is
+/// none of the scalars or collections, and no project CLASS is one of its
+/// ancestors; a module may be mixed into it by reflection, as
+/// `compatible` assumes for every module-typed contract.
+fn other_core_fits(expected: &Ty, index: &ProjectIndex) -> bool {
+    match expected {
+        Ty::Unknown => true,
+        Ty::Instance(p) => index.class(*p).is_module,
+        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),
+        _ => false,
+    }
+}
 
 /// Bead ita-qst: every `#: as <target>` inline-cast comment
 /// (sorbet.org/docs/rbs-support's "inline type assertion" form) in
@@ -148,6 +217,10 @@ fn check_file_inner(
     dark: bool,
 ) -> (Vec<Diagnostic>, Vec<DarkSingleton>) {
     let text = file.text(db);
+    // RBI files are declarations, not executable source bodies.
+    if file.path(db).extension().is_some_and(|ext| ext == "rbi") {
+        return (Vec::new(), Vec::new());
+    }
     let parse = ruby_prism::parse(text.as_bytes());
     let cast_comments = collect_cast_comments(
         text,
@@ -196,6 +269,7 @@ fn check_file_inner(
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -224,11 +298,16 @@ fn check_file_inner(
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.dark = dark;
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let dark_recs = std::mem::take(&mut checker.dark_recs);
@@ -527,6 +606,7 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -555,11 +635,16 @@ pub fn call_stats(db: &dyn salsa::Database, file: SourceFile) -> CallStats {
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.stats
 }
@@ -594,6 +679,7 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -622,11 +708,16 @@ pub fn definition_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) 
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.goto_found
 }
@@ -689,6 +780,7 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -717,11 +809,16 @@ pub fn hover_at(db: &dyn salsa::Database, file: SourceFile, offset: usize) -> Op
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     let ty = checker
         .hover_ty
@@ -764,6 +861,7 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         dark_recs: Vec::new(),
         returns: Vec::new(),
         return_memo: FxHashMap::default(),
+        contract_memo: std::cell::RefCell::default(),
         return_cause_memo: FxHashMap::default(),
         in_progress: FxHashSet::default(),
         depth: 0,
@@ -792,11 +890,16 @@ pub fn constraint_report(db: &dyn salsa::Database, file: SourceFile) -> Vec<Cons
         narrowed_names: Vec::new(),
         asserted_subject_spans: Vec::new(),
         operand_locals: FxHashMap::default(),
+        trusted_collections: FxHashSet::default(),
+        ivar_hidden_memo: FxHashMap::default(),
+        ancestors_memo: FxHashMap::default(),
+        own_ancestry_memo: FxHashMap::default(),
     };
     let mut env = Env::default();
     // Toplevel statements are one Ruby local scope; E0108's literal
     // proof is per scope (see `Checker::operand_locals`).
     checker.operand_locals = checker.scope_operand_locals(None, Some(&parse.node()));
+    checker.trusted_collections = trusted_collection_locals(None, Some(&parse.node()));
     checker.walk_scope(&[], None, false, &parse.node(), &mut env);
     checker.constraint_outcomes
 }
@@ -893,6 +996,41 @@ enum NarrowKind {
     NilCheckOrGuard,
 }
 
+type Contract = (crate::sorbet_sig::SorbetSig, Vec<String>);
+type ContractKey = (SourceFile, (usize, usize), String);
+
+/// Work the Sorbet contract path did on this thread, counted so that a
+/// regression test can bound it without a wall clock.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ContractWork {
+    /// Family members `ProjectIndex::contract_dispatch_diverges` visited.
+    pub family_visits: u64,
+    /// Uncached `effective_sorbet` answers.
+    pub contract_resolutions: u64,
+    /// `sig_fill` calls on the return path.
+    pub return_probes: u64,
+}
+
+thread_local! {
+    static CONTRACT_WORK: std::cell::Cell<ContractWork> = std::cell::Cell::new(ContractWork::default());
+}
+
+/// This thread's contract work so far.
+#[doc(hidden)]
+#[must_use]
+pub fn contract_work() -> ContractWork {
+    CONTRACT_WORK.with(std::cell::Cell::get)
+}
+
+pub(crate) fn note_contract_work(update: impl FnOnce(&mut ContractWork)) {
+    CONTRACT_WORK.with(|cell| {
+        let mut work = cell.get();
+        update(&mut work);
+        cell.set(work);
+    });
+}
+
 struct Checker<'db> {
     db: &'db dyn salsa::Database,
     index: &'db ProjectIndex,
@@ -914,6 +1052,8 @@ struct Checker<'db> {
     /// Explicit `return` types of the method body currently being inferred.
     returns: Vec<Ty>,
     return_memo: FxHashMap<(ClassId, String, bool), Ty>,
+    /// `effective_sorbet` answers by definition and called name.
+    contract_memo: std::cell::RefCell<FxHashMap<ContractKey, Option<Contract>>>,
     /// Bead ita-mv5: same `(ClassId, name, singleton)` key as
     /// `return_memo`, written/read alongside it — only ever holds an
     /// entry when the memoized return WAS `Ty::Unknown` (a known return
@@ -1097,6 +1237,26 @@ struct Checker<'db> {
     /// nothing else can rebind it (see `prove_operand_locals`); empty on
     /// every `silent` walk, which emits nothing anyway.
     operand_locals: FxHashMap<String, Ty>,
+    /// The locals of the scope being walked whose collection type
+    /// arguments are proven (see `trusted_collection_locals`): every
+    /// other local read of an Array or Hash drops its element types.
+    /// Rebuilt and restored with `operand_locals`, but on EVERY walk,
+    /// silent ones included — a silent walk infers the method returns
+    /// that contracts are checked against.
+    trusted_collections: FxHashSet<String>,
+    /// `ivar_writes_hidden`'s SETTLED answers, per class and ivar name.
+    /// The index never changes during one check, so an answer computed
+    /// with no class walk in progress is final; one that met an
+    /// in-progress walk (the fixpoint fallback) is never stored.
+    ivar_hidden_memo: FxHashMap<ClassId, FxHashMap<String, bool>>,
+    /// `ProjectIndex::ancestors` per class for this check (the index is
+    /// immutable during it): `ivar_writes_hidden` reads the ancestry of
+    /// every class of a hierarchy, and a deep one must linearize each
+    /// class once, not once per ivar read per descendant.
+    ancestors_memo: FxHashMap<ClassId, Rc<(Vec<ClassId>, bool)>>,
+    /// Per (class, superclass) edge: how much of the class's ancestry is
+    /// its OWN (see `Checker::own_ancestry_len`).
+    own_ancestry_memo: FxHashMap<(ClassId, ClassId), usize>,
 }
 
 impl Checker<'_> {
@@ -1372,7 +1532,10 @@ impl Checker<'_> {
                     let mut class_env = Env::default();
                     let proven = self.scope_operand_locals(None, Some(&body));
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+                    let trusted = trusted_collection_locals(None, Some(&body));
+                    let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
             }
@@ -1390,7 +1553,10 @@ impl Checker<'_> {
                     let mut class_env = Env::default();
                     let proven = self.scope_operand_locals(None, Some(&body));
                     let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+                    let trusted = trusted_collection_locals(None, Some(&body));
+                    let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                     self.walk_scope(&child_scope, id, false, &body, &mut class_env);
+                    self.trusted_collections = saved_trusted;
                     self.operand_locals = saved_operands;
                 }
             }
@@ -1398,7 +1564,13 @@ impl Checker<'_> {
                 let sc = node.as_singleton_class_node().unwrap();
                 if sc.expression().as_self_node().is_some() {
                     if let Some(body) = sc.body() {
+                        // `class << self` opens a fresh local scope; the
+                        // walk still shares `env`, so its locals are
+                        // proven by their own scan, never the outer one.
+                        let trusted = trusted_collection_locals(None, Some(&body));
+                        let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
                         self.walk_scope(scope, class, true, &body, env);
+                        self.trusted_collections = saved_trusted;
                     }
                 }
             }
@@ -1432,6 +1604,91 @@ impl Checker<'_> {
         m.and_then(|m| m.sig.clone())
     }
 
+    /// Inline metadata wins, including an unsupported inline signature.
+    /// An RBI is eligible only for this exact source definition's owner,
+    /// dispatch track and Ruby parameter layout.
+    fn effective_sorbet(
+        &self,
+        method: &MethodSig,
+        name: &str,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        if method.sig.is_some() || method.arity_unknown || method.abstract_stub {
+            return None;
+        }
+        if method.sorbet_sig.is_none() && (method.sorbet_annotated || self.rbi_map.is_none()) {
+            return None;
+        }
+        // Every call to the method asks, and the answer is fixed by the
+        // definition while the index is.
+        let key = (method.file, method.def_span, name.to_owned());
+        if let Some(hit) = self.contract_memo.borrow().get(&key) {
+            return hit.clone();
+        }
+        note_contract_work(|w| w.contract_resolutions += 1);
+        let contract = self.resolve_contract(method, name);
+        self.contract_memo.borrow_mut().insert(key, contract.clone());
+        contract
+    }
+
+    /// `effective_sorbet`'s uncached half.
+    fn resolve_contract(
+        &self,
+        method: &MethodSig,
+        name: &str,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        let path = method.nesting.last()?;
+        let (owner, name, singleton) = self.dispatching_name(method, name, path)?;
+        // Cheap first: most unsigned methods have no RBI declaration, and
+        // the dispatch walk below visits a whole family.
+        let contract = if method.sorbet_annotated {
+            method.sorbet_sig.clone().map(|sig| (sig, method.nesting.clone()))
+        } else {
+            let declaration = crate::index::source_rbi_method(path, name, singleton, self.rbi_map?)?;
+            if !declaration.matches_source(method) {
+                return None;
+            }
+            declaration.definition.sorbet_sig.map(|sig| (sig, declaration.nesting))
+        }?;
+        let diverges = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);
+        (!diverges).then_some(contract)
+    }
+
+    /// The owner, name and dispatch track this exact definition answers
+    /// on, or `None` when the owner is open: no signature written there is
+    /// proven to govern the call that reaches it.
+    fn dispatching_name<'n>(
+        &self,
+        method: &MethodSig,
+        name: &'n str,
+        path: &str,
+    ) -> Option<(ClassId, &'n str, bool)> {
+        let owner = *self.index.by_path.get(path)?;
+        let class = self.index.class(owner);
+        if class.open {
+            return None;
+        }
+        let same = |m: &MethodSig| m.file == method.file && m.def_span == method.def_span;
+        let name = if name == "new" && class.methods.get("initialize").is_some_and(same) { "initialize" } else { name };
+        let singleton = class.singleton_methods.get(name).is_some_and(same);
+        Some((owner, name, singleton))
+    }
+
+    fn sorbet_of_def(
+        &self,
+        class: Option<ClassId>,
+        def: &DefNode<'_>,
+        singleton: bool,
+    ) -> Option<(crate::sorbet_sig::SorbetSig, Vec<String>)> {
+        let cd = self.index.class(class?);
+        let name = String::from_utf8_lossy(def.name().as_slice());
+        let method = if singleton { cd.singleton_methods.get(name.as_ref()) } else { cd.methods.get(name.as_ref()) }?;
+        let loc = def.location();
+        if method.def_span != (loc.start_offset(), loc.end_offset()) {
+            return None;
+        }
+        self.effective_sorbet(method, &name)
+    }
+
     /// Check a method body; returns the inferred return type (last expression
     /// unioned with explicit returns).
     fn check_method_body(
@@ -1443,6 +1700,7 @@ impl Checker<'_> {
         sig: Option<&RbsSig>,
     ) -> Ty {
         let mut env = Env::default();
+        let sorbet = self.sorbet_of_def(class, def, singleton);
         let saved_method_params = std::mem::take(&mut self.method_params);
         let saved_block_depth = std::mem::replace(&mut self.rebindable_block_depth, 0);
         if let Some(params) = def.parameters() {
@@ -1548,6 +1806,14 @@ impl Checker<'_> {
                 }
             }
         }
+        if let Some((contract, nesting)) = &sorbet {
+            for (name, expr) in &contract.params {
+                let ty = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+                if ty != Ty::Unknown && env.contains_key(name) {
+                    env.insert(name.clone(), ty);
+                }
+            }
+        }
 
         let self_ty = self_ty_of(class, singleton);
         // E0108's per-scope literal proof. The parameter list is handed
@@ -1559,6 +1825,11 @@ impl Checker<'_> {
             def.body().as_ref(),
         );
         let saved_operands = std::mem::replace(&mut self.operand_locals, proven);
+        let trusted = trusted_collection_locals(
+            def.parameters().map(|p| p.as_node()).as_ref(),
+            def.body().as_ref(),
+        );
+        let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);
         let saved_returns = std::mem::take(&mut self.returns);
         let saved_name = self
             .current_method_name
@@ -1573,6 +1844,9 @@ impl Checker<'_> {
         self.current_method_name = saved_name;
         let last_is_unknownish = matches!(last, Ty::Unknown | Ty::Union(_));
         let returns = std::mem::replace(&mut self.returns, saved_returns);
+        if let Some((contract, nesting)) = &sorbet {
+            self.check_sorbet_return(def, contract, nesting);
+        }
         let folded = returns.into_iter().fold(last, Ty::union);
         if self.census {
             // Bead ita-mv5: classify WHY this method's own return died on
@@ -1647,7 +1921,46 @@ impl Checker<'_> {
         self.method_params = saved_method_params;
         self.rebindable_block_depth = saved_block_depth;
         self.operand_locals = saved_operands;
+        self.trusted_collections = saved_trusted;
         folded
+    }
+
+    /// E0109, literal-only: the body is accused only for a value it WRITES
+    /// as a literal — an explicit `return <literal>` (a bare `return` is a
+    /// written `nil`), judged on its own, or an implicit tail whose every
+    /// leaf is one. Anything else the body returns is never judged.
+    fn check_sorbet_return(&mut self, def: &DefNode<'_>, contract: &crate::sorbet_sig::SorbetSig, nesting: &[String]) {
+        if self.silent || contract.void {
+            return;
+        }
+        let (Some(expr), Some(body)) = (contract.ret.as_deref(), def.body()) else { return };
+        let mut safety = ReturnContractSafety::default();
+        safety.visit(&body);
+        if safety.uncertain {
+            return;
+        }
+        let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+        let explicit = safety.returns.iter().flatten()
+            .find(|literal| self.contract_breaks(std::slice::from_ref(*literal), &expected))
+            .map(|literal| vec![literal.clone()]);
+        let actual = explicit.or_else(|| {
+            let mut leaves = Vec::new();
+            (!return_terminal(&body) && tail_literals(&body, &mut leaves) && self.contract_breaks(&leaves, &expected))
+                .then_some(leaves)
+        });
+        if let Some(actual) = actual {
+            let mut names: Vec<String> = Vec::new();
+            for name in actual.iter().map(|leaf| leaf.name(self.index)) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            let loc = def.name_loc();
+            self.emit(loc.start_offset(), loc.end_offset(), E0109_RETURN_TYPE_MISMATCH,
+                Severity::Error, format!("return of `{}` expects {}, got {}",
+                    String::from_utf8_lossy(def.name().as_slice()),
+                    ty_name(&expected, self.index), names.join(" | ")));
+        }
     }
 
     // -- expression inference ----------------------------------------------
@@ -1711,17 +2024,14 @@ impl Checker<'_> {
         self_ty: SelfTy,
         scope: &[String],
     ) -> Ty {
+        if let Some(ty) = scalar_literal_ty(node) {
+            return ty;
+        }
         match node {
-            Node::IntegerNode { .. } => Ty::Int,
-            Node::FloatNode { .. } | Node::RationalNode { .. } | Node::ImaginaryNode { .. } => {
-                Ty::Float
-            }
-            Node::StringNode { .. } | Node::XStringNode { .. } => Ty::Str,
-            Node::SymbolNode { .. } => Ty::Sym,
-            Node::TrueNode { .. } | Node::FalseNode { .. } => Ty::Bool,
-            Node::NilNode { .. } => Ty::Nil,
+            // No modeled type is a `Rational` or a `Complex`.
+            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,
+            Node::XStringNode { .. } => Ty::Str,
             Node::SelfNode { .. } => self_ty.as_ty(),
-            Node::SourceFileNode { .. } | Node::SourceLineNode { .. } => Ty::Str,
             Node::SourceEncodingNode { .. } => Ty::Unknown,
 
             Node::InterpolatedStringNode { .. } => {
@@ -1824,7 +2134,10 @@ impl Checker<'_> {
             Node::LocalVariableReadNode { .. } => {
                 let n = node.as_local_variable_read_node().unwrap();
                 let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                env.get(&name).cloned().unwrap_or(Ty::Unknown)
+                let ty = env.get(&name).cloned().unwrap_or(Ty::Unknown);
+                // A collection this scope may change in place (or hand to
+                // code that can) holds unproven elements on EVERY read.
+                if self.trusted_collections.contains(&name) { ty } else { erase_type_arguments(&ty) }
             }
             Node::LocalVariableWriteNode { .. } => {
                 let n = node.as_local_variable_write_node().unwrap();
@@ -1895,9 +2208,14 @@ impl Checker<'_> {
                     return Ty::Unknown;
                 };
                 match self_ty {
+                    // An ivar collection is reachable from every method
+                    // of the object (and through any reader it exposes),
+                    // so an in-place change anywhere (`@items << x`) is
+                    // invisible to the write fold: its elements are never
+                    // proven.
                     SelfTy::Instance(c) => {
                         let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                        self.ivar_ty(c, &name)
+                        erase_type_arguments(&self.ivar_ty(c, &name))
                     }
                     _ => Ty::Unknown,
                 }
@@ -1908,14 +2226,7 @@ impl Checker<'_> {
                 // Side channel for `ivar_ty`'s silent re-walk: capture this
                 // assignment's type when it matches the (class, name) it's
                 // currently collecting for.
-                if let SelfTy::Instance(c) = self_ty {
-                    let name = String::from_utf8_lossy(n.name().as_slice()).into_owned();
-                    if let Some((cap_class, values)) = self.ivar_capture.as_mut() {
-                        if *cap_class == c {
-                            values.entry(name).or_default().push(ty.clone());
-                        }
-                    }
-                }
+                self.capture_ivar_write(self_ty, n.name().as_slice(), ty.clone());
                 ty
             }
             Node::ClassVariableWriteNode { .. } => {
@@ -1926,22 +2237,26 @@ impl Checker<'_> {
                 let n = node.as_global_variable_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope)
             }
-            // ponytail: `||=`/`&&=`/op-assign ivar writes don't feed
-            // `ivar_ty` — contract scope is the literal `@x = <expr>`
-            // form; widen the net here if a fixture ever needs it.
+            // `||=`/`&&=`/op-assign ivar writes are not typed here, but they
+            // ARE writes: each one feeds `ivar_ty` an Unknown, so an ivar
+            // whose only literal write is `@x = nil` never reads back as
+            // exactly nil once `@x ||= compute` exists.
             Node::InstanceVariableOrWriteNode { .. } => {
                 let n = node.as_instance_variable_or_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
             Node::InstanceVariableAndWriteNode { .. } => {
                 let n = node.as_instance_variable_and_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
             Node::InstanceVariableOperatorWriteNode { .. } => {
                 let n = node.as_instance_variable_operator_write_node().unwrap();
                 self.infer_expr(&n.value(), env, self_ty, scope);
+                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);
                 Ty::Unknown
             }
 
@@ -2955,6 +3270,18 @@ impl Checker<'_> {
     /// class this project never declares) leaves `t` untouched — the
     /// call's diagnostics stay byte-identical to having no cast comment
     /// at all, never a guess.
+    /// Record `node` as a contract literal when it is WRITTEN as one and
+    /// no inline cast comment on its line says otherwise.
+    fn note_contract_literal(&self, node: &Node<'_>, literals: &mut Vec<((usize, usize), LiteralClass)>) {
+        let loc = node.location();
+        if self.cast_comment_at(loc.start_offset()).is_some() {
+            return;
+        }
+        if let Some(class) = literal_class(node) {
+            literals.push(((loc.start_offset(), loc.end_offset()), class));
+        }
+    }
+
     fn apply_cast_comment(&self, t: Ty, start: usize) -> Ty {
         match self.cast_comment_at(start) {
             Some(CastTarget::NotNil) => strip_nil(t),
@@ -3064,12 +3391,16 @@ impl Checker<'_> {
 
         // Arguments.
         let mut pos_args: Vec<(Ty, (usize, usize), Option<String>)> = Vec::new();
+        let mut kw_args: Vec<KeywordArg> = Vec::new();
+        let mut literals: Vec<((usize, usize), LiteralClass)> = Vec::new();
+        let mut sorbet_args_known = call.block().is_none();
         let mut exact_arity = true;
         if let Some(args) = call.arguments() {
             for a in &args.arguments() {
                 match &a {
                     Node::SplatNode { .. } | Node::ForwardingArgumentsNode { .. } => {
                         exact_arity = false;
+                        sorbet_args_known = false;
                         self.infer_expr(&a, env, self_ty, scope);
                     }
                     Node::KeywordHashNode { .. } => {
@@ -3077,9 +3408,48 @@ impl Checker<'_> {
                         // when the callee has no keyword params: positional
                         // arity is no longer knowable here.
                         exact_arity = false;
-                        self.infer_expr(&a, env, self_ty, scope);
+                        let Some(hash) = a.as_keyword_hash_node() else {
+                            sorbet_args_known = false;
+                            self.infer_expr(&a, env, self_ty, scope);
+                            continue;
+                        };
+                        for element in &hash.elements() {
+                            if let Some(assoc) = element.as_assoc_node() {
+                                if let Some(key) = assoc.key().as_symbol_node() {
+                                    let value = assoc.value();
+                                    let loc = value.location();
+                                    let ty = self.infer_expr(&value, env, self_ty, scope);
+                                    let ty = self.apply_cast_comment(ty, loc.start_offset());
+                                    let name = String::from_utf8_lossy(key.unescaped()).into_owned();
+                                    self.note_contract_literal(&value, &mut literals);
+                                    if kw_args.iter().any(|(previous, _, _)| previous == &name) {
+                                        sorbet_args_known = false;
+                                    }
+                                    kw_args.push((
+                                        name,
+                                        ty,
+                                        (loc.start_offset(), loc.end_offset()),
+                                    ));
+                                } else {
+                                    // A string, constant or interpolated key: no
+                                    // named binding, but both sides are still
+                                    // code whose own diagnostics must fire.
+                                    sorbet_args_known = false;
+                                    self.infer_expr(&assoc.key(), env, self_ty, scope);
+                                    self.infer_expr(&assoc.value(), env, self_ty, scope);
+                                }
+                            } else {
+                                sorbet_args_known = false;
+                                // `infer_expr` has no arm for a bare
+                                // AssocSplatNode; walk the splatted value.
+                                match element.as_assoc_splat_node().and_then(|s| s.value()) {
+                                    Some(value) => { self.infer_expr(&value, env, self_ty, scope); }
+                                    None => { self.infer_expr(&element, env, self_ty, scope); }
+                                }
+                            }
+                        }
                     }
-                    Node::BlockArgumentNode { .. } => {}
+                    Node::BlockArgumentNode { .. } => { sorbet_args_known = false; }
                     _ => {
                         let loc = a.location();
                         let t = self.infer_expr(&a, env, self_ty, scope);
@@ -3095,6 +3465,7 @@ impl Checker<'_> {
                         let lit = a
                             .as_string_node()
                             .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
+                        self.note_contract_literal(&a, &mut literals);
                         pos_args.push((t, (loc.start_offset(), loc.end_offset()), lit));
                     }
                 }
@@ -3136,6 +3507,11 @@ impl Checker<'_> {
             || span_of_call(call),
             |l| (l.start_offset(), l.end_offset()),
         );
+        let typed_args = CallTypeArgs {
+            positional: &pos_args,
+            keywords: sorbet_args_known.then_some(kw_args.as_slice()),
+            literals: &literals,
+        };
 
         // E0108 is decided from the operand NODES, independently of
         // which method table below resolves the operator.
@@ -3212,7 +3588,7 @@ impl Checker<'_> {
                     {
                         self.check_arity(&m, &name, pos_args.len(), msg_loc);
                     }
-                    self.check_sig_args(&m, &name, &pos_args, Some(owner), scope);
+                    self.check_sig_args(&m, &name, &typed_args, Some(owner), scope);
                     if let Some(col_type) = &m.schema_col_type {
                         self.check_schema_cast(col_type, &name, &pos_args);
                     }
@@ -3275,7 +3651,7 @@ impl Checker<'_> {
                     );
                     Ty::Unknown
                 },
-                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false) {
+                MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, false, &typed_args) {
                     ty
                 } else {
                     let blocker = self.index.inconclusive_reason(c, false);
@@ -3393,7 +3769,7 @@ impl Checker<'_> {
                             if exact_arity {
                                 self.check_arity(&m, "new", pos_args.len(), msg_loc);
                             }
-                            self.check_sig_args(&m, "new", &pos_args, Some(owner), scope);
+                            self.check_sig_args(&m, "new", &typed_args, Some(owner), scope);
                             return Ty::Instance(c);
                         }
                         MethodLookup::Inconclusive => {
@@ -3413,7 +3789,7 @@ impl Checker<'_> {
                             if exact_arity {
                                 self.check_arity(&m, "new", pos_args.len(), msg_loc);
                             }
-                            self.check_sig_args(&m, "new", &pos_args, Some(owner), scope);
+                            self.check_sig_args(&m, "new", &typed_args, Some(owner), scope);
                         }
                         MethodLookup::NotFound => {
                             // Bead ita-gjb: ancestry fully closed with no
@@ -3439,7 +3815,7 @@ impl Checker<'_> {
                             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
                         }
                         MethodLookup::Inconclusive => {
-                            if self.rbi_escalate(c, "initialize", false).is_none() {
+                            if self.rbi_escalate(c, "initialize", false, &typed_args).is_none() {
                                 let blocker = self.index.inconclusive_reason(c, true);
                                 self.tally_inconclusive(blocker);
                                 self.tally_ar_base(blocker, c);
@@ -3457,7 +3833,7 @@ impl Checker<'_> {
                         if exact_arity {
                             self.check_arity(&m, &name, pos_args.len(), msg_loc);
                         }
-                        self.check_sig_args(&m, &name, &pos_args, Some(c), scope);
+                        self.check_sig_args(&m, &name, &typed_args, Some(c), scope);
                         let ret = self.method_return(c, &name, true, &m, scope);
                         if ret == Ty::Unknown {
                             self.note_unknown_origin(
@@ -3470,7 +3846,7 @@ impl Checker<'_> {
                     }
                     // Class objects have a large builtin surface (name,
                     // ancestors, ...): never unknown-method here.
-                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true) {
+                    MethodLookup::Inconclusive => if let Some(ty) = self.rbi_escalate(c, &name, true, &typed_args) {
                         ty
                     } else {
                         let blocker = self.index.inconclusive_reason(c, true);
@@ -3566,7 +3942,13 @@ impl Checker<'_> {
                     if exact_arity {
                         self.check_core_arity(cm, &name, pos_args.len(), msg_loc);
                     }
-                    let ret = core_ret_to_ty(cm.ret, t);
+                    let args: Vec<Ty> = pos_args.iter().map(|(ty, _, _)| ty.clone()).collect();
+                    let shape = CoreCallShape {
+                        args: exact_arity.then_some(args.as_slice()),
+                        int_literal: first_int_literal(call),
+                        block: call.block().is_some(),
+                    };
+                    let ret = core_call_ret(cc, &name, cm.ret, t, &shape);
                     if ret == Ty::Unknown {
                         self.note_unknown_origin(call, UnkOrigin::CoreRet, None);
                     }
@@ -3908,18 +4290,15 @@ impl Checker<'_> {
     /// function: step (3) needs no RBI and must still run, which is the
     /// entire point of shipping a curated inventory instead of only
     /// widening the RBI walk.
-    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {
-        if self.silent {
-            return None;
-        }
+    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool, args: &CallTypeArgs<'_>) -> Option<Ty> {
         if let Some(map) = self.rbi_map {
-            if let Some(ty) = crate::index::dsl_method_lookup(self.index, c, name, singleton, map) {
+            if let Some(declaration) = crate::index::dsl_method_contract(self.index, c, name, singleton, map) {
                 self.tally(Bucket::DslMethod);
-                return Some(ty);
+                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
             }
-            if let Some(ty) = crate::index::rbi_method_lookup(self.index, c, name, singleton, map) {
+            if let Some(declaration) = crate::index::rbi_method_contract(self.index, c, name, singleton, map) {
                 self.tally(Bucket::RbiMethod);
-                return Some(ty);
+                return Some(self.rbi_contract_call(c, name, singleton, &declaration, args));
             }
         }
         if self.index.declared_by(c, "ActiveRecord::Base") {
@@ -3934,6 +4313,22 @@ impl Checker<'_> {
             }
         }
         None
+    }
+
+    fn rbi_contract_call(
+        &mut self,
+        class: ClassId,
+        name: &str,
+        singleton: bool,
+        declaration: &crate::index::RbiMethod,
+        args: &CallTypeArgs<'_>,
+    ) -> Ty {
+        if crate::index::rbi_contract_dispatch_eligible(self.index, class, name, singleton, declaration) {
+            if let (Some(sig), Some(names)) = (&declaration.definition.sorbet_sig, &declaration.definition.positional_names) {
+                self.check_sorbet_args(sig, &declaration.nesting, names, &declaration.definition.keywords, name, args);
+            }
+        }
+        declaration.return_ty(self.index)
     }
 
     /// Bead ita-dqo, deliverable 1 (E0107 constraint contradiction):
@@ -4418,11 +4813,16 @@ impl Checker<'_> {
         &mut self,
         m: &MethodSig,
         name: &str,
-        pos_args: &[(Ty, (usize, usize), Option<String>)],
+        args: &CallTypeArgs<'_>,
         owner: Option<ClassId>,
         scope: &[String],
     ) {
-        let Some(sig) = &m.sig else { return };
+        let Some(sig) = &m.sig else {
+            if let (Some((sig, nesting)), Some(names)) = (self.effective_sorbet(m, name), &m.positional_names) {
+                self.check_sorbet_args(&sig, &nesting, names, &m.keywords, name, args);
+            }
+            return;
+        };
         let sig = sig.clone();
         let param_tys: Vec<Ty> = sig
             .params
@@ -4433,11 +4833,11 @@ impl Checker<'_> {
             })
             .map(|t| self.rbs_to_ty(t, owner, scope, &sig.type_params))
             .collect();
-        for (i, (arg_ty, span, _)) in pos_args.iter().enumerate() {
+        for (i, (arg_ty, span, _)) in args.positional.iter().enumerate() {
             let Some(param_ty) = param_tys.get(i) else {
                 break;
             };
-            if !compatible(arg_ty, param_ty, self.index) {
+            if !compatible(arg_ty, param_ty, self.index, self.rbi_map) {
                 let message = format!(
                     "argument {} of `{name}` expects {}, got {}",
                     i + 1,
@@ -4453,6 +4853,63 @@ impl Checker<'_> {
                 );
             }
         }
+    }
+
+    fn check_sorbet_args(
+        &mut self,
+        sig: &crate::sorbet_sig::SorbetSig,
+        nesting: &[String],
+        positional_names: &[String],
+        keywords: &[(String, bool)],
+        method: &str,
+        args: &CallTypeArgs<'_>,
+    ) {
+        let Some(keyword_args) = args.keywords else { return };
+        // A keyword hash can be a positional Hash in Ruby. Without a matching
+        // keyword layout, do not guess which parameter received it.
+        if keyword_args.iter().any(|(name, _, _)| !keywords.iter().any(|(kw, _)| kw == name)) {
+            return;
+        }
+        let positional = positional_names.iter().zip(args.positional).map(|(name, (_, span, _))| (name, *span));
+        let bound = positional.chain(keyword_args.iter().map(|(name, _, span)| (name, *span)));
+        for (name, span) in bound {
+            // Literal-only: an argument that is not WRITTEN as a literal is
+            // never judged, whatever its inferred type says.
+            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone()) else {
+                continue;
+            };
+            self.check_sorbet_argument(sig, nesting, method, name, (&literal, span));
+        }
+    }
+
+    fn check_sorbet_argument(
+        &mut self,
+        sig: &crate::sorbet_sig::SorbetSig,
+        nesting: &[String],
+        method: &str,
+        name: &str,
+        (literal, span): (&LiteralClass, (usize, usize)),
+    ) {
+        let Some((_, expr)) = sig.params.iter().find(|(param, _)| param == name) else { return };
+        let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
+        if self.contract_breaks(std::slice::from_ref(literal), &expected) {
+            self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
+                format!("argument `{name}` of `{method}` expects {}, got {}",
+                    ty_name(&expected, self.index), literal.name(self.index)));
+        }
+    }
+
+    /// Does a value that can only be one of `leaves` break the contract
+    /// `expected`? A literal is judged by the class it is written as, so
+    /// the only doubt left is which leaf runs: a union of branch leaves is
+    /// accused only when NO leaf fits, because this checker cannot tell a
+    /// dead branch from a live one. A project that turns runtime checking
+    /// off (`T::Configuration.default_checked_level = :never`) enforces no
+    /// sig, so nothing is accused there.
+    fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
+        !self.index.sorbet_runtime_unchecked
+            && !leaves.is_empty()
+            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map))
     }
 
     /// E0106 (bead ita-yho): literal-argument-only, cast-is-provably-
@@ -4514,6 +4971,8 @@ impl Checker<'_> {
             self.set_ret_cause(None);
             return Ty::Unknown;
         }
+        // A memo entry is only ever written after `sig_fill` answered
+        // Unknown for this same key, so it is read first.
         let key = (class, name.to_string(), singleton);
         if let Some(t) = self.return_memo.get(&key) {
             let t = t.clone();
@@ -4529,17 +4988,18 @@ impl Checker<'_> {
             self.set_ret_cause(cause);
             return t;
         }
+        let declared = self.sig_fill(m, name);
+        if declared != Ty::Unknown {
+            self.set_ret_cause(None);
+            return declared;
+        }
         if !self.in_progress.insert(key.clone()) {
             self.set_ret_cause(None);
-            // Bead ita-4xy: the fixpoint fallback still consults the sig.
-            // The sig is a static annotation on the def itself, not a
-            // product of this walk, so checking it here costs nothing and
-            // can only turn a blind Unknown into a real type.
-            return self.sig_fill(m);
+            return Ty::Unknown;
         }
         let text = m.file.text(self.db);
         let parse = ruby_prism::parse(text.as_bytes());
-        let mut ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
+        let ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
             let was_silent = self.silent;
             self.silent = true;
             // This walks another method's body — byte offsets there
@@ -4577,7 +5037,7 @@ impl Checker<'_> {
                     }),
                 ),
             );
-            let owner_scope = self.index.class(class).nesting.clone();
+            let owner_scope = m.nesting.clone();
             let t = self.check_method_body(
                 &def,
                 &owner_scope,
@@ -4597,14 +5057,6 @@ impl Checker<'_> {
             Ty::Unknown
         };
         self.in_progress.remove(&key);
-        // Bead ita-4xy: the ONE point where an inferred-body answer would
-        // otherwise surface as the final `Ty::Unknown` — try the sig here,
-        // never before. An inferred body type, however partial, already
-        // won by construction (this arm only runs when `ty` IS Unknown),
-        // so there is no precedence for the sig to steal.
-        if ty == Ty::Unknown {
-            ty = self.sig_fill(m);
-        }
         // Bead ita-mv5: freshly-computed path — pair `return_cause_memo`
         // with `return_memo` right here, at the exact key both are keyed
         // by. `check_method_body` already set `self.last_ret_cause` (or
@@ -4615,15 +5067,16 @@ impl Checker<'_> {
         ty
     }
 
-    /// Bead ita-4xy: `method_return`'s sig fallback — only ever called on
-    /// a path that already landed on `Ty::Unknown`, so this can never
-    /// steal precedence from an inferred body type. `#:` RBS sigs are a
-    /// separate, earlier-checked field (`m.sig`, line ~2891) and never
-    /// reach here. `resolve_ret_ty` itself is invariant-#1-safe: an
-    /// unresolvable name (project class not found, or a shape the
-    /// scanner doesn't recognize) stays `Ty::Unknown`, never a guess.
-    fn sig_fill(&self, m: &MethodSig) -> Ty {
-        crate::sorbet_sig::resolve_ret_ty(m.sorbet_ret.as_deref(), self.index)
+    /// Consumer types use the explicit contract; the source body is checked
+    /// independently by `check_method_body`, never against this assumed result.
+    fn sig_fill(&self, m: &MethodSig, name: &str) -> Ty {
+        note_contract_work(|w| w.return_probes += 1);
+        self.effective_sorbet(m, name)
+            .filter(|(sig, _)| !sig.void)
+            .and_then(|(sig, nesting)| sig.ret.map(|expr| {
+                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)
+            }))
+            .unwrap_or(Ty::Unknown)
     }
 
     /// Bead ita-mv5: `last_ret_cause` writer. Exists so `method_return`'s
@@ -4684,19 +5137,168 @@ impl Checker<'_> {
     /// (Unknown never manufactures a diagnostic, only a possible false
     /// negative), confirmed measured on corpus-c: identical error hashes (2)
     /// and warning ceiling (4321) before and after this bead.
+    ///
+    /// The fold only sees `@name` writes in `class`'s own instance
+    /// methods, so it is a proof only when no other writer exists:
+    /// `ivar_writes_hidden` turns every other writer path into Unknown.
     fn ivar_ty(&mut self, class: ClassId, name: &str) -> Ty {
-        if let Some(map) = self.ivar_class_memo.get(&class) {
-            return map.get(name).cloned().unwrap_or(Ty::Unknown);
+        if !self.ensure_ivar_walk(class) {
+            return Ty::Unknown; // recursive read mid-computation: fixpoint fallback
+        }
+        let own = self.ivar_class_memo.get(&class).and_then(|map| map.get(name)).cloned();
+        match own {
+            Some(ty) if ty != Ty::Unknown && !self.ivar_writes_hidden(class, name) => ty,
+            _ => Ty::Unknown,
+        }
+    }
+
+    /// Walks `class`'s instance methods once and memoizes the folded
+    /// writes; `false` while that walk is already in progress.
+    fn ensure_ivar_walk(&mut self, class: ClassId) -> bool {
+        if self.ivar_class_memo.contains_key(&class) {
+            return true;
         }
         if !self.ivar_class_in_progress.insert(class) {
-            return Ty::Unknown; // recursive read mid-computation: fixpoint fallback
+            return false;
         }
         let collected = self.walk_class_ivars(class);
         self.ivar_class_in_progress.remove(&class);
-        let result_map = fold_ivar_writes(collected);
-        let ty = result_map.get(name).cloned().unwrap_or(Ty::Unknown);
-        self.ivar_class_memo.insert(class, result_map);
-        ty
+        self.ivar_class_memo.insert(class, fold_ivar_writes(collected));
+        true
+    }
+
+    /// Can `@name` on an instance of `class` be written by anything the
+    /// per-class walk did not see as a typed write? Every answer this
+    /// cannot rule out is `true` (invariant #1: an ivar whose only
+    /// visible write is `@x = nil` must not read back as exactly nil
+    /// when an attribute writer or reflection can replace it):
+    ///
+    /// - a write the index saw outside any class's instance method, in a
+    ///   block that may rebind `self`, or through reflection
+    ///   (`ProjectIndex::hidden_ivar_writes`);
+    /// - a writer method `name=` (`attr_writer`/`attr_accessor`, a
+    ///   `define_method`, a hand-written one) anywhere in the ancestry or
+    ///   the descendants, or an ancestry that cannot rule one out;
+    /// - a write to the same name in any ancestor's or descendant's own
+    ///   instance methods, which run on this same object.
+    ///
+    /// Asked on every ivar read, so the settled answer is memoized per
+    /// (class, name) and every ancestry comes from `cached_ancestors`: a
+    /// deep hierarchy used to re-linearize each descendant on each read.
+    fn ivar_writes_hidden(&mut self, class: ClassId, name: &str) -> bool {
+        if self.index.hidden_ivar_writes_any || self.index.hidden_ivar_writes.contains(name) {
+            return true;
+        }
+        if let Some(&hidden) = self.ivar_hidden_memo.get(&class).and_then(|memo| memo.get(name)) {
+            return hidden;
+        }
+        let subtree = subclass_edges(self.index, class);
+        let writer = format!("{}=", name.trim_start_matches('@'));
+        let (hidden, settled) = if self.ivar_writer_may_exist(class, &writer, &subtree) {
+            (true, true)
+        } else {
+            self.family_writes_ivar(class, name, &subtree)
+        };
+        if settled {
+            self.ivar_hidden_memo.entry(class).or_default().insert(name.to_owned(), hidden);
+        }
+        hidden
+    }
+
+    /// Does any ancestor or descendant of `class` write `name` in its own
+    /// instance methods? `(answer, settled)`: a member whose walk is in
+    /// progress answers `true` unsettled — the fixpoint fallback, never
+    /// memoized.
+    fn family_writes_ivar(&mut self, class: ClassId, name: &str, subtree: &[(ClassId, ClassId)]) -> (bool, bool) {
+        let ancestors = self.cached_ancestors(class);
+        let family = ancestors.0.iter().copied().chain(subtree.iter().map(|&(kid, _)| kid)).filter(|&c| c != class);
+        for member in family {
+            if !self.ensure_ivar_walk(member) {
+                return (true, false);
+            }
+            if self.ivar_class_memo.get(&member).is_some_and(|map| map.contains_key(name)) {
+                return (true, true);
+            }
+        }
+        (false, true)
+    }
+
+    /// `lookup_method(class, writer)` is not `NotFound`, or
+    /// `descendant_defines(class, writer, false)`: the same answer, read
+    /// off memoized ancestries. `subtree` is `class`'s descendants as
+    /// (class, superclass) edges.
+    ///
+    /// Past the ancestor walk and `descendant_defines`, every descendant
+    /// is closed and none defines the writer, which is where
+    /// `abstract_family_defines` then looks: a descendant answering every
+    /// name (`method_missing`/`respond_to_missing?`), an incomplete
+    /// ancestry, or an ancestry member defining the writer or open for a
+    /// reason other than `AbstractRaise`. Only a descendant's OWN part of
+    /// its ancestry is read (`own_ancestry_len`): the rest is exactly its
+    /// superclass's, which is `class` (read above) or another descendant
+    /// (read in its own turn).
+    fn ivar_writer_may_exist(&mut self, class: ClassId, writer: &str, subtree: &[(ClassId, ClassId)]) -> bool {
+        let index = self.index;
+        let supplies = |a: ClassId| {
+            let c = index.class(a);
+            (c.open && c.open_reason != Some(OpenReason::AbstractRaise)) || c.methods.contains_key(writer)
+        };
+        let ancestors = self.cached_ancestors(class);
+        if ancestors.0.iter().any(|&a| supplies(a)) || !ancestors.1 || index.class(class).is_module {
+            return true;
+        }
+        if subtree.iter().any(|&(kid, _)| index.class(kid).open || index.class(kid).methods.contains_key(writer)) {
+            return true;
+        }
+        for &(kid, parent) in subtree {
+            let methods = &index.class(kid).methods;
+            if methods.contains_key("method_missing") || methods.contains_key("respond_to_missing?") {
+                return true;
+            }
+            let chain = self.cached_ancestors(kid);
+            let own = self.own_ancestry_len(kid, parent);
+            if !chain.1 || chain.0[..own].iter().any(|&a| supplies(a)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// `index.ancestors(id)`, linearized once per class per check.
+    fn cached_ancestors(&mut self, id: ClassId) -> Rc<(Vec<ClassId>, bool)> {
+        let index = self.index;
+        Rc::clone(self.ancestors_memo.entry(id).or_insert_with(|| Rc::new(index.ancestors(id))))
+    }
+
+    /// How long a prefix of `kid`'s ancestry is its own: when the rest is
+    /// EXACTLY `parent`'s ancestry (the linearization appends the
+    /// superclass chain after the class's prepends, itself and its
+    /// includes), the prefix before it; otherwise the whole ancestry.
+    fn own_ancestry_len(&mut self, kid: ClassId, parent: ClassId) -> usize {
+        if let Some(&len) = self.own_ancestry_memo.get(&(kid, parent)) {
+            return len;
+        }
+        let chain = self.cached_ancestors(kid);
+        let above = self.cached_ancestors(parent);
+        let len = chain
+            .0
+            .len()
+            .checked_sub(above.0.len())
+            .filter(|&start| chain.0[start..] == above.0[..])
+            .unwrap_or(chain.0.len());
+        self.own_ancestry_memo.insert((kid, parent), len);
+        len
+    }
+
+    /// Side channel for `ivar_ty`'s silent re-walk: record one write's type
+    /// when it lands on the (class, name) being collected.
+    fn capture_ivar_write(&mut self, self_ty: SelfTy, name: &[u8], ty: Ty) {
+        let SelfTy::Instance(c) = self_ty else { return };
+        if let Some((cap_class, values)) = self.ivar_capture.as_mut() {
+            if *cap_class == c {
+                values.entry(String::from_utf8_lossy(name).into_owned()).or_default().push(ty);
+            }
+        }
     }
 
     /// Single silent walk of every instance method of `class`, capturing
@@ -4793,6 +5395,24 @@ impl Checker<'_> {
     }
 }
 
+/// Every transitive subclass of `id` (the runtime classes an instance
+/// method of `id` can run on), each with the superclass it was reached
+/// from, in depth-first discovery order.
+fn subclass_edges(index: &ProjectIndex, id: ClassId) -> Vec<(ClassId, ClassId)> {
+    let mut out = Vec::new();
+    let mut seen = FxHashSet::default();
+    let mut stack = vec![id];
+    while let Some(cur) = stack.pop() {
+        for &kid in index.subclasses.get(&cur).into_iter().flatten() {
+            if seen.insert(kid) {
+                out.push((kid, cur));
+                stack.push(kid);
+            }
+        }
+    }
+    out
+}
+
 /// Fold each ivar's collected assignment types (from `Checker::walk_class_ivars`)
 /// into one `Ty` per name: two assignments of the same type keep that type;
 /// a differing type, or any `Unknown`, collapses straight to `Ty::Unknown` —
@@ -4853,6 +5473,10 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
     }
 }
 
+/// `RbiProject`'s `constant name -> declaring .rbi files` map, as the
+/// checker holds it.
+type RbiMap = HashMap<String, Vec<std::path::PathBuf>>;
+
 /// Strict-but-safe compatibility: Unknown always passes. An `Instance` arg
 /// also passes when the param class is in its ancestry (a subclass IS the
 /// param type at runtime) — or when that ancestry is incomplete, because
@@ -4860,23 +5484,83 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
 /// accusation. Surfaced by bead ita-p24: once malformed sig comments stopped
 /// dying as E0105, genuine subtype calls (e.g. `Entry::Method` into
 /// `(entry: Entry)`) fired E0103 on exact-equality.
-fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
+///
+/// Both nominal questions fail closed. A MODULE-typed param is never
+/// proof against anything: any class, core ones included, can gain a
+/// module at runtime by reflection this index never records as an
+/// ancestor edge (`Late.include(M)`, `Late.send(:include, M)`,
+/// `Late.class_eval { include M }`, a class method that calls `include`),
+/// and `X.extend(M)` makes a class object itself an `M`. An `Instance` arg
+/// against a core scalar or collection param is accused only when
+/// `may_be_core_value` rules the core type out — `class SafeStr < String`
+/// IS a String under sorbet-runtime.
+fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
     match (arg, param) {
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
-        (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index)),
-        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index)),
-        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index),
+        // An instance of a MODULE (`self` in a module method, a value typed
+        // by a module name) is an instance of some class that includes it,
+        // which this checker cannot name: never proof against anything.
+        (Ty::Instance(a), _) if index.class(*a).is_module => true,
+        (_, Ty::Instance(p)) if index.class(*p).is_module => true,
+        (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index, rbi)),
+        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index, rbi)),
+        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index, rbi),
         (Ty::Hash(ak, av), Ty::Hash(pk, pv)) => {
-            compatible(ak, pk, index) && compatible(av, pv, index)
+            compatible(ak, pk, index, rbi) && compatible(av, pv, index, rbi)
         }
-        (Ty::Instance(a), Ty::Instance(p)) => {
-            if a == p {
+        (Ty::Instance(a), p) => instance_compatible(*a, p, index, rbi),
+        (a, p) => a == p,
+    }
+}
+
+/// `compatible` for an instance of project class `a` against a param that
+/// is neither Unknown, a union nor a module.
+fn instance_compatible(a: ClassId, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+    match param {
+        Ty::Instance(p) => {
+            if a == *p {
                 return true;
             }
-            let (anc, complete) = index.ancestors(*a);
+            let (anc, complete) = index.ancestors(a);
             anc.contains(p) || !complete
         }
-        (a, p) => a == p,
+        // Neither a sig nor an RBS param ever resolves to `Ty::Class`, so
+        // every param left here is a core scalar or collection.
+        _ => may_be_core_value(a, index, rbi),
+    }
+}
+
+/// Could an instance of project class `id` be a core value (a `String`, a
+/// `Hash`, an `Array`, ...)? Only a superclass edge makes a class one, so
+/// the answer is NO only when every link of its ancestry is known and
+/// none of them may be a core class: the ancestry is complete (`class
+/// SafeStr < String` leaves `String` unresolved), no ancestor is `open`
+/// (a core reopen such as `class Hash` is `ReopenedExternal`, a
+/// `declarations/gems.rbi` class `DeclaredExternal`, and since the first
+/// recorded reason wins, no open reason is trusted to rule either out),
+/// and no `sorbet/rbi` file declares an ancestor's path (a project
+/// reopening of a gem class written without its superclass looks like a
+/// fresh Object subclass here). Any doubt is `true`, never an accusation.
+/// The trade-off is a false negative: an instance of an open project
+/// class (a Rails model with `validates`) is no longer accused against
+/// `String` and friends.
+fn may_be_core_value(id: ClassId, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+    let (ancestors, complete) = index.ancestors(id);
+    !complete
+        || ancestors.iter().any(|&c| index.class(c).open)
+        || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))
+}
+
+/// A collection whose CONTENTS are unproven keeps only its category: a
+/// local changed in place, an ivar any method may change, a collection
+/// nested in another one (all shared by reference). Its type arguments
+/// become Unknown; that it IS an Array or a Hash still holds.
+fn erase_type_arguments(t: &Ty) -> Ty {
+    match t {
+        Ty::Array(_) => Ty::Array(Box::new(Ty::Unknown)),
+        Ty::Hash(_, _) => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+        Ty::Union(parts) => Ty::Union(parts.iter().map(erase_type_arguments).collect()),
+        other => other.clone(),
     }
 }
 
@@ -4918,6 +5602,250 @@ fn arity_str(m: &MethodSig) -> String {
     }
 }
 
+/// What a core call site proves about its arguments: `args` is the
+/// positional argument types when the call shape is exact (no splat, no
+/// keyword hash, no `...`), `int_literal` the value of a first
+/// argument written as a plain Integer literal, and `block` whether the
+/// call passes a block (a literal one or `&blk`).
+struct CoreCallShape<'a> {
+    args: Option<&'a [Ty]>,
+    int_literal: Option<i64>,
+    block: bool,
+}
+
+/// The first positional argument's value when it is written as an
+/// Integer literal (`2`, `-1`), else `None`.
+fn first_int_literal(call: &CallNode<'_>) -> Option<i64> {
+    let args = call.arguments()?;
+    let first = args.arguments().iter().next()?;
+    let text = first.as_integer_node()?.location().as_slice().to_vec();
+    String::from_utf8(text).ok()?.replace('_', "").parse().ok()
+}
+
+/// A core method's return at THIS call site. The table's `CoreRet` is
+/// the answer for the argument-free form (or an argument that cannot
+/// change the type); every method below returns a different type
+/// depending on its arguments, so it answers only when the argument
+/// types make the result trivially provable and is `Ty::Unknown`
+/// otherwise (invariant #1: a wrong precise type here becomes an E0101,
+/// E0103 or E0109 accusation downstream).
+///
+/// The block decides first: a table return describes one block shape
+/// only, so a call in the other shape is `Unknown` (`core_ret_holds_for_block`).
+fn core_call_ret(cc: CoreClass, name: &str, ret: CoreRet, recv: &Ty, shape: &CoreCallShape<'_>) -> Ty {
+    if !core_ret_holds_for_block(cc, name, shape.block) {
+        return Ty::Unknown;
+    }
+    let Some(args) = shape.args else {
+        return if core_ret_depends_on_args(cc, name) { Ty::Unknown } else { core_ret_to_ty(ret, recv) };
+    };
+    let answer = match cc {
+        CoreClass::Integer => integer_call_ret(name, args, shape.int_literal),
+        CoreClass::Float => float_call_ret(name, args, shape.int_literal),
+        CoreClass::Array => array_call_ret(name, args, recv),
+        CoreClass::Hash => hash_call_ret(name, args, recv),
+        CoreClass::Str => str_call_ret(name, args, shape.block),
+        _ => None,
+    };
+    answer.unwrap_or_else(|| core_ret_to_ty(ret, recv))
+}
+
+/// Does the table's return describe a call in this block shape? Two
+/// families of core methods answer something else entirely depending on
+/// the block, so the other shape is never proven:
+///
+/// - an ITERATOR called without a block answers an `Enumerator`, never
+///   the receiver or its elements (`[3, 1].each_with_index`,
+///   `{a: 1}.each`, `[1].sort_by`, `3.times`);
+/// - a method that BUILDS its result from the block answers what the
+///   block returned (`{a: 1}.to_h { |k, v| [k.to_s, v.to_s] }`,
+///   `a.merge(b) { |key, old, new| ... }`), and `String#split`/`#chars`
+///   with a block answer the receiver string instead of an Array.
+fn core_ret_holds_for_block(cc: CoreClass, name: &str, block: bool) -> bool {
+    if block {
+        return !matches!(
+            (cc, name),
+            (CoreClass::Hash, "to_h" | "merge") | (CoreClass::Str, "split" | "chars")
+        );
+    }
+    !matches!(
+        (cc, name),
+        (
+            CoreClass::Array,
+            "each" | "each_with_index" | "map" | "collect" | "select" | "filter" | "reject"
+                | "flat_map" | "sort_by" | "find_index"
+        ) | (CoreClass::Hash, "each" | "each_pair" | "map")
+            | (CoreClass::Integer, "times")
+    )
+}
+
+/// `Integer` methods whose return follows the arguments; `None` means
+/// the table's own return applies.
+fn integer_call_ret(name: &str, args: &[Ty], int_literal: Option<i64>) -> Option<Ty> {
+    let ty = match name {
+        // Arithmetic takes the operand's numeric class (`1 * 1.5` is a
+        // Float); anything else (Rational, BigDecimal, an unknown object's
+        // `coerce`) is unproven.
+        "+" | "-" | "*" | "/" | "%" => match args {
+            [Ty::Int] => Ty::Int,
+            [Ty::Float] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        // A negative exponent answers a Rational: only a literal
+        // non-negative one is proven Integer.
+        "**" => match (args, int_literal) {
+            ([Ty::Int], Some(n)) if n >= 0 => Ty::Int,
+            _ => Ty::Unknown,
+        },
+        // `clamp` returns the receiver or one of its bounds.
+        "clamp" => match args {
+            [Ty::Int, Ty::Int] => Ty::Int,
+            _ => Ty::Unknown,
+        },
+        _ => return None,
+    };
+    Some(ty)
+}
+
+/// `Float` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn float_call_ret(name: &str, args: &[Ty], int_literal: Option<i64>) -> Option<Ty> {
+    let ty = match name {
+        // An Integer or Float operand keeps a Float; a BigDecimal or
+        // Complex one does not.
+        "+" | "-" | "*" | "/" | "%" => match args {
+            [Ty::Int | Ty::Float] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        // `(-8.0) ** 0.5` is a Complex: only an Integer exponent is proven.
+        "**" => match args {
+            [Ty::Int] => Ty::Float,
+            _ => Ty::Unknown,
+        },
+        "round" | "floor" | "ceil" => float_digits_ret(args, int_literal),
+        _ => return None,
+    };
+    Some(ty)
+}
+
+/// `Float#round`/`#floor`/`#ceil`: no digits (or digits <= 0) answer an
+/// Integer, positive digits a Float; digits nobody wrote are unproven.
+fn float_digits_ret(args: &[Ty], int_literal: Option<i64>) -> Ty {
+    match (args, int_literal) {
+        ([], _) => Ty::Int,
+        ([Ty::Int], Some(n)) if n > 0 => Ty::Float,
+        ([Ty::Int], Some(_)) => Ty::Int,
+        _ => Ty::Unknown,
+    }
+}
+
+/// `Array` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn array_call_ret(name: &str, args: &[Ty], recv: &Ty) -> Option<Ty> {
+    match name {
+        // With a count, these return an Array of elements, not one.
+        "first" | "last" | "min" | "max" | "pop" | "shift" => match (args, recv) {
+            ([], _) => None,
+            ([Ty::Int], Ty::Array(_)) => Some(recv.clone()),
+            _ => Some(Ty::Unknown),
+        },
+        "flatten" => Some(flatten_ret(recv, args.is_empty())),
+        // The result holds the receiver's elements AND the arguments'
+        // (`[1] + ["a"]`, `[1].concat(["s"])`, `[1] << "s"`): the union of
+        // both sides when every side is known, else Unknown elements.
+        // An argument to `+`/`concat` that is not a proven Array (an
+        // object answering `to_ary`) has unknown elements.
+        "+" | "concat" => {
+            let parts = args.iter().map(|a| match a {
+                Ty::Array(e) => (**e).clone(),
+                _ => Ty::Unknown,
+            });
+            Some(Ty::Array(Box::new(union_with_elements(recv, parts))))
+        }
+        "<<" | "push" => Some(Ty::Array(Box::new(union_with_elements(recv, args.iter().cloned())))),
+        _ => None,
+    }
+}
+
+/// The receiver Array's element type unioned with `more` — `Unknown` as
+/// soon as any side is (`Ty::union` never absorbs an unknown member).
+fn union_with_elements(recv: &Ty, more: impl Iterator<Item = Ty>) -> Ty {
+    let Ty::Array(elem) = recv else { return Ty::Unknown };
+    more.fold((**elem).clone(), Ty::union)
+}
+
+/// `Hash` methods whose return follows the arguments; `None` means the
+/// table's own return applies.
+fn hash_call_ret(name: &str, args: &[Ty], recv: &Ty) -> Option<Ty> {
+    match name {
+        // `merge` holds the receiver's pairs AND every argument's
+        // (`{a: 1}.merge({b: "x"})`): unions when every side is a proven
+        // Hash, Unknown pairs otherwise.
+        "merge" => {
+            let Ty::Hash(k, v) = recv else { return Some(Ty::Unknown) };
+            let (mut key, mut val) = ((**k).clone(), (**v).clone());
+            for a in args {
+                let (ak, av) = match a {
+                    Ty::Hash(ak, av) => ((**ak).clone(), (**av).clone()),
+                    _ => (Ty::Unknown, Ty::Unknown),
+                };
+                key = Ty::union(key, ak);
+                val = Ty::union(val, av);
+            }
+            Some(Ty::Hash(Box::new(key), Box::new(val)))
+        }
+        _ => None,
+    }
+}
+
+/// `String` methods whose return follows the arguments; `None` means the
+/// table's own return applies. `gsub(pattern)` with no replacement and no
+/// block answers an `Enumerator`.
+fn str_call_ret(name: &str, args: &[Ty], block: bool) -> Option<Ty> {
+    (name == "gsub" && args.len() == 1 && !block).then_some(Ty::Unknown)
+}
+
+/// Does `core_call_ret` read the arguments for this method? Those answer
+/// `Unknown` when the call shape hides the arguments (a splat, a keyword
+/// hash, `...`).
+fn core_ret_depends_on_args(cc: CoreClass, name: &str) -> bool {
+    match cc {
+        CoreClass::Integer => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "clamp"),
+        CoreClass::Float => matches!(name, "+" | "-" | "*" | "/" | "%" | "**" | "round" | "floor" | "ceil"),
+        CoreClass::Array => matches!(
+            name,
+            "first" | "last" | "min" | "max" | "pop" | "shift" | "flatten" | "+" | "concat" | "<<" | "push"
+        ),
+        CoreClass::Hash => name == "merge",
+        CoreClass::Str => name == "gsub",
+        _ => false,
+    }
+}
+
+/// `Array#flatten`: the receiver's type only when its elements cannot
+/// be flattened at all (a core scalar); a full flatten of nested arrays
+/// of scalars is an Array of what the INNER arrays hold, and those are
+/// shared by reference (see `CoreRet::Elem`), so its elements are
+/// unproven; anything that may respond to `to_ary` (a project instance,
+/// an unknown, a union) is unproven.
+fn flatten_ret(recv: &Ty, full: bool) -> Ty {
+    fn scalar(t: &Ty) -> bool {
+        matches!(t, Ty::Int | Ty::Float | Ty::Str | Ty::Sym | Ty::Bool | Ty::Nil | Ty::Hash(_, _))
+    }
+    let Ty::Array(elem) = recv else { return Ty::Unknown };
+    if scalar(elem) {
+        return recv.clone();
+    }
+    if !full {
+        return Ty::Unknown;
+    }
+    let mut inner: &Ty = elem;
+    while let Ty::Array(e) = inner {
+        inner = e;
+    }
+    if scalar(inner) { Ty::Array(Box::new(Ty::Unknown)) } else { Ty::Unknown }
+}
+
 fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {
     match ret {
         CoreRet::Int => Ty::Int,
@@ -4927,16 +5855,20 @@ fn core_ret_to_ty(ret: CoreRet, recv: &Ty) -> Ty {
         CoreRet::Bool => Ty::Bool,
         CoreRet::Nil => Ty::Nil,
         CoreRet::SelfSame => recv.clone(),
+        // An element that is itself a collection is shared by reference:
+        // `outer.first << "s"` changes what `outer` holds without writing
+        // `outer`, so a collection taken out of a collection never keeps
+        // its own type arguments.
         CoreRet::Elem => match recv {
-            Ty::Array(e) => (**e).clone(),
+            Ty::Array(e) => erase_type_arguments(e),
             _ => Ty::Unknown,
         },
         CoreRet::KeyArray => match recv {
-            Ty::Hash(k, _) => Ty::Array(k.clone()),
+            Ty::Hash(k, _) => Ty::Array(Box::new(erase_type_arguments(k))),
             _ => Ty::Unknown,
         },
         CoreRet::ValArray => match recv {
-            Ty::Hash(_, v) => Ty::Array(v.clone()),
+            Ty::Hash(_, v) => Ty::Array(Box::new(erase_type_arguments(v))),
             _ => Ty::Unknown,
         },
         CoreRet::StrArray => Ty::Array(Box::new(Ty::Str)),
@@ -5239,6 +6171,230 @@ fn stmts_diverge(stmts: &ruby_prism::StatementsNode<'_>) -> bool {
         }
         _ => false,
     }
+}
+
+/// Return conformance is narrower than inference: closures, ensure overrides,
+/// loops and unreachable suffixes must not manufacture an E0109.
+#[derive(Default)]
+struct ReturnContractSafety {
+    uncertain: bool,
+    /// Every explicit `return`, as the literal it returns or `None` when
+    /// its value is not written as one (never judged).
+    returns: Vec<Option<LiteralClass>>,
+}
+
+impl<'pr> Visit<'pr> for ReturnContractSafety {
+    fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
+        let literal = match node.arguments() {
+            None => Some(LiteralClass::Modeled(Ty::Nil)),
+            Some(args) => {
+                let values: Vec<Node<'pr>> = args.arguments().iter().collect();
+                match values.as_slice() {
+                    [value] => literal_class(value),
+                    // `return a, b` returns a new Array, whatever it holds.
+                    _ => Some(LiteralClass::Modeled(Ty::Array(Box::new(Ty::Unknown)))),
+                }
+            }
+        };
+        self.returns.push(literal);
+        ruby_prism::visit_return_node(self, node);
+    }
+    fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_lambda_node(&mut self, _: &ruby_prism::LambdaNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_ensure_node(&mut self, _: &ruby_prism::EnsureNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_rescue_node(&mut self, _: &ruby_prism::RescueNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_while_node(&mut self, _: &ruby_prism::WhileNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_until_node(&mut self, _: &ruby_prism::UntilNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_for_node(&mut self, _: &ruby_prism::ForNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_def_node(&mut self, _: &DefNode<'pr>) {
+        self.uncertain = true;
+    }
+    fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
+        if matches!(node.predicate(), Node::TrueNode { .. } | Node::FalseNode { .. } | Node::NilNode { .. }) {
+            self.uncertain = true;
+        }
+        ruby_prism::visit_if_node(self, node);
+    }
+    fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
+        if matches!(node.predicate(), Node::TrueNode { .. } | Node::FalseNode { .. } | Node::NilNode { .. }) {
+            self.uncertain = true;
+        }
+        ruby_prism::visit_unless_node(self, node);
+    }
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        let mut terminal = false;
+        for statement in &node.body() {
+            if terminal {
+                self.uncertain = true;
+            }
+            self.visit(&statement);
+            terminal = return_terminal(&statement);
+        }
+    }
+}
+
+/// The class of `node` when it is WRITTEN as a literal, else `None`.
+/// Literals: strings and symbols (plain or interpolated), numbers,
+/// `nil`/`true`/`false`, `__FILE__`/`__LINE__`, Array and Hash literals
+/// (whatever they hold), ranges, regexps, and a parenthesized literal. A
+/// bare keyword hash (`m(a: 1)`) is not one: its pairs are keyword
+/// arguments, each judged on its own.
+/// Never a literal: a variable, a constant, `self`, any call (`X.new`
+/// included), a ternary or `if`, a backtick command (`` ` `` can be
+/// redefined).
+fn literal_class(node: &Node<'_>) -> Option<LiteralClass> {
+    if let Some(ty) = scalar_literal_ty(node).or_else(|| composite_literal_ty(node)) {
+        return Some(LiteralClass::Modeled(ty));
+    }
+    if let Some(name) = unmodeled_literal_class(node) {
+        return Some(LiteralClass::Other(name));
+    }
+    let statements = node.as_parentheses_node()?.body()?.as_statements_node()?;
+    let mut body = statements.body().iter();
+    let only = body.next()?;
+    if body.next().is_none() { literal_class(&only) } else { None }
+}
+
+/// An interpolated string or symbol, or a collection literal (its type
+/// arguments are never read: see `LiteralClass::Modeled`).
+fn composite_literal_ty(node: &Node<'_>) -> Option<Ty> {
+    Some(match node {
+        Node::InterpolatedStringNode { .. } => Ty::Str,
+        Node::InterpolatedSymbolNode { .. } => Ty::Sym,
+        Node::ArrayNode { .. } => Ty::Array(Box::new(Ty::Unknown)),
+        Node::HashNode { .. } => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+        _ => return None,
+    })
+}
+
+/// A literal of a core class no modeled type names.
+fn unmodeled_literal_class(node: &Node<'_>) -> Option<&'static str> {
+    Some(match node {
+        Node::RangeNode { .. } => "Range",
+        Node::RegularExpressionNode { .. } | Node::InterpolatedRegularExpressionNode { .. } => "Regexp",
+        Node::RationalNode { .. } => "Rational",
+        Node::ImaginaryNode { .. } => "Complex",
+        _ => return None,
+    })
+}
+
+/// The scalar a literal node is, shared by inference and contracts so
+/// the two never disagree about what a literal is.
+fn scalar_literal_ty(node: &Node<'_>) -> Option<Ty> {
+    Some(match node {
+        Node::IntegerNode { .. } | Node::SourceLineNode { .. } => Ty::Int,
+        Node::FloatNode { .. } => Ty::Float,
+        Node::StringNode { .. } | Node::SourceFileNode { .. } => Ty::Str,
+        Node::SymbolNode { .. } => Ty::Sym,
+        Node::TrueNode { .. } | Node::FalseNode { .. } => Ty::Bool,
+        Node::NilNode { .. } => Ty::Nil,
+        _ => return None,
+    })
+}
+
+/// Collect the leaves an implicit tail can evaluate to — through a
+/// statement list's last statement, `if`/`unless`/ternary and `case`/`when`
+/// branches (a missing branch is a written `nil`), a plain `begin` and
+/// parentheses — and answer whether EVERY leaf is a literal. A leaf that
+/// is not (a variable, a call, a `return`, a `raise`) makes the whole
+/// tail unjudged, so a union is never accused on the literal half of it.
+fn tail_literals(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> bool {
+    if let Some(every_leaf) = tail_branches(node, leaves) {
+        return every_leaf;
+    }
+    match literal_class(node) {
+        Some(literal) => {
+            leaves.push(literal);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `tail_literals` through a node that picks among values, or `None` when
+/// `node` is not one.
+fn tail_branches(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(statements) = node.as_statements_node() {
+        return Some(tail_branch(statements.body().iter().last(), leaves));
+    }
+    if let Some(else_node) = node.as_else_node() {
+        return Some(tail_branch(else_node.statements().map(|s| s.as_node()), leaves));
+    }
+    if let Some(parentheses) = node.as_parentheses_node() {
+        return Some(tail_branch(parentheses.body(), leaves));
+    }
+    conditional_leaves(node, leaves).or_else(|| case_or_begin_leaves(node, leaves))
+}
+
+/// Both arms of an `if`/ternary/`unless` (a missing one is a written `nil`).
+fn conditional_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(if_node) = node.as_if_node() {
+        let then = tail_branch(if_node.statements().map(|s| s.as_node()), leaves);
+        return Some(then && tail_branch(if_node.subsequent(), leaves));
+    }
+    let unless = node.as_unless_node()?;
+    let then = tail_branch(unless.statements().map(|s| s.as_node()), leaves);
+    Some(then && tail_branch(unless.else_clause().map(|e| e.as_node()), leaves))
+}
+
+/// Every `when` and the `else` of a `case`, or the body of a `begin` that
+/// has no `rescue`, `else` or `ensure` clause.
+fn case_or_begin_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(case) = node.as_case_node() {
+        let whens = case.conditions().iter().all(|condition| {
+            condition.as_when_node().is_some_and(|when| tail_branch(when.statements().map(|s| s.as_node()), leaves))
+        });
+        return Some(whens && tail_branch(case.else_clause().map(|e| e.as_node()), leaves));
+    }
+    let begin = node.as_begin_node()?;
+    let plain = begin.rescue_clause().is_none() && begin.else_clause().is_none() && begin.ensure_clause().is_none();
+    Some(plain && tail_branch(begin.statements().map(|s| s.as_node()), leaves))
+}
+
+fn tail_branch(node: Option<Node<'_>>, leaves: &mut Vec<LiteralClass>) -> bool {
+    if let Some(node) = node {
+        return tail_literals(&node, leaves);
+    }
+    // A branch that is not written evaluates to `nil`.
+    leaves.push(LiteralClass::Modeled(Ty::Nil));
+    true
+}
+
+/// Downcasts decide the shape here rather than the node discriminant: a
+/// failed downcast is a node this walk cannot read, which is not a proven
+/// terminal return — the same fail-closed answer as an unrecognized node.
+fn return_terminal(node: &Node<'_>) -> bool {
+    if matches!(node, Node::ReturnNode { .. }) {
+        return true;
+    }
+    if let Some(statements) = node.as_statements_node() {
+        return statements.body().iter().last().is_some_and(|n| return_terminal(&n));
+    }
+    if let Some(else_node) = node.as_else_node() {
+        return else_node.statements().is_some_and(|n| return_terminal(&n.as_node()));
+    }
+    if let Some(if_node) = node.as_if_node() {
+        return if_node.statements().is_some_and(|n| return_terminal(&n.as_node()))
+            && if_node.subsequent().is_some_and(|n| return_terminal(&n));
+    }
+    if let Some(call) = node.as_call_node() {
+        return call.receiver().is_none() && matches!(call.name().as_slice(), b"raise" | b"fail");
+    }
+    false
 }
 
 /// Pessimistic widening: pattern matching etc. may rebind anything.
@@ -5575,6 +6731,146 @@ impl<'pr> Visit<'pr> for OperandLocalScan {
     // The four scope gates below: a local written inside one of these is
     // never the local read outside it (Ruby opens a fresh local scope
     // there), so descending would poison names provably untouched.
+    fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
+
+    fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}
+
+    fn visit_module_node(&mut self, _node: &ruby_prism::ModuleNode<'pr>) {}
+
+    fn visit_singleton_class_node(&mut self, _node: &ruby_prism::SingletonClassNode<'pr>) {}
+}
+
+/// Which locals of ONE Ruby scope keep their collection type arguments
+/// when read? An Array or Hash changes what it holds without its local
+/// ever being written — `arr << "s"`, `arr.map!`, `h[:k] = v`,
+/// `arr.clear.push(x)`, `mutate(arr)`, `b = arr; b << x` — and the flow
+/// walk tracks writes only. So the proof is an allowlist, not a list of
+/// mutators: a local is trusted only when EVERY read of it anywhere in
+/// the scope (blocks and lambdas included, the scope gates excluded, as
+/// in `prove_operand_locals`) is the receiver of a call that neither
+/// changes the receiver nor hands it out (`collection_read_keeps_elements`),
+/// or an iteration statement whose value is discarded
+/// (`discarded_iteration`). Any other read — an argument, an assignment's
+/// right-hand side, an element of a literal, a `return`, a condition, a
+/// receiver of any other method — makes every read of that name in the
+/// scope drop its element types. A string `eval` (or `binding`) can
+/// rewrite any local, so none is trusted.
+fn trusted_collection_locals(params: Option<&Node<'_>>, body: Option<&Node<'_>>) -> FxHashSet<String> {
+    let mut scan = CollectionReadScan::default();
+    if let Some(params) = params {
+        scan.visit(params);
+    }
+    if let Some(body) = body {
+        scan.visit(body);
+    }
+    if scan.bail {
+        return FxHashSet::default();
+    }
+    let CollectionReadScan { mut safe, escaped, .. } = scan;
+    safe.retain(|name| !escaped.contains(name));
+    safe
+}
+
+/// Calls that leave their receiver's contents alone and never return the
+/// receiver itself: queries, element reads, and methods that build a NEW
+/// collection. `each`, `to_a`, `to_h`, `itself`, `tap`, `freeze` and
+/// every bang or setter method are absent on purpose — they either
+/// change the receiver or answer it, and the answer is then an alias the
+/// scan cannot follow.
+fn collection_read_keeps_elements(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"first" | b"last" | b"size" | b"length" | b"count" | b"empty?" | b"any?" | b"all?"
+            | b"none?" | b"one?" | b"include?" | b"member?" | b"key?" | b"has_key?"
+            | b"value?" | b"has_value?" | b"min" | b"max" | b"sum" | b"join" | b"index"
+            | b"find_index" | b"rindex" | b"[]" | b"at" | b"dig" | b"fetch" | b"values_at"
+            | b"keys" | b"values" | b"map" | b"collect" | b"flat_map" | b"filter_map"
+            | b"select" | b"filter" | b"reject" | b"find" | b"detect" | b"find_all"
+            | b"sort" | b"sort_by" | b"min_by" | b"max_by" | b"group_by" | b"partition"
+            | b"uniq" | b"compact" | b"flatten" | b"reverse" | b"take" | b"drop"
+            | b"take_while" | b"drop_while" | b"zip" | b"reduce" | b"inject" | b"+" | b"-"
+            | b"&" | b"|" | b"==" | b"!=" | b"nil?" | b"is_a?" | b"kind_of?"
+            | b"instance_of?" | b"frozen?" | b"to_s" | b"inspect" | b"hash" | b"dup"
+            | b"transform_values" | b"transform_keys" | b"merge" | b"each_with_object"
+            | b"tally" | b"sample"
+    )
+}
+
+/// `arr.each { ... }` as a statement whose value nobody reads: the call
+/// answers the receiver, but the answer is dropped, so it leaks no alias.
+/// The last statement of a body is its value and never counts.
+fn discarded_iteration(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"each" | b"each_with_index" | b"each_pair" | b"each_key" | b"each_value"
+            | b"reverse_each" | b"each_index"
+    )
+}
+
+/// The scan behind `trusted_collection_locals`: `safe` holds names read
+/// through an allowlisted call, `escaped` every name read any other way.
+#[derive(Default)]
+struct CollectionReadScan {
+    safe: FxHashSet<String>,
+    escaped: FxHashSet<String>,
+    bail: bool,
+}
+
+impl CollectionReadScan {
+    /// When `call`'s receiver is a local read and `allowed` holds, record
+    /// it as a safe read and walk the rest of the call; `false` leaves
+    /// the call for the ordinary walk.
+    fn safe_receiver_read(&mut self, call: &CallNode<'_>, allowed: bool) -> bool {
+        let Some(local) = call.receiver().and_then(|r| r.as_local_variable_read_node().map(|l| l.name())) else {
+            return false;
+        };
+        if !allowed {
+            return false;
+        }
+        self.safe.insert(String::from_utf8_lossy(local.as_slice()).into_owned());
+        if let Some(args) = call.arguments() {
+            self.visit_arguments_node(&args);
+        }
+        if let Some(block) = call.block() {
+            self.visit(&block);
+        }
+        true
+    }
+}
+
+impl<'pr> Visit<'pr> for CollectionReadScan {
+    fn visit_local_variable_read_node(&mut self, node: &ruby_prism::LocalVariableReadNode<'pr>) {
+        self.escaped.insert(String::from_utf8_lossy(node.name().as_slice()).into_owned());
+    }
+
+    fn visit_statements_node(&mut self, node: &ruby_prism::StatementsNode<'pr>) {
+        let body: Vec<Node<'pr>> = node.body().iter().collect();
+        let value = body.len().saturating_sub(1);
+        for (i, statement) in body.iter().enumerate() {
+            if i < value {
+                if let Some(call) = statement.as_call_node() {
+                    if self.safe_receiver_read(&call, discarded_iteration(call.name().as_slice())) {
+                        continue;
+                    }
+                }
+            }
+            self.visit(statement);
+        }
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        if matches!(
+            node.name().as_slice(),
+            b"eval" | b"instance_eval" | b"class_eval" | b"module_eval" | b"binding" | b"local_variable_set"
+        ) {
+            self.bail = true;
+        }
+        if !self.safe_receiver_read(node, collection_read_keeps_elements(node.name().as_slice())) {
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+
+    // Scope gates, exactly as `OperandLocalScan`'s.
     fn visit_def_node(&mut self, _node: &ruby_prism::DefNode<'pr>) {}
 
     fn visit_class_node(&mut self, _node: &ruby_prism::ClassNode<'pr>) {}

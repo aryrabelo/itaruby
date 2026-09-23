@@ -57,6 +57,48 @@ found, and the launch bar is winning on both.
   `conflicting_superclasses`, `ancestry_review_controls`, and
   `scripts/conflicting-superclasses-mutants.py` (gate c1 and CI); public
   baselines require a fresh measured audit after source changes.
+- A project's Sorbet `sig { ... }` is a contract, not a hint (learned
+  2026-09-22, binding). The declared return types the consumer. Accusations
+  are LITERAL-ONLY (2026-09-23, binding, the E0108 rule): E0109 (at the
+  method name) only for an explicit `return <literal>` (bare `return` is a
+  written `nil`), judged alone, or an implicit tail whose every
+  `if`/`unless`/`case`/`begin`/parentheses leaf is a literal and none fits;
+  E0103 (at the argument, by param name, across positional, keyword and
+  default layouts) only for an argument node that is itself a literal.
+  Never judged: variables, `self`, constants, calls (`X.new` included),
+  ternaries in argument position, a literal behind a `#: as` cast. Three
+  review rounds found 24 false positives, all an inferred type held to a
+  sig — do not reintroduce inferred evidence. Known false negatives: every
+  contradiction carried by an inferred value. A literal
+  `T::Configuration.default_checked_level = :never` anywhere turns every
+  contract accusation off; a module named by a multi-argument
+  `include A, B` (or `prepend`/`extend`), and its ancestors, lose their
+  contracts until the reversed linearization of that call is fixed. A client RBI supplies the same contracts
+  only on an exact match of owner, dispatch track and Ruby parameter layout.
+  It never replaces a check the Ruby source earned. Precedence is inline
+  `#:` RBS, then inline `sig`, then RBI. Every unprovable shape resolves to
+  `Ty::Unknown` and diagnoses nothing: generics, `bind`, `T.proc`,
+  overloads, duplicate or dynamic clauses, post-optional, rest and block
+  layouts, duplicate definitions, open classes, conflicting RBIs and stale
+  RBI layouts. An unsupported but well-formed collection element keeps the
+  collection's category, and a malformed expression is Unknown. Recognized-sig
+  fixtures need `extend T::Sig`. A `.rbi` naming a project class softens that
+  class's E0101 through `gem_reopens`. That behavior predates contracts; never
+  narrow it to win a contract fixture. Every path that can redefine a method
+  poisons its contract (`sorbet_sig = None`, `sorbet_annotated = true`),
+  as a duplicate `def` does: singleton patches, extended-hook installs,
+  named-receiver eval/define/alias injections, and include-time code
+  (`included`/`prepended` hooks, or an open project module in the include
+  chain). A contract also stays
+  off any call whose receiver's family (subclasses, includers, extenders)
+  can dispatch the name elsewhere (`contract_dispatch_diverges`). Contract
+  work is memoized per definition and never walks a family for a method
+  with no contract; `contract_work_is_per_definition_not_per_call` bounds
+  it. Known false negatives: `.new` does not check `initialize`'s `sig`,
+  and a method with rest, keyword-rest, block or post params drops its
+  whole contract, the return included. Claim only what the suites prove, never
+  Sorbet parity. Focused proof: `sorbet_contracts`, `sorbet_contract_parser`,
+  `project_sigs`, and `scripts/sorbet-contracts-mutants.py` (gate c1 and CI).
 - A code path that turns silence into an error must never read absence of
   evidence as evidence of absence (learned 2026-08-24, binding): a gate that
   finds no signal on an upward search (e.g. no Gemfile discovered within N
@@ -366,8 +408,10 @@ found, and the launch bar is winning on both.
   the harness's own semantics (`src.count(needle)`) costs three seconds:
   every anchor edit does it, and no anchor edit is believed until its leg
   has been re-run once. Since 2026-09-19 that count is a script —
-  `scripts/mutant-anchors` counts every needle in every `scripts/*-mutants.sh`
-  against the working tree (111 anchors across ten harnesses), and gate c1 runs
+  `scripts/mutant-anchors` counts every needle in every `scripts/*-mutants.sh`,
+  and in every `scripts/*-mutants.py` that declares a `MUTATIONS` table,
+  against the working tree (154 anchors across twelve harnesses, measured
+  2026-09-22), and gate c1 runs
   it BEFORE the families, so a dead anchor costs two seconds instead of the 26
   minutes of family it cost the day wave 2's neighbour insertions killed M14 and
   M15. It refuses to run while a harness holds the tree, because a mutant is
@@ -397,7 +441,7 @@ green but at least one declared corpus could not be checked on this machine
 | Gate 0b — MRI interpreter (`ruby -v` ≥ 3.x; a missing ruby is fine, the MRI legs skip) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the twelve mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-R) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the twelve mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-R) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) and `scripts/sorbet-contracts-mutants.py` (the Sorbet `sig`/RBI contract decisions: which definition a signature governs, the RBI's exact owner/track/layout match, instance/singleton separation, the E0109 body check and its silent paths, by-name param correspondence, unusable or stacked sigs still counting as annotated, every redefinition path poisoning the contract, the family dispatch walk, and the per-definition cost bounds; builds an isolated temporary source copy, never the checkout, and `--anchors` counts its needles without building; run against the `sorbet_contracts`, `sorbet_contract_parser`, `project_sigs` and `sorbet_sig` suites) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
@@ -853,6 +897,48 @@ Per-run artifacts land in `target/gauntlet/` (gitignored).
 4. Remove stale or contradictory text.
 5. Run verification when relevant.
 6. Report any docs intentionally left unchanged and why.
+7. Close through the `closing` gate (below) before the pull request.
+
+### The closing gate — asked of Jev, every time a change closes
+
+"The gates passed" used to be a sentence in a hand-off. It is now the
+`closing` gate in `.software-factory/policy.yaml`, and three rules hold it:
+
+- `L3.GATE_HAS_FRESH_EVIDENCE` — `scripts/closing-evidence` runs
+  `./scripts/dev gates` on the committed tree, writes
+  `.software-factory/evidence/closing-run.json` (the gate digest with every
+  private-corpus revision removed, plus seven assertions policy requires) and
+  `sf seal closing` binds it to the implementation digest. Any later change to
+  the checker, a baseline, a mutant family or the gate scripts expires it.
+- `L4.CLAIM_CITES_ITS_EVIDENCE` — the sentence below is the closing claim and
+  names the gate that proves it.
+- `L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE` — `scripts/claim-judge-gate` asks
+  TypeSafe's Jev (reference oracle from nicolasmelo1/software-factory#63,
+  `scripts/claim-judge.mjs`) whether that report supports that sentence:
+  `supports` at confidence ≥ 0.8, and a negated twin (the `supports` and
+  `says_nothing` criteria swapped) that must be REFUSED, or the oracle is
+  approving anything. The deterministic part runs first: the question must
+  carry the marked sentence and the sealed report byte for byte, so re-running
+  the gates or rewording the claim without re-asking Jev is red. Verdicts are
+  cached in `.software-factory/evidence/jev/closing.cache.json` and committed.
+
+Where it is enforced: CI on every pull request (`sf check --allow-commands`,
+nothing filtered, no TypeSafe key — a verdict missing from the cache is red).
+The pre-commit hook runs `scripts/sf-check-local`, which tolerates exactly
+the two closing findings (printed, not hidden) so a commit is not forced to
+be a closing. The key comes from 1Password (`typesafe-api-key` in `ops`) and
+the judge always calls TypeSafe's default endpoint, `https://api.typesafe.ai`
+— the fleet-wide `TYPESAFE_BASE_URL` shim is dropped for this call. The
+request leaves the machine, so nothing private may enter the report — `closing-evidence` strips
+corpus revisions and error-set hashes and the corpus ids are the generic ones.
+It proves corpus-c on this machine only; corpus-a/b still need
+`./scripts/dev anchor` on `work`, exactly as before.
+
+To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
+commit the files it names.
+
+<!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
+At the closing commit every gate `./scripts/dev gates` runs on this machine passed: the corpus gate proved corpus-c with zero new errors, the public corpora showed no drift, every per-fix source mutant was accused by a named test, the drift detectors were proven to fire, and the checker source was untouched after the mutants ran.
 
 ## Child DOX Index
 

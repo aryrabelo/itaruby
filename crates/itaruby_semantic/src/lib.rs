@@ -17,11 +17,11 @@ pub use check::{
     CallStats, ConstraintOutcome, DarkSingleton, DarkVerdict, DefSite, HoverInfo, MethodHover,
 };
 pub use discovery::{find_upward_dir, upward_start, wire_declaration_sources, DiscoveredSources};
-pub use index::{core_methods_of, file_defs, project_consts, project_index, rbi_core_methods, rbi_files_parsed_count, stdlib_singleton_method, Blocker, FileDefs, OpenReason, ProjectIndex};
+pub use index::{ancestor_walks, core_methods_of, file_defs, project_consts, project_index, rbi_core_methods, rbi_files_parsed_count, stdlib_singleton_method, Blocker, FileDefs, OpenReason, ProjectIndex};
 pub use itaruby_syntax::{LineIndex, SourceFile};
 pub use types::{
     ConstraintCall, ConstraintProof, Diagnostic, Severity, Ty, E0107_CONSTRAINT_CONTRADICTION,
-    E0108_OPERAND_TYPE_MISMATCH,
+    E0108_OPERAND_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH,
 };
 
 /// The concrete database. All queries take `&dyn salsa::Database`.

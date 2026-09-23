@@ -31,3 +31,5 @@ scripts/bug-replay/results/
 # here: a stray copy at the repo root made `sf check` scan 55k unrelated .rb
 # files and blocked every commit in this repository (2026-09-19).
 /gitlab/
+# sf's local trail of attempts per finding; machine-local, never evidence.
+.software-factory/escapes/

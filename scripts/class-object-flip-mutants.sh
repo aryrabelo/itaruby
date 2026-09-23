@@ -299,9 +299,7 @@ mutant CO-M "$COR" \
 
 mutant CO-N "$IDX" \
   '                                    "include" | "prepend" if in_singleton => {
-                                        if !self.fragments[i].extends.contains(&path) {
-                                            self.fragments[i].extends.push(path);
-                                        }
+                                        self.singleton_mixin(i, call.name().as_slice(), path);
                                     }' \
   '' \
   sclass_include_arity_is_checked \

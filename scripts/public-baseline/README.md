@@ -389,3 +389,69 @@ sites, one per file:
 
 No GONE line is a detection this wave lost: every one is a reference the
 checker could not resolve because the walker had not read the definition.
+
+## Regeneration 2026-09-22 — conflicting-superclass reconciliation (main's 1341582)
+
+rails and mastodon regenerated, and only DOWNWARD. discourse is byte-identical
+and was not touched. Release binary built from task/sig-rbi at `864125d` (the keyword-walk
+fix; source byte-identical to the tree the binary was built from)
+(sha256 prefix `8f92e643ff1aa6f7`). Run against the pinned `-head` clones and
+normalized exactly the way `scripts/public-gate.sh` does it: the clone root in
+`path` becomes `<id>/`, only lines starting with `{` are kept, then `sort -u`.
+
+| id | pinned sha | lines before → after | errors | warnings before → after |
+|----|-----------|---------------------:|-------:|------------------------:|
+| rails | `6610cb45b39b6a2c1f260f90bbe920b5899f844b` | 906 → 873 | 2 → 2 | 904 → 871 |
+| mastodon | `2c92a56e5d0fb490cc2e49a0dd9652499000fcb4` | 986 → 973 | 0 → 0 | 986 → 973 |
+| discourse | `eff621544daf344ce70e470b7f54f27bc75b68d9` | 1939 → 1939 (unchanged) | 10 → 10 | 1929 → 1929 |
+
+0 NEW lines. Error counts did not change.
+
+**Where the drift came from.** This drift is on main, not on this branch. We
+bisected with scratch release builds. `3f7592a` (the previous re-pin),
+`218e5b7` and `4981963` reproduce the committed baselines. `1341582` ("fix:
+keep the cbase marker on a harvested alias target") removes exactly these 46
+lines. It reached main through the task/alpha-ci merge (`6d04dc7`, PR #2)
+without a re-pin, so origin/main `05a282e` already measured rails 33 / mastodon
+13 gone. The mechanism is `reconcile_superclasses` / `ambiguous_ancestry` in
+`index.rs`. Before it, the first `< Base` header the index saw won. Now a class
+declared with incompatible superclasses in different files, or a class whose
+ancestry reaches such a class, is ambiguous. An inherited constant lookup
+inside it cannot conclude, so E0104 stays silent. This is a fail-closed
+suppression, not a new resolution. Every constant it silenced below really
+exists at runtime.
+
+**The 85252d8 keyword regression was fixed, not re-pinned.** On this branch,
+`85252d8` briefly removed 4 more lines: mastodon `Webpush` at
+`app/workers/web/push_notification_worker.rb:53,54` and discourse
+`Logster::Web` at `config/routes.rb:51,55`. The new keyword-argument loop in
+`check.rs` stopped walking hash elements that are not symbol-keyed: string
+keys, constant keys and `**splat` values. Those elements fell into
+`infer_expr`'s `_ => Ty::Unknown` arm, which does not visit their children, so
+every diagnostic inside them was lost. A scratch fixture showed it: an E0101
+error on `take('str' => Widget.nonexistent_class_method)` and E0104 on
+`take('k' => Missing)`, `take(Missing => 1)` and `take(**Missing)` all went
+silent. Those 4 lines were false positives (the `webpush` and `logster` gems
+are in Gemfile.lock), but the change that removed them was a blind spot, not a
+correction. The loop now walks a non-symbol pair's key and value and a splat's
+value, and all 4 lines are present again in the baselines above.
+
+### GONE lines — 46, every one a FALSE POSITIVE going away
+
+All are `warning E0104 unresolved constant`. Each ambiguous class is named with
+its conflicting headers.
+
+| id | file:line | constant | verdict |
+|----|-----------|----------|---------|
+| rails | `activesupport/test/cache/stores/mem_cache_store_test.rb:11,22,23,26,45,46,49,385,432,436`; `actionpack/test/dispatch/session/mem_cache_store_test.rb:42,43,185` (13) | `Dalli`, `Dalli::Client`, `Dalli::DalliError`, `Dalli::VERSION`, `Dalli::Protocol`, `Dalli::Protocol::Meta`, `Dalli::Protocol::Binary` | FALSE POSITIVE. Both files `require "dalli"`, and dalli 5.0.6 is in Gemfile.lock. `MemCacheStoreTest` is declared `< ActiveSupport::TestCase` and `< ActionDispatch::IntegrationTest`. `Dalli::Protocol::Binary` (:26) is only in the `else` of `if Dalli::VERSION >= "5."`, a compatibility branch for older dalli that the locked version never runs. |
+| rails | `activejob/test/cases/logging_test.rb:22,401,406,425,430,436,441,447,452,471,476,495,500` (13) | `ActiveSupport::Logger::Severity`, `WARN`, `INFO`, `FATAL`, `ERROR` | FALSE POSITIVE. `ActiveSupport::Logger < ::Logger` (`activesupport/lib/active_support/logger.rb:8`), and stdlib `::Logger::Severity` defines the levels, which the class includes at :22. `LoggingTest` is declared `< ActiveSupport::TestCase` and `< ActionController::TestCase` (`actionpack/test/controller/logging_test.rb:5`). |
+| rails | `activerecord/test/cases/dirty_test.rb:13`, `attribute_methods_test.rb:21` (2) | `InTimeZone` | FALSE POSITIVE. It is `ActiveRecord::TestCase::InTimeZone` (`activerecord/test/cases/helper.rb:38`), inherited. `DirtyTest` and `AttributeMethodsTest` are also declared `< ActiveModel::TestCase` in activemodel. |
+| rails | `activerecord/test/cases/adapters/abstract_mysql_adapter/connection_test.rb:11` (1) | `SQLSubscriber` | FALSE POSITIVE. It is `ActiveRecord::TestCase::SQLSubscriber` (`helper.rb:21`), inherited through `ActiveRecord::AbstractMysqlTestCase`. `ConnectionTest` is also declared `< ActionCable::Connection::TestCase`. |
+| rails | `activerecord/test/cases/inheritance_test.rb:559,560` (2) | `Firm::FirmOnTheFly` | FALSE POSITIVE. `Firm.const_set :FirmOnTheFly, Class.new(Firm)` at :555 creates it first. `Company` is declared `< AbstractCompany` and `< ActiveRecord::Base` (actionpack/actionview fixtures), which makes `Firm < Company` ambiguous through its ancestry. |
+| rails | `activerecord/test/cases/validations_test.rb:136` (1) | `IncorporealModel` | FALSE POSITIVE. `Object.const_set :IncorporealModel, ...` at :133. `ValidationsTest` is also declared `< ActiveModel::TestCase`. |
+| rails | `guides/bug_report_templates/action_controller.rb:41` (1) | `Rack::Test::Methods` | FALSE POSITIVE. The file does `require "rack/test"`. `BugTest` has four different superclasses across `guides/bug_report_templates/*.rb`. |
+| mastodon | `lib/paperclip/vips_lazy_thumbnail.rb:4,26,27,38,65,72,73,74,75,94,100`; `lib/paperclip/lazy_thumbnail.rb:4,17` (13) | `Paperclip::Processor`, `Paperclip::Thumbnail`, `Geometry`, `TempfileFactory`, `Terrapin::CommandLine`, `Terrapin::ExitStatusError`, `Terrapin::CommandNotFoundError`, `Paperclip::Error`, `Paperclip::Errors::CommandNotFoundError`, `Vips::Image` | FALSE POSITIVE. These come from gems locked in Gemfile.lock: kt-paperclip 8.0.0, terrapin 1.1.1 and ruby-vips 2.3.0. The bare `Geometry`/`TempfileFactory` resolve lexically to `Paperclip::Geometry`/`Paperclip::TempfileFactory`. `Paperclip::LazyThumbnail` is declared `< Paperclip::Processor` and `< Paperclip::Thumbnail` in the two files. |
+
+No GONE line is a lost detection. Every one is a reference to a constant that
+exists at runtime, either from a locked gem, inherited through the test base,
+or created by `const_set` just before the reference.

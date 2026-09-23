@@ -201,3 +201,19 @@ err corpus-c de6fab5dc1f10706
 # `raise NotImplementedError` stub — so it is a real dormant NoMethodError,
 # firing every time that path runs.
 err corpus-c 33aded51a652e5b7
+# 5th and 6th err added 2026-09-22 (Sorbet sig/RBI contracts, E0109):
+# surfaced when a project's own `sig` became a contract its body is checked
+# against. Proven true positive by reading both sites: two definitions of one
+# method, each declaring `sig { returns(String) }` over a body whose only
+# expression is a Symbol-keyed Hash literal. sorbet-runtime checks the return
+# category on every call, so each raises TypeError whenever it runs. The same
+# audit found 35 other new contract errors on this corpus to be false positives
+# (unproven nil, erased collection type arguments); the checker was fixed for
+# those, and none of them entered this file. Same tracked revision
+# (e10255bf93, three untracked non-Ruby files), warnings 170 <= 170.
+# Re-hashed the same day, same two sites, same finding: once contracts
+# became literal-only the message names the literal's category ("got Hash")
+# instead of type arguments the verdict never read ("got Hash[Symbol,
+# String]"). Old hashes 3d2472b897405ecb / 074e0ecc814117fc.
+err corpus-c 380713db6d6ed10c
+err corpus-c 1a27c7f6f94eab3d

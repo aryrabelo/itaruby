@@ -494,6 +494,11 @@ MUTATIONS = [
      "    for (id, names, singleton_only) in hits {\n        index.include_time_code.insert(id);\n",
      "    for (id, names, singleton_only) in hits {\n",
      "outside_redefinition_of_a_subclass_keeps_the_parent_contract_off_the_call"),
+    # -- a collection literal is named by the category the contract compared
+    ("literal-only collection named by type arguments", CHECK,
+     "            LiteralClass::Modeled(Ty::Hash(_, _)) => \"Hash\".to_owned(),\n",
+     "",
+     "collection_literal_is_named_by_its_category"),
 ]
 
 

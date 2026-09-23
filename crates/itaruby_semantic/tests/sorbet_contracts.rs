@@ -3416,3 +3416,25 @@ ContractE2.new.k("s")
     let control = check("multi-mixin-control", &SOURCE.replace("MIXIN", "include ContractQ"), None);
     assert_eq!(contract_codes(&control), ["E0103"], "control must accuse with one module per call: {control:?}");
 }
+
+/// A collection literal is named by the category the contract compared,
+/// never by type arguments the verdict did not read.
+#[test]
+fn collection_literal_is_named_by_its_category() {
+    let diags = check("literal-name", r#"
+class ContractLiteralName
+  extend T::Sig
+  sig { returns(String) }
+  def lookup
+    { plants: "plants" }
+  end
+  sig { returns(Integer) }
+  def list = [1, 2]
+end
+"#, None);
+    let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(messages, [
+        "return of `lookup` expects String, got Hash",
+        "return of `list` expects Integer, got Array",
+    ], "{diags:?}");
+}

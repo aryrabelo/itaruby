@@ -68,8 +68,13 @@ impl LiteralClass {
         }
     }
 
+    /// The class the contract compared, and nothing it did not: a
+    /// collection literal is named by its category alone, because its type
+    /// arguments were never part of the verdict.
     fn name(&self, index: &ProjectIndex) -> String {
         match self {
+            LiteralClass::Modeled(Ty::Array(_)) => "Array".to_owned(),
+            LiteralClass::Modeled(Ty::Hash(_, _)) => "Hash".to_owned(),
             LiteralClass::Modeled(ty) => ty_name(ty, index),
             LiteralClass::Other(name) => (*name).to_owned(),
         }

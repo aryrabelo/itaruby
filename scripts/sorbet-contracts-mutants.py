@@ -72,13 +72,15 @@ MUTATIONS = [
      "rbi_singleton_contract_matches_source_track"),
     # -- E0109: the body answers to its own signature
     ("body never checked against sig", CHECK,
-     "            self.check_sorbet_return(def, contract, nesting, &last, &returns);",
+     "            self.check_sorbet_return(def, contract, nesting);",
      "            let _ = (contract, nesting);",
      ("incompatible_source_return_accuses_without_a_call",
       "explicit_returns_and_implicit_branches_are_checked")),
     ("explicit returns not inspected", CHECK,
-     "        let actual = returns.iter().find(|ty| contract_accuses(ty, &expected, returns_nil, self.index, self.rbi_map))\n            .or_else(",
-     "        let actual = None\n            .or_else(",
+     "        let explicit = safety.returns.iter().flatten()\n"
+     "            .find(|literal| self.contract_breaks(std::slice::from_ref(*literal), &expected))\n"
+     "            .map(|literal| vec![literal.clone()]);\n",
+     "        let explicit: Option<Vec<LiteralClass>> = None;\n",
      "explicit_returns_and_implicit_branches_are_checked"),
     ("uncertain return paths accused", CHECK,
      "        if safety.uncertain {\n            return;\n        }\n",
@@ -97,12 +99,12 @@ MUTATIONS = [
      "void_unknown_and_uncertain_return_paths_stay_silent"),
     # -- E0103: parameters correspond by NAME, never by position
     ("params zipped by sig order", CHECK,
-     "        for (name, (ty, span, _)) in positional_names.iter().zip(args.positional) {",
-     "        for (name, (ty, span, _)) in sig.params.iter().map(|(n, _)| n).zip(args.positional) {",
+     "        let positional = positional_names.iter().zip(args.positional)",
+     "        let positional = sig.params.iter().map(|(n, _)| n).zip(args.positional)",
      "named_positional_params_accuse_at_argument"),
     ("keyword args never checked", CHECK,
-     "        for (name, ty, span) in keyword_args {\n            let literal_nil",
-     "        for (name, ty, span) in keyword_args.iter().take(0) {\n            let literal_nil",
+     "        let bound = positional.chain(keyword_args.iter().map(",
+     "        let bound = positional.chain(keyword_args.iter().take(0).map(",
      "keywords_and_defaults_keep_named_correspondence"),
     ("splat keeps positional correspondence", CHECK,
      "                        exact_arity = false;\n                        sorbet_args_known = false;\n                        self.infer_expr(&a, env, self_ty, scope);",
@@ -122,26 +124,60 @@ MUTATIONS = [
      "            sorbet_annotated: matches!(pending_sorbet_sig, Some(PendingSig::Parsed(_))),",
      "unusable_inline_sig_still_blocks_the_rbi_contract"),
     # -- nil is proven only where it is written (invariant #1)
-    # A union is accused only when NO member fits, so a nil member counted as
-    # PROVEN can no longer change a verdict (the other members already decide
-    # it): that old mutant is equivalent now. The live nil-in-a-union decision
-    # is the other direction — a dropped nil must not become an alibi either.
-    ("union member nil excuses the union", CHECK,
-     "members.iter().filter(|m| **m != Ty::Nil).map(erase_type_arguments)",
-     "members.iter().map(|m| if *m == Ty::Nil { &Ty::Unknown } else { m }).map(erase_type_arguments)",
-     "literal_nil_and_mismatched_union_members_still_accuse"),
-    ("nil read from a variable counts as proven", CHECK,
-     "    if literal_nil && *actual == Ty::Nil {\n        return !compatible(",
-     "    if *actual == Ty::Nil {\n        return !compatible(",
-     "nil_read_from_a_variable_is_not_proof"),
-    ("literal nil never accused", CHECK,
-     "    if literal_nil && *actual == Ty::Nil {\n        return !compatible(",
-     "    if false && literal_nil && *actual == Ty::Nil {\n        return !compatible(",
-     "literal_nil_and_mismatched_union_members_still_accuse"),
-    # -- a flow-derived union is what the body MIGHT hold: one member is no proof
+    # removed: union member nil excuses the union — literal-only: every nil a contract sees is a written leaf, judged like any other; the nil filter is gone
+    # removed: nil read from a variable counts as proven — literal-only: no variable is ever read, so the `literal_nil` gate is gone
+    # removed: literal nil never accused — literal-only: a literal nil has no special case left to remove; `literal_nil_and_mismatched_union_members_still_accuse` still holds it
+    # -- literal-only: a contract judges a value only where it is WRITTEN as a literal
+    ("literal-only non-literal argument judged", CHECK,
+     "            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone()) else {",
+     "            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone())"
+     ".or(Some(LiteralClass::Modeled(Ty::Sym))) else {",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only cast comment ignored", CHECK,
+     "        if self.cast_comment_at(loc.start_offset()).is_some() {\n            return;\n        }\n        if let Some(class) = literal_class(node) {",
+     "        if let Some(class) = literal_class(node) {",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only non-literal explicit return judged", CHECK,
+     "        let explicit = safety.returns.iter().flatten()\n",
+     "        let sym = LiteralClass::Modeled(Ty::Sym);\n"
+     "        let explicit = safety.returns.iter().map(|r| r.as_ref().unwrap_or(&sym))\n",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only non-literal tail leaf dropped", CHECK,
+     "            leaves.push(literal);\n            true\n        }\n        None => false,",
+     "            leaves.push(literal);\n            true\n        }\n        None => true,",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only missing branch is not a nil leaf", CHECK,
+     "    // A branch that is not written evaluates to `nil`.\n    leaves.push(LiteralClass::Modeled(Ty::Nil));\n    true\n",
+     "    false\n",
+     "union_with_no_compatible_member_still_accuses"),
+    ("literal-only unmodeled core literal fits every contract", CHECK,
+     "        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),\n        _ => false,",
+     "        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),\n        _ => true,",
+     ("contracts_accuse_only_literal_values", "unmodeled_core_literals_fit_only_what_the_checker_cannot_read")),
+    ("literal-only __LINE__ typed as a String", CHECK,
+     "        Node::IntegerNode { .. } | Node::SourceLineNode { .. } => Ty::Int,",
+     "        Node::IntegerNode { .. } => Ty::Int,\n        Node::SourceLineNode { .. } => Ty::Str,",
+     ("contracts_accuse_only_literal_values", "source_line_and_exotic_numerics_type_their_consumers")),
+    ("literal-only rational literal typed as a Float", CHECK,
+     "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,",
+     "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Float,",
+     "source_line_and_exotic_numerics_type_their_consumers"),
+    ("literal-only default_checked_level never still accuses", CHECK,
+     "        !self.index.sorbet_runtime_unchecked\n            && !leaves.is_empty()",
+     "        !leaves.is_empty()",
+     "default_checked_level_never_turns_contract_accusations_off"),
+    ("literal-only multi-argument mixin keeps its contract", INDEX,
+     "    poison_ambiguous_mixin_contracts(&mut index);\n",
+     "",
+     "multi_argument_mixin_takes_the_contract_off"),
+    ("literal-only multi-argument mixin ancestors trusted", INDEX,
+     "        for id in index.ancestors(module).0 {",
+     "        for id in [module] {",
+     "multi_argument_mixin_takes_the_contract_off"),
+    # -- literal branches are what the body MIGHT return: one leaf is no proof
     ("union member mismatch accuses the union", CHECK,
-     "    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index, rbi))",
-     "    !judged.is_empty() && judged.iter().any(|m| !compatible(m, expected, index, rbi))",
+     "            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map))",
+     "            && leaves.iter().any(|leaf| !leaf.fits(expected, self.index, self.rbi_map))",
      "union_with_one_compatible_member_stays_silent"),
     # -- sig names: a core name stays core, an inherited name never falls to the top level
     ("reopened core name becomes a project instance", SIG,
@@ -390,10 +426,7 @@ MUTATIONS = [
      "    let (ancestors, complete) = index.ancestors(id);\n    true || !complete\n",
      "closed_project_ancestry_still_accuses_core_contracts"),
     # -- collection type arguments are erased at runtime; only the category binds
-    ("type arguments held as a contract", CHECK,
-     ".filter(|m| **m != Ty::Nil).map(erase_type_arguments).collect();",
-     ".filter(|m| **m != Ty::Nil).cloned().collect();",
-     "collection_type_arguments_are_erased_but_the_category_still_accuses"),
+    # removed: type arguments held as a contract — literal-only: an Array/Hash literal's class is built without type arguments, so the contract path erases nothing
     # -- the keyword loop still WALKS what it cannot bind by name
     ("non-symbol keyword pair left unwalked", CHECK,
      "                                    self.infer_expr(&assoc.key(), env, self_ty, scope);\n                                    self.infer_expr(&assoc.value(), env, self_ty, scope);\n",

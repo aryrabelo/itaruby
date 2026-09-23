@@ -584,6 +584,13 @@ pub struct FileDefs {
     pub hidden_ivar_writes: Vec<String>,
     /// Reflection wrote an instance variable whose name is not a literal.
     pub hidden_ivar_writes_any: bool,
+    /// This file sets `T::Configuration.default_checked_level = :never`:
+    /// sorbet-runtime enforces no sig in the project.
+    pub sorbet_runtime_unchecked: bool,
+    /// Every constant argument of an `include`/`prepend`/`extend` call
+    /// with more than one argument, with the lexical nesting at the call:
+    /// see `ProjectIndex::ambiguous_mixins`.
+    pub ambiguous_mixins: Vec<(String, Vec<String>)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -660,6 +667,8 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         call_blocks_lexical: Vec::new(),
         hidden_ivar_writes: Vec::new(),
         hidden_ivar_writes_any: false,
+        sorbet_runtime_unchecked: false,
+        ambiguous_mixins: Vec::new(),
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -683,6 +692,8 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         load_hook_bases: scan.load_hook_bases,
         hidden_ivar_writes: scan.hidden_ivar_writes,
         hidden_ivar_writes_any: scan.hidden_ivar_writes_any,
+        sorbet_runtime_unchecked: scan.sorbet_runtime_unchecked,
+        ambiguous_mixins: scan.ambiguous_mixins,
     }
 }
 
@@ -899,6 +910,8 @@ struct FileScan {
     call_blocks_lexical: Vec<bool>,
     hidden_ivar_writes: Vec<String>,
     hidden_ivar_writes_any: bool,
+    sorbet_runtime_unchecked: bool,
+    ambiguous_mixins: Vec<(String, Vec<String>)>,
 }
 
 /// Whose instance variable an `@x` write at this point of `FileScan`'s
@@ -1077,6 +1090,7 @@ impl<'pr> Visit<'pr> for FileScan {
         self.note_opaque_eval(node);
         self.note_injection(node);
         self.note_load_hook_base(node);
+        self.note_sorbet_runtime_hazard(node);
         ruby_prism::visit_call_node(self, node);
         self.call_blocks_lexical.pop();
     }
@@ -1095,6 +1109,29 @@ impl FileScan {
         let name = String::from_utf8_lossy(name).into_owned();
         if !self.hidden_ivar_writes.contains(&name) {
             self.hidden_ivar_writes.push(name);
+        }
+    }
+
+    /// Two project-wide facts that decide whether a Sorbet sig is a
+    /// contract sorbet-runtime enforces as written: a literal
+    /// `T::Configuration.default_checked_level = :never` (no sig is
+    /// checked at runtime), and a multi-argument `include A, B` (and
+    /// `prepend`/`extend`), whose ancestor order this index does not yet
+    /// linearize the way Ruby does, so a method both modules answer may
+    /// resolve to the wrong one.
+    fn note_sorbet_runtime_hazard(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let name = node.name();
+        let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if name.as_slice() == b"default_checked_level="
+            && node.receiver().as_ref().and_then(const_path_str).is_some_and(|r| r.trim_start_matches("::") == "T::Configuration")
+            && matches!(args.as_slice(), [value] if value.as_symbol_node().is_some_and(|s| s.unescaped() == b"never"))
+        {
+            self.sorbet_runtime_unchecked = true;
+        }
+        if matches!(name.as_slice(), b"include" | b"prepend" | b"extend") && args.len() > 1 {
+            for path in args.iter().filter_map(const_path_str) {
+                self.ambiguous_mixins.push((path, self.nesting.clone()));
+            }
         }
     }
 
@@ -4946,6 +4983,16 @@ pub struct ProjectIndex {
     pub hidden_ivar_writes: FxHashSet<String>,
     /// Some file wrote an ivar by a non-literal name: every ivar is unproven.
     pub hidden_ivar_writes_any: bool,
+    /// Some file sets `T::Configuration.default_checked_level = :never`:
+    /// sorbet-runtime checks no sig, so no Sorbet contract is accused.
+    pub sorbet_runtime_unchecked: bool,
+    /// Modules named together by one `include A, B` (or `prepend`/
+    /// `extend`), as `(path, nesting)`. This index linearizes such a call
+    /// in reverse of Ruby's order (a known ancestry bug), so which module
+    /// answers a name both define is unproven: every contract of these
+    /// modules and of their ancestors comes off
+    /// (`poison_ambiguous_mixin_contracts`).
+    pub ambiguous_mixins: Vec<(String, Vec<String>)>,
     /// Distinct literal `require '<lib>'` targets across every project
     /// file (W3 require/autoload). Ruby's `require` is process-global, so
     /// the stdlib gate consults this project-wide set, never per-file:
@@ -5175,6 +5222,7 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     build_mixer_map(&mut index);
     poison_include_time_redefinitions(&mut index);
     poison_prepend_shadowed_contracts(&mut index);
+    poison_ambiguous_mixin_contracts(&mut index);
     build_methods_by_name(&mut index);
     index
 }
@@ -5381,6 +5429,8 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.load_hook_raw.extend(defs.load_hook_bases.iter().cloned());
     index.hidden_ivar_writes.extend(defs.hidden_ivar_writes.iter().cloned());
     index.hidden_ivar_writes_any |= defs.hidden_ivar_writes_any;
+    index.sorbet_runtime_unchecked |= defs.sorbet_runtime_unchecked;
+    index.ambiguous_mixins.extend(defs.ambiguous_mixins.iter().cloned());
     for name in &defs.string_source_consts {
         if !index.string_source_consts.contains(name) {
             index.string_source_consts.push(name.clone());
@@ -7778,6 +7828,27 @@ fn poison_prepend_shadowed_contracts(index: &mut ProjectIndex) {
             track.values_mut().for_each(poison_contract);
             index.include_time_code.insert(id);
         }
+    }
+}
+
+/// Fail-closed half of a known ancestry bug: `include A, B` is
+/// linearized here in reverse of Ruby's order, so a name that both
+/// modules (or their ancestors) answer resolves to the wrong one. Until
+/// that is fixed, no contract written in a module named by such a call,
+/// or in any of its ancestors, is trusted.
+fn poison_ambiguous_mixin_contracts(index: &mut ProjectIndex) {
+    let mut hit: Vec<ClassId> = Vec::new();
+    for (path, nesting) in &index.ambiguous_mixins {
+        let Some(module) = index.resolve_const(nesting, path) else { continue };
+        for id in index.ancestors(module).0 {
+            if !hit.contains(&id) {
+                hit.push(id);
+            }
+        }
+    }
+    for id in hit {
+        let class = &mut index.classes[id.0 as usize];
+        class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
     }
 }
 

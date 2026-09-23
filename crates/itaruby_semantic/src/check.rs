@@ -35,9 +35,61 @@ struct CallTypeArgs<'a> {
     positional: &'a [PositionalArg],
     /// None means splats/forwarding/blocks made named binding unprovable.
     keywords: Option<&'a [KeywordArg]>,
-    /// Spans of the arguments WRITTEN as a literal `nil` — the only nil a
-    /// Sorbet contract may accuse (see `contract_accuses`).
-    nil_literals: &'a [(usize, usize)],
+    /// The arguments WRITTEN as a literal, by span, with the class that
+    /// literal is at runtime — the only argument values a Sorbet contract
+    /// may accuse (see `literal_class`).
+    literals: &'a [((usize, usize), LiteralClass)],
+}
+
+/// The runtime class of an expression WRITTEN as a literal: the only
+/// evidence a Sorbet contract (E0103/E0109) accepts. Three review rounds
+/// found 24 false-positive shapes, almost all an imprecise INFERRED type
+/// held to a signature (dispatch to an override or a redefinition, an
+/// overridden `.new`, a declared supertype read as exact, a setter's
+/// value, declared type arguments, refinements); a literal's class is
+/// none of those.
+#[derive(Clone, Debug, PartialEq)]
+enum LiteralClass {
+    /// A class this checker models, as the type a contract compares:
+    /// collections carry no type arguments (sorbet-runtime checks only
+    /// the category, never what an Array or a Hash holds).
+    Modeled(Ty),
+    /// A core class no modeled type names (`Range`, `Regexp`, `Rational`,
+    /// `Complex`): it fits only a contract this checker cannot read, or a
+    /// module one.
+    Other(&'static str),
+}
+
+impl LiteralClass {
+    fn fits(&self, expected: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+        match self {
+            LiteralClass::Modeled(ty) => compatible(ty, expected, index, rbi),
+            LiteralClass::Other(_) => other_core_fits(expected, index),
+        }
+    }
+
+    fn name(&self, index: &ProjectIndex) -> String {
+        match self {
+            LiteralClass::Modeled(ty) => ty_name(ty, index),
+            LiteralClass::Other(name) => (*name).to_owned(),
+        }
+    }
+}
+
+/// Could a `Range`/`Regexp`/`Rational`/`Complex` value satisfy `expected`?
+/// A sig name resolves to a modeled scalar or collection, a project class,
+/// a project module or `Unknown` (every core constant it does not model,
+/// `Range` itself and a project reopen of it included). Such a value is
+/// none of the scalars or collections, and no project CLASS is one of its
+/// ancestors; a module may be mixed into it by reflection, as
+/// `compatible` assumes for every module-typed contract.
+fn other_core_fits(expected: &Ty, index: &ProjectIndex) -> bool {
+    match expected {
+        Ty::Unknown => true,
+        Ty::Instance(p) => index.class(*p).is_module,
+        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),
+        _ => false,
+    }
 }
 
 /// Bead ita-qst: every `#: as <target>` inline-cast comment
@@ -1788,7 +1840,7 @@ impl Checker<'_> {
         let last_is_unknownish = matches!(last, Ty::Unknown | Ty::Union(_));
         let returns = std::mem::replace(&mut self.returns, saved_returns);
         if let Some((contract, nesting)) = &sorbet {
-            self.check_sorbet_return(def, contract, nesting, &last, &returns);
+            self.check_sorbet_return(def, contract, nesting);
         }
         let folded = returns.into_iter().fold(last, Ty::union);
         if self.census {
@@ -1868,14 +1920,11 @@ impl Checker<'_> {
         folded
     }
 
-    fn check_sorbet_return(
-        &mut self,
-        def: &DefNode<'_>,
-        contract: &crate::sorbet_sig::SorbetSig,
-        nesting: &[String],
-        last: &Ty,
-        returns: &[Ty],
-    ) {
+    /// E0109, literal-only: the body is accused only for a value it WRITES
+    /// as a literal — an explicit `return <literal>` (a bare `return` is a
+    /// written `nil`), judged on its own, or an implicit tail whose every
+    /// leaf is one. Anything else the body returns is never judged.
+    fn check_sorbet_return(&mut self, def: &DefNode<'_>, contract: &crate::sorbet_sig::SorbetSig, nesting: &[String]) {
         if self.silent || contract.void {
             return;
         }
@@ -1886,26 +1935,26 @@ impl Checker<'_> {
             return;
         }
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
-        // A bare `nil` is proven only where it is WRITTEN: a `return` with
-        // no value or a literal `nil`, or a literal `nil` as the tail.
-        let tail_nil = match body.as_statements_node() {
-            Some(statements) => statements.body().iter().last().is_some_and(|n| matches!(n, Node::NilNode { .. })),
-            None => matches!(body, Node::NilNode { .. }),
-        };
-        let returns_nil = safety.returns_literal_nil;
-        // Explicit returns make the existing inference fold Unknown. Inspect
-        // their proven values independently; never treat that Unknown as nil.
-        let actual = returns.iter().find(|ty| contract_accuses(ty, &expected, returns_nil, self.index, self.rbi_map))
-            .or_else(|| {
-                (!return_terminal(&body) && contract_accuses(last, &expected, tail_nil, self.index, self.rbi_map))
-                    .then_some(last)
-            });
+        let explicit = safety.returns.iter().flatten()
+            .find(|literal| self.contract_breaks(std::slice::from_ref(*literal), &expected))
+            .map(|literal| vec![literal.clone()]);
+        let actual = explicit.or_else(|| {
+            let mut leaves = Vec::new();
+            (!return_terminal(&body) && tail_literals(&body, &mut leaves) && self.contract_breaks(&leaves, &expected))
+                .then_some(leaves)
+        });
         if let Some(actual) = actual {
+            let mut names: Vec<String> = Vec::new();
+            for name in actual.iter().map(|leaf| leaf.name(self.index)) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
             let loc = def.name_loc();
             self.emit(loc.start_offset(), loc.end_offset(), E0109_RETURN_TYPE_MISMATCH,
                 Severity::Error, format!("return of `{}` expects {}, got {}",
                     String::from_utf8_lossy(def.name().as_slice()),
-                    ty_name(&expected, self.index), ty_name(actual, self.index)));
+                    ty_name(&expected, self.index), names.join(" | ")));
         }
     }
 
@@ -1970,17 +2019,14 @@ impl Checker<'_> {
         self_ty: SelfTy,
         scope: &[String],
     ) -> Ty {
+        if let Some(ty) = scalar_literal_ty(node) {
+            return ty;
+        }
         match node {
-            Node::IntegerNode { .. } => Ty::Int,
-            Node::FloatNode { .. } | Node::RationalNode { .. } | Node::ImaginaryNode { .. } => {
-                Ty::Float
-            }
-            Node::StringNode { .. } | Node::XStringNode { .. } => Ty::Str,
-            Node::SymbolNode { .. } => Ty::Sym,
-            Node::TrueNode { .. } | Node::FalseNode { .. } => Ty::Bool,
-            Node::NilNode { .. } => Ty::Nil,
+            // No modeled type is a `Rational` or a `Complex`.
+            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,
+            Node::XStringNode { .. } => Ty::Str,
             Node::SelfNode { .. } => self_ty.as_ty(),
-            Node::SourceFileNode { .. } | Node::SourceLineNode { .. } => Ty::Str,
             Node::SourceEncodingNode { .. } => Ty::Unknown,
 
             Node::InterpolatedStringNode { .. } => {
@@ -3219,6 +3265,18 @@ impl Checker<'_> {
     /// class this project never declares) leaves `t` untouched — the
     /// call's diagnostics stay byte-identical to having no cast comment
     /// at all, never a guess.
+    /// Record `node` as a contract literal when it is WRITTEN as one and
+    /// no inline cast comment on its line says otherwise.
+    fn note_contract_literal(&self, node: &Node<'_>, literals: &mut Vec<((usize, usize), LiteralClass)>) {
+        let loc = node.location();
+        if self.cast_comment_at(loc.start_offset()).is_some() {
+            return;
+        }
+        if let Some(class) = literal_class(node) {
+            literals.push(((loc.start_offset(), loc.end_offset()), class));
+        }
+    }
+
     fn apply_cast_comment(&self, t: Ty, start: usize) -> Ty {
         match self.cast_comment_at(start) {
             Some(CastTarget::NotNil) => strip_nil(t),
@@ -3329,7 +3387,7 @@ impl Checker<'_> {
         // Arguments.
         let mut pos_args: Vec<(Ty, (usize, usize), Option<String>)> = Vec::new();
         let mut kw_args: Vec<KeywordArg> = Vec::new();
-        let mut nil_literals: Vec<(usize, usize)> = Vec::new();
+        let mut literals: Vec<((usize, usize), LiteralClass)> = Vec::new();
         let mut sorbet_args_known = call.block().is_none();
         let mut exact_arity = true;
         if let Some(args) = call.arguments() {
@@ -3358,9 +3416,7 @@ impl Checker<'_> {
                                     let ty = self.infer_expr(&value, env, self_ty, scope);
                                     let ty = self.apply_cast_comment(ty, loc.start_offset());
                                     let name = String::from_utf8_lossy(key.unescaped()).into_owned();
-                                    if matches!(value, Node::NilNode { .. }) {
-                                        nil_literals.push((loc.start_offset(), loc.end_offset()));
-                                    }
+                                    self.note_contract_literal(&value, &mut literals);
                                     if kw_args.iter().any(|(previous, _, _)| previous == &name) {
                                         sorbet_args_known = false;
                                     }
@@ -3404,9 +3460,7 @@ impl Checker<'_> {
                         let lit = a
                             .as_string_node()
                             .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned());
-                        if matches!(a, Node::NilNode { .. }) {
-                            nil_literals.push((loc.start_offset(), loc.end_offset()));
-                        }
+                        self.note_contract_literal(&a, &mut literals);
                         pos_args.push((t, (loc.start_offset(), loc.end_offset()), lit));
                     }
                 }
@@ -3451,7 +3505,7 @@ impl Checker<'_> {
         let typed_args = CallTypeArgs {
             positional: &pos_args,
             keywords: sorbet_args_known.then_some(kw_args.as_slice()),
-            nil_literals: &nil_literals,
+            literals: &literals,
         };
 
         // E0108 is decided from the operand NODES, independently of
@@ -4811,13 +4865,15 @@ impl Checker<'_> {
         if keyword_args.iter().any(|(name, _, _)| !keywords.iter().any(|(kw, _)| kw == name)) {
             return;
         }
-        for (name, (ty, span, _)) in positional_names.iter().zip(args.positional) {
-            let literal_nil = args.nil_literals.contains(span);
-            self.check_sorbet_argument(sig, nesting, method, name, (ty, *span, literal_nil));
-        }
-        for (name, ty, span) in keyword_args {
-            let literal_nil = args.nil_literals.contains(span);
-            self.check_sorbet_argument(sig, nesting, method, name, (ty, *span, literal_nil));
+        let positional = positional_names.iter().zip(args.positional).map(|(name, (_, span, _))| (name, *span));
+        let bound = positional.chain(keyword_args.iter().map(|(name, _, span)| (name, *span)));
+        for (name, span) in bound {
+            // Literal-only: an argument that is not WRITTEN as a literal is
+            // never judged, whatever its inferred type says.
+            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone()) else {
+                continue;
+            };
+            self.check_sorbet_argument(sig, nesting, method, name, (&literal, span));
         }
     }
 
@@ -4827,16 +4883,28 @@ impl Checker<'_> {
         nesting: &[String],
         method: &str,
         name: &str,
-        // The argument's type, its span, and whether it is WRITTEN `nil`.
-        (actual, span, literal_nil): (&Ty, (usize, usize), bool),
+        (literal, span): (&LiteralClass, (usize, usize)),
     ) {
         let Some((_, expr)) = sig.params.iter().find(|(param, _)| param == name) else { return };
         let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);
-        if contract_accuses(actual, &expected, literal_nil, self.index, self.rbi_map) {
+        if self.contract_breaks(std::slice::from_ref(literal), &expected) {
             self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
                 format!("argument `{name}` of `{method}` expects {}, got {}",
-                    ty_name(&expected, self.index), ty_name(actual, self.index)));
+                    ty_name(&expected, self.index), literal.name(self.index)));
         }
+    }
+
+    /// Does a value that can only be one of `leaves` break the contract
+    /// `expected`? A literal is judged by the class it is written as, so
+    /// the only doubt left is which leaf runs: a union of branch leaves is
+    /// accused only when NO leaf fits, because this checker cannot tell a
+    /// dead branch from a live one. A project that turns runtime checking
+    /// off (`T::Configuration.default_checked_level = :never`) enforces no
+    /// sig, so nothing is accused there.
+    fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
+        !self.index.sorbet_runtime_unchecked
+            && !leaves.is_empty()
+            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map))
     }
 
     /// E0106 (bead ita-yho): literal-argument-only, cast-is-provably-
@@ -5478,51 +5546,10 @@ fn may_be_core_value(id: ClassId, index: &ProjectIndex, rbi: Option<&RbiMap>) ->
         || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))
 }
 
-/// Sorbet contract conformance (E0103/E0109) under invariant #1.
-///
-/// A union `actual` is the set of values the flow MIGHT hold, and this
-/// checker does not narrow through `case`/`when`, `is_a?`/`kind_of?`/
-/// `instance_of?`, `===`, a guard `return`/`raise`/`or return`, nor
-/// through a block, loop or rescue that rewrote a local; a mixed array
-/// literal's element and `s && s.empty?` are unions of the same kind. So
-/// ONE mismatched member is never proof: a union is accused only when NO
-/// member can be the expected type. A single (non-union) type answers for
-/// itself as before.
-///
-/// Nil membership is a FLOW fact this checker cannot prove: a `T.nilable`
-/// param seeds `T | nil` into the body and nothing strips nil through
-/// `x || d`, `x ||= d` or guards such as `return if x.blank?`, and a bare
-/// `nil` read back from a local, an ivar or a call may have been replaced
-/// by a write it never saw (an attribute writer, reflection). So a `nil`
-/// member is neither proof nor alibi — it is dropped, and the rest of the
-/// union answers for itself — unless the caller proved the value is a
-/// `nil` written right there (`literal_nil`), which keeps a top-level
-/// `Nil`. Nils nested in a collection go with its erased type arguments.
-fn contract_accuses(
-    actual: &Ty,
-    expected: &Ty,
-    literal_nil: bool,
-    index: &ProjectIndex,
-    rbi: Option<&RbiMap>,
-) -> bool {
-    if literal_nil && *actual == Ty::Nil {
-        return !compatible(&Ty::Nil, expected, index, rbi);
-    }
-    // `Ty::union` flattens, so a union's members are never unions.
-    let members = match actual {
-        Ty::Union(parts) => parts.as_slice(),
-        single => std::slice::from_ref(single),
-    };
-    let judged: Vec<Ty> = members.iter().filter(|m| **m != Ty::Nil).map(erase_type_arguments).collect();
-    !judged.is_empty() && judged.iter().all(|m| !compatible(m, expected, index, rbi))
-}
-
-/// Sorbet's generics are erased at runtime: sorbet-runtime checks that a
-/// value IS an Array or a Hash, never what it holds, so `{a: 1}` returned
-/// under `returns(T::Hash[String, T.untyped])` runs. Symbol-vs-String keys
-/// were 8 of corpus-c's new contract errors on correct code (measured
-/// 2026-09-22). Only the collection category is a contract this checker
-/// can hold a value to; its type arguments become Unknown.
+/// A collection whose CONTENTS are unproven keeps only its category: a
+/// local changed in place, an ivar any method may change, a collection
+/// nested in another one (all shared by reference). Its type arguments
+/// become Unknown; that it IS an Array or a Hash still holds.
 fn erase_type_arguments(t: &Ty) -> Ty {
     match t {
         Ty::Array(_) => Ty::Array(Box::new(Ty::Unknown)),
@@ -6146,21 +6173,25 @@ fn stmts_diverge(stmts: &ruby_prism::StatementsNode<'_>) -> bool {
 #[derive(Default)]
 struct ReturnContractSafety {
     uncertain: bool,
-    /// Some `return` is written as `return` or `return nil`: the only
-    /// `nil` an explicit return may be accused of (see `contract_accuses`).
-    returns_literal_nil: bool,
+    /// Every explicit `return`, as the literal it returns or `None` when
+    /// its value is not written as one (never judged).
+    returns: Vec<Option<LiteralClass>>,
 }
 
 impl<'pr> Visit<'pr> for ReturnContractSafety {
     fn visit_return_node(&mut self, node: &ruby_prism::ReturnNode<'pr>) {
         let literal = match node.arguments() {
-            None => true,
+            None => Some(LiteralClass::Modeled(Ty::Nil)),
             Some(args) => {
                 let values: Vec<Node<'pr>> = args.arguments().iter().collect();
-                matches!(values.as_slice(), [Node::NilNode { .. }])
+                match values.as_slice() {
+                    [value] => literal_class(value),
+                    // `return a, b` returns a new Array, whatever it holds.
+                    _ => Some(LiteralClass::Modeled(Ty::Array(Box::new(Ty::Unknown)))),
+                }
             }
         };
-        self.returns_literal_nil |= literal;
+        self.returns.push(literal);
         ruby_prism::visit_return_node(self, node);
     }
     fn visit_block_node(&mut self, _: &ruby_prism::BlockNode<'pr>) {
@@ -6209,6 +6240,133 @@ impl<'pr> Visit<'pr> for ReturnContractSafety {
             terminal = return_terminal(&statement);
         }
     }
+}
+
+/// The class of `node` when it is WRITTEN as a literal, else `None`.
+/// Literals: strings and symbols (plain or interpolated), numbers,
+/// `nil`/`true`/`false`, `__FILE__`/`__LINE__`, Array and Hash literals
+/// (whatever they hold), ranges, regexps, and a parenthesized literal. A
+/// bare keyword hash (`m(a: 1)`) is not one: its pairs are keyword
+/// arguments, each judged on its own.
+/// Never a literal: a variable, a constant, `self`, any call (`X.new`
+/// included), a ternary or `if`, a backtick command (`` ` `` can be
+/// redefined).
+fn literal_class(node: &Node<'_>) -> Option<LiteralClass> {
+    if let Some(ty) = scalar_literal_ty(node).or_else(|| composite_literal_ty(node)) {
+        return Some(LiteralClass::Modeled(ty));
+    }
+    if let Some(name) = unmodeled_literal_class(node) {
+        return Some(LiteralClass::Other(name));
+    }
+    let statements = node.as_parentheses_node()?.body()?.as_statements_node()?;
+    let mut body = statements.body().iter();
+    let only = body.next()?;
+    if body.next().is_none() { literal_class(&only) } else { None }
+}
+
+/// An interpolated string or symbol, or a collection literal (its type
+/// arguments are never read: see `LiteralClass::Modeled`).
+fn composite_literal_ty(node: &Node<'_>) -> Option<Ty> {
+    Some(match node {
+        Node::InterpolatedStringNode { .. } => Ty::Str,
+        Node::InterpolatedSymbolNode { .. } => Ty::Sym,
+        Node::ArrayNode { .. } => Ty::Array(Box::new(Ty::Unknown)),
+        Node::HashNode { .. } => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+        _ => return None,
+    })
+}
+
+/// A literal of a core class no modeled type names.
+fn unmodeled_literal_class(node: &Node<'_>) -> Option<&'static str> {
+    Some(match node {
+        Node::RangeNode { .. } => "Range",
+        Node::RegularExpressionNode { .. } | Node::InterpolatedRegularExpressionNode { .. } => "Regexp",
+        Node::RationalNode { .. } => "Rational",
+        Node::ImaginaryNode { .. } => "Complex",
+        _ => return None,
+    })
+}
+
+/// The scalar a literal node is, shared by inference and contracts so
+/// the two never disagree about what a literal is.
+fn scalar_literal_ty(node: &Node<'_>) -> Option<Ty> {
+    Some(match node {
+        Node::IntegerNode { .. } | Node::SourceLineNode { .. } => Ty::Int,
+        Node::FloatNode { .. } => Ty::Float,
+        Node::StringNode { .. } | Node::SourceFileNode { .. } => Ty::Str,
+        Node::SymbolNode { .. } => Ty::Sym,
+        Node::TrueNode { .. } | Node::FalseNode { .. } => Ty::Bool,
+        Node::NilNode { .. } => Ty::Nil,
+        _ => return None,
+    })
+}
+
+/// Collect the leaves an implicit tail can evaluate to — through a
+/// statement list's last statement, `if`/`unless`/ternary and `case`/`when`
+/// branches (a missing branch is a written `nil`), a plain `begin` and
+/// parentheses — and answer whether EVERY leaf is a literal. A leaf that
+/// is not (a variable, a call, a `return`, a `raise`) makes the whole
+/// tail unjudged, so a union is never accused on the literal half of it.
+fn tail_literals(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> bool {
+    if let Some(every_leaf) = tail_branches(node, leaves) {
+        return every_leaf;
+    }
+    match literal_class(node) {
+        Some(literal) => {
+            leaves.push(literal);
+            true
+        }
+        None => false,
+    }
+}
+
+/// `tail_literals` through a node that picks among values, or `None` when
+/// `node` is not one.
+fn tail_branches(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(statements) = node.as_statements_node() {
+        return Some(tail_branch(statements.body().iter().last(), leaves));
+    }
+    if let Some(else_node) = node.as_else_node() {
+        return Some(tail_branch(else_node.statements().map(|s| s.as_node()), leaves));
+    }
+    if let Some(parentheses) = node.as_parentheses_node() {
+        return Some(tail_branch(parentheses.body(), leaves));
+    }
+    conditional_leaves(node, leaves).or_else(|| case_or_begin_leaves(node, leaves))
+}
+
+/// Both arms of an `if`/ternary/`unless` (a missing one is a written `nil`).
+fn conditional_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(if_node) = node.as_if_node() {
+        let then = tail_branch(if_node.statements().map(|s| s.as_node()), leaves);
+        return Some(then && tail_branch(if_node.subsequent(), leaves));
+    }
+    let unless = node.as_unless_node()?;
+    let then = tail_branch(unless.statements().map(|s| s.as_node()), leaves);
+    Some(then && tail_branch(unless.else_clause().map(|e| e.as_node()), leaves))
+}
+
+/// Every `when` and the `else` of a `case`, or the body of a `begin` that
+/// has no `rescue`, `else` or `ensure` clause.
+fn case_or_begin_leaves(node: &Node<'_>, leaves: &mut Vec<LiteralClass>) -> Option<bool> {
+    if let Some(case) = node.as_case_node() {
+        let whens = case.conditions().iter().all(|condition| {
+            condition.as_when_node().is_some_and(|when| tail_branch(when.statements().map(|s| s.as_node()), leaves))
+        });
+        return Some(whens && tail_branch(case.else_clause().map(|e| e.as_node()), leaves));
+    }
+    let begin = node.as_begin_node()?;
+    let plain = begin.rescue_clause().is_none() && begin.else_clause().is_none() && begin.ensure_clause().is_none();
+    Some(plain && tail_branch(begin.statements().map(|s| s.as_node()), leaves))
+}
+
+fn tail_branch(node: Option<Node<'_>>, leaves: &mut Vec<LiteralClass>) -> bool {
+    if let Some(node) = node {
+        return tail_literals(&node, leaves);
+    }
+    // A branch that is not written evaluates to `nil`.
+    leaves.push(LiteralClass::Modeled(Ty::Nil));
+    true
 }
 
 /// Downcasts decide the shape here rather than the node discriminant: a

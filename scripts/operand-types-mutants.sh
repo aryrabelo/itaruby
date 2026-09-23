@@ -222,10 +222,12 @@ mutant M13 "$IDX" \
 # a family that had already run its other 45 mutants. The neighbour
 # statement is the fragile half of every anchor here: re-count it with the
 # harness's own `src.count(needle) == 1` before a run, never after a red.
+# (2026-09-23: the literal-only Sorbet contracts added
+# `note_sorbet_runtime_hazard` as the chain's last call; re-anchored.)
 mutant M14 "$IDX" \
-  '        self.note_load_hook_base(node);
+  '        self.note_sorbet_runtime_hazard(node);
         ruby_prism::visit_call_node(self, node);' \
-  '        self.note_load_hook_base(node);
+  '        self.note_sorbet_runtime_hazard(node);
         let _ = &node;' \
   a_refinement_inside_a_module_new_block_is_silent \
   'recursion into call blocks: a refine inside `Module.new do ... end` is still a refine'

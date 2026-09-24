@@ -58,7 +58,19 @@ found, and the launch bar is winning on both.
   `scripts/conflicting-superclasses-mutants.py` (gate c1 and CI); public
   baselines require a fresh measured audit after source changes.
 - A project's Sorbet `sig { ... }` is a contract, not a hint (learned
-  2026-09-22, binding). The declared return types the consumer. Accusations
+  2026-09-22, binding). The declared return types the consumer ONLY when
+  body inference answers `Ty::Unknown` (`method_return`'s `sig_fill`
+  fallback, `main`'s ita-4xy precedence restored 2026-09-23, binding):
+  sorbet-runtime proves only `is_a?`, which a decorator overriding it or
+  an object given singleton methods also passes, so an inferred type is
+  never overridden, and a sig's params are never bound into the body.
+  `X.new` is `Ty::Unknown` (`singleton_new_hidden`, `constructed`) when a
+  project singleton `new` may answer it: on `X` or an ancestor (`def
+  self.new`, `class << self`), `def X.new`/`X.extend(M)` from outside
+  (`outside_new`), an extended or singleton-prepended module defining
+  `new` or not fully known (unresolved, open other than `T::Sig`,
+  incomplete chain), a project-side open ancestor, or an ambiguous
+  superclass. Accusations
   are LITERAL-ONLY (2026-09-23, binding, the E0108 rule): E0109 (at the
   method name) only when EVERY return point is a literal and none fits
   (review F9) — each reachable explicit `return` (bare `return` is a
@@ -106,7 +118,7 @@ found, and the launch bar is winning on both.
   `main`'s (05a282e) consumer typing through `rbi_escalate`
   (`rbi_method_lookup`/`dsl_method_lookup`, skipped in silent walks as on
   `main`) and nothing more. Declared type arguments never type a consumer:
-  `sig_fill`, the body's param binding and `rbi_escalate` all pass the
+  `sig_fill` and `rbi_escalate` both pass the
   declared type through `erase_type_arguments` (`T::Array[String]` ->
   `Array[untyped]`; `T.nilable`/`T.any` keep member categories). Precedence
   is inline `#:` RBS, then inline `sig`. Every unprovable shape resolves to

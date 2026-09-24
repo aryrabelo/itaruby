@@ -54,10 +54,15 @@ raise under MRI.
 
 This alpha is not a replacement for Sorbet in annotated projects. A
 project method's own recognized `sig { ... }` is checked as a contract.
-Its declared return types the caller, a collection by its category only
-(`returns(T::Array[String])` is `Array[untyped]` to the caller, and a
-declared param binds the body the same way): sorbet-runtime never checks
-type arguments. The contract accuses only values
+Its declared return types the caller only where body inference answers
+nothing (an inferred return always wins: sorbet-runtime proves only
+`is_a?`, which a decorator overriding it also passes), a collection by its
+category only (`returns(T::Array[String])` is `Array[untyped]` to the
+caller): sorbet-runtime never checks type arguments. A declared param
+never types the method body. `X.new` types nothing when a project
+singleton `new` may answer it (on `X`, a superclass or an extended or
+singleton-prepended module, `def X.new` anywhere, or an extended module
+whose methods are not fully known). The contract accuses only values
 WRITTEN as literals (strings, symbols, numbers, `nil`, `true`/`false`,
 Array/Hash literals, ranges, regexps, `__FILE__`/`__LINE__`): a literal
 the body returns contradicts the declared return (E0109) only when every
@@ -122,7 +127,7 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names, a mixin hook on a module the class mixes in, or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class); the receiver must be typed, and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names, a mixin hook on a module the class mixes in, or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class); the receiver must be typed (a sig's declared return types it only when the body's own return is unknown; `X.new` types nothing when a project singleton `new` may answer it), and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |

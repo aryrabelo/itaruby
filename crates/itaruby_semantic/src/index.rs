@@ -5430,6 +5430,10 @@ pub struct ProjectIndex {
     /// fully known (`poison_prepend_shadowed_contracts`). A contract higher
     /// in their family never treats one as a plain inheritor.
     pub include_time_code: FxHashSet<ClassId>,
+    /// Classes and modules a source written outside their body may give a
+    /// `new` (`def X.new`, `X.extend(M)`, a body nobody can read), so
+    /// `X.new` proves no `X` (`singleton_new_hidden`).
+    pub outside_new: FxHashSet<ClassId>,
     /// Every ivar name some file writes through a path the checker's
     /// per-class ivar walk cannot attribute (`FileDefs::hidden_ivar_writes`),
     /// project-wide and name-keyed: the receiving object may be of any
@@ -8152,6 +8156,9 @@ fn poison_injected_contracts(index: &mut ProjectIndex) {
         .collect();
     for (id, names, singleton_only) in hits {
         index.include_time_code.insert(id);
+        if names.as_ref().is_none_or(|n| n.iter().any(|name| name == "new")) {
+            index.outside_new.insert(id);
+        }
         let class = &mut index.classes[id.0 as usize];
         match names {
             Some(names) => {
@@ -9151,6 +9158,54 @@ impl ProjectIndex {
             }
         }
         None
+    }
+
+    /// Can a project singleton `new` answer `X.new` instead of
+    /// `Class#new`, so `X.new` proves no `X` instance? Asked where
+    /// `lookup_singleton_own(id, "new")` finds none: every link it cannot
+    /// close counts, except sorbet-runtime's own `T::Sig` (it defines only
+    /// `sig`) and a descendant's `self.new`, which never runs for `X.new`.
+    /// It also sees what that lookup does not: a source written outside a
+    /// class body (`outside_new`). A singleton prepend is an `extends` edge
+    /// here too (`singleton_mixin`).
+    pub fn singleton_new_hidden(&self, id: ClassId) -> bool {
+        let t_sig = self.by_path.get("T::Sig").copied();
+        let (ancestors, _complete) = self.ancestors(id);
+        for &a in &ancestors {
+            let class = self.class(a);
+            if class.open {
+                if class.open_reason == Some(OpenReason::DeclaredExternal) {
+                    continue;
+                }
+                return true;
+            }
+            if class.singleton_methods.contains_key("new") || self.outside_new.contains(&a) {
+                return true;
+            }
+            if class.extends.iter().any(|ext| self.module_hides_new(class, ext, t_sig)) {
+                return true;
+            }
+        }
+        self.ambiguous_ancestry.contains(&id)
+    }
+
+    /// Can `ext`, extended onto (or prepended to) `class`'s singleton, answer
+    /// `new`? Unless it resolves to a fully known chain with no `new` and
+    /// no mixin hook.
+    fn module_hides_new(&self, class: &ClassDef, ext: &str, t_sig: Option<ClassId>) -> bool {
+        let Some(mid) = self.resolve_const(&class.nesting, ext) else {
+            return true;
+        };
+        let (chain, complete) = self.ancestors(mid);
+        if !complete {
+            return true;
+        }
+        chain.iter().any(|&m| {
+            let module = self.class(m);
+            let answers_new = module.methods.contains_key("new") || self.outside_new.contains(&m);
+            // What a mixin hook installs on the extender is `outside_new`'s.
+            answers_new || (module.open && Some(m) != t_sig)
+        })
     }
 
     /// Bead ita-6bq: does a class's OWN singleton `new` show up somewhere

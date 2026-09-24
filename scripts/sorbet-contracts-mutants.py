@@ -28,7 +28,7 @@ CHECK = SRC / "check.rs"
 INDEX = SRC / "index.rs"
 SIG = SRC / "sorbet_sig.rs"
 DISCOVERY = SRC / "discovery.rs"
-TESTS = ("sorbet_contracts", "sorbet_contract_parser", "project_sigs", "sorbet_sig")
+TESTS = ("sorbet_contracts", "sorbet_contract_parser", "project_sigs", "sorbet_sig", "conflicting_superclasses")
 
 # (label, file, needle, replacement, named test(s) that must FAIL)
 MUTATIONS = [
@@ -64,10 +64,7 @@ MUTATIONS = [
      "                erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting))",
      "                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)",
      "declared_type_arguments_never_type_consumers"),
-    ("sig param keeps its type arguments", CHECK,
-     "                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));",
-     "                let ty = crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting);",
-     "declared_type_arguments_never_type_consumers"),
+    # removed: sig param keeps its type arguments — r4: a sig's params never bind into the body, so there is no bound type left to erase
     # -- instance / singleton separation
     ("source track forced to instance", CHECK,
      "        let singleton = class.singleton_methods.get(name).is_some_and(same);",
@@ -422,9 +419,82 @@ MUTATIONS = [
      "        let sig = method.sorbet_sig.as_ref()?;\n",
      "contract_work_is_per_definition_not_per_call"),
     ("return memo read after sig_fill", CHECK,
-     "        // A memo entry is only ever written after `sig_fill` answered\n",
-     "        let _ = self.sig_fill(m, name);\n",
+     "        let key = (class, name.to_string(), singleton);\n        if let Some(t) = self.return_memo.get(&key) {\n",
+     "        let _ = self.sig_fill(m, name);\n        let key = (class, name.to_string(), singleton);\n        if let Some(t) = self.return_memo.get(&key) {\n",
      "contract_work_is_per_definition_not_per_call"),
+    # -- r4: a sig proves only `is_a?`, so it types a consumer only as a fallback
+    ("r4 declared return overrides inference", CHECK,
+     "        if ty == Ty::Unknown {\n            ty = self.sig_fill(m, name);\n        }\n",
+     "        let declared = self.sig_fill(m, name);\n        if declared != Ty::Unknown {\n            ty = declared;\n        }\n",
+     ("inferred_return_wins_over_the_declared_one", "declared_return_checks_body_but_never_overrides_inference")),
+    ("r4 sig params bind the body", CHECK,
+     "        // A sorbet sig's params never bind into the body: sorbet-runtime\n",
+     "        if let Some((contract, nesting)) = &sorbet {\n"
+     "            for (name, expr) in &contract.params {\n"
+     "                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));\n"
+     "                if ty != Ty::Unknown && env.contains_key(name) {\n"
+     "                    env.insert(name.clone(), ty);\n"
+     "                }\n"
+     "            }\n"
+     "        }\n",
+     "signature_params_never_bind_the_source_body"),
+    # -- r4: `X.new` proves an `X` only when `Class#new` answers it
+    ("r4 project self.new constructs its receiver", CHECK,
+     "                            // nothing downstream is judged against `c`.\n                            return Ty::Unknown;\n",
+     "                            // nothing downstream is judged against `c`.\n                            return Ty::Instance(c);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 hidden singleton new ignored", CHECK,
+     "        if self.index.singleton_new_hidden(c) {\n            Ty::Unknown\n",
+     "        if false {\n            Ty::Unknown\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 open ancestor hides no new", INDEX,
+     "                if class.open_reason == Some(OpenReason::DeclaredExternal) {\n                    continue;\n                }\n                return true;\n",
+     "                continue;\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 declared ancestor hides a new", INDEX,
+     "                if class.open_reason == Some(OpenReason::DeclaredExternal) {\n                    continue;\n                }\n                return true;\n",
+     "                return true;\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 superclass singleton new ignored", INDEX,
+     "            if class.singleton_methods.contains_key(\"new\") || self.outside_new.contains(&a) {\n",
+     "            if self.outside_new.contains(&a) {\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new on an ancestor ignored", INDEX,
+     "            if class.singleton_methods.contains_key(\"new\") || self.outside_new.contains(&a) {\n",
+     "            if class.singleton_methods.contains_key(\"new\") {\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new never recorded", INDEX,
+     "            index.outside_new.insert(id);\n",
+     "",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 unresolved extend hides no new", INDEX,
+     "        let Some(mid) = self.resolve_const(&class.nesting, ext) else {\n            return true;\n        };\n        let (chain, complete) = self.ancestors(mid);\n",
+     "        let Some(mid) = self.resolve_const(&class.nesting, ext) else {\n            return false;\n        };\n        let (chain, complete) = self.ancestors(mid);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 incomplete extend chain hides no new", INDEX,
+     "        let (chain, complete) = self.ancestors(mid);\n        if !complete {\n            return true;\n        }\n",
+     "        let (chain, _complete) = self.ancestors(mid);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 extended module new ignored", INDEX,
+     "            let answers_new = module.methods.contains_key(\"new\") || self.outside_new.contains(&m);\n",
+     "            let answers_new = self.outside_new.contains(&m);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new on an extended module ignored", INDEX,
+     "            let answers_new = module.methods.contains_key(\"new\") || self.outside_new.contains(&m);\n",
+     "            let answers_new = module.methods.contains_key(\"new\");\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 open extended module hides no new", INDEX,
+     "            answers_new || (module.open && Some(m) != t_sig)\n",
+     "            answers_new\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 T::Sig hides a new", INDEX,
+     "            answers_new || (module.open && Some(m) != t_sig)\n",
+     "            answers_new || module.open\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 ambiguous superclass hides no new", INDEX,
+     "        self.ambiguous_ancestry.contains(&id)\n    }\n\n    /// Can `ext`",
+     "        false\n    }\n\n    /// Can `ext`",
+     "identical_base_text_in_different_scopes_conflicts_but_local_methods_remain_known"),
     # -- self in a module is an instance of an includer nobody named
     ("module instance proves incompatibility", CHECK,
      "        (Ty::Instance(a), _) if index.class(*a).is_module => true,\n",

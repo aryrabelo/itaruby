@@ -1833,16 +1833,8 @@ impl Checker<'_> {
                 }
             }
         }
-        // sorbet-runtime checks a generic's category, never its type
-        // arguments, so a declared collection binds as `Array[untyped]`.
-        if let Some((contract, nesting)) = &sorbet {
-            for (name, expr) in &contract.params {
-                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));
-                if ty != Ty::Unknown && env.contains_key(name) {
-                    env.insert(name.clone(), ty);
-                }
-            }
-        }
+        // A sorbet sig's params never bind into the body: sorbet-runtime
+        // proves only `is_a?`, which a decorator also passes.
 
         let self_ty = self_ty_of(class, singleton);
         // E0108's per-scope literal proof. The parameter list is handed
@@ -3817,14 +3809,16 @@ impl Checker<'_> {
                                 self.check_arity(&m, "new", pos_args.len(), msg_loc);
                             }
                             self.check_sig_args(&m, "new", &typed_args, Some(owner), scope);
-                            return Ty::Instance(c);
+                            // A project `self.new` may return anything, so
+                            // nothing downstream is judged against `c`.
+                            return Ty::Unknown;
                         }
                         MethodLookup::Inconclusive => {
                             let blocker = self.index.inconclusive_reason(c, true);
                             self.tally_inconclusive(blocker);
                             self.tally_ar_base(blocker, c);
                             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
-                            return Ty::Instance(c);
+                            return self.constructed(c);
                         }
                         MethodLookup::NotFound => {}
                     }
@@ -3870,7 +3864,7 @@ impl Checker<'_> {
                             }
                         }
                     }
-                    return Ty::Instance(c);
+                    return self.constructed(c);
                 }
                 match self.index.lookup_singleton_rbi(c, &name, self.rbi_map) {
                     MethodLookup::Found(m, _) => {
@@ -5030,8 +5024,6 @@ impl Checker<'_> {
             self.set_ret_cause(None);
             return Ty::Unknown;
         }
-        // A memo entry is only ever written after `sig_fill` answered
-        // Unknown for this same key, so it is read first.
         let key = (class, name.to_string(), singleton);
         if let Some(t) = self.return_memo.get(&key) {
             let t = t.clone();
@@ -5047,18 +5039,13 @@ impl Checker<'_> {
             self.set_ret_cause(cause);
             return t;
         }
-        let declared = self.sig_fill(m, name);
-        if declared != Ty::Unknown {
-            self.set_ret_cause(None);
-            return declared;
-        }
         if !self.in_progress.insert(key.clone()) {
             self.set_ret_cause(None);
             return Ty::Unknown;
         }
         let text = m.file.text(self.db);
         let parse = ruby_prism::parse(text.as_bytes());
-        let ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
+        let mut ty = if let Some(def) = find_def_at(&parse.node(), m.def_span) {
             let was_silent = self.silent;
             self.silent = true;
             // This walks another method's body — byte offsets there
@@ -5116,6 +5103,12 @@ impl Checker<'_> {
             Ty::Unknown
         };
         self.in_progress.remove(&key);
+        // sorbet-runtime proves only `is_a?`, which a decorator or a
+        // singleton-extended object also passes, so an inferred body type
+        // always wins and the declared return fills only an Unknown.
+        if ty == Ty::Unknown {
+            ty = self.sig_fill(m, name);
+        }
         // Bead ita-mv5: freshly-computed path — pair `return_cause_memo`
         // with `return_memo` right here, at the exact key both are keyed
         // by. `check_method_body` already set `self.last_ret_cause` (or
@@ -5126,8 +5119,19 @@ impl Checker<'_> {
         ty
     }
 
-    /// Consumer types use the explicit contract; the source body is checked
-    /// independently by `check_method_body`, never against this assumed result.
+    /// What `X.new` proves when no project `self.new` was found for `X`:
+    /// an `X` only when nothing hidden can answer `new` instead.
+    fn constructed(&self, c: ClassId) -> Ty {
+        if self.index.singleton_new_hidden(c) {
+            Ty::Unknown
+        } else {
+            Ty::Instance(c)
+        }
+    }
+
+    /// `method_return`'s fallback, consulted only once body inference
+    /// answered Unknown: it never overrides an inferred type. The source
+    /// body is checked independently by `check_method_body`.
     /// sorbet-runtime checks only a returned collection's category, so its
     /// declared type arguments never reach the consumer.
     fn sig_fill(&self, m: &MethodSig, name: &str) -> Ty {

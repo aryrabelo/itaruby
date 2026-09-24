@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A Sorbet `sig` no longer overrides what its method is inferred to return
+  (r4, a regression against `main` 05a282e): sorbet-runtime proves a
+  returned value only `is_a?`, which a decorator overriding `is_a?`, or an
+  object given singleton methods, also passes. `sig { returns(User) }` over
+  a body returning `UserDecorator.new(user)` no longer makes
+  `.display_name` a false E0101: the declared return types a call only when
+  body inference answers nothing, as on `main`. A sig's params are no
+  longer bound into the method body (`u: User` typed `u` inside it), also
+  as on `main`; the literal E0103/E0109 contracts are unchanged. `X.new`
+  types nothing when a project singleton `new` may answer it — `def
+  self.new`, `class << self; def new`, `def X.new` or `X.extend(M)` from
+  outside or through a mixin hook's install, a superclass's singleton `new`, an extended or
+  singleton-prepended module defining `new` or whose methods are not fully
+  known, a project-side open ancestor, or an ambiguous superclass — so no
+  contract is judged against a method that never runs. sorbet-runtime's
+  own `T::Sig` and a descendant's `self.new` still leave `X.new` an `X`.
 - A hidden definition no longer takes every contract in the project off
   where its reach can be bounded (r4). What a mixin hook installs through
   its receiver parameter (`def self.included(base)`, `def

@@ -107,10 +107,22 @@ ContractSplatPair.new.pair(*[1], "good")
     assert!(diags[0].message.contains("label"), "{diags:?}");
 }
 
+/// sorbet-runtime proves a parameter only `is_a?`, which a decorator that
+/// overrides it also passes, so a sig's param types never bind into the
+/// body. The sig still accuses a literal argument at the call.
 #[test]
-fn signature_params_bind_the_source_body() {
-    let diags = check("binding", r"
+fn signature_params_never_bind_the_source_body() {
+    let source = r#"
 class ContractBoundValue
+end
+class ContractBoundDecorator
+  def initialize(value)
+    @value = value
+  end
+  def is_a?(klass)
+    super || @value.is_a?(klass)
+  end
+  def absent_bound_method; end
 end
 class ContractBinding
   extend T::Sig
@@ -120,10 +132,126 @@ class ContractBinding
     1
   end
 end
-", None);
-    assert_eq!(diags.len(), 1, "{diags:?}");
-    assert_eq!(diags[0].code, "E0101");
-    assert!(diags[0].message.contains("absent_bound_method"), "{diags:?}");
+ContractBinding.new.inspect_value(ContractBoundDecorator.new(ContractBoundValue.new))
+ContractBinding.new.inspect_value("literal")
+"#;
+    let diags = check("binding", source, None);
+    assert_eq!(codes(&diags), ["E0103"], "{diags:?}");
+    assert_eq!(&source[diags[0].start..diags[0].end], "\"literal\"");
+}
+
+/// A declared return is proof only of `is_a?`: a decorator overriding it
+/// passes sorbet-runtime's check, so an inferred body type always wins
+/// over the declaration, and the declaration types a consumer only where
+/// body inference answers Unknown.
+#[test]
+fn inferred_return_wins_over_the_declared_one() {
+    let source = r"
+class ContractDecoratedUser
+end
+class ContractUserDecorator
+  def initialize(user)
+    @user = user
+  end
+  def is_a?(klass)
+    super || @user.is_a?(klass)
+  end
+  def display_name; end
+end
+class ContractPresenter
+  extend T::Sig
+  sig { returns(ContractDecoratedUser) }
+  def user
+    ContractUserDecorator.new(ContractDecoratedUser.new)
+  end
+  sig { returns(ContractDecoratedUser) }
+  def opaque_user
+    @opaque_user
+  end
+end
+ContractPresenter.new.user.display_name
+ContractPresenter.new.opaque_user.display_name
+";
+    let diags = check("decorated-return", source, None);
+    assert_eq!(codes(&diags), ["E0101"], "{diags:?}");
+    let opaque = source.find("ContractPresenter.new.opaque_user").unwrap();
+    assert!(diags[0].start > opaque, "only the opaque body takes the declared type: {diags:?}");
+}
+
+/// `X.new` proves an `X` only when `Class#new` answers it. A project
+/// singleton `new` — on `X`, on a superclass's singleton, in a module `X`
+/// extends — or an extended module whose methods are not fully known may
+/// return anything, so the instance contract below is never judged against
+/// a method that may not run. sorbet-runtime's own `T::Sig` answers only
+/// `sig`, a descendant's `self.new` never runs for `X.new`, and a gem base
+/// class's own `new` builds the receiver as `Class#new` does.
+#[test]
+fn a_project_singleton_new_proves_no_instance() {
+    const TARGET: &str = r#"
+PRELUDE
+class ContractNewTarget PARENT
+  extend T::Sig
+  BODY
+  sig { params(n: Integer).void }
+  def take(n); end
+end
+OUTSIDE
+ContractNewTarget.new.take("literal")
+"#;
+    let render = |prelude: &str, parent: &str, body: &str, outside: &str| {
+        TARGET.replace("PRELUDE", prelude).replace("PARENT", parent).replace("BODY", body).replace("OUTSIDE", outside)
+    };
+    let factory = "module ContractNewFactory\n  def new(*args)\n    super\n  end\nend\n";
+    let base = "class ContractNewBase\n  def self.new(*args)\n    super\n  end\nend\n";
+    let open_base = "class ContractNewOpenBase\n  unmodeled_dsl :factory\nend\n";
+    let partial = "module ContractNewPartial\n  include ContractNewMissing::Mixin\nend\n";
+    let dsl = "module ContractNewDsl\n  unmodeled_dsl :factory\nend\n";
+    let hooked = "module ContractNewHooked\n  def self.extended(base)\n    base.define_singleton_method(:new) { |*args| super(*args) }\n  end\nend\n";
+    let shapes = [
+        ("", "", "def self.new(*args)\n    super\n  end", ""),
+        ("", "", "class << self\n    def new(*args)\n      super\n    end\n  end", ""),
+        ("", "", "", "def ContractNewTarget.new(*args)\n  super\nend\n"),
+        (base, "< ContractNewBase", "", ""),
+        (open_base, "< ContractNewOpenBase", "", ""),
+        (factory, "", "extend ContractNewFactory", ""),
+        ("", "", "extend ContractNewUnknown::Factory", ""),
+        ("", "", "class << self\n    prepend ContractNewFactory\n  end", factory),
+        ("", "", "", "ContractNewTarget.extend(ContractNewFactory)\n"),
+        ("module ContractNewLate\nend\n", "", "extend ContractNewLate", "ContractNewLate.define_method(:new) { |*args| super(*args) }\n"),
+        (partial, "", "extend ContractNewPartial", ""),
+        (dsl, "", "extend ContractNewDsl", ""),
+        (hooked, "", "extend ContractNewHooked", ""),
+    ];
+    for (i, (prelude, parent, body, outside)) in shapes.iter().enumerate() {
+        let source = render(prelude, parent, body, outside);
+        let diags = check(&format!("singleton-new-{i}"), &source, None);
+        assert!(contract_codes(&diags).is_empty(), "{source}: {diags:?}");
+    }
+    // A superclass spelled to two different classes may be either one.
+    let ambiguous = "class ContractNewSpelled\nend\nmodule ContractNewOuter\n  class ContractNewSpelled\n  end\n  class Target < ContractNewSpelled\n    extend T::Sig\n    sig { params(n: Integer).void }\n    def take(n); end\n  end\nend\nclass ContractNewOuter::Target < ContractNewSpelled; end\nContractNewOuter::Target.new.take(\"literal\")\nmade = ContractNewOuter::Target.new\nmade\n";
+    let diags = check("singleton-new-ambiguous", ambiguous, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // The lookups on an ambiguous class are already inconclusive, so the
+    // decision shows only in what `.new` proves: no instance of either base.
+    assert_ne!(
+        ty_at("singleton-new-ambiguous", ambiguous, "made = ", "made").as_deref(),
+        Some("ContractNewOuter::Target"),
+        "{ambiguous}"
+    );
+
+    let quiet = "module ContractNewQuiet\n  def quiet; end\nend\n";
+    let kid = "class ContractNewKid < ContractNewTarget\n  def self.new(*args)\n    super\n  end\nend\n";
+    let controls = [
+        render("", "", "", ""),
+        render(quiet, "", "extend ContractNewQuiet", ""),
+        render("", "", "", kid),
+        render("", "< ActiveRecord::Base", "", ""),
+        render(quiet, "", "", "ContractNewTarget.extend(ContractNewQuiet)\ndef ContractNewTarget.quiet; end\n"),
+    ];
+    for (i, source) in controls.iter().enumerate() {
+        let diags = check(&format!("singleton-new-control-{i}"), source, None);
+        assert_eq!(contract_codes(&diags), ["E0103"], "{source}: {diags:?}");
+    }
 }
 
 #[test]
@@ -1146,8 +1274,9 @@ fn assert_types(name: &str, source: &str, expected: &[(&str, &str, Option<&str>)
     }
 }
 
-/// Each method's value is inferred, so no contract judges it (the sigs only
-/// bind the parameters); hover shows what the core model answers.
+/// Each method's value is inferred, so no contract judges it; a sig never
+/// binds its parameters into the body, so each receiver is a literal and
+/// hover shows what the core model answers.
 #[test]
 fn integer_arithmetic_takes_the_operand_type() {
     let source = r"
@@ -1155,23 +1284,23 @@ class ContractIntOperand
   extend T::Sig
   sig { params(x: Integer).returns(Float) }
   def half(x)
-    x + 0.5
+    2 + 0.5
   end
   sig { params(x: Integer, y: T.untyped).returns(Float) }
   def scaled(x, y)
-    x * y
+    2 * y
   end
   sig { params(x: Integer).returns(T::Boolean) }
   def ratio(x)
-    (x * 1.5).nan?
+    (2 * 1.5).nan?
   end
   sig { params(x: Float, y: T.untyped).returns(Integer) }
   def decimal(x, y)
-    x * y
+    1.5 * y
   end
   sig { params(x: Integer).returns(Integer) }
   def wrong(x)
-    x * 1.5
+    2 * 1.5
   end
 end
 ";
@@ -1192,19 +1321,19 @@ class ContractFloatDigits
   extend T::Sig
   sig { params(x: Float).returns(Float) }
   def cents(x)
-    x.round(2)
+    1.25.round(2)
   end
   sig { params(x: Float, n: Integer).returns(Float) }
   def floored(x, n)
-    x.floor(n)
+    1.25.floor(n)
   end
   sig { params(x: Float).returns(T::Boolean) }
   def odd_cents(x)
-    x.ceil(1).nan?
+    1.25.ceil(1).nan?
   end
   sig { params(x: Float).returns(String) }
   def whole(x)
-    x.round
+    1.25.round
   end
 end
 ";
@@ -1282,11 +1411,11 @@ class ContractClamp
   extend T::Sig
   sig { params(x: Integer).returns(Float) }
   def bounded(x)
-    x.clamp(0.5, 2.5)
+    3.clamp(0.5, 2.5)
   end
   sig { params(x: Integer).returns(String) }
   def wrong(x)
-    x.clamp(1, 5)
+    3.clamp(1, 5)
   end
 end
 ";
@@ -1639,10 +1768,8 @@ class ContractMixinChild < ContractMixinParent
   MIXIN
 end
 class ContractMixinUser
-  extend T::Sig
-  sig { params(parent: ContractMixinParent).void }
-  def use(parent)
-    parent.echo("text")
+  def use
+    ContractMixinParent.new.echo("text")
   end
 end
 "#;
@@ -1675,10 +1802,8 @@ class ContractConcernChild < ContractConcernHost
   OVERRIDE
 end
 class ContractConcernUser
-  extend T::Sig
-  sig { params(host: ContractConcernHost).void }
-  def use(host)
-    host.echo("text")
+  def use
+    ContractConcernHost.new.echo("text")
   end
 end
 "#;
@@ -1817,10 +1942,8 @@ class ContractHookChild < ContractHookParent
   INCLUSION
 end
 class ContractHookUser
-  extend T::Sig
-  sig { params(parent: ContractHookParent).void }
-  def use(parent)
-    parent.echo("text")
+  def use
+    ContractHookParent.new.echo("text")
   end
 end
 "#;
@@ -2421,7 +2544,8 @@ fn def_on_a_constant_redefines_its_singleton_contract() {
 /// `X.singleton_class.prepend(M)` from outside, `class << X` out of line —
 /// shadows the signed class method it answers, also from a method body. A
 /// module whose methods are not fully known takes every contract on that
-/// track off.
+/// track off, and may answer `new` too, so `ContractScaleCfg.new` then
+/// proves no instance either.
 #[test]
 fn singleton_prepend_takes_the_shadowed_contract_off() {
     // The last shape's module answers no `scale` itself: its `prepended`
@@ -2445,7 +2569,8 @@ fn singleton_prepend_takes_the_shadowed_contract_off() {
         let extra = format!("{STRING_SCALE}{outside}");
         let sources = [target.as_str(), extra.as_str()];
         let diags = check_files(&format!("singleton-prepend-{i}"), &sources);
-        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.new.grow(\"text\")"], "{body}{outside}: {diags:?}");
+        let expected: &[&str] = if i == 4 { &[] } else { &["ContractScaleCfg.new.grow(\"text\")"] };
+        assert_eq!(scaled_accusations(&diags, &sources), expected, "{body}{outside}: {diags:?}");
     }
 
     // A fully known module that does not answer `scale` shadows nothing.
@@ -2541,10 +2666,8 @@ class ContractScaleChild < ContractScaleParent
   CHILD
 end
 class ContractScaleUser
-  extend T::Sig
-  sig { params(parent: ContractScaleParent).void }
-  def use(parent)
-    parent.grow("text")
+  def use
+    ContractScaleParent.new.grow("text")
   end
 end
 "#;
@@ -3695,10 +3818,10 @@ fn lockfile_without_real_sorbet_runtime_makes_sigs_inert() {
 
 /// F4: sorbet-runtime checks a generic's category, never its type
 /// arguments (`T::Array[String]` accepts `[1]` at run time), so a declared
-/// element, key or value type never types a consumer — not through the
-/// return, and not through a parameter bound into the body. The category
-/// survives, and `T.nilable` keeps its member's: `names.absent_on_array`
-/// and `items.absent_on_param_array` are still accused.
+/// element, key or value type never types a consumer through the return.
+/// The category survives, and `T.nilable` keeps its member's:
+/// `names.absent_on_array` is still accused. A parameter is never bound
+/// into the body at all, so `items.absent_on_param_array` is silent.
 #[test]
 fn declared_type_arguments_never_type_consumers() {
     let source = r"
@@ -3706,17 +3829,12 @@ class ContractErasedItem
 end
 class ContractErased
   extend T::Sig
+  # Opaque bodies: a declared return types a consumer only where body
+  # inference answers Unknown.
   sig { returns(T::Array[String]) }
-  def names; []; end
+  def names; @names; end
   sig { returns(T.nilable(T::Hash[Symbol, Integer])) }
-  def table; nil; end
-  # Read only through `first`, `items` stays a trusted local: only the
-  # binding decides what its elements are.
-  sig { params(items: T::Array[ContractErasedItem]).returns(Integer) }
-  def count(items)
-    items.first
-    1
-  end
+  def table; @table; end
   sig { params(items: T::Array[ContractErasedItem]).returns(Integer) }
   def probe(items)
     items.absent_on_param_array
@@ -3733,12 +3851,11 @@ ContractErased.new.names.absent_on_array
         .filter(|d| d.code == "E0101")
         .filter_map(|d| d.message.split('`').nth(1))
         .collect();
-    assert_eq!(absent, ["absent_on_param_array", "absent_on_array"], "{diags:?}");
+    assert_eq!(absent, ["absent_on_array"], "{diags:?}");
     assert_types("erased", source, &[
         ("ContractErased.new.names.first", "names", Some("Array[untyped]")),
         ("ContractErased.new.names.first", "first", None),
         ("ContractErased.new.table", "table", Some("Hash[untyped, untyped] | nil")),
-        ("    items.first", "first", None),
     ]);
 }
 
@@ -3866,10 +3983,8 @@ end
 class ContractAliasChild < ContractAliasParent
 end
 class ContractAliasUser
-  extend T::Sig
-  sig { params(parent: ContractAliasParent).void }
-  def use(parent)
-    parent.grow("text")
+  def use
+    ContractAliasParent.new.grow("text")
   end
 end
 "#;
@@ -4243,3 +4358,4 @@ fn a_rebound_hook_param_is_an_unnamed_receiver() {
         assert_hidden_untouched(&format!("hook-rebound-control-{i}"), outside);
     }
 }
+

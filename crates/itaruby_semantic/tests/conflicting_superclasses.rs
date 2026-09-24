@@ -220,7 +220,12 @@ module Outer
   end
 end
 ", "class Outer::Child < Base; end", "
-Outer::Child.new.inherited(1, 2)
+class Outer::Child
+  def probe
+    inherited(1, 2)
+    local(1, 2)
+  end
+end
 Outer::Child.new.local(1, 2)
 "];
     for reverse in [false, true] {
@@ -230,10 +235,13 @@ Outer::Child.new.local(1, 2)
         assert!(matches!(index.lookup_method(child, "inherited"), MethodLookup::Inconclusive));
         assert!(matches!(index.lookup_method(child, "local"), MethodLookup::Found(_, _)));
         let diagnostics = itaruby_semantic::check_file(&db, files[2]);
+        // Either candidate superclass may define a singleton `new`, so
+        // `Outer::Child.new` proves no instance; `self` still does.
         assert_eq!(diagnostics.len(), 1, "only the local arity is known: {diagnostics:?}");
         assert_eq!(diagnostics[0].code, "E0102");
-        let local_call = sources[2].find("Outer::Child.new.local").unwrap();
-        assert!((local_call..sources[2].len()).contains(&diagnostics[0].start));
+        let local_call = sources[2].find("    local(1, 2)").unwrap();
+        let constructed = sources[2].find("Outer::Child.new").unwrap();
+        assert!((local_call..constructed).contains(&diagnostics[0].start));
     }
 }
 

@@ -1,12 +1,12 @@
-//! A project method's own sorbet `sig` is a CONTRACT, not a hint. Bead
-//! ita-4xy landed it as a fallback consulted only when body inference
-//! reached `Ty::Unknown`; the signature delivery replaced that with the
-//! rule a signature is worth writing for — the declared return types the
-//! consumer, and the body is checked against it independently, so a body
-//! that disagrees is accused (E0109) instead of quietly winning. The
-//! precedence assertions below are the lock on that direction, and (b) is
-//! the one that changed sides: it used to prove an inferred `Ty::Str` body
-//! beat the declaration.
+//! A project method's own sorbet `sig` is a CONTRACT on its body and its
+//! literal arguments, but only a fallback for the CONSUMER's type. Bead
+//! ita-4xy landed the declared return as a fallback consulted only when
+//! body inference reached `Ty::Unknown`, and that precedence stands:
+//! sorbet-runtime proves a returned value only `is_a?`, which a decorator
+//! overriding it also passes, so an inferred body type always wins. The
+//! body is still checked against its declaration independently, so a body
+//! that disagrees is accused (E0109) where it is written. The precedence
+//! assertions below are the lock on that direction.
 //!
 //! Inline sources only (no `testdata/` fixtures: gate c scans that whole
 //! tree for diagnostics, and every fixture here is deliberately built to
@@ -66,24 +66,18 @@ ProjSigOwnerA.new.make(1).nonexistent_method_a
     );
 }
 
-/// (b) Precedence, in the direction signatures are written for. The body
-/// returns a plain string literal while the sig declares
-/// `ProjSigWidgetB`, and BOTH halves of the contract must be observable
-/// from one fixture:
+/// (b) Precedence: the body returns a plain string literal while the sig
+/// declares `ProjSigWidgetB`, and both halves must be observable from one
+/// fixture:
 ///
 /// * E0109 on `make` — the body is checked against its own declaration,
 ///   independently of any call site, so an implementation that contradicts
 ///   the signature is accused where it is written.
-/// * E0101 on `nonexistent_method_b` — the CONSUMER is typed by the
-///   declared `ProjSigWidgetB` (a closed project class), not by the body's
-///   inferred `Ty::Str`. Under the old ita-4xy fallback this call was
-///   silent, because `Ty::Str` is a core type with `ClosedWorld` unwired
-///   here; that silence is exactly what a declaration is supposed to end.
-///
-/// Losing either assertion leaves the other passing, which is why both are
-/// asserted by name rather than by count alone.
+/// * silence on `nonexistent_method_b` — the CONSUMER is typed by the
+///   inferred `Ty::Str` (a core type, `ClosedWorld` unwired here), never by
+///   the declaration: a declared return fills only an Unknown.
 #[test]
-fn declared_return_checks_body_and_types_consumer() {
+fn declared_return_checks_body_but_never_overrides_inference() {
     let diags = check_src(
         r#"
 class ProjSigWidgetB
@@ -101,9 +95,8 @@ end
 ProjSigOwnerB.new.make.nonexistent_method_b
 "#,
     );
-    assert_eq!(diags.len(), 2, "{diags:?}");
-    assert!(diags.iter().any(|d| d.contains("E0109") && d.contains("make")), "{diags:?}");
-    assert!(diags.iter().any(|d| d.contains("E0101") && d.contains("nonexistent_method_b")), "{diags:?}");
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert!(diags[0].contains("E0109") && diags[0].contains("make"), "{diags:?}");
 }
 
 /// (c) A sig naming a class that resolves nowhere in the project stays

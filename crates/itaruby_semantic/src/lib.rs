@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod index;
 pub mod rbi;
 pub mod rbs_comment;
+pub mod runtime_gate;
 pub mod schema;
 pub mod sorbet_sig;
 pub mod structure_sql;

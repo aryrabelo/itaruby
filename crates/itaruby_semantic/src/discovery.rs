@@ -82,6 +82,7 @@ pub fn wire_declaration_sources(db: &mut Db, roots: &[PathBuf]) -> DiscoveredSou
         wire_gemfile_lock_namespaces(db, &lock);
         wire_sorbet_runtime_lock(db, &lock);
     }
+    wire_runtime_hazards(db, roots);
 
     DiscoveredSources {
         schema_rb: declarations_only.first().cloned(),
@@ -178,6 +179,78 @@ fn wire_sorbet_runtime_lock(db: &Db, lock_path: &Path) {
         return;
     };
     SorbetRuntimeLock::new(db, sorbet_runtime_locked(&text));
+}
+
+/// Singleton input: some Ruby file under the project root that the check
+/// does not load carries a sorbet-runtime hazard (`crate::runtime_gate`),
+/// which makes every Sorbet sig inert project-wide
+/// (`ProjectIndex::sorbet_runtime_unchecked`). A checked `app/` still runs
+/// with `config/initializers`, a `Rakefile`, `bin/` scripts and the rest,
+/// so those are read too. Wired only when a hazard is found.
+#[salsa::input(singleton)]
+pub struct SorbetRuntimeHazard {
+    pub found: bool,
+}
+
+/// What marks a project root: the nearest directory, walking up from a
+/// checked path, that holds one of these.
+const PROJECT_MARKERS: &[&str] = &["Gemfile", "Gemfile.lock", ".git"];
+
+fn wire_runtime_hazards(db: &Db, roots: &[PathBuf]) {
+    let checked: Vec<PathBuf> =
+        roots.iter().flat_map(|root| [Some(root.clone()), std::fs::canonicalize(root).ok()]).flatten().collect();
+    if project_roots(roots).iter().any(|project| outside_hazard(project, &checked)) {
+        SorbetRuntimeHazard::new(db, true);
+    }
+}
+
+/// The project root of every checked path: the nearest directory holding
+/// a `PROJECT_MARKERS` entry, or a checked directory itself when none
+/// does. A checked lone file with no project reads nothing more.
+fn project_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        let marked = upward_dirs(root)
+            .into_iter()
+            .find(|dir| PROJECT_MARKERS.iter().any(|marker| dir.join(marker).exists()));
+        if let Some(project) = marked.or_else(|| root.is_dir().then(|| root.clone())) {
+            if !out.contains(&project) {
+                out.push(project);
+            }
+        }
+    }
+    out
+}
+
+/// Does some Ruby file under `project` that the check does not load carry
+/// a hazard, type-test definitions included? `ita check` loads every `.rb`
+/// under a checked path, and those files answer through their own
+/// `FileDefs`.
+fn outside_hazard(project: &Path, checked: &[PathBuf]) -> bool {
+    ignore::WalkBuilder::new(project)
+        .parents(false)
+        .build()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|t| t.is_file()))
+        .map(ignore::DirEntry::into_path)
+        .filter(|path| ruby_source(path) && !(rb_file(path) && checked.iter().any(|root| path.starts_with(root))))
+        .any(|path| {
+            std::fs::read_to_string(&path).is_ok_and(|text| crate::runtime_gate::sorbet_runtime_hazard(&text, true))
+        })
+}
+
+fn rb_file(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "rb")
+}
+
+/// A file Ruby loads: `.rb`, `.rake`, `.gemspec`, `.ru`, a `Gemfile`, a
+/// `Rakefile`, or anything directly in a `bin/` directory.
+fn ruby_source(path: &Path) -> bool {
+    let ext = path.extension().and_then(|ext| ext.to_str());
+    let name = path.file_name().and_then(|name| name.to_str());
+    matches!(ext, Some("rb" | "rake" | "gemspec" | "ru"))
+        || matches!(name, Some("Gemfile" | "Rakefile"))
+        || path.parent().and_then(Path::file_name).is_some_and(|dir| dir == "bin")
 }
 
 /// A gem is NAMED by a lock when some line's first token is exactly it:

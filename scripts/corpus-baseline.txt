@@ -201,19 +201,20 @@ err corpus-c de6fab5dc1f10706
 # `raise NotImplementedError` stub — so it is a real dormant NoMethodError,
 # firing every time that path runs.
 err corpus-c 33aded51a652e5b7
-# 5th and 6th err added 2026-09-22 (Sorbet sig/RBI contracts, E0109):
-# surfaced when a project's own `sig` became a contract its body is checked
-# against. Proven true positive by reading both sites: two definitions of one
-# method, each declaring `sig { returns(String) }` over a body whose only
-# expression is a Symbol-keyed Hash literal. sorbet-runtime checks the return
-# category on every call, so each raises TypeError whenever it runs. The same
-# audit found 35 other new contract errors on this corpus to be false positives
-# (unproven nil, erased collection type arguments); the checker was fixed for
-# those, and none of them entered this file. Same tracked revision
-# (e10255bf93, three untracked non-Ruby files), warnings 170 <= 170.
-# Re-hashed the same day, same two sites, same finding: once contracts
-# became literal-only the message names the literal's category ("got Hash")
-# instead of type arguments the verdict never read ("got Hash[Symbol,
-# String]"). Old hashes 3d2472b897405ecb / 074e0ecc814117fc.
-err corpus-c 380713db6d6ed10c
-err corpus-c 1a27c7f6f94eab3d
+# 5th and 6th err (Sorbet sig contracts, E0109, hashes 380713db6d6ed10c /
+# 1a27c7f6f94eab3d, earlier 3d2472b897405ecb / 074e0ecc814117fc) were added
+# 2026-09-22 and RETRACTED 2026-09-29 (r4 runtime gates). The audit read both
+# sites and wrote "sorbet-runtime checks the return category on every call,
+# so each raises TypeError whenever it runs". That sentence was never proven:
+# the checked root is the app directory, and the project installs a
+# `T::Configuration.call_validation_error_handler` in an initializer OUTSIDE
+# it whose production branch reports instead of raising. Measured at the
+# pinned revision (e10255bf93, same three untracked non-Ruby files): the
+# handler raises in every environment but production. So in production both
+# methods return and the code runs — by this repo's contract a soft handler
+# leaves every sig inert, and the checker only accused because it did not
+# read the file that installed it. Once project-root hazards are read the two
+# lines are gone, and they leave this file rather than be pinned as wrong
+# diagnostics (a false positive in a baseline stays green forever). Warnings
+# unchanged, 170 <= 170. No contract error from this corpus is in the
+# baseline now.

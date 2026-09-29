@@ -11,6 +11,7 @@ itaruby_syntax = { path = "../itaruby_syntax" }
 ruby-prism = { workspace = true }
 salsa = { workspace = true }
 rustc-hash = "2"
+ignore = { workspace = true }
 
 [dev-dependencies]
 # The performance baseline. `L6.PERFORMANCE_REGRESSION_IS_GUARDED` names

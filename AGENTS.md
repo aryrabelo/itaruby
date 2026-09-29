@@ -100,15 +100,21 @@ found, and the launch bar is winning on both.
   binding); otherwise it is inert: no E0103/E0109, no declared type for
   consumers (`poison_contract`/`PendingSig::Unusable`).
   Project-wide inert (`sorbet_runtime_unchecked`, gated in
-  `effective_sorbet` and `contract_breaks`): `default_checked_level` set to
-  anything but a literal `:always`, any `T::Configuration.*_handler=`, or a
-  visible `Gemfile.lock` naming `sorbet-runtime-stub` or not naming
-  `sorbet-runtime` (no lock: source decides). Per sig: `.checked(:never)`
-  or `.checked(:tests)`. Per class (`poison_runtime_inert_contracts`): no
+  `effective_sorbet` and `contract_breaks`): a visible `Gemfile.lock`
+  naming `sorbet-runtime-stub` or not naming `sorbet-runtime` (no lock:
+  source decides), or a `runtime_gate.rs` hazard in ANY Ruby file under
+  the project root (nearest dir with `Gemfile`/`Gemfile.lock`/`.git`;
+  checked files via `FileDefs::sorbet_runtime_unchecked`, every other file
+  incl. `Gemfile`/`Rakefile`/`*.rake`/`*.gemspec`/`*.ru`/`bin/*` via
+  `discovery::SorbetRuntimeHazard`): any `T::Configuration`/`T::Private`
+  reference but the literal `T::Configuration.default_checked_level =
+  :always`, any method named `sig`, any `method_added`/
+  `singleton_method_added` without `super`, and (outside files only) any
+  type-test definition. Keep these project-wide — per-class tracking was
+  evaded five ways in review 5. Per sig: `.checked(:never)` or
+  `.checked(:tests)`. Per class (`poison_runtime_inert_contracts`): no
   `T::Sig` extended by the class or a superclass and no `include T::Sig`
-  into `Object`/`Module`/`Class`; a homemade `def self.sig` on that chain;
-  a `method_added`/`singleton_method_added` without `super` on the class or
-  an ancestor. A module named by a multi-argument `include A, B` (or
+  into `Object`/`Module`/`Class`. A module named by a multi-argument `include A, B` (or
   `prepend`/`extend`), and its ancestors, lose their contracts until the
   reversed linearization of that call is fixed. An RBI is never checked at
   runtime (2026-09-23, binding): no RBI is ever a contract (no E0103/E0109

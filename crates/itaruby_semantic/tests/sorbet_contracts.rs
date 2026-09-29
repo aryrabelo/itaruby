@@ -3692,8 +3692,10 @@ fn default_checked_level_other_than_always_makes_sigs_inert() {
 /// F3: any `T::Configuration.*_handler` assignment may log instead of
 /// raising (measured: a `call_validation_error_handler` lambda lets the
 /// broken call run to its end), so no sig is proven enforced. The
-/// controls — another `T::Configuration` setting, or a `*_handler=` on a
-/// receiver that is not `T::Configuration` — still accuse and type.
+/// control — a `*_handler=` on a receiver that is not
+/// `T::Configuration` — still accuses and types; any other
+/// `T::Configuration` setting is inert too
+/// (`any_runtime_configuration_reference_makes_sigs_inert`).
 #[test]
 fn soft_runtime_error_handler_makes_sigs_inert() {
     for (i, handler) in ["call_validation_error_handler", "sig_validation_error_handler", "inline_type_error_handler"]
@@ -3704,16 +3706,9 @@ fn soft_runtime_error_handler_makes_sigs_inert() {
         let diags = check(&format!("handler-inert-{i}"), &runtime_gate(&prelude, "", "extend T::Sig", ""), None);
         assert!(gate_codes(&diags).is_empty(), "{handler}: {diags:?}");
     }
-    for (i, prelude) in [
-        "T::Configuration.enable_final_checks_on_hooks",
-        "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }",
-    ]
-    .iter()
-    .enumerate()
-    {
-        let diags = check(&format!("handler-enforced-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
-        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
-    }
+    let prelude = "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }";
+    let diags = check("handler-enforced", &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
 }
 
 /// F7: a bare `sig` is sorbet-runtime's only when `T::Sig` is on the
@@ -3814,6 +3809,157 @@ fn lockfile_without_real_sorbet_runtime_makes_sigs_inert() {
     let real = lock("    sorbet-runtime (0.5.11934)\n", "  sorbet-runtime\n");
     let diags = run("real", &real);
     assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (b): a reference to `T::Configuration` or `T::Private`
+/// can reach sorbet-runtime's switches through any spelling — `send`, an
+/// alias constant, a block parameter, `instance_eval`, `RuntimeLevels`, a
+/// lexical `module T`, `const_get` — so any reference other than the
+/// literal statement `T::Configuration.default_checked_level = :always`
+/// makes every sig inert. The controls — that statement alone, homonymous
+/// constants under another namespace, a handler on another receiver —
+/// still accuse and type.
+#[test]
+fn any_runtime_configuration_reference_makes_sigs_inert() {
+    for (i, prelude) in [
+        "T::Configuration.public_send(:default_checked_level=, :never)",
+        "T::Configuration.send(:call_validation_error_handler=, lambda { |*args| args })",
+        "ContractGateConfig = T::Configuration\nContractGateConfig.default_checked_level = :never",
+        "T::Configuration.tap { |c| c.default_checked_level = :never }",
+        "T::Configuration.instance_eval { self.default_checked_level = :never }",
+        "T::Private::RuntimeLevels.default_checked_level = :never",
+        "module T\n  Configuration.default_checked_level = :never\nend",
+        "T.const_get(:Configuration).default_checked_level = :never",
+        "Object.const_get(\"T::Configuration\").default_checked_level = :never",
+        "ContractGateRuntime = Object.const_get(:\"T::Private\")",
+        "T::Configuration.enable_final_checks_on_hooks",
+        "T::Configuration.default_checked_level = :always\nT::Configuration&.default_checked_level = :never",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("config-ref-inert-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}: {diags:?}");
+    }
+    for (i, prelude) in [
+        "T::Configuration.default_checked_level = :always",
+        "::T::Configuration.default_checked_level = :always",
+        "module ContractGateConfig\n  Configuration = 1\n  Private = 2\nend\nContractGateConfig::Configuration",
+        "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("config-ref-enforced-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
+    }
+}
+
+/// r4-runtime-gates (c): a project method named `sig` anywhere — a module
+/// extended after `T::Sig`, a reopened `T::Sig`, an unrelated class, a
+/// `define_method`/`alias`/`attr_reader` spelling — may answer a bare
+/// `sig` before sorbet-runtime's, so every sig is inert. The controls —
+/// methods whose names only start with `sig` — still accuse and type.
+#[test]
+fn any_project_sig_definition_makes_sigs_inert() {
+    for (i, (prelude, body)) in [
+        ("module ContractQuietSig\n  def sig(*args) = args\nend", "extend T::Sig\n  extend ContractQuietSig"),
+        ("module T\n  module Sig\n    def sig(*args) = args\n  end\nend", "extend T::Sig"),
+        ("module ContractElsewhere\n  def self.sig(*args) = args\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  define_method(:sig) { |*args| args }\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  alias sig inspect\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  attr_reader :sig\nend", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("sig-def-inert-{i}"), &runtime_gate(prelude, "", body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{body}: {diags:?}");
+    }
+    let control = "class ContractElsewhere\n  def signature(*args) = args\n  define_method(:sig_off) { nil }\n  attr_reader :signal\nend";
+    let diags = check("sig-def-enforced", &runtime_gate(control, "", "extend T::Sig", ""), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (d): a `method_added`/`singleton_method_added` that
+/// does not call `super`, defined anywhere — a module extended on a
+/// subclass, a module prepended to `class << self`, the top level, a
+/// `define_method` spelling — may swallow sorbet-runtime's attachment, so
+/// every sig is inert. The controls — the same hooks calling `super` —
+/// still accuse and type.
+#[test]
+fn any_swallowing_method_added_hook_makes_sigs_inert() {
+    let subclass = "class ContractGateSub < ContractGate\n  extend ContractHooky\nend\n";
+    let swallow = "module ContractHooky\n  def method_added(name); end\nend";
+    for (i, (prelude, body, after)) in [
+        (swallow, "extend T::Sig", subclass),
+        ("", "extend T::Sig\n  class << self\n    prepend(Module.new { def method_added(name) = name })\n  end", ""),
+        ("def singleton_method_added(name); end", "extend T::Sig", ""),
+        ("class ContractElsewhere\n  define_method(:method_added) { |name| super(name) }\nend", "extend T::Sig", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = format!("{}{after}", runtime_gate(prelude, "", body, ""));
+        let diags = check(&format!("hook-anywhere-inert-{i}"), &source, None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{body}: {diags:?}");
+    }
+    let calling = "module ContractHooky\n  def method_added(name)\n    super\n  end\nend\ndef singleton_method_added(name)\n  super(name)\nend";
+    let diags = check("hook-anywhere-enforced", &format!("{}{subclass}", runtime_gate(calling, "", "extend T::Sig", "")), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (a): the project-wide facts come from the whole
+/// project root (the nearest directory holding a `Gemfile`,
+/// `Gemfile.lock` or `.git`), not only from the checked paths: checking
+/// `app/` still reads `config/initializers`, a `Rakefile`, a `.rake`
+/// task (inside the checked path too: only its `.rb` files are loaded), a
+/// `bin/` script, `config.ru`, and a core extension defining a type test. The controls — the same files saying nothing hazardous —
+/// still accuse and type.
+#[test]
+fn project_root_hazards_reach_a_partial_check() {
+    let run = |name: &str, rel: &str, text: &str| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-root-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dir.join("Gemfile"), "source \"https://rubygems.org\"\n").unwrap();
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let mut db = Db::default();
+        itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&app));
+        let file = SourceFile::new(&db, app.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+        ProjectFiles::new(&db, vec![file]);
+        ClosedWorld::new(&db, true);
+        check_file(&db, file).clone()
+    };
+    for (i, (rel, text)) in [
+        ("config/initializers/sorbet.rb", "T::Configuration.default_checked_level = :never\n"),
+        ("Rakefile", "T::Configuration.default_checked_level = :never\n"),
+        ("lib/tasks/gate.rake", "module ContractTask\n  def sig(*args) = args\nend\n"),
+        ("bin/setup", "#!/usr/bin/env ruby\nclass ContractBin\n  def self.method_added(name); end\nend\n"),
+        ("config.ru", "T::Private::RuntimeLevels.default_checked_level = :never\n"),
+        ("app/tasks/gate.rake", "def method_added(name); end\n"),
+        ("lib/core_ext.rb", "class Object\n  def is_a?(klass) = true\nend\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = run(&format!("inert-{i}"), rel, text);
+        assert!(gate_codes(&diags).is_empty(), "{rel}: {diags:?}");
+    }
+    for (i, (rel, text)) in [
+        ("config/initializers/sorbet.rb", "T::Configuration.default_checked_level = :always\n"),
+        ("Rakefile", "task :default\n"),
+        ("lib/core_ext.rb", "class Object\n  def is_a_thing? = true\nend\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = run(&format!("enforced-{i}"), rel, text);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{rel}: {diags:?}");
+    }
 }
 
 /// F4: sorbet-runtime checks a generic's category, never its type

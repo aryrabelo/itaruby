@@ -71,16 +71,22 @@ reachable implicit tail) is a literal and none fits; a literal argument
 that contradicts a declared param, matched by name, is E0103. A variable, `self`, a constant or any call is never judged, so a
 contradiction carried by an inferred value is a known false negative. A
 sig accuses and types callers only where sorbet-runtime provably enforces
-it; otherwise it is inert (no E0103/E0109, no declared type for callers). Inert everywhere in a project that sets
-`T::Configuration.default_checked_level` to anything but a literal
-`:always`, assigns any `T::Configuration.*_handler`, or whose visible
-`Gemfile.lock` names `sorbet-runtime-stub` or never names
-`sorbet-runtime` (no lock found: judged from source). Inert per sig for
-`.checked(:never)`/`.checked(:tests)`, and per class when `T::Sig` is not
-extended by the class or a superclass (or included into every class via
-`Object`/`Module`/`Class`), when a homemade `def self.sig` answers first,
-or when the class or an ancestor defines a `method_added`/
-`singleton_method_added` that never calls `super`. An RBI is never
+it; otherwise it is inert (no E0103/E0109, no declared type for callers). Inert everywhere in a project
+whose visible `Gemfile.lock` names `sorbet-runtime-stub` or never names
+`sorbet-runtime` (no lock found: judged from source), or where any Ruby
+file under the project root (the nearest directory holding a `Gemfile`,
+`Gemfile.lock` or `.git`, so `ita check app/` still reads
+`config/initializers`, a `Rakefile`, `*.rake`, `*.gemspec`, `config.ru`
+and `bin/*`) references `T::Configuration` or `T::Private` in any
+spelling other than the literal statement
+`T::Configuration.default_checked_level = :always`, defines a method
+named `sig` on any receiver, or defines a `method_added`/
+`singleton_method_added` that never calls `super` (a `define_method` or
+`alias` spelling of either counts as one); a file outside the checked
+paths that defines `is_a?`/`kind_of?`/`instance_of?` does too. Inert per
+sig for `.checked(:never)`/`.checked(:tests)`, and per class when
+`T::Sig` is not extended by the class or a superclass (or included into
+every class via `Object`/`Module`/`Class`). An RBI is never
 checked at runtime, so it is never a contract: no RBI accuses, and no RBI
 types the callers of a method the project source defines. A method that
 exists only in an RBI (a gem, a Tapioca DSL file) still types its callers
@@ -127,7 +133,7 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`, no hook swallowing `method_added`, no softened runtime configuration or lock without `sorbet-runtime`, no redefinition of that name through a receiver no constant names, a mixin hook on a module the class mixes in, or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class); the receiver must be typed (a sig's declared return types it only when the body's own return is unknown; `X.new` types nothing when a project singleton `new` may answer it), and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`; anywhere under the project root, not only in the checked paths: no hook swallowing `method_added`, no project method named `sig`, no `T::Configuration`/`T::Private` reference but a literal `default_checked_level = :always`, no lock without `sorbet-runtime`; no redefinition of that name through a receiver no constant names, a mixin hook on a module the class mixes in, or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class, nor any in a project file outside the checked paths); the receiver must be typed (a sig's declared return types it only when the body's own return is unknown; `X.new` types nothing when a project singleton `new` may answer it), and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |

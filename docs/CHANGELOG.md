@@ -8,6 +8,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- The sorbet-runtime enforcement gates can no longer be evaded (r4,
+  review 5), and they read the whole project root, not only the checked
+  paths: `ita check app/` now also reads `config/initializers`, `lib/`, a
+  `Gemfile`, `Rakefile`, `*.rake`, `*.gemspec`, `config.ru` and `bin/*`
+  under the nearest directory holding a `Gemfile`, `Gemfile.lock` or
+  `.git`. Every sig in the project is inert (no E0103/E0109, no declared
+  type for a consumer) when any of those files references
+  `T::Configuration` or `T::Private` in any spelling (`send`/`public_send`,
+  an alias constant, a `tap` block parameter, `instance_eval`,
+  `T::Private::RuntimeLevels`, a bare `Configuration` inside `module T`,
+  `T.const_get`, a string or symbol naming it) other than the literal
+  statement `T::Configuration.default_checked_level = :always`; defines a
+  method named `sig` on any receiver (a module extended after `T::Sig`, a
+  reopened `T::Sig`, `define_method`/`alias`/`attr_reader`); or defines a
+  `method_added`/`singleton_method_added` without `super` anywhere (a
+  module extended on a subclass, a module prepended to `class << self`,
+  the top level, any `define_method` spelling). A file outside the
+  checked paths that defines `is_a?`/`kind_of?`/`instance_of?` makes every
+  sig inert too. These were per-class checks before; any other
+  `T::Configuration` setting (`enable_final_checks_on_hooks`, for one) now
+  also makes every sig inert. The two E0109 lines this branch had added to
+  corpus-c's baseline are retracted: that project installs a validation
+  handler outside the checked app directory that reports instead of raising
+  in production, so neither violation was proven to raise. The corpus is
+  `new=0 gone=0` without them.
 - A Sorbet `sig` no longer overrides what its method is inferred to return
   (r4, a regression against `main` 05a282e): sorbet-runtime proves a
   returned value only `is_a?`, which a decorator overriding `is_a?`, or an

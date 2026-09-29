@@ -581,19 +581,17 @@ pub struct FileDefs {
     pub hidden_ivar_writes: Vec<String>,
     /// Reflection wrote an instance variable whose name is not a literal.
     pub hidden_ivar_writes_any: bool,
-    /// This file weakens sorbet-runtime project-wide: it sets
-    /// `T::Configuration.default_checked_level` to anything but a literal
-    /// `:always`, or assigns any `T::Configuration.*_handler` (a handler
-    /// may log instead of raise). No sig is proven to be enforced.
+    /// This file leaves sorbet-runtime's enforcement unproven project-wide
+    /// (`crate::runtime_gate`): it references `T::Configuration` or
+    /// `T::Private` other than to set `default_checked_level` to a literal
+    /// `:always`, defines a method named `sig`, or defines a
+    /// `method_added`/`singleton_method_added` that does not call `super`.
+    /// No sig is proven to be enforced.
     pub sorbet_runtime_unchecked: bool,
     /// This file writes `include T::Sig` into `Object`, `Module` or
     /// `Class` (a reopen, `Module.include(T::Sig)`, or a bare top-level
     /// `include`): sorbet-runtime's `sig` is on every class and module.
     pub sorbet_sig_everywhere: bool,
-    /// Classes/modules (full path) that define a `method_added` or
-    /// `singleton_method_added` whose body never calls `super`: the hook
-    /// sorbet-runtime uses to attach a sig to its def may never run.
-    pub sig_hook_swallowers: Vec<String>,
     /// Every constant argument of an `include`/`prepend`/`extend` call
     /// with more than one argument, with the lexical nesting at the call:
     /// see `ProjectIndex::ambiguous_mixins`.
@@ -683,9 +681,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         call_blocks_lexical: Vec::new(),
         hidden_ivar_writes: Vec::new(),
         hidden_ivar_writes_any: false,
-        sorbet_runtime_unchecked: false,
         sorbet_sig_everywhere: false,
-        sig_hook_swallowers: Vec::new(),
         ambiguous_mixins: Vec::new(),
         hidden_definitions: Vec::new(),
         hook_installs: Vec::new(),
@@ -714,9 +710,9 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         load_hook_bases: scan.load_hook_bases,
         hidden_ivar_writes: scan.hidden_ivar_writes,
         hidden_ivar_writes_any: scan.hidden_ivar_writes_any,
-        sorbet_runtime_unchecked: scan.sorbet_runtime_unchecked,
+        sorbet_runtime_unchecked: crate::runtime_gate::mentions_hazard(text, false)
+            && crate::runtime_gate::tree_hazard(&parse.node(), false),
         sorbet_sig_everywhere: scan.sorbet_sig_everywhere,
-        sig_hook_swallowers: scan.sig_hook_swallowers,
         ambiguous_mixins: scan.ambiguous_mixins,
         hidden_definitions: scan.hidden_definitions,
         hook_installs: scan.hook_installs,
@@ -936,9 +932,7 @@ struct FileScan {
     call_blocks_lexical: Vec<bool>,
     hidden_ivar_writes: Vec<String>,
     hidden_ivar_writes_any: bool,
-    sorbet_runtime_unchecked: bool,
     sorbet_sig_everywhere: bool,
-    sig_hook_swallowers: Vec<String>,
     ambiguous_mixins: Vec<(String, Vec<String>)>,
     hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
     hook_installs: Vec<(Vec<String>, PollutionSource)>,
@@ -1082,7 +1076,6 @@ impl<'pr> Visit<'pr> for FileScan {
         }
         self.note_hidden_def(node);
         self.note_const_returning_body(node);
-        self.note_swallowed_sig_hook(node);
         let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
         let in_own_singleton = self.self_singleton_depths.last() == Some(&self.ivar_scopes.len());
         let scope = if in_body && node.receiver().is_none() { IvarScope::InstanceDef } else { IvarScope::Opaque };
@@ -1178,8 +1171,8 @@ impl FileScan {
     }
 
     /// Project-wide facts that decide whether a Sorbet sig is a contract
-    /// sorbet-runtime enforces as written: a runtime configuration that
-    /// may not raise on a broken sig (`runtime_config_softens`), an
+    /// sorbet-runtime enforces as written (the rest are
+    /// `crate::runtime_gate`'s): an
     /// `include T::Sig` that reaches every class (`note_sig_everywhere`),
     /// and a multi-argument `include A, B` (and `prepend`/`extend`), whose
     /// ancestor order this index does not yet linearize the way Ruby does,
@@ -1187,9 +1180,6 @@ impl FileScan {
     fn note_sorbet_runtime_hazard(&mut self, node: &ruby_prism::CallNode<'_>) {
         let name = node.name();
         let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
-        if node.receiver().as_ref().and_then(const_path_str).is_some_and(|r| r.trim_start_matches("::") == "T::Configuration") {
-            self.sorbet_runtime_unchecked |= runtime_config_softens(name.as_slice(), &args);
-        }
         self.note_sig_everywhere(node, &args);
         if matches!(name.as_slice(), b"include" | b"prepend" | b"extend") && args.len() > 1 {
             for path in args.iter().filter_map(const_path_str) {
@@ -1217,25 +1207,6 @@ impl FileScan {
         };
         if matches!(target.trim_start_matches("::"), "Object" | "Module" | "Class") {
             self.sorbet_sig_everywhere = true;
-        }
-    }
-
-    /// sorbet-runtime attaches a sig to the def after it from the
-    /// class's `method_added`/`singleton_method_added` hook. A project
-    /// hook of that name whose body never calls `super` can swallow it,
-    /// so every sig of its owner is unproven. Any `super` anywhere in the
-    /// body counts as calling it.
-    fn note_swallowed_sig_hook(&mut self, node: &ruby_prism::DefNode<'_>) {
-        if !matches!(node.name().as_slice(), b"method_added" | b"singleton_method_added") {
-            return;
-        }
-        let Some(owner) = self.nesting.last() else { return };
-        let mut calls = SuperCallScan(false);
-        if let Some(body) = node.body() {
-            calls.visit(&body);
-        }
-        if !calls.0 && !self.sig_hook_swallowers.contains(owner) {
-            self.sig_hook_swallowers.push(owner.clone());
         }
     }
 
@@ -4410,30 +4381,6 @@ impl DefWalker<'_> {
     }
 }
 
-/// Does this `T::Configuration.<name>(args)` call leave a broken sig
-/// possibly unraised? A `default_checked_level` other than a literal
-/// `:always` (`:never`, `:tests`, or any expression), or ANY `*_handler`
-/// assignment — a handler may log, notify, or swallow instead of raising.
-fn runtime_config_softens(name: &[u8], args: &[Node<'_>]) -> bool {
-    if name == b"default_checked_level=" {
-        return !matches!(args, [value] if value.as_symbol_node().is_some_and(|s| s.unescaped() == b"always"));
-    }
-    name.ends_with(b"_handler=")
-}
-
-/// Does a body contain a `super` / bare `super` call anywhere?
-struct SuperCallScan(bool);
-
-impl<'pr> Visit<'pr> for SuperCallScan {
-    fn visit_super_node(&mut self, _node: &ruby_prism::SuperNode<'pr>) {
-        self.0 = true;
-    }
-
-    fn visit_forwarding_super_node(&mut self, _node: &ruby_prism::ForwardingSuperNode<'pr>) {
-        self.0 = true;
-    }
-}
-
 /// What the `sig` calls sitting immediately above a `def` amount to.
 /// `Option<PendingSig>` keeps the three states apart: `None` — no `sig`
 /// was written; `Some(Unusable)` — one was, but this checker cannot use
@@ -5442,9 +5389,10 @@ pub struct ProjectIndex {
     /// Some file wrote an ivar by a non-literal name: every ivar is unproven.
     pub hidden_ivar_writes_any: bool,
     /// sorbet-runtime is not proven to raise on a broken sig anywhere in
-    /// the project: some file sets `T::Configuration.default_checked_level`
-    /// to anything but a literal `:always` or assigns a
-    /// `T::Configuration.*_handler`, or the project's visible
+    /// the project: some Ruby file under the project root carries a
+    /// `crate::runtime_gate` hazard (a checked file's own
+    /// `FileDefs::sorbet_runtime_unchecked`, any other file's
+    /// `crate::discovery::SorbetRuntimeHazard`), or the project's visible
     /// `Gemfile.lock` names `sorbet-runtime-stub` or does not name
     /// `sorbet-runtime` (`crate::discovery::SorbetRuntimeLock`). No
     /// Sorbet contract accuses or types anything then.
@@ -5452,9 +5400,6 @@ pub struct ProjectIndex {
     /// Some file puts `T::Sig` on every class and module
     /// (`FileDefs::sorbet_sig_everywhere`).
     pub sorbet_sig_everywhere: bool,
-    /// Full paths of classes/modules with a hook that can swallow
-    /// sorbet-runtime's sig attachment (`FileDefs::sig_hook_swallowers`).
-    pub sig_hook_swallowers: FxHashSet<String>,
     /// Modules named together by one `include A, B` (or `prepend`/
     /// `extend`), as `(path, nesting)`. This index linearizes such a call
     /// in reverse of Ruby's order (a known ancestry bug), so which module
@@ -5619,6 +5564,11 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // sorbet-runtime means no sig is enforced. No lock found keeps the
     // source-only answer (`SorbetRuntimeLock`'s doc comment).
     if crate::discovery::SorbetRuntimeLock::try_get(db).is_some_and(|lock| !lock.enforced(db)) {
+        index.sorbet_runtime_unchecked = true;
+    }
+    // A hazard in a project file outside the checked set
+    // (`SorbetRuntimeHazard`'s doc comment).
+    if crate::discovery::SorbetRuntimeHazard::try_get(db).is_some() {
         index.sorbet_runtime_unchecked = true;
     }
     // Bead ita-c8h: generalizes past `apply_gem_reopenings` itself — a
@@ -5918,7 +5868,6 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.hidden_ivar_writes_any |= defs.hidden_ivar_writes_any;
     index.sorbet_runtime_unchecked |= defs.sorbet_runtime_unchecked;
     index.sorbet_sig_everywhere |= defs.sorbet_sig_everywhere;
-    index.sig_hook_swallowers.extend(defs.sig_hook_swallowers.iter().cloned());
     index.ambiguous_mixins.extend(defs.ambiguous_mixins.iter().cloned());
     index.hidden_raw.extend(defs.hidden_definitions.iter().cloned());
     index.hook_raw.extend(defs.hook_installs.iter().cloned());
@@ -8253,10 +8202,10 @@ fn poison_ambiguous_mixin_contracts(index: &mut ProjectIndex) {
 /// A `sig` block is a contract only when it is sorbet-runtime's own
 /// `T::Sig#sig` and its method-added hook really attaches it to the def.
 /// Every contract of a class fails that proof when the class's `sig` is
-/// not provably `T::Sig`'s (`sorbet_sig_reaches`), or when the class or
-/// an ancestor defines a hook that can swallow the attachment
-/// (`FileDefs::sig_hook_swallowers`). Such a sig is inert: never a
-/// contract, and never a declared type for a consumer.
+/// not provably `T::Sig`'s (`sorbet_sig_reaches`). Such a sig is inert:
+/// never a contract, and never a declared type for a consumer. A project
+/// `sig` or a hook that can swallow the attachment makes EVERY sig inert
+/// (`crate::runtime_gate`), so neither is tracked per class here.
 fn poison_runtime_inert_contracts(index: &mut ProjectIndex) {
     let t_sig = index.by_path.get("T::Sig").copied();
     let hit: Vec<ClassId> = (0..index.classes.len())
@@ -8265,10 +8214,7 @@ fn poison_runtime_inert_contracts(index: &mut ProjectIndex) {
             let class = index.class(id);
             class.methods.values().chain(class.singleton_methods.values()).any(|m| m.sorbet_sig.is_some())
         })
-        .filter(|&id| {
-            !sorbet_sig_reaches(index, id, t_sig)
-                || index.ancestors(id).0.iter().any(|&a| index.sig_hook_swallowers.contains(&index.class(a).path))
-        })
+        .filter(|&id| !sorbet_sig_reaches(index, id, t_sig))
         .collect();
     for id in hit {
         let class = &mut index.classes[id.0 as usize];
@@ -8413,8 +8359,7 @@ fn poison_alias_reopen_redefinitions(index: &mut ProjectIndex) {
 
 /// Is the bare `sig` in `id`'s body sorbet-runtime's? The class-object
 /// lookup chain is the class and its superclasses (a module: itself
-/// alone); a homemade `def self.sig` anywhere on it answers first and is
-/// never proof. Otherwise one of them must `extend` (or `class << self;
+/// alone), and one of them must `extend` (or `class << self;
 /// include`) a module whose ancestry holds `T::Sig`, or the project puts
 /// `T::Sig` on every class. This index files a `class << self; extend
 /// T::Sig` with the class's own extends, though a `sig` inside `class <<
@@ -8426,9 +8371,6 @@ fn sorbet_sig_reaches(index: &ProjectIndex, id: ClassId, t_sig: Option<ClassId>)
     } else {
         index.ancestors(id).0.into_iter().filter(|&a| !index.class(a).is_module).collect()
     };
-    if chain.iter().any(|&a| index.class(a).singleton_methods.contains_key("sig")) {
-        return false;
-    }
     if index.sorbet_sig_everywhere {
         return true;
     }

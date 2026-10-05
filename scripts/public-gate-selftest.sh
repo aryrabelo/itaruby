@@ -1,9 +1,5 @@
 #!/usr/bin/env bash
-# Two-sided proof for the FAIL-CLOSED clone-path check in
-# scripts/public-gate.sh (AGENTS.md, Rules of proof: a gate that can read
-# another tree than the one its transcript names is the false-green shape this
-# repo already paid for twice, so the decision that forbids it gets probes
-# next to it).
+# Two-sided proof for the fail-closed public-corpus workflow.
 #
 # The public gate takes an optional 5th declaration field, <clone-dir>, that
 # names the exact tree to measure for a re-pin. When it is present the gate is
@@ -12,23 +8,19 @@
 # revision. Without the field the historical semantics stand (a missing or
 # wrong-HEAD canonical clone is a SKIP).
 #
-# Silence side: four labelled corpora over one real git clone —
-#   match        declared tree at the declared sha  -> PASS, tree+sha named
-#   wrong-rev    declared tree at a DIFFERENT sha    -> FAIL (fail-closed)
-#   missing      declared tree absent               -> FAIL (fail-closed)
-#   default-skip NO field, canonical clone off-pin  -> SKIP (unchanged)
+# Silence side: the shipped gate still proves its clone-path and ceiling
+# controls. The workflow controls also exercise the one shared
+# scripts/public-corpora-fetch.sh implementation with a local fixture remote:
+#   missing, already-at-pin, wrong-HEAD, no-baseline, failed-fetch, and the
+#   PUBLIC_GATE_CLONE=1 gate path.
 #
-# Accusation side: each half of the fail-closed guard is removed by one
-# literal replacement on a COPY of the gate, and the case that defends it must
-# flip from FAIL to SKIP. Every mutation is diff-guarded (a replacement that
-# changed nothing is INVALIDO), and for every mutant the `match` case must
-# stay PASS — a mutant that breaks the happy path is a broken harness, not a
-# demonstration.
+# Accusation side: every guard has a labelled mutant and its named case must
+# accuse it. Every mutation is diff-guarded (a replacement that changed
+# nothing is INVALIDO), and the happy path remains a positive control.
 #
 # Timing controls also select measured dev/CI columns independently of CI,
-# refuse unmeasured/invalid CI ceilings, and mutate column selection. The
-# workflow shell blocks run in a transport-stubbed lab: accepting other
-# SKIPs/failures and fetching unbaselined corpora each have a named mutant.
+# refuse unmeasured/invalid CI ceilings, and mutate column selection.
+# Workflow verdict controls accept only the intentional GitLab SKIP.
 #
 #   0  both sides proved
 #   1  a case behaved wrong, or a mutant was not accused by its case
@@ -257,29 +249,50 @@ wf=$LAB/workflow
 mkdir -p "$wf/scripts/public-baseline" "$wf/fakebin"
 python3 - "$ROOT/.github/workflows/gauntlet.yml" "$wf" <<'PY'
 import pathlib, sys
-lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
-for name, output in [
-    ("Public corpus gate (only GitLab baseline may be absent)", "verdict.sh"),
-    ("Shallow-clone each declared repo at its pinned sha", "clone.sh"),
-]:
-    start = lines.index("      - name: " + name) + 1
-    while start < len(lines) and not lines[start].startswith("      - "):
-        if lines[start] == "        run: |":
-            start += 1
-            break
+workflow = pathlib.Path(sys.argv[1]).read_text().splitlines()
+# The fetch step is found by its NAME, like the verdict block below, and its
+# single-line `run:` is what CI executes.
+step = "      - name: Restore pinned public corpora"
+if step not in workflow:
+    sys.exit("public job has no 'Restore pinned public corpora' step")
+at = workflow.index(step) + 1
+fetch_command = None
+while at < len(workflow) and not workflow[at].startswith("      - "):
+    stripped = workflow[at].strip()
+    if stripped.startswith("run: "):
+        fetch_command = stripped[len("run: "):]
+        break
+    at += 1
+if fetch_command is None:
+    sys.exit("public job does not invoke scripts/public-corpora-fetch.sh")
+lines = workflow
+name = "Public corpus gate (only GitLab baseline may be absent)"
+start = lines.index("      - name: " + name) + 1
+while start < len(lines) and not lines[start].startswith("      - "):
+    if lines[start] == "        run: |":
         start += 1
-    body = []
-    for line in lines[start:]:
-        if not line.startswith("          "):
-            break
-        body.append(line[10:])
-    if not body:
-        sys.exit("missing shell block: " + name)
-    pathlib.Path(sys.argv[2], output).write_text("\n".join(body) + "\n")
+        break
+    start += 1
+body = []
+for line in lines[start:]:
+    if not line.startswith("          "):
+        break
+    body.append(line[10:])
+if not body:
+    sys.exit("missing shell block: " + name)
+pathlib.Path(sys.argv[2], "verdict.sh").write_text("\n".join(body) + "\n")
+pathlib.Path(sys.argv[2], "clone.sh").write_text(fetch_command + "\n")
 PY
 if [[ $? != 0 ]]; then
   bad 'workflow extraction failed'
 else
+  if grep -Fq './scripts/public-corpora-fetch.sh' "$wf/clone.sh"; then
+    ok 'workflow public step invokes the shared corpus fetcher'
+  else
+    bad 'workflow public step does not invoke the shared corpus fetcher'
+  fi
+  cp "$ROOT/scripts/public-corpora-fetch.sh" "$wf/scripts/public-corpora-fetch.sh"
+  chmod +x "$wf/scripts/public-corpora-fetch.sh"
   cat >"$wf/scripts/public-gate.sh" <<'SH'
 #!/bin/sh
 printf '%s\n' "$WORKFLOW_TRANSCRIPT"
@@ -327,41 +340,202 @@ SH
     fi
   done
 
-  # Real clone block, fake transport: no network and no real git mutation.
-  printf 'lab file:///lab %s 999 lab-head\ngitlab-foss file:///absent %s 999\n' \
-    "$SGOOD" "$SGOOD" >"$wf/scripts/public-corpora.txt"
-  printf '{}\n' >"$wf/scripts/public-baseline/lab.jsonl"
-  cat >"$wf/fakebin/git" <<'SH'
-#!/bin/sh
-printf '%s\n' "$*" >>"$GIT_WITNESS"
-exit 0
-SH
-  chmod +x "$wf/fakebin/git"
-  run_clone() {
-    : >"$wf/git.log"
-    ( cd "$wf" && PATH="$wf/fakebin:$PATH" GIT_WITNESS="$wf/git.log" \
-        PUBLIC_CORPORA_ROOT="$wf/corpora" bash -eo pipefail "$1" >"$wf/clone.log" 2>&1 )
+  # The fixture remote is local, but this is still a real depth-1 fetch. Git's
+  # upload-pack setting makes fetch-by-object-id work across supported Git
+  # versions, while the fetcher's fallback covers servers that decline it.
+  REMOTE=$LAB/public-remote.git
+  git_clean clone -q --bare "$HEADCLONE" "$REMOTE"
+  git_clean -C "$REMOTE" config uploadpack.allowAnySHA1InWant true
+  fetch_case() {
+    local root=$1 declarations=$2 baseline=$3 out=$4 rc
+    ( cd "$wf" && PUBLIC_CORPORA_ROOT="$root" \
+        PUBLIC_CORPORA_FILE="$declarations" PUBLIC_BASELINE_DIR="$baseline" \
+        bash "$wf/scripts/public-corpora-fetch.sh" >"$out" 2>&1 )
+    rc=$?
+    printf '%s\n' "$rc" >"$out.rc"
+    return "$rc"
   }
-  if run_clone "$wf/clone.sh" &&
-      grep -Fq "fetch -q --depth 1 origin $SGOOD" "$wf/git.log" &&
-      grep -Fq 'remote add origin file:///lab' "$wf/git.log" &&
-      ! grep -Fq 'file:///absent' "$wf/git.log"; then
-    ok 'workflow provisions measured corpus and leaves unmeasured corpus alone'
+  baseline="$wf/scripts/public-baseline"
+  printf '{}\n' >"$baseline/lab.jsonl"
+
+  # missing -> fetched atomically at the final path
+  missing_root=$wf/fetch-missing
+  printf 'lab %s %s 999\n' "$REMOTE" "$SGOOD" >"$wf/missing.txt"
+  if fetch_case "$missing_root" "$wf/missing.txt" "$baseline" "$wf/missing.log" &&
+      grep -Fq "fetched lab @ ${SGOOD:0:7}" "$wf/missing.log" &&
+      [[ $(git_clean -C "$missing_root/lab" rev-parse HEAD) == "$SGOOD" ]]; then
+    ok 'fetcher missing corpus'
   else
-    bad 'workflow clone baseline guard'
+    bad 'fetcher missing corpus'
   fi
-  if ! mutate "$wf/clone.sh" "$wf/clone-mutant.sh" \
-      '[ -s "scripts/public-baseline/$id.jsonl" ] || continue' ':' ||
-      cmp -s "$wf/clone.sh" "$wf/clone-mutant.sh"; then
-    bad 'INVALIDO-cmp: clone baseline guard'
-  elif ! bash -n "$wf/clone-mutant.sh"; then
-    bad 'INVALIDO-parse: clone baseline guard'
-  elif run_clone "$wf/clone-mutant.sh" &&
-      grep -Fq 'remote add origin file:///absent' "$wf/git.log" &&
-      grep -Fq 'remote add origin file:///lab' "$wf/git.log"; then
-    ok 'clone mutant fetches unmeasured corpus (measured control survives)'
+
+  # already at pin -> no network (the URL is intentionally nonexistent)
+  already_root=$wf/fetch-already
+  mkdir -p "$already_root"
+  git_clean clone -q --no-local "$REMOTE" "$already_root/lab"
+  git_clean -C "$already_root/lab" checkout -q --detach "$SGOOD"
+  printf 'lab %s %s 999\n' "$LAB/does-not-exist" "$SGOOD" >"$wf/already.txt"
+  if fetch_case "$already_root" "$wf/already.txt" "$baseline" "$wf/already.log" &&
+      grep -Fq "ok lab already at ${SGOOD:0:7}" "$wf/already.log"; then
+    ok 'fetcher already-at-pin avoids network'
   else
-    bad 'clone mutant did NOT reproduce the unmeasured fetch'
+    bad 'fetcher already-at-pin made a network call'
+  fi
+
+  # other sha -> FAIL without touching the tree
+  other_root=$wf/fetch-other
+  mkdir -p "$other_root"
+  git_clean clone -q --no-local "$REMOTE" "$other_root/lab"
+  git_clean -C "$other_root/lab" checkout -q --detach "$SPARENT"
+  before=$(git_clean -C "$other_root/lab" rev-parse HEAD)
+  printf 'lab %s %s 999\n' "$REMOTE" "$SGOOD" >"$wf/other.txt"
+  if ! fetch_case "$other_root" "$wf/other.txt" "$baseline" "$wf/other.log" &&
+      [[ $(git_clean -C "$other_root/lab" rev-parse HEAD) == "$before" ]] &&
+      grep -Fq 'refusing to move a tree' "$wf/other.log"; then
+    ok 'fetcher refuses a differently pinned tree'
+  else
+    bad 'fetcher moved or accepted a differently pinned tree'
+  fi
+
+  # a plain dir nested INSIDE another checkout that sits at the pinned sha is
+  # still "not a git repo": the host's HEAD must never be borrowed.
+  nested_host=$wf/fetch-nested-host
+  git_clean clone -q --no-local "$REMOTE" "$nested_host"
+  git_clean -C "$nested_host" checkout -q --detach "$SGOOD"
+  mkdir -p "$nested_host/corpora/lab"
+  if ! fetch_case "$nested_host/corpora" "$wf/missing.txt" "$baseline" "$wf/nested.log" &&
+      grep -Fq 'is not a git repo' "$wf/nested.log"; then
+    ok 'fetcher refuses a plain dir nested in another checkout'
+  else
+    bad 'fetcher borrowed a host checkout HEAD for a plain dir'
+  fi
+
+  # no baseline -> SKIP and never fetch, even with a valid local remote
+  nobase_root=$wf/fetch-no-baseline
+  printf 'nobase %s %s 999\n' "$REMOTE" "$SGOOD" >"$wf/nobase.txt"
+  if fetch_case "$nobase_root" "$wf/nobase.txt" "$wf/no-baseline" "$wf/nobase.log" &&
+      grep -Fq 'skip nobase (no baseline; never fetched)' "$wf/nobase.log" &&
+      [[ ! -e "$nobase_root/nobase" ]]; then
+    ok 'fetcher leaves an unbaselined corpus alone'
+  else
+    bad 'fetcher fetched an unbaselined corpus'
+  fi
+
+  # failing fetch -> no final tree and no partial directory. TWO failing repos,
+  # because the exit trap alone cleans the LAST partial: only the per-failure
+  # cleanup keeps the first one from leaking, and only two repos can tell.
+  bad_root=$wf/fetch-bad
+  badsha=ffffffffffffffffffffffffffffffffffffffff
+  printf 'bad %s %s 999\nbad2 %s %s 999\n' "$REMOTE" "$badsha" "$REMOTE" "$badsha" >"$wf/bad.txt"
+  # A baseline makes the fetcher actually try (and fail); without one it
+  # would skip both and this case would prove nothing about cleanup.
+  printf '{}\n' >"$baseline/bad.jsonl"
+  printf '{}\n' >"$baseline/bad2.jsonl"
+  no_partials() { # ROOT
+    [[ ! -e "$1/bad" && ! -e "$1/bad2" ]] && ! compgen -G "$1/bad*.partial.*" >/dev/null
+  }
+  if ! fetch_case "$bad_root" "$wf/bad.txt" "$baseline" "$wf/bad.log" &&
+      no_partials "$bad_root"; then
+    ok 'fetcher removes a failed partial fetch'
+  else
+    bad 'fetcher left a failed partial fetch behind'
+  fi
+
+  # PUBLIC_GATE_CLONE=1 uses the same fetcher and yields a shallow clone.
+  gate=$wf/gate-path
+  mkdir -p "$gate/scripts" "$gate/target/release" "$gate/scripts/public-baseline"
+  cp "$GATE" "$gate/scripts/public-gate.sh"
+  cp "$ROOT/scripts/public-corpora-fetch.sh" "$gate/scripts/public-corpora-fetch.sh"
+  chmod +x "$gate/scripts/public-gate.sh" "$gate/scripts/public-corpora-fetch.sh"
+  printf 'gate %s %s 999\n' "$REMOTE" "$SGOOD" >"$gate/scripts/public-corpora.txt"
+  printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"gate/f.rb","severity":"error"}\n' \
+    >"$gate/scripts/public-baseline/gate.jsonl"
+  cat >"$gate/target/release/ita" <<'SH'
+#!/bin/sh
+printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"%s/f.rb","severity":"error"}\n' "$2"
+SH
+  chmod +x "$gate/target/release/ita"
+  if ( cd "$gate" && PUBLIC_GATE_CLONE=1 \
+      PUBLIC_CORPORA_FILE="$gate/scripts/public-corpora.txt" \
+      PUBLIC_BASELINE_DIR="$gate/scripts/public-baseline" \
+      PUBLIC_CORPORA_ROOT="$gate/corpora" ART="$gate/art" \
+      bash "$gate/scripts/public-gate.sh" >"$gate/gate.log" 2>&1 ) &&
+      git_clean -C "$gate/corpora/gate" rev-parse --is-shallow-repository | grep -Fxq true &&
+      grep -Fq 'RESULT: PASS' "$gate/gate.log"; then
+    ok 'gate auto-restore is a shallow pinned fetch'
+  else
+    bad 'gate auto-restore did not produce a shallow pinned fetch'
+  fi
+
+  # Accuse the baseline guard: its mutant fetches the unbaselined fixture.
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-baseline.sh" \
+      'if [[ ! -s $base ]]; then' 'if [[ -s $base ]]; then' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-baseline.sh"; then
+    bad 'INVALIDO-cmp: fetcher baseline guard'
+  elif ! bash -n "$wf/fetch-mutant-baseline.sh"; then
+    bad 'INVALIDO-parse: fetcher baseline guard'
+  else
+    mutant_root=$wf/fetch-mutant-baseline
+    if ( cd "$wf" && PUBLIC_CORPORA_ROOT="$mutant_root" \
+        PUBLIC_CORPORA_FILE="$wf/nobase.txt" PUBLIC_BASELINE_DIR="$wf/no-baseline" \
+        bash "$wf/fetch-mutant-baseline.sh" >"$wf/fetch-mutant-baseline.log" 2>&1 ) &&
+        [[ -d "$mutant_root/nobase" ]]; then
+      ok 'fetcher baseline mutant accused by no-baseline'
+    else
+      bad 'fetcher baseline mutant did not fetch the unbaselined corpus'
+    fi
+  fi
+
+  # Accuse the already-at-pin guard: its mutant rejects a pinned existing tree.
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-pin.sh" \
+      'if [[ $head == "$sha" ]]; then' 'if [[ $head != "$sha" ]]; then' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-pin.sh"; then
+    bad 'INVALIDO-cmp: fetcher already-at-pin guard'
+  elif ! bash -n "$wf/fetch-mutant-pin.sh"; then
+    bad 'INVALIDO-parse: fetcher already-at-pin guard'
+  elif ( cd "$wf" && PUBLIC_CORPORA_ROOT="$already_root" \
+      PUBLIC_CORPORA_FILE="$wf/already.txt" PUBLIC_BASELINE_DIR="$baseline" \
+      bash "$wf/fetch-mutant-pin.sh" >"$wf/fetch-mutant-pin.log" 2>&1 ); then
+    bad 'fetcher already-at-pin mutant was not accused'
+  else
+    ok 'fetcher already-at-pin mutant accused by already-at-pin'
+  fi
+
+  # Accuse the per-failure cleanup: without it the FIRST failed partial leaks
+  # (the exit trap only ever holds the last one).
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-cleanup.sh" \
+      $'\n    cleanup_partial\n' $'\n' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-cleanup.sh"; then
+    bad 'INVALIDO-cmp: fetcher partial cleanup'
+  elif ! bash -n "$wf/fetch-mutant-cleanup.sh"; then
+    bad 'INVALIDO-parse: fetcher partial cleanup'
+  else
+    mutant_root=$wf/fetch-mutant-cleanup
+    ( cd "$wf" && PUBLIC_CORPORA_ROOT="$mutant_root" \
+        PUBLIC_CORPORA_FILE="$wf/bad.txt" PUBLIC_BASELINE_DIR="$baseline" \
+        bash "$wf/fetch-mutant-cleanup.sh" >"$wf/fetch-mutant-cleanup.log" 2>&1 )
+    if no_partials "$mutant_root"; then
+      bad 'fetcher partial-cleanup mutant was not accused'
+    else
+      ok 'fetcher partial-cleanup mutant accused by failed-fetch'
+    fi
+  fi
+
+  # Accuse the top-level check: without it the nested plain dir reads the
+  # host checkout's HEAD and passes as "already at" the pin.
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-nested.sh" \
+      ' || [[ -n $prefix ]]; then' '; then' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-nested.sh"; then
+    bad 'INVALIDO-cmp: fetcher top-level check'
+  elif ! bash -n "$wf/fetch-mutant-nested.sh"; then
+    bad 'INVALIDO-parse: fetcher top-level check'
+  elif ( cd "$wf" && PUBLIC_CORPORA_ROOT="$nested_host/corpora" \
+      PUBLIC_CORPORA_FILE="$wf/missing.txt" PUBLIC_BASELINE_DIR="$baseline" \
+      bash "$wf/fetch-mutant-nested.sh" >"$wf/fetch-mutant-nested.log" 2>&1 ) &&
+      grep -Fq 'ok lab already at' "$wf/fetch-mutant-nested.log"; then
+    ok 'fetcher top-level mutant accused by nested-host'
+  else
+    bad 'fetcher top-level mutant was not accused'
   fi
 fi
 

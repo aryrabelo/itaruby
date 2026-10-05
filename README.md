@@ -215,11 +215,13 @@ here degrades to `Unknown` — never to an error.
 
 `./scripts/dev setup` prepares the machine (git hooks, release build,
 [software-factory], the local issue tracker) and prints which gates run
-here. `./scripts/dev gates` delegates to `scripts/gauntlet-gates.sh`: it
-runs [software-factory]'s checks, `cargo test --workspace`, the release
-build, the mutation probes under `testdata/`, the unwrap-shape gate, and
-the performance ceiling — all of which need only this repository and run on
-any machine.
+here. `./scripts/dev gates` runs `scripts/gauntlet-gates.sh` in one gate
+box — a worktree under `~/.cache/itaruby/gate-box` that mirrors your tree
+(HEAD plus uncommitted changes), one run at a time — so worktrees don't each
+grow a cargo `target/`. It runs [software-factory]'s checks,
+`cargo test --workspace`, the release build, the mutation probes under
+`testdata/`, the unwrap-shape gate, and the performance ceiling — all of
+which need only this repository and run on any machine.
 
 [software-factory]: https://github.com/nicolasmelo1/software-factory
 

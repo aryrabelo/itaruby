@@ -94,6 +94,8 @@ jobs:
   ancestry-mutants:
     name: mutants (conflicting-superclasses)
     runs-on: ubuntu-latest
+    env:
+      ITA_MUTANT_LAB: ${{ runner.temp }}/mutant-lab
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
@@ -122,6 +124,8 @@ jobs:
         run: ./scripts/gate-triage-selftest.sh
       - name: public-gate selftest
         run: ./scripts/public-gate-selftest.sh
+      - name: gate-box selftest
+        run: ./scripts/gate-box-selftest.sh
       - name: public drift attribution selftest
         run: ./scripts/public-drift-attrib-selftest.sh
 
@@ -185,20 +189,9 @@ jobs:
         with:
           path: ${{ env.PUBLIC_CORPORA_ROOT }}
           key: public-corpora-${{ hashFiles('scripts/public-corpora.txt', 'scripts/public-baseline/*.jsonl') }}
-      - name: Shallow-clone each declared repo at its pinned sha
+      - name: Restore pinned public corpora
         if: steps.corpora.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p "$PUBLIC_CORPORA_ROOT"
-          grep -v '^#' scripts/public-corpora.txt | while read -r id url sha ceiling clone_dir; do
-            [ -n "$id" ] || continue
-            [ -s "scripts/public-baseline/$id.jsonl" ] || continue
-            dir="$PUBLIC_CORPORA_ROOT/${clone_dir:-$id}"
-            git init -q "$dir"
-            git -C "$dir" remote add origin "$url"
-            git -C "$dir" fetch -q --depth 1 origin "$sha"
-            git -C "$dir" checkout -q FETCH_HEAD
-            echo "$id @ $(git -C "$dir" rev-parse --short HEAD)"
-          done
+        run: ./scripts/public-corpora-fetch.sh
       - run: cargo build --release
       - name: Public corpus gate (only GitLab baseline may be absent)
         run: |

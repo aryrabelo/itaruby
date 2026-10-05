@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two-sided ancestry probes. Builds only a temporary source copy, never the checkout.
+"""Two-sided ancestry probes. Builds in a persistent source lab, never the checkout.
 
 Run: python3 scripts/conflicting-superclasses-mutants.py
 The baseline and each mutant run the focused integration test. Invalid/no-op
@@ -9,9 +9,13 @@ from pathlib import Path
 import filecmp
 import os
 import re
-import shutil
 import subprocess
-import tempfile
+import sys
+
+# No scripts/__pycache__/: it would dirty the tree and ride into the gate box.
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mutant_lab import fresh_build, open_lab
 
 ROOT = Path(__file__).resolve().parent.parent
 SOURCE = Path("crates/itaruby_semantic/src/index.rs")
@@ -35,7 +39,7 @@ def verdict(build_code, run_code, output, expected):
 
 def run(copy, *args):
     env = os.environ.copy()
-    env["CARGO_TARGET_DIR"] = str(copy / "target")
+    env["CARGO_TARGET_DIR"] = str(copy.parent / "target")
     tests = [argument for test in TESTS for argument in ("--test", test)]
     result = subprocess.run(
         ["cargo", "test", "--locked", "--no-fail-fast", "-p", "itaruby_semantic", *tests, *args],
@@ -46,7 +50,7 @@ def run(copy, *args):
     return result
 
 
-def exercise(copy, original, content, expected):
+def exercise(copy, original, content, expected, require_fresh=False):
     target = copy / SOURCE
     target.write_text(content)
     if expected and filecmp.cmp(original, target, shallow=False):
@@ -54,6 +58,9 @@ def exercise(copy, original, content, expected):
     built = run(copy, "--no-run")
     if built.returncode != 0:
         return "INVALID-build", (built.returncode, None, built.stdout)
+    if require_fresh and not fresh_build(built.stdout):
+        print("INVALID-stale: the lab did not rebuild itaruby_semantic from this run's source", flush=True)
+        raise SystemExit(1)
     tested = run(copy, "--", "--test-threads=1")
     evidence = (built.returncode, tested.returncode, tested.stdout)
     return verdict(*evidence, expected), evidence
@@ -67,21 +74,19 @@ def require(actual, expected, label):
 
 def main():
     source = (ROOT / SOURCE).read_text()
-    with tempfile.TemporaryDirectory(prefix="ita-ancestry-mutants-") as temporary:
-        copy = Path(temporary)
-        for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]:
-            shutil.copy2(ROOT / name, copy / name)
-        shutil.copytree(ROOT / "crates", copy / "crates")
-        # Cargo builds this semantic-crate bin for integration tests too.
-        # Copy its public source explicitly, never the scripts directory
-        # (which may contain machine-local corpus configuration).
-        (copy / "scripts").mkdir()
-        generator = Path("scripts/gen-activerecord-inventory.rs")
-        shutil.copy2(ROOT / generator, copy / generator)
+    with open_lab(
+        ROOT,
+        "ancestry",
+        files=["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "scripts/gen-activerecord-inventory.rs"],
+        trees=["crates"],
+    ) as lab:
+        copy = lab.src
+        # The helper copies only this generator, never the scripts directory,
+        # which may contain machine-local corpus configuration.
         original = copy / "original-index.rs"
         original.write_text(source)
 
-        result, _ = exercise(copy, original, source, None)
+        result, _ = exercise(copy, original, source, None, require_fresh=True)
         require(result, "PASS", "positive control")
         result, _ = exercise(copy, original, source, CONFLICT)
         require(result, "INVALID-cmp", "no-op guard")

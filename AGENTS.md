@@ -344,6 +344,54 @@ found, and the launch bar is winning on both.
   directory it had just created). Any test/bench/mutation evidence from
   a worktree pins `CARGO_TARGET_DIR` to that worktree, and a lone red
   from a shared-dir run is re-run pinned before it is believed.
+- The pin above has a price, and on 2026-09-29 it was the largest consumer
+  on the disk (learned 2026-10-04, binding, measured): every worktree that
+  ran the gauntlet grew a `target/` of its own, which the fleet's
+  `cargo-sweep` never sees (it sweeps the shared dir only), and the itaruby
+  targets summed ~150 GiB (`singleton-flip` 64.6, `task-sig-rbi` 31.1, the
+  main checkout 21.0). One full gauntlet also WRITES ~35 GiB (≈160 mutants
+  at ~0.16 GiB per rebuild, extrapolated from one measured M1a rebuild). So
+  the full gauntlet and the mutant matrices run in ONE place:
+  `./scripts/dev gates` mirrors the calling tree — its HEAD plus the
+  uncommitted delta, proved by an equal temp-index `write-tree` in both
+  trees (exit 65 otherwise) — into the gate box (`$ITA_GATE_BOX`, default
+  `~/.cache/itaruby/gate-box`: writable from omp-safe sessions, and a
+  reproducible cache that is safe to delete), one run at a time under a
+  lock (exit 75 while busy, `--wait` to queue). The box keeps ONE persistent
+  target; the in-place mutants rewrite the box, never the tree an agent is
+  editing, and the next run's forced checkout heals a killed one. Untracked
+  files above 50 MiB in total are refused (exit 65), so a stray media dir is
+  never hashed into the object DB on every run, and the lock helper's own
+  environment never reaches the script (a nested `scripts/dev gates` would
+  otherwise skip its lock). Feature worktrees run focused
+  `cargo test --test <suite>` only, still pinned to themselves.
+  `scripts/gate-box-selftest.sh` (gate c2b) proves the mirror, the lock, the
+  corpora-map copy, the env cleanup and that scrub two-sided. First full
+  gauntlet in the box with the lean dev profile (2026-10-04, m5, load ~5):
+  21 min wall, ~28 GiB written machine-wide in that window, and the box's
+  whole target at 3.4 GiB afterwards (debug 2.0, release 1.0, labs 0.4).
+- A persistent lab target with PRESERVED mtimes serves artifacts built from
+  older or mutated source (learned 2026-10-04, binding): the Python mutant
+  families used a fresh `TemporaryDirectory` per run, which rebuilt every
+  dependency each time (~0.6 GiB written, ~30 s) and left ~0.9 GB orphans
+  when killed. They now share `scripts/mutant_lab.py`: one lab per family
+  under `target/mutant-lab/<name>/` (`$ITA_MUTANT_LAB` moves the root; CI
+  points it at the runner's temp dir so its cache does not grow), whose
+  `src/` is recopied with FRESH mtimes on every run — cargo rebuilds the
+  workspace crates and reuses the dependencies — held under a lock, and
+  whose first build must print `Compiling itaruby_semantic` or the run
+  aborts `INVALID-stale`. The `mutant-lab-fresh-build` case in
+  `scripts/instrument-mutants.sh` re-injects the `copy2` defect and demands
+  the stale verdict.
+- A durable gate input never lives in a swept scratch area (learned
+  2026-10-04, binding, measured): the public corpora sat in
+  `~/Sites/temp-files/public-corpora`, the fleet's `libera-hd` archived and
+  deleted them on 2026-09-29 (that tree is scratch by policy), and the
+  fail-closed public gate went red on m5 for a reason that had nothing to do
+  with the checker. They now live in `~/.local/share/itaruby/public-corpora`
+  and come from `scripts/public-corpora-fetch.sh` — depth 1 at each pinned
+  sha, only for repos with a baseline, never moving an existing tree, and the
+  same fetcher CI calls.
 - A perf ceiling measured on a loaded machine is not a measurement
   (learned 2026-09-17, binding, measured): with other agents building on
   the same host (load average ~13), the PRISTINE `HEAD` tree measured
@@ -399,11 +447,12 @@ green but at least one declared corpus could not be checked on this machine
 | Mutation probes in `testdata/` | only the repo | **any machine** |
 | Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the twelve mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-R) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
-| `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
+| `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin, mutant-lab fresh build): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
+| `scripts/gate-box-selftest.sh` — the gate box that runs the gauntlet: mirror exact (HEAD + uncommitted delta), lock exclusive, corpora map copied, the caller's `CARGO_TARGET_DIR` dropped; each step removed as a mutant and accused by its named case | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
 | Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-a/corpus-b: **only `work`**; corpus-c: **only `m5`** |
 | Navigation oracle vs `scripts/navfixture/oracle.jsonl` | only the repo | **any machine** |
-| `scripts/public-gate.sh` vs `scripts/public-corpora.txt` + `scripts/public-baseline/<id>.jsonl` | a clone of each declared public repo under `$HOME/Sites/temp-files/public-corpora` (never auto-cloned; `PUBLIC_GATE_CLONE=1` opts in); error sets are **drift detectors, unaudited** until `scripts/public-baseline/README.md`'s ledger has a verdict per family | **any machine with the clones** |
+| `scripts/public-gate.sh` vs `scripts/public-corpora.txt` + `scripts/public-baseline/<id>.jsonl` | a depth-1 clone of each declared public repo at its pinned sha under `$HOME/.local/share/itaruby/public-corpora`, fetched by `scripts/public-corpora-fetch.sh` (never auto-fetched by the gate; `PUBLIC_GATE_CLONE=1` opts in); error sets are **drift detectors, unaudited** until `scripts/public-baseline/README.md`'s ledger has a verdict per family | **any machine with the clones** |
 | `scripts/inference-gate.sh` — the inference bench (`scripts/inference-bench.jsonl`), guarded by `scripts/inference-bench-selftest.sh` | only the repo; `ruby` for the ground truth, `srb` at the pinned version for the comparison leg (missing/mismatched → that leg skips) | **any machine** |
 | `scripts/gate-digest` — the whole run as ONE compact JSON at `target/gauntlet/digest.json` (per-gate status + one-line reason + numbers, and for a FAIL the artifact path and line numbers), written on every exit path of `gauntlet-gates.sh` including the early ones; a reporter, never an exit code. Guarded by `scripts/gate-digest-selftest.sh` (gate c2b): four fixture gauntlet dirs under `scripts/gate-digest-fixture/` reported exactly, five cmp-guarded mutants each accused by its own case. Two rules it cannot break: PRIVATE corpus artifacts (`corpus-*`) yield counts, hashes and line numbers only — never a byte of content — while public corpora may show `path:line` of NEW/GONE lines; and a PASS whose evidence file is missing or empty is reported `FAIL "artifact absent"`, never PASS. Read this INSTEAD of the ~115 MB `target/gauntlet/` holds (measured 2026-09-18: `public-discourse.txt` alone is 440 KB, ~110k tokens; an all-green digest is 1791 B) | only the repo | **any machine** |
 | `scripts/gate-triage` — routes a finished run to its next action, reading `target/gauntlet/digest.json` ONLY: deterministic rules over digest features (perf red without a parent-revision measurement, corpus rev drift, corpus error drift, artifact absence, public drift, loaded host), plus four optional Jev judgments (`typesafe/jev-1.13`, ~0.6 s and ~US$0.00005 measured 2026-09-18). Three rules it cannot break: ADVISORY ONLY — it never gates, the gauntlet's exit codes stay untouched, transport failure prints one advice line and exits 4 fail-open; DIGEST-ONLY STATE — the state sent to the model is a proven pure function of `digest.json` (the secrecy wall travels with the digest; no model call ever sees artifact content); JUDGMENTS ROUTE, PROOF STAYS WITH THE READER — a Jev answer may annotate or order an action, never create, dismiss, or block one. Guarded by `scripts/gate-triage-selftest.sh` (gate c2c, offline by construction): eight fixture runs routed exactly (green routes NOTHING), ten cmp-guarded mutants each accused by its named guard, unknown answer keys rejected (exit 2), a byte ceiling on the green state (1723 B measured) | only the repo | **any machine** |
@@ -545,6 +594,14 @@ workspace level, and a handful of `#[expect]` at call sites where the value
 is provably bounded. `expect` rather than `allow` on purpose: a suppression
 that stops being needed fails the build instead of quietly rotting.
 
+The dev profile is lean on purpose, and its reasons live next to it in
+`Cargo.toml` (measured 2026-10-04 on m5): `debug = "line-tables-only"`,
+dependencies without debuginfo and `incremental = false` cut the full test
+target from 2.91 to 1.74 GiB and the bytes written per mutant rebuild from
+0.160 to 0.105 GiB, for ~0.5 s more per mutant. Backtraces keep file:line;
+for locals under lldb, `CARGO_PROFILE_DEV_DEBUG=true`. The release
+profile's `debug = true` is untouched.
+
 Full proof today needs two machines — `./scripts/dev gates` on `m5` (proves
 corpus-c) plus the anchor on `work` (proves corpus-a and corpus-b) — because
 no single machine holds all three corpora.
@@ -656,6 +713,10 @@ If the machine hosts a corpus, also create `scripts/corpora-local.txt`
 (gitignored) mapping corpus id to absolute path, one per line:
 `corpus-c /path/to/the/corpus`.
 
+The public corpora (~1 GB, depth 1 at the pinned shas, into
+`~/.local/share/itaruby/public-corpora`) come from one command:
+`scripts/public-corpora-fetch.sh`.
+
 `./scripts/dev setup` is the one-line idempotent equivalent and also prints
 which gates this machine can run (see `scripts/dev` for the other verbs,
 `gates` and `anchor`).
@@ -663,9 +724,17 @@ which gates this machine can run (see `scripts/dev` for the other verbs,
 ## Verification
 
 ```sh
-./scripts/dev gates    # local gates; exit 2 = declared corpus(es) absent here (named in transcript)
-./scripts/dev anchor   # gates on work, at the local HEAD sha
+./scripts/dev gates            # the gauntlet in the gate box, mirroring this tree; exit 2 = declared corpus(es) absent here (named in transcript), 75 = box busy
+./scripts/dev gates --at <rev> # the same, for a committed revision (clean, no delta)
+./scripts/dev anchor           # gates on work, at the local HEAD sha
 ```
+
+`gates` never builds in the calling tree: it mirrors it into the gate box
+(see the pin rule under "Rules of proof"), runs `scripts/gauntlet-gates.sh`
+there, and prints the box's artifacts dir and the
+`scripts/gate-triage --digest <box>/target/gauntlet/digest.json` command.
+`--run <script>` runs one repo-relative script in the box instead (a single
+mutant family, for instance).
 
 `anchor` checks out the local sha on `work` on purpose: an anchor run against
 whatever the remote happened to have on disk is a false green. It requires the

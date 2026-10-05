@@ -248,6 +248,16 @@ if INSTRUMENT_MUTANTS_LAB="$ART/instrument-mutants" \
 else
   bad 'evidence instruments (see target/gauntlet/instrument-mutants.txt)'
 fi
+# The gate box is itself an evidence producer: if its mirror, lock, or
+# environment contract drifts, every following result can describe another
+# tree or another machine. Its fixture repo re-injects each omission and
+# demands the named accusation, without touching this checkout.
+if GATE_BOX_LAB="$ART/gate-box-selftest" \
+   "$ROOT/scripts/gate-box-selftest.sh" >"$ART/gate-box-selftest.txt" 2>&1; then
+  ok 'gate box (mirror exact, lock exclusive, env clean, each mutant accused)'
+else
+  bad 'gate box (see target/gauntlet/gate-box-selftest.txt)'
+fi
 # Same family, one level up: scripts/gate-digest is what a reader (human or
 # model) now believes INSTEAD of the 115 MB of artifacts, so it is itself an
 # evidence producer and gets the same two-sided proof — four fixture

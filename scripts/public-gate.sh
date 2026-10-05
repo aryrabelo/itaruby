@@ -36,14 +36,15 @@
 # scripts/gate-digest's read of it) can belong to an unnamed tree.
 #
 # Unlike the private corpora (which the project never writes), the public
-# corpora DO get cloned on demand — but never automatically. gitlab-foss
+# corpora DO get restored on demand — but never automatically. gitlab-foss
 # alone is multi-GB, so the human decides when a machine is ready: only
-# PUBLIC_GATE_CLONE=1 turns a missing clone into a clone, or a
-# broken/pinned-mismatched clone into a repair. Without it that repo is a
-# per-repo SKIP (exit 2), named in the transcript.
+# PUBLIC_GATE_CLONE=1 turns a missing clone into a pinned depth-1 fetch, or
+# a broken/pinned-mismatched clone into a repair. Without it that repo is a
+# per-repo SKIP (exit 2), named in the transcript. The shared fetcher is
+# scripts/public-corpora-fetch.sh, used by CI and local runs alike.
 #
 # Clones live at $PUBLIC_CORPORA_ROOT/<id> (default
-# $HOME/Sites/temp-files/public-corpora), or at
+# $HOME/.local/share/itaruby/public-corpora), or at
 # $PUBLIC_CORPORA_ROOT/<clone-dir> when the declaration names one — a linked
 # `git worktree` of the canonical clone is the normal case for a re-pin,
 # because re-pointing the canonical clone would move the tree another
@@ -52,9 +53,9 @@
 # the directory (a test hook; the committed layout is authoritative).
 #
 # Sorbet timing is informational only: when `srb` is on PATH and the clone
-# carries a `sorbet/` directory, `srb tc --typed true` is timed (best
-# effort, 600s cap) and printed next to ita's wall time. It never affects
-# the exit code. A missing srb prints "srb: not installed".
+# carries a `sorbet/` directory, `srb tc --typed true` is timed (best effort,
+# 600s cap) and printed next to ita's wall time. It never affects the exit code.
+# A missing srb prints "srb: not installed".
 set -uo pipefail
 
 cd "$(dirname "$0")/.." || exit 1
@@ -62,7 +63,7 @@ ROOT=$PWD
 ITA=$ROOT/target/release/ita
 CORPORA_FILE=${PUBLIC_CORPORA_FILE:-$ROOT/scripts/public-corpora.txt}
 BASELINE_DIR=${PUBLIC_BASELINE_DIR:-$ROOT/scripts/public-baseline}
-CLONE_ROOT=${PUBLIC_CORPORA_ROOT:-$HOME/Sites/temp-files/public-corpora}
+CLONE_ROOT=${PUBLIC_CORPORA_ROOT:-$HOME/.local/share/itaruby/public-corpora}
 ATTRIB=${PUBLIC_ATTRIB:-$ROOT/scripts/public-drift-attrib}
 ART=${ART:-$ROOT/target/gauntlet}
 SRB_TIMEOUT=600
@@ -165,7 +166,11 @@ while read -r id url sha ceiling clone_dir; do
   if [[ ! -d $clone ]]; then
     if [[ ${PUBLIC_GATE_CLONE:-0} == 1 ]]; then
       mkdir -p "$CLONE_ROOT"
-      if ! git clone --quiet "$url" "$clone" >"$ART/public-$id.txt" 2>&1; then
+      if ! PUBLIC_CORPORA_ROOT="$CLONE_ROOT" \
+          PUBLIC_CORPORA_FILE="$CORPORA_FILE" \
+          PUBLIC_BASELINE_DIR="$BASELINE_DIR" \
+          "$ROOT/scripts/public-corpora-fetch.sh" --id "$id" \
+          >"$ART/public-$id.txt" 2>&1; then
         bad "public corpus ($id): clone failed (see target/gauntlet/public-$id.txt)"
         continue
       fi

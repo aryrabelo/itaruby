@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Disk diet for the development workflow (2026-10-04, measured on m5):
+  every worktree that ran the gauntlet used to grow its own `target/`
+  (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet
+  writes ~35 GiB.
+  - `./scripts/dev gates` now runs the gauntlet in ONE gate box
+    (`$ITA_GATE_BOX`, default `~/.cache/itaruby/gate-box`): the calling
+    tree's HEAD plus its uncommitted delta, proved equal by a temp-index
+    `write-tree`, one run at a time under a lock (exit 75 while busy,
+    `--wait` to queue). `--at <rev>` gates a committed revision and
+    `--run <script>` runs one script there. `scripts/gate-box-selftest.sh`
+    (gate c2b, CI `instruments`) proves the mirror, the lock, the
+    corpora-map copy and the env cleanup two-sided.
+  - Lean dev profile: `debug = "line-tables-only"`, dependencies without
+    debuginfo, `incremental = false` — full test target 2.91 → 1.74 GiB,
+    bytes written per mutant rebuild 0.160 → 0.105 GiB.
+  - The Python mutant families share `scripts/mutant_lab.py`: a persistent
+    lab per family (`target/mutant-lab/<name>/`) recopied with fresh mtimes,
+    held under a lock, and aborted `INVALID-stale` unless the run rebuilt
+    `itaruby_semantic` — no more full dependency rebuild per run. Proved by
+    the `mutant-lab-fresh-build` case in `scripts/instrument-mutants.sh`.
+  - Public corpora move to `~/.local/share/itaruby/public-corpora` (their
+    old `~/Sites/temp-files` home is swept: it was archived and deleted on
+    2026-09-29, turning the fail-closed public gate red on m5), fetched by
+    the new `scripts/public-corpora-fetch.sh` — depth 1 at each pinned sha,
+    only for repos with a baseline, the same fetcher CI now calls.
+
 ### Fixed
 - Class-object flip regression fixtures now distinguish the missing `sig`
   provider from the missing instance method in the no-RBI lookup control.

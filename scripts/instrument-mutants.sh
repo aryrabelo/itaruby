@@ -421,6 +421,86 @@ else
   fi
 fi
 
+# ---------- case 5: mutant-lab fresh source ----------
+# A persistent target is safe only when every copied source file receives a
+# fresh mtime. The copy2 mutant preserves the fixture's mtimes, so its second
+# build reuses the first build's artifact (STALE) even though open_lab
+# recreated the source directory — the fresh-build guard is what turns that
+# into INVALID-stale in a real harness. Each helper gets its OWN lab: a shared
+# one would hand the mutant's first build an up-to-date target and prove
+# nothing.
+say 'case mutant-lab-fresh-build — persistent targets must rebuild fresh source'
+c5=$LAB/mutant-lab
+fixture=$c5/fixture
+mkdir -p "$fixture/src"
+cat >"$fixture/Cargo.toml" <<'TOML'
+# Empty table: this lab lives under the repo's target/, and without it cargo
+# walks up, finds the repo's root [workspace] and refuses the package.
+[workspace]
+
+[package]
+name = "itaruby_semantic"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+TOML
+printf 'pub fn probe() -> usize { 1 }\n' >"$fixture/src/lib.rs"
+cat >"$c5/driver.py" <<'PY'
+import os
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+helper_path = Path(sys.argv[1]).resolve()
+spec = importlib.util.spec_from_file_location("mutant_lab_probe", helper_path)
+if spec is None or spec.loader is None:
+    raise SystemExit(f"cannot import {helper_path}")
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+fresh_build = module.fresh_build
+open_lab = module.open_lab
+
+root = Path(sys.argv[2]).resolve()
+for _ in range(2):
+    with open_lab(root, "probe", files=["Cargo.toml"], trees=["src"]) as lab:
+        env = os.environ.copy()
+        env["CARGO_TARGET_DIR"] = str(lab.target)
+        result = subprocess.run(
+            ["cargo", "build", "--offline"],
+            cwd=lab.src,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if result.returncode != 0:
+            print(result.stdout, end="")
+            raise SystemExit(result.returncode)
+        print("FRESH" if fresh_build(result.stdout) else "STALE")
+PY
+cp "$ROOT/scripts/mutant_lab.py" "$c5/helper-shipped.py"
+if ! mutate "$ROOT/scripts/mutant_lab.py" "$c5/helper-mutant.py" \
+      'copy_function=shutil.copy,' 'copy_function=shutil.copy2,'; then
+  bad 'mutant-lab-fresh-build: mutation did not apply (INVALIDO-cmp)'
+else
+  ship_out=$(ITA_MUTANT_LAB="$c5/lab-shipped" python3 -B "$c5/driver.py" "$c5/helper-shipped.py" "$fixture")
+  mutant_out=$(ITA_MUTANT_LAB="$c5/lab-mutant" python3 -B "$c5/driver.py" "$c5/helper-mutant.py" "$fixture")
+  if [[ $ship_out == $'FRESH\nFRESH' ]]; then
+    ok 'mutant-lab-fresh-build: shipped helper rebuilds both source copies'
+  else
+    bad "mutant-lab-fresh-build: shipped helper output was $ship_out"
+  fi
+  if [[ $mutant_out == $'FRESH\nSTALE' ]]; then
+    ok 'mutant-lab-fresh-build: copy2 mutant reproduces stale target'
+  else
+    bad "mutant-lab-fresh-build: copy2 mutant output was $mutant_out"
+  fi
+fi
+
 say 'summary'
 if (( failed )); then echo "RESULT: FAIL (lab kept at $LAB)"; exit 1; fi
 echo "RESULT: PASS (lab kept at $LAB)"

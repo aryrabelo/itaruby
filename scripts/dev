@@ -1,10 +1,18 @@
 #!/usr/bin/env bash
 # Single entry point for a human or an agent on a clean machine: prepare it,
-# then run the gates. Three verbs only — this script is the contract, not a
-# suggestion; see AGENTS.md for the gate table and the multi-machine flow.
+# then run the gates. `gates` runs in ONE persistent, serialized linked
+# worktree under `~/.cache` (the gate box), so the checkout an agent is
+# editing is never rewritten by an in-place mutant.
+#
+# Every worktree that ran gates grew its own target (about 150 GiB across the
+# itaruby worktrees on 2026-09-29). One gate box keeps one persistent target
+# and serializes runs, which the perf gate needs anyway: a loaded machine is
+# not a measurement. A killed run is healed by the next forced checkout.
+# The box is a reproducible cache under ~/.cache (omp-safe sessions may write
+# there) and is safe to delete.
 #
 #   setup   idempotent machine prep + prints which gates this machine can run
-#   gates   delegates to scripts/gauntlet-gates.sh, propagating its exit code
+#   gates   mirror this tree into the gate box, then run the gates
 #   anchor  runs the gates on the corpora machine (work) over ssh
 #   prove   local gates + anchor, and demands their union cover every corpus
 #
@@ -24,6 +32,9 @@
 # runner. Until then this is the lazier and equally correct choice.
 set -uo pipefail
 
+# The locked re-entry must run THIS file, whatever it is called: resolve it
+# before the cd below makes a relative $0 meaningless.
+SELF=$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")
 cd "$(dirname "$0")/.."
 ROOT=$PWD
 CORPORA_ROOT=${CORPORA_ROOT:-$HOME/Sites}
@@ -32,10 +43,14 @@ WORK_HOST=${WORK_HOST:-work}
 
 usage() {
   cat >&2 <<EOF
-usage: scripts/dev <setup|gates|anchor|prove>
+usage: scripts/dev <setup|gates|anchor|prove> [options]
 
   setup   prepare this machine (idempotent), report which gates it can run
-  gates   run scripts/gauntlet-gates.sh here, propagate its exit code
+  gates   mirror into the serialized gate box, then run a script
+          --at <rev>      run exactly a committed revision, without overlay
+          --run <path>    run this repo-relative script (default: scripts/gauntlet-gates.sh)
+          --wait          wait for a busy gate box instead of exiting 75
+          --              forward all following arguments to the script
   anchor  run the gates on \$WORK_HOST (default: work) over ssh
   prove   gates + anchor; exit 0 only if every declared corpus was proved
 EOF
@@ -43,6 +58,262 @@ EOF
 
 say() { printf '\n=== %s\n' "$1"; }
 
+# git subprocesses must not inherit a linked worktree's ambient repository
+# variables. In particular, a caller's GIT_INDEX_FILE would make the mirror
+# proof inspect the wrong index.
+git_clean() {
+  env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX \
+    -u GIT_COMMON_DIR -u GIT_AUTHOR_DATE -u GIT_COMMITTER_DATE git "$@"
+}
+git_index() {
+  local index=$1
+  shift
+  env -u GIT_DIR -u GIT_INDEX_FILE -u GIT_WORK_TREE -u GIT_PREFIX \
+    -u GIT_COMMON_DIR -u GIT_AUTHOR_DATE -u GIT_COMMITTER_DATE \
+    GIT_INDEX_FILE="$index" git "$@"
+}
+
+
+copy_corpora_map() {
+  local source=$1 box=$2 common=$3 source_map main_map box_map
+  source_map=$source/scripts/corpora-local.txt
+  main_map="$(dirname "$common")/scripts/corpora-local.txt"
+  box_map=$box/scripts/corpora-local.txt
+  if [[ -f $source_map ]]; then
+    cp "$source_map" "$box_map" || return 65
+    cmp -s "$source_map" "$box_map" || {
+      echo 'gate box corpus map does not match source' >&2
+      return 65
+    }
+  elif [[ -f $main_map ]]; then
+    cp "$main_map" "$box_map" || return 65
+    cmp -s "$main_map" "$box_map" || {
+      echo 'gate box corpus map does not match main checkout' >&2
+      return 65
+    }
+  else
+    rm -f "$box_map"
+  fi
+}
+
+copy_untracked() {
+  local source=$1 box=$2 count
+  # Check the complete byte budget before handing paths to tar. This is
+  # deliberately a second git ls-files call: retaining NUL-delimited paths in
+  # a shell variable would corrupt names containing whitespace or newlines.
+  if ! git_clean -C "$source" ls-files -z --others --exclude-standard |
+    python3 -c '
+import os
+import sys
+root = sys.argv[1]
+raw = sys.stdin.buffer.read()
+paths = [p for p in raw.split(b"\0") if p]
+total = 0
+sizes = []
+for encoded in paths:
+    rel = os.fsdecode(encoded)
+    try:
+        size = os.lstat(os.path.join(root, rel)).st_size
+    except FileNotFoundError:
+        size = 0
+    total += size
+    sizes.append((size, rel))
+limit = 50 * 1024 * 1024
+if total > limit:
+    print(f"gate box refuses {total} bytes of untracked files (limit {limit})",
+          file=sys.stderr)
+    for size, rel in sorted(sizes, reverse=True)[:10]:
+        print(f"  {size:>12} {rel}", file=sys.stderr)
+    raise SystemExit(65)
+' "$source"
+  then
+    return 65
+  fi
+  count=$(git_clean -C "$source" ls-files -z --others --exclude-standard |
+    python3 -c 'import sys; print(sum(1 for p in sys.stdin.buffer.read().split(b"\0") if p))') ||
+    return 65
+  if (( count )); then
+    git_clean -C "$source" ls-files -z --others --exclude-standard |
+      tar -C "$source" --null -T - -cf - |
+      tar -C "$box" -xf - || return 65
+  fi
+}
+
+tree_for() {
+  local tree=$1 index=$2
+  git_index "$index" -C "$tree" read-tree HEAD &&
+    git_index "$index" -C "$tree" add -A &&
+    git_index "$index" -C "$tree" write-tree
+}
+
+run_gate_box() {
+  local source=$1 box=$2 at_rev=$3 run_script=$4
+  shift 4
+  local common source_head target_sha box_head source_tree box_tree expected_tree
+  local source_actual_tree delta artifacts status
+  # These are globals because the EXIT trap runs after this function's locals
+  # have gone out of scope.
+  common=$(git_clean -C "$source" rev-parse --path-format=absolute --git-common-dir) ||
+    return 65
+  source=$(cd "$source" && pwd -P)
+  box=$(cd "$box" 2>/dev/null && pwd -P || printf '%s' "$box")
+  source_head=$(git_clean -C "$source" rev-parse HEAD) || return 65
+  if [[ -n $at_rev ]]; then
+    target_sha=$(git_clean -C "$source" rev-parse "$at_rev^{commit}") || {
+      echo "gate box cannot resolve --at $at_rev" >&2
+      return 65
+    }
+  else
+    target_sha=$source_head
+  fi
+
+  case $run_script in
+    /* | ../* | */../* | ..)
+      echo "gate box --run must be a repo-relative path: $run_script" >&2
+      return 64
+      ;;
+  esac
+  run_script=${run_script#./}
+
+  if [[ $source == "$box" ]]; then
+    [[ -f $box/$run_script ]] || {
+      echo "gate box script not found: $run_script" >&2
+      return 65
+    }
+    printf 'gate box: %s — direct (locked) @ %s\n' "$box" "${target_sha:0:7}"
+    (
+      cd "$box" || exit 65
+      # The lock helper's own state must not reach the script: a nested
+      # `scripts/dev gates` (the gate-box selftest, run by gate c2b inside
+      # this very box) would otherwise skip its lock and read OUR source.
+      unset ITA_GATE_BOX ITA_GATE_BOX_LOCKED ITA_GATE_BOX_SOURCE \
+        ITA_GATE_BOX_TARGET_SHA ITA_GATE_BOX_COMMON ITA_GATE_BOX_WAIT
+      env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u ART -u TRANSCRIPT \
+        "./$run_script" "$@"
+    )
+    status=$?
+    artifacts=$box/target/gauntlet
+    printf 'gate box artifacts: %s\n' "$artifacts"
+    printf 'gate box triage: scripts/gate-triage --digest %s/digest.json\n' "$artifacts"
+    return "$status"
+  fi
+
+  if [[ -e $box ]]; then
+    local box_common
+    box_common=$(git_clean -C "$box" rev-parse --path-format=absolute --git-common-dir) ||
+      { echo "gate box exists but is not a worktree: $box" >&2; return 65; }
+    if [[ $box_common != "$common" ]]; then
+      echo "gate box belongs to another repository: $box" >&2
+      return 65
+    fi
+  else
+    git_clean -C "$source" worktree prune || return 65
+    mkdir -p "$(dirname "$box")" || return 65
+    git_clean -C "$source" worktree add --detach --force "$box" "$target_sha" ||
+      return 65
+  fi
+
+  git_clean -C "$box" checkout --detach --force "$target_sha" || return 65
+  git_clean -C "$box" clean -fd || return 65
+  if [[ -z $at_rev ]]; then
+    # GATE_BOX_TRACKED_OVERLAY
+    if ! git_clean -C "$source" diff --quiet --binary HEAD; then
+      git_clean -C "$source" diff --binary HEAD |
+        git_clean -C "$box" apply || return 65
+    fi
+    copy_untracked "$source" "$box" || return 65
+  fi
+  # GATE_BOX_CORPORA_MAP
+  copy_corpora_map "$source" "$box" "$common" || return 65
+
+  GATE_BOX_SOURCE_INDEX=$common/ita-gate-box-source-index.$$.${RANDOM}
+  GATE_BOX_BOX_INDEX=$common/ita-gate-box-box-index.$$.${RANDOM}
+  trap 'rm -f "${GATE_BOX_SOURCE_INDEX:-}" "${GATE_BOX_BOX_INDEX:-}"' EXIT
+  source_actual_tree=$(tree_for "$source" "$GATE_BOX_SOURCE_INDEX") || return 65
+  box_tree=$(tree_for "$box" "$GATE_BOX_BOX_INDEX") || return 65
+  box_head=$(git_clean -C "$box" rev-parse HEAD) || return 65
+  # GATE_BOX_VERIFY_MIRROR
+  if [[ -n $at_rev ]]; then
+    expected_tree=$(git_clean -C "$source" rev-parse "$target_sha^{tree}") || return 65
+    source_tree=$expected_tree
+    if [[ $box_tree != "$expected_tree" || $box_head != "$target_sha" ]]; then
+      echo "gate box does not mirror $source: tree $source_tree != $box_tree" >&2
+      return 65
+    fi
+  else
+    source_tree=$source_actual_tree
+    if [[ $source_tree != "$box_tree" || $source_head != "$box_head" ]]; then
+      echo "gate box does not mirror $source: tree $source_tree != $box_tree" >&2
+      return 65
+    fi
+  fi
+  expected_tree=${expected_tree:-$source_tree}
+  # The label describes what the BOX holds: an `--at` run never carries the
+  # source's uncommitted delta, whatever state the source tree is in.
+  if [[ -z $at_rev && $source_actual_tree != "$(git_clean -C "$source" rev-parse HEAD^{tree})" ]]; then
+    delta='+ uncommitted delta'
+  else
+    delta='clean'
+  fi
+  if [[ $delta == clean ]]; then
+    printf 'gate box: %s — %s @ %s (clean)\n' \
+      "$box" "$source" "${target_sha:0:7}"
+  else
+    printf 'gate box: %s — %s @ %s (+ uncommitted delta, tree %s)\n' \
+      "$box" "$source" "${target_sha:0:7}" "${expected_tree:0:7}"
+  fi
+  [[ -f $box/$run_script ]] || {
+    echo "gate box script not found after mirroring: $run_script" >&2
+    return 65
+  }
+  (
+    cd "$box" || exit 65
+    # GATE_BOX_INTERNAL_SCRUB — see the direct branch above.
+    unset ITA_GATE_BOX ITA_GATE_BOX_LOCKED ITA_GATE_BOX_SOURCE \
+      ITA_GATE_BOX_TARGET_SHA ITA_GATE_BOX_COMMON ITA_GATE_BOX_WAIT
+    # GATE_BOX_ENV_CLEAN
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u ART -u TRANSCRIPT \
+      "./$run_script" "$@"
+  )
+  status=$?
+  artifacts=$box/target/gauntlet
+  printf 'gate box artifacts: %s\n' "$artifacts"
+  printf 'gate box triage: scripts/gate-triage --digest %s/digest.json\n' "$artifacts"
+  return "$status"
+}
+
+acquire_gate_box_lock() {
+  python3 - "$@" <<'PY'
+import fcntl
+import os
+import sys
+import time
+
+source, box, sha, script = sys.argv[1:5]
+args = sys.argv[5:]
+common = os.environ["ITA_GATE_BOX_COMMON"]
+wait = os.environ.pop("ITA_GATE_BOX_WAIT", "0") == "1"
+fd = os.open(os.path.join(common, "ita-gate-box.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+except BlockingIOError:
+    with os.fdopen(os.dup(fd), "r", encoding="utf-8", errors="replace") as holder:
+        line = holder.readline().strip() or "unknown holder"
+    print(f"gate box busy: {line}", file=sys.stderr)
+    os.close(fd)
+    raise SystemExit(75)
+os.ftruncate(fd, 0)
+os.write(fd, f"pid={os.getpid()} since={time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+             f"src={source} rev={sha}\n".encode())
+os.set_inheritable(fd, True)
+env = os.environ.copy()
+env["ITA_GATE_BOX_LOCKED"] = "1"
+env["ITA_GATE_BOX"] = box
+env["ITA_GATE_BOX_SOURCE"] = source
+env["ITA_GATE_BOX_TARGET_SHA"] = sha
+os.execvpe("bash", ["bash", script, "gates", *args], env)
+PY
+}
 cmd_setup() {
   say 'git hooks'
   git config core.hooksPath .githooks
@@ -112,7 +383,61 @@ cmd_setup() {
 }
 
 cmd_gates() {
-  exec ./scripts/gauntlet-gates.sh "$@"
+  local at_rev="" run_script="scripts/gauntlet-gates.sh" wait=0
+  local source_root box common source_head target_sha
+  local -a forwarded=() helper_args=()
+  while (($#)); do
+    case $1 in
+      --at)
+        (($# >= 2)) || { echo 'gates: --at requires a revision' >&2; return 64; }
+        at_rev=$2; shift 2 ;;
+      --run)
+        (($# >= 2)) || { echo 'gates: --run requires a path' >&2; return 64; }
+        run_script=$2; shift 2 ;;
+      --wait) wait=1; shift ;;
+      --)
+        shift
+        forwarded=("$@")
+        break ;;
+      *)
+        echo "gates: unknown option: $1 (use -- to forward it)" >&2
+        return 64 ;;
+    esac
+  done
+  box=${ITA_GATE_BOX:-$HOME/.cache/itaruby/gate-box}
+  [[ $box == /* ]] || box=$ROOT/$box
+  source_root=${ITA_GATE_BOX_SOURCE:-$ROOT}
+
+  # The lock helper execs this same script with an inheritable fd. Re-entry
+  # therefore performs the mirror and the run while Python's flock remains
+  # held, rather than taking a second lock.
+  if [[ ${ITA_GATE_BOX_LOCKED:-0} == 1 ]]; then
+    run_gate_box "$source_root" "$box" "$at_rev" "$run_script" \
+      "${forwarded[@]}"
+    return $?
+  fi
+
+  common=$(git_clean -C "$ROOT" rev-parse --path-format=absolute --git-common-dir) ||
+    return 65
+  source_head=$(git_clean -C "$ROOT" rev-parse HEAD) || return 65
+  if [[ -n $at_rev ]]; then
+    target_sha=$(git_clean -C "$ROOT" rev-parse "$at_rev^{commit}") || {
+      echo "gate box cannot resolve --at $at_rev" >&2
+      return 65
+    }
+  else
+    target_sha=$source_head
+  fi
+  helper_args=("$ROOT" "$box" "$target_sha" "$SELF")
+  [[ -n $at_rev ]] && helper_args+=(--at "$at_rev")
+  [[ $run_script != scripts/gauntlet-gates.sh ]] &&
+    helper_args+=(--run "$run_script")
+  helper_args+=(--)
+  helper_args+=("${forwarded[@]}")
+  export ITA_GATE_BOX_COMMON=$common
+  export ITA_GATE_BOX_WAIT=$wait
+  # GATE_BOX_LOCK_ACQUIRE
+  acquire_gate_box_lock "${helper_args[@]}"
 }
 
 # Captures the remote run so the union of proved corpora can be checked. Exit 2

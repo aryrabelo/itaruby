@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Close a change: run every gate, write the closing report, seal it, ask Jev.
+
+Run: ops exec typesafe-api-key -- scripts/closing-evidence   (clean tree, at the commit being closed)
+
+Why this exists (AGENTS.md, closing gate): "the gates passed" was a sentence in
+a hand-off, and a sentence is what the software factory refuses to trust. This
+turns it into the `closing` gate's evidence:
+
+  1. `./scripts/dev gates` runs here, on the committed tree. Nothing is reused
+     from an earlier run: a digest that cannot name the commit it measured is
+     not evidence about this one.
+  2. `target/gauntlet/digest.json` becomes `.software-factory/evidence/
+     closing-run.json`, with every private-corpus revision removed (the report
+     is committed AND sent to the judge; the secrecy wall covers both).
+  3. `sf seal closing` binds the report to the implementation digest, so the
+     next change to the checker expires it (L3.GATE_HAS_FRESH_EVIDENCE).
+  4. The marked closing claim and the report, verbatim, become Jev's question
+     (`.software-factory/evidence/jev/closing.json`) and its negated twin; `scripts/claim-judge-gate`
+     asks both and caches the verdicts (L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE).
+
+Exit: 0 closed · 1 a gate or the judge said no (the report is still written,
+unsealed, so the reason is readable) · 2 could not run.
+"""
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+ART = ROOT / "target/gauntlet"
+REPORT = ROOT / ".software-factory/evidence/closing-run.json"
+REQUEST = ROOT / ".software-factory/evidence/jev/closing.json"
+TWIN = ROOT / ".software-factory/evidence/jev/closing.twin.json"
+CLAIM_DOC = ROOT / "AGENTS.md"
+CLAIM_ID = "CLOSING_GATES_GREEN"
+# Paths this script itself writes; everything else must be committed first.
+OWN = {
+    ".software-factory/evidence/closing.json",
+    ".software-factory/evidence/closing-run.json",
+    ".software-factory/evidence/jev/closing.json",
+    ".software-factory/evidence/jev/closing.twin.json",
+    ".software-factory/evidence/jev/closing.cache.json",
+}
+GOAL = (
+    "Close this change the way the repository's owner closes one: run every gate "
+    "this machine can run against the committed tree, and show that nothing the "
+    "checker says about real code got worse."
+)
+QUESTION = {
+    "relation": {
+        "type": "choice",
+        "instructions": (
+            "`claim` is a sentence the repository makes about the commit it closes. "
+            "`evidence` is the gate report produced by running the gates on that commit. "
+            "Does the evidence support the claim? Judge only what the evidence shows."
+        ),
+        "criteria": {
+            "supports": "the evidence contains every effect the claim promises",
+            "contradicts": "the evidence shows at least one of the promised effects did not happen",
+            "says_nothing": "the evidence is silent about at least one effect the claim promises",
+        },
+    }
+}
+
+
+def git(*args):
+    return subprocess.run(["git", *args], cwd=ROOT, text=True, capture_output=True, check=True).stdout
+
+
+def claim_sentence():
+    """The sentence right after the marker, so the doc and the question cannot drift."""
+    lines = CLAIM_DOC.read_text().splitlines()
+    marker = re.compile(rf"<!--\s*claim:\s*{CLAIM_ID}\s+proven-by:\s*closing\s*-->")
+    hits = [i for i, line in enumerate(lines) if marker.search(line)]
+    if len(hits) != 1:
+        raise SystemExit(f"closing-evidence: expected one `{CLAIM_ID}` marker in AGENTS.md, found {len(hits)}")
+    rest = [line.strip() for line in lines[hits[0] + 1:]]
+    sentence = []
+    for line in rest:
+        if not line:
+            if sentence:
+                break
+            continue
+        sentence.append(line)
+    return " ".join(sentence)
+
+
+def redact(digest):
+    """Private-corpus revisions and error-set hashes never leave this machine."""
+    for gate in digest.get("gates", []):
+        for corpus in gate.get("numbers", {}).get("corpora", []) if isinstance(gate.get("numbers"), dict) else []:
+            for key in ("rev", "pinned", "error_set_sha"):
+                corpus.pop(key, None)
+        if isinstance(gate.get("reason"), str):
+            gate["reason"] = re.sub(r"\[rev [^\]]*\]", "[rev withheld]", gate["reason"])
+    digest.pop("machine", None)
+    return digest
+
+
+def gate(digest, name):
+    return next((g for g in digest.get("gates", []) if g.get("name") == name), {})
+
+
+def assertions(exit_code, digest, src_clean):
+    corpus_c = next(
+        (c for c in gate(digest, "d").get("numbers", {}).get("corpora", []) if c.get("id") == "corpus-c"),
+        None,
+    )
+    c1 = gate(digest, "c1").get("numbers", {})
+    checks = {
+        "dev_gates.exit_zero": exit_code == 0 and digest.get("result") == "PASS",
+        "corpus.proved_corpus_c": "corpus-c" in digest.get("corpus", {}).get("proved", []),
+        "corpus_c.no_new_errors": corpus_c is not None and corpus_c.get("new") == 0,
+        "public_corpora.no_drift": gate(digest, "f").get("status") == "PASS",
+        "mutants.every_decision_accused": gate(digest, "c1").get("status") == "PASS"
+        and c1.get("not_accused") == 0 and c1.get("total", 0) > 0,
+        # The negative path: the drift detectors themselves are proven to fire
+        # on planted drift, so "no drift" above is a measurement, not silence.
+        "instruments.drift_detectors_fire": gate(digest, "c2b").get("status") == "PASS",
+        "source.untouched_after_mutants": src_clean,
+    }
+    return [{"type": k, "status": "passed" if v else "failed"} for k, v in checks.items()]
+
+
+def request(claim, evidence, criteria):
+    question = json.loads(json.dumps(QUESTION))
+    question["relation"]["criteria"] = criteria
+    return {"model": "jev-latest", "state": {"claim": claim, "evidence": evidence}, "questions": question}
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n")
+
+
+def main():
+    dirty = [line[3:] for line in git("status", "--porcelain", "--untracked-files=all").splitlines()
+             if line[3:] not in OWN]
+    if dirty:
+        print("closing-evidence: commit first; evidence certifies committed code only:", *dirty, sep="\n  ")
+        return 2
+    claim = claim_sentence()
+    head = git("rev-parse", "HEAD").strip()
+
+    gates = subprocess.run(["./scripts/dev", "gates"], cwd=ROOT, check=False)
+    try:
+        digest = json.loads((ART / "digest.json").read_text())
+    except (OSError, ValueError) as error:
+        print(f"closing-evidence: no gate digest to read: {error}")
+        return 2
+    src_clean = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "crates"], cwd=ROOT).returncode == 0
+
+    results = assertions(gates.returncode, redact(digest), src_clean)
+    passed = all(a["status"] == "passed" for a in results)
+    sf = subprocess.run(["sf", "--version"], text=True, capture_output=True, check=False).stdout.strip()
+    report = {
+        "scenario": "closing",
+        "status": "passed" if passed else "failed",
+        "goal": GOAL,
+        "commit": head,
+        "sf": sf,
+        "observed": digest,
+        "assertions": results,
+    }
+    write_json(REPORT, report)
+    for a in results:
+        print(f"{a['status'].upper():7} {a['type']}")
+    if not passed:
+        print("closing-evidence: NOT closed; report written unsealed at", REPORT.relative_to(ROOT))
+        return 1
+
+    evidence = REPORT.read_text()
+    real = QUESTION["relation"]["criteria"]
+    # The twin swaps what `supports` and `says_nothing` mean: same claim, same
+    # evidence, the definition of passing turned upside down. A judge that
+    # approves both is approving anything.
+    twin = dict(real, supports=real["says_nothing"], says_nothing=real["supports"])
+    write_json(REQUEST, request(claim, evidence, real))
+    write_json(TWIN, request(claim, evidence, twin))
+
+    if subprocess.run(["sf", "seal", "closing"], cwd=ROOT, check=False).returncode != 0:
+        print("closing-evidence: sf seal closing failed")
+        return 2
+    # The verdict comes from TypeSafe's own endpoint, never a local proxy: a
+    # machine-wide TYPESAFE_BASE_URL (this fleet points it at an OpenRouter
+    # shim for other tools) is dropped so the judge uses its default,
+    # https://api.typesafe.ai. Run under `ops exec typesafe-api-key --`.
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("closing-evidence: TYPESAFE_API_KEY is not set — run: ops exec typesafe-api-key -- scripts/closing-evidence")
+        return 2
+    judge_env = {k: v for k, v in os.environ.items() if k != "TYPESAFE_BASE_URL"}
+    judged = subprocess.run([sys.executable, "scripts/claim-judge-gate", "--expect", "relation=supports",
+                             "--min-confidence", "0.8"], cwd=ROOT, env=judge_env, check=False)
+    if judged.returncode != 0:
+        print("closing-evidence: Jev did not accept the claim against this evidence")
+        return judged.returncode
+    print(f"closed {head[:10]}: commit .software-factory/evidence/closing*.json and .software-factory/evidence/jev/closing*.json")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

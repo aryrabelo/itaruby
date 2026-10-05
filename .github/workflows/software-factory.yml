@@ -17,16 +17,21 @@ jobs:
           fetch-depth: 0
       - name: Install sf
         # Pinned so an upstream push can't silently change this CI's result;
-        # bumping this sha is a deliberate act. Resolved via
-        # `gh api repos/nicolasmelo1/software-factory/commits/HEAD --jq .sha`
-        # (2026-08-24, upstream main).
-        run: cargo install --git https://github.com/nicolasmelo1/software-factory --rev 76ec836dd0264712844fa86abc3fc26b35ccac4f --locked
+        # bumping this sha is a deliberate act. d48374c is the head of
+        # nicolasmelo1/software-factory#63 (upstream main 309cc53 plus
+        # L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE), the same commit the local
+        # `sf` is built from (2026-09-22). Re-pin to the merge commit once
+        # #63 lands on upstream main.
+        run: cargo install --git https://github.com/nicolasmelo1/software-factory --rev d48374c5eb07d0707334b8942f297a3cf19b597b --locked
       # verify first: a check that stopped firing makes the run below
       # meaningless, and it is the cheaper failure to discover.
       - name: Prove the checks still fire
         run: sf verify
-      - name: Check the repository
-        run: sf check --changed origin/${{ github.base_ref || 'main' }}
+      # --allow-commands runs the closing claim's judge (Jev). CI holds no
+      # TypeSafe key on purpose: the verdict must already be in the committed
+      # cache, so a closing nobody asked Jev about is red here, not re-asked.
+      - name: Check the repository (closing gate enforced)
+        run: sf check --allow-commands --changed origin/${{ github.base_ref || 'main' }}
 
   tests:
     runs-on: ubuntu-latest

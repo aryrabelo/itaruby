@@ -1,11 +1,17 @@
-//! Bead ita-4xy: `method_return` consumes a project method's own sorbet
-//! `sig { returns(...) }` (bead ita-uh1's `MethodDef::sorbet_ret`, now
-//! plumbed onto `MethodSig` too) as a FALLBACK when the method's own body
-//! inference lands on `Ty::Unknown` — never a precedence override. Inline
-//! sources only (no `testdata/` fixtures: gate c scans that whole tree for
-//! diagnostics, and every fixture here is deliberately built to raise one).
-//! Globally-unique class name prefix `ProjSig` per test, one inline
-//! `SourceFile` per `Db`.
+//! A project method's own sorbet `sig` is a CONTRACT, not a hint. Bead
+//! ita-4xy landed it as a fallback consulted only when body inference
+//! reached `Ty::Unknown`; the signature delivery replaced that with the
+//! rule a signature is worth writing for — the declared return types the
+//! consumer, and the body is checked against it independently, so a body
+//! that disagrees is accused (E0109) instead of quietly winning. The
+//! precedence assertions below are the lock on that direction, and (b) is
+//! the one that changed sides: it used to prove an inferred `Ty::Str` body
+//! beat the declaration.
+//!
+//! Inline sources only (no `testdata/` fixtures: gate c scans that whole
+//! tree for diagnostics, and every fixture here is deliberately built to
+//! raise one). Globally-unique class name prefix `ProjSig` per test, one
+//! inline `SourceFile` per `Db`.
 //!
 //! Recognized-sig fixtures extend `T::Sig`, the external provider of the
 //! class-body DSL. Without that provider the class-object flip correctly
@@ -60,17 +66,24 @@ ProjSigOwnerA.new.make(1).nonexistent_method_a
     );
 }
 
-/// (b) Precedence: an inferred body type that is NOT `Ty::Unknown`
-/// (here a plain string literal, `Ty::Str`) always wins over the sig —
-/// `method_return`'s fallback only ever runs when the body's own answer
-/// IS Unknown. If the fill wrongly stole precedence, the call site would
-/// type as `Ty::Instance(ProjSigWidgetB)` instead of `Ty::Str`, and
-/// `nonexistent_method_b` (real on neither, but only diagnosable on the
-/// closed PROJECT class) would fire E0101. `Ty::Str` is a core type
-/// (`ClosedWorld` off, unwired here), so the correct precedence stays
-/// silent — this is the mutation lock for "sig steals precedence".
+/// (b) Precedence, in the direction signatures are written for. The body
+/// returns a plain string literal while the sig declares
+/// `ProjSigWidgetB`, and BOTH halves of the contract must be observable
+/// from one fixture:
+///
+/// * E0109 on `make` — the body is checked against its own declaration,
+///   independently of any call site, so an implementation that contradicts
+///   the signature is accused where it is written.
+/// * E0101 on `nonexistent_method_b` — the CONSUMER is typed by the
+///   declared `ProjSigWidgetB` (a closed project class), not by the body's
+///   inferred `Ty::Str`. Under the old ita-4xy fallback this call was
+///   silent, because `Ty::Str` is a core type with `ClosedWorld` unwired
+///   here; that silence is exactly what a declaration is supposed to end.
+///
+/// Losing either assertion leaves the other passing, which is why both are
+/// asserted by name rather than by count alone.
 #[test]
-fn inferred_body_beats_sig_precedence() {
+fn declared_return_checks_body_and_types_consumer() {
     let diags = check_src(
         r#"
 class ProjSigWidgetB
@@ -88,12 +101,9 @@ end
 ProjSigOwnerB.new.make.nonexistent_method_b
 "#,
     );
-    assert!(
-        diags.is_empty(),
-        "an inferred `Ty::Str` body must beat the sig; if the sig stole precedence \
-         this would type as ProjSigWidgetB (a closed project class) and E0101 would \
-         fire; got: {diags:?}"
-    );
+    assert_eq!(diags.len(), 2, "{diags:?}");
+    assert!(diags.iter().any(|d| d.contains("E0109") && d.contains("make")), "{diags:?}");
+    assert!(diags.iter().any(|d| d.contains("E0101") && d.contains("nonexistent_method_b")), "{diags:?}");
 }
 
 /// (c) A sig naming a class that resolves nowhere in the project stays
@@ -158,17 +168,21 @@ ProjSigOwnerD.make(1).nonexistent_method_d
     );
 }
 
-/// (f) Non-regression: the project's own `#:` RBS comment sig (checked
-/// FIRST in `method_return`, unconditionally, before any body walk or
-/// sorbet sig is even consulted) still wins over BOTH a disagreeing
-/// sorbet `sig { ... }` AND a concretely-typed body — this bead changes
-/// none of that existing precedence, only adds a fallback for the case
-/// `#:` never covered (no RBS comment at all). `make` here has all
-/// three: an `#:` sig naming `ProjSigWidgetF`, a sorbet sig naming a
-/// DIFFERENT class, and a body that returns a plain string — the `#:`
-/// type must be the one that governs, proven by E0101 on `ProjSigWidgetF`
-/// (closed leaf class) instead of silence (which either of the other two
-/// answers would give).
+/// (f) Non-regression: the project's own `#:` RBS comment sig is checked
+/// FIRST in `method_return`, before any body walk or sorbet sig is
+/// consulted, and still wins over BOTH a disagreeing sorbet `sig { ... }`
+/// AND a concretely-typed body. `make` here carries all three — an `#:`
+/// sig naming `ProjSigWidgetF`, a sorbet sig naming a DIFFERENT class, and
+/// a body returning a plain string — so the single E0101 on
+/// `ProjSigWidgetF` (a closed leaf class) is what proves which of the
+/// three governed: either other answer gives a different diagnostic or
+/// none at all.
+///
+/// The body is deliberately NOT accused here the way (b)'s is: this
+/// delivery checks a body against a sorbet `sig`, and adds no RBS
+/// body-return validation. That asymmetry is a scope boundary, not an
+/// oversight — an `#:` comment sig still types consumers without judging
+/// the implementation underneath it.
 #[test]
 fn rbs_comment_sig_wins_over_sorbet_sig_and_body() {
     let diags = check_src(

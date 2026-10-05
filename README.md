@@ -52,11 +52,27 @@ every would-be accusation on the three public corpora until the residue
 was 8 records across rails/mastodon/discourse, each read and proven to
 raise under MRI.
 
-This alpha is not a replacement for Sorbet in annotated projects. Support
-for existing Sorbet `sig`s and RBI files is partial, including extraction
-of some return types. Full contract checking of parameters and returns,
-and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
-alongside itaruby to preserve your existing Sorbet checks.
+This alpha is not a replacement for Sorbet in annotated projects. A
+project method's own recognized `sig { ... }` is checked as a contract.
+Its declared return types the caller. The contract accuses only values
+WRITTEN as literals (strings, symbols, numbers, `nil`, `true`/`false`,
+Array/Hash literals, ranges, regexps, `__FILE__`/`__LINE__`): a literal
+the body returns that contradicts the declared return (E0109), and a
+literal argument that contradicts a declared param, matched by name
+(E0103). A variable, `self`, a constant or any call is never judged, so a
+contradiction carried by an inferred value is a known false negative. A
+project that sets `T::Configuration.default_checked_level = :never` gets
+no contract accusations. A client RBI supplies the same contracts only
+when it matches the Ruby definition exactly: owner, instance or
+class-method track, and parameter layout. Everything else stays silent
+rather than guessed:
+generics, procs, overloads, rest and block parameters, duplicate
+definitions or any other redefinition (a `class << X` patch, a hook, a
+`class_eval`), open classes, and stale or conflicting RBIs. Two known
+gaps follow from that: `Foo.new(...)` is not checked against
+`initialize`'s `sig`, and a method with a `*rest`, `**kwrest`, `&block` or
+post parameter loses its whole contract, the return type included. Keep running
+`srb tc` alongside itaruby to preserve your existing Sorbet checks.
 
 ## Quick start
 
@@ -84,12 +100,13 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (or an exactly matching RBI param), only a literal argument is judged |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |
 | E0107 | Warning | a local's inferred usage contradicts every candidate type |
 | E0108 | Error | operator operand pairing MRI raises `TypeError` on, both operands proven from literals in one scope |
+| E0109 | Error | a literal a method returns (an explicit `return <literal>`, or a tail whose every branch is a literal and none fits) contradicts its own Sorbet `sig` (or exactly matching RBI) return type |
 | E0001 | Error | syntax error (prism, error-tolerant) |
 
 itaruby reads whatever else exists for free: Tapioca RBIs (`sorbet/rbi/`,

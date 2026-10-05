@@ -126,7 +126,6 @@
 {"code":"E0104","column":12,"line":52,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/app/services/update_account_service.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":7,"message":"unresolved constant `Doorkeeper::Application`","path":"mastodon/app/controllers/api/v1/apps_controller.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":74,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/app/models/domain_block.rb","severity":"warning"}
-{"code":"E0104","column":12,"line":74,"message":"unresolved constant `Terrapin::CommandNotFoundError`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":76,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/app/lib/text_formatter.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":91,"message":"unresolved constant `ActiveModelSerializers::SerializableResource`","path":"mastodon/app/helpers/statuses_helper.rb","severity":"warning"}
 {"code":"E0104","column":12,"line":93,"message":"unresolved constant `Parslet::ParseFailed`","path":"mastodon/app/models/webhook.rb","severity":"warning"}
@@ -136,7 +135,6 @@
 {"code":"E0104","column":13,"line":16,"message":"unresolved constant `Paperclip::Error`","path":"mastodon/lib/paperclip/blurhash_transcoder.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":22,"message":"unresolved constant `Sidekiq::ScheduledSet`","path":"mastodon/app/workers/poll_expiration_notify_worker.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":25,"message":"unresolved constant `Paperclip::Error`","path":"mastodon/lib/paperclip/transcoder.rb","severity":"warning"}
-{"code":"E0104","column":13,"line":38,"message":"unresolved constant `TempfileFactory`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":43,"message":"unresolved constant `OpenTelemetry::Trace`","path":"mastodon/spec/controllers/concerns/deprecation_concern_spec.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":44,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/requests/omniauth_callbacks_spec.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":44,"message":"unresolved constant `HTTP::TimeoutError`","path":"mastodon/app/lib/request.rb","severity":"warning"}
@@ -148,8 +146,6 @@
 {"code":"E0104","column":13,"line":62,"message":"unresolved constant `Webpush::Legacy::Encryption`","path":"mastodon/spec/workers/web/push_notification_worker_spec.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":68,"message":"unresolved constant `FileUtils`","path":"mastodon/app/lib/attachment_batch.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":72,"message":"unresolved constant `Paperclip::Error`","path":"mastodon/lib/paperclip/color_extractor.rb","severity":"warning"}
-{"code":"E0104","column":13,"line":73,"message":"unresolved constant `Paperclip::Error`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
-{"code":"E0104","column":13,"line":75,"message":"unresolved constant `Paperclip::Errors::CommandNotFoundError`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":131,"line":263,"message":"unresolved constant `Elastic::Transport::Transport::Error`","path":"mastodon/app/services/account_search_service.rb","severity":"warning"}
 {"code":"E0104","column":131,"line":35,"message":"unresolved constant `Elastic::Transport::Transport::Error`","path":"mastodon/app/services/tag_search_service.rb","severity":"warning"}
 {"code":"E0104","column":131,"line":40,"message":"unresolved constant `Elastic::Transport::Transport::Error`","path":"mastodon/app/services/statuses_search_service.rb","severity":"warning"}
@@ -162,7 +158,6 @@
 {"code":"E0104","column":14,"line":63,"message":"unresolved constant `Terrapin::ExitStatusError`","path":"mastodon/lib/paperclip/transcoder.rb","severity":"warning"}
 {"code":"E0104","column":14,"line":65,"message":"unresolved constant `Terrapin::CommandNotFoundError`","path":"mastodon/lib/paperclip/transcoder.rb","severity":"warning"}
 {"code":"E0104","column":14,"line":79,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/app/models/email_domain_block.rb","severity":"warning"}
-{"code":"E0104","column":149,"line":27,"message":"unresolved constant `Geometry`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":15,"line":10,"message":"unresolved constant `ActiveRecord::Assertions::QueryAssertions::SQLCounter`","path":"mastodon/spec/support/matchers/sql_queries.rb","severity":"warning"}
 {"code":"E0104","column":15,"line":106,"message":"unresolved constant `SidekiqUniqueJobs::Middleware::Client`","path":"mastodon/config/initializers/sidekiq.rb","severity":"warning"}
 {"code":"E0104","column":15,"line":114,"message":"unresolved constant `Addressable::IDNA`","path":"mastodon/app/serializers/initial_state_serializer.rb","severity":"warning"}
@@ -310,7 +305,6 @@
 {"code":"E0104","column":19,"line":49,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":51,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":61,"message":"unresolved constant `Terrapin::CommandLine`","path":"mastodon/lib/paperclip/transcoder.rb","severity":"warning"}
-{"code":"E0104","column":19,"line":65,"message":"unresolved constant `Terrapin::CommandLine`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":70,"message":"unresolved constant `Doorkeeper`","path":"mastodon/app/models/session_activation.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":72,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
 {"code":"E0104","column":19,"line":81,"message":"unresolved constant `StatusToBeDeleted`","path":"mastodon/lib/mastodon/cli/statuses.rb","severity":"warning"}
@@ -430,15 +424,12 @@
 {"code":"E0104","column":25,"line":29,"message":"unresolved constant `Sidekiq::ProcessSet`","path":"mastodon/app/lib/admin/system_check/sidekiq_process_check.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":36,"message":"unresolved constant `Doorkeeper`","path":"mastodon/spec/requests/oauth/authorizations_spec.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":37,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_security.rb","severity":"warning"}
-{"code":"E0104","column":25,"line":4,"message":"unresolved constant `Paperclip::Processor`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
-{"code":"E0104","column":25,"line":4,"message":"unresolved constant `Paperclip::Thumbnail`","path":"mastodon/lib/paperclip/lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":49,"message":"unresolved constant `Paperclip::Attachment`","path":"mastodon/app/lib/admin/system_check/media_privacy_check.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":5,"message":"unresolved constant `OpenTelemetry::Trace`","path":"mastodon/app/lib/activitypub/opentelemetry.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":6,"message":"unresolved constant `Paperclip::Processor`","path":"mastodon/lib/paperclip/type_corrector.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":62,"message":"unresolved constant `Doorkeeper::AccessToken`","path":"mastodon/app/models/session_activation.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":66,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":7,"message":"unresolved constant `Stoplight::DataStore::Redis`","path":"mastodon/config/initializers/stoplight.rb","severity":"warning"}
-{"code":"E0104","column":25,"line":72,"message":"unresolved constant `Terrapin::ExitStatusError`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":25,"line":8,"message":"unresolved constant `Stoplight::Notifier::Logger`","path":"mastodon/config/initializers/stoplight.rb","severity":"warning"}
 {"code":"E0104","column":26,"line":17,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
 {"code":"E0104","column":26,"line":19,"message":"unresolved constant `TermDefinition`","path":"mastodon/config/initializers/json_ld_identity.rb","severity":"warning"}
@@ -863,7 +854,6 @@
 {"code":"E0104","column":58,"line":149,"message":"unresolved constant `Doorkeeper::Application::APP_REDIRECT_URI_LIMIT`","path":"mastodon/spec/requests/api/v1/apps_spec.rb","severity":"warning"}
 {"code":"E0104","column":59,"line":3,"message":"unresolved constant `ActiveModel::Serializer`","path":"mastodon/app/serializers/rest/account_relationship_severance_event_serializer.rb","severity":"warning"}
 {"code":"E0104","column":60,"line":42,"message":"unresolved constant `PrometheusExporter::Instrumentation::Puma`","path":"mastodon/config/puma.rb","severity":"warning"}
-{"code":"E0104","column":64,"line":26,"message":"unresolved constant `Geometry`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":64,"line":3,"message":"unresolved constant `Doorkeeper`","path":"mastodon/db/seeds/01_web_app.rb","severity":"warning"}
 {"code":"E0104","column":64,"line":54,"message":"unresolved constant `TestObject`","path":"mastodon/spec/lib/activitypub/adapter_spec.rb","severity":"warning"}
 {"code":"E0104","column":64,"line":64,"message":"unresolved constant `PublicSuffix`","path":"mastodon/app/services/activitypub/process_account_service.rb","severity":"warning"}
@@ -887,7 +877,6 @@
 {"code":"E0104","column":7,"line":146,"message":"unresolved constant `FileUtils`","path":"mastodon/lib/mastodon/cli/upgrade.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":15,"message":"unresolved constant `PrometheusExporter::Client`","path":"mastodon/lib/mastodon/prometheus_exporter/local_server.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":168,"message":"unresolved constant `HTTP`","path":"mastodon/app/lib/request.rb","severity":"warning"}
-{"code":"E0104","column":7,"line":17,"message":"unresolved constant `Paperclip::Thumbnail`","path":"mastodon/lib/paperclip/lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":174,"message":"unresolved constant `WebAuthn::Credential`","path":"mastodon/spec/controllers/settings/two_factor_authentication/webauthn_credentials_controller_spec.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":176,"message":"unresolved constant `Linzer`","path":"mastodon/app/lib/signed_request.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":18,"message":"unresolved constant `FileUtils`","path":"mastodon/config/initializers/sidekiq.rb","severity":"warning"}
@@ -933,7 +922,6 @@
 {"code":"E0104","column":80,"line":71,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/app/models/account_migration.rb","severity":"warning"}
 {"code":"E0104","column":81,"line":39,"message":"unresolved constant `Elastic::Transport::Transport::Errors::InternalServerError`","path":"mastodon/spec/lib/mastodon/cli/search_spec.rb","severity":"warning"}
 {"code":"E0104","column":85,"line":27,"message":"unresolved constant `SUPPORTED_TYPES`","path":"mastodon/app/services/activitypub/fetch_remote_key_service.rb","severity":"warning"}
-{"code":"E0104","column":9,"line":100,"message":"unresolved constant `Vips::Image`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":107,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/lib/content_security_policy_spec.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":11,"message":"unresolved constant `Doorkeeper::Grape::AuthorizationDecorator`","path":"mastodon/config/initializers/rack_attack.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":110,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/helpers/application_helper_spec.rb","severity":"warning"}
@@ -980,7 +968,6 @@
 {"code":"E0104","column":9,"line":83,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/lib/content_security_policy_spec.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":83,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/presenters/instance_presenter_spec.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":84,"message":"unresolved constant `Linzer`","path":"mastodon/app/models/keypair.rb","severity":"warning"}
-{"code":"E0104","column":9,"line":94,"message":"unresolved constant `Vips::Image`","path":"mastodon/lib/paperclip/vips_lazy_thumbnail.rb","severity":"warning"}
 {"code":"E0104","column":9,"line":95,"message":"unresolved constant `ClimateControl`","path":"mastodon/spec/lib/content_security_policy_spec.rb","severity":"warning"}
 {"code":"E0104","column":94,"line":49,"message":"unresolved constant `Addressable::URI::InvalidURIError`","path":"mastodon/spec/validators/email_mx_validator_spec.rb","severity":"warning"}
 {"code":"E0104","column":95,"line":12,"message":"unresolved constant `Elastic::Transport::Transport::Error`","path":"mastodon/app/services/concerns/search_stoplight.rb","severity":"warning"}

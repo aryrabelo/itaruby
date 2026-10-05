@@ -94,12 +94,15 @@ jobs:
   ancestry-mutants:
     name: mutants (conflicting-superclasses)
     runs-on: ubuntu-latest
-    env:
-      ITA_MUTANT_LAB: ${{ runner.temp }}/mutant-lab
     steps:
       - uses: actions/checkout@v7
       - uses: Swatinem/rust-cache@v2
+      # Step-level env: the `runner` context does not exist in a job-level
+      # `env` (actionlint: "context runner is not allowed here"), and GitHub
+      # rejects the whole workflow file over it.
       - name: Ancestry and alias source mutants (isolated public-source copy)
+        env:
+          ITA_MUTANT_LAB: ${{ runner.temp }}/mutant-lab
         run: python3 scripts/conflicting-superclasses-mutants.py
 
   # Gate c2b/c2c: the evidence producers and the reporters, two-sided.

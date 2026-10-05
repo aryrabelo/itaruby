@@ -32,6 +32,17 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
 
+# Every step runs under `shell: bash`, which GitHub executes as
+# `bash --noprofile --norc -eo pipefail {0}`. A step that names no shell
+# gets `bash -e {0}` instead, without pipefail, so `gate | tee` reports
+# tee's status: main's run 35762883001 logged the public gate's
+# `RESULT: FAIL` and still passed. scripts/public-gate-selftest.sh runs the
+# public verdict block under the shell resolved from this file and accuses
+# a copy with this default removed.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # Gate a + b + c2: the suite, a warning-free release build, and the
   # unwrap shape over production source.

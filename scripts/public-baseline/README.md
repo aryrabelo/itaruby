@@ -389,3 +389,129 @@ sites, one per file:
 
 No GONE line is a detection this wave lost: every one is a reference the
 checker could not resolve because the walker had not read the definition.
+
+## Regeneration 2026-10-05 — conflicting-superclass ambiguity became suppression
+
+The drift entered on 2026-09-22 with `1341582` and went unseen until
+2026-10-04: the CI public job piped `public-gate.sh` through `tee` under
+GitHub's default step shell (`bash -e`, no `pipefail`), so `tee`'s zero
+status masked the gate's non-zero result. Run `35762883001` (main at
+`05a282e`) logged `RESULT: FAIL` and passed. The checked-build audit below
+proves that the drift comes from checker source, not corpus movement. The
+pinned clone trees were Rails `6610cb45b39b6a2c1f260f90bbe920b5899f844b`,
+Mastodon `2c92a56e5d0fb490cc2e49a0dd9652499000fcb4`, and Discourse
+`eff621544daf344ce70e470b7f54f27bc75b68d9`.
+
+The endpoint `3f7592a` reproduced `rails.jsonl` exactly (906 lines) and
+`mastodon.jsonl` exactly (986 lines). Each measurement was preceded by
+`cargo build --release --locked` with its exit status checked and with
+`CARGO_TARGET_DIR` inside the scratch worktree. The culprit is `1341582`
+(`fix: keep the cbase marker on a harvested alias target`): the 33 Rails
+lines and 13 Mastodon lines below are present in its parent's build and
+absent from its own. Its parent `4981963` sits on the CI branch, which
+forked at `b038ea9`, before `20a8204` (the class-object flip). That branch
+therefore also lacks the flip's own changes: relative to the `3f7592a`
+baseline its builds carry the 30 `ita-blk` false positives the flip
+deleted and miss the flip's 1 E0101. Those 31 lines are branch content,
+not drift, and the merges `5887580`/`6d04dc7` reunite them, which is why
+`05a282e` reads 0 new / 33 gone. `60d8a06` (`test: ship the ancestry
+controls and their mutation harness`) is not a second culprit: its parent
+and its own checked builds measure the same. The mechanism is the
+superclass reconciliation `1341582` brought into `index.rs`:
+`resolve_const_segment` returns `ConstResolution::Ambiguous` when the
+owner is in `ambiguous_ancestry` (or the lexical scope conflicts), and
+`const_exists` treats `Ambiguous` as existence, so E0104 stays silent
+instead of reporting a missing constant. This is suppression, not a source
+change in either public clone.
+
+### Rails GONE — 33 lines, 32 FALSE POSITIVES repaired + 1 unreachable reference
+
+Every line is an E0104 warning. 32 name a constant that exists when the
+pinned Rails application and its locked dependencies are loaded. The
+33rd, `Dalli::Protocol::Binary`, names a constant that does NOT exist
+under the lock, in a branch the lock never runs. No TRUE POSITIVE was
+lost.
+
+| file:line | constant | verdict and proof |
+|---|---|---|
+| `actionpack/test/dispatch/session/mem_cache_store_test.rb:42` | `Dalli::Client` | FALSE POSITIVE repaired — `dalli` 5.0.6 in Rails `Gemfile.lock`. |
+| `activerecord/test/cases/dirty_test.rb:13` | `InTimeZone` | FALSE POSITIVE repaired — project file `activerecord/test/cases/helper.rb:38-51`, inherited from `ActiveRecord::TestCase`. |
+| `activerecord/test/cases/attribute_methods_test.rb:21` | `InTimeZone` | FALSE POSITIVE repaired — same project helper and ancestor. |
+| `activejob/test/cases/logging_test.rb:22` | `ActiveSupport::Logger::Severity` | FALSE POSITIVE repaired — the project loads Rails' logger severity module. |
+| `guides/bug_report_templates/action_controller.rb:41` | `Rack::Test::Methods` | FALSE POSITIVE repaired — `rack-test` 2.2.0 is in Rails `Gemfile.lock`. |
+| `actionpack/test/dispatch/session/mem_cache_store_test.rb:43` | `Dalli::DalliError` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:45` | `Dalli::Client` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:49` | `Dalli::DalliError` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:46` | `Dalli::DalliError` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:432` | `Dalli` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:436` | `Dalli::Protocol` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activerecord/test/cases/adapters/abstract_mysql_adapter/connection_test.rb:11` | `SQLSubscriber` | FALSE POSITIVE repaired — project file `activerecord/test/cases/helper.rb:20-36` defines it on the `ActiveRecord::TestCase` ancestor. |
+| `activejob/test/cases/logging_test.rb:401` | `WARN` | FALSE POSITIVE repaired — `ActiveSupport::Logger::Severity` included at `:22` supplies the severity constants. |
+| `activejob/test/cases/logging_test.rb:406` | `INFO` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:425` | `WARN` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:430` | `INFO` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:436` | `WARN` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:441` | `INFO` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:447` | `WARN` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:452` | `INFO` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:471` | `WARN` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:476` | `INFO` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:495` | `FATAL` | FALSE POSITIVE repaired — same included severity module. |
+| `activejob/test/cases/logging_test.rb:500` | `ERROR` | FALSE POSITIVE repaired — same included severity module. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:23` | `Dalli::Protocol::Meta` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:26` | `Dalli::Protocol::Binary` | UNREACHABLE REFERENCE, not a runtime error — the line is the `else` arm of `if Dalli::VERSION >= "5."` (`:22`). The locked `dalli` 5.0.6 takes the `Meta` arm, and its gem ships only `protocol/meta.rb`, so `Binary` is absent under the lock but never evaluated. With a dalli older than 5 the arm runs and `Binary` exists. Silence loses no NameError. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:11` | `Dalli::Client` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `actionpack/test/dispatch/session/mem_cache_store_test.rb:185` | `Dalli::DalliError` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activerecord/test/cases/inheritance_test.rb:559` | `Firm::FirmOnTheFly` | FALSE POSITIVE repaired — the same project test executes `Firm.const_set :FirmOnTheFly` at `:555` before this call. |
+| `activerecord/test/cases/inheritance_test.rb:560` | `Firm::FirmOnTheFly` | FALSE POSITIVE repaired — the same runtime `Firm.const_set` at `:555` proves the constant. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:385` | `Dalli::DalliError` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activesupport/test/cache/stores/mem_cache_store_test.rb:22` | `Dalli::VERSION` | FALSE POSITIVE repaired — `dalli` 5.0.6 in the lockfile. |
+| `activerecord/test/cases/validations_test.rb:136` | `IncorporealModel` | FALSE POSITIVE repaired — the preceding project line `:133` executes `Object.const_set :IncorporealModel`. |
+
+### Mastodon GONE — 13 lines, all FALSE POSITIVE repaired
+
+All 13 are E0104 warnings in the Paperclip processor. They resolve through
+the locked dependency surface: `kt-paperclip` 8.0.0, `terrapin` 1.1.1, and
+`ruby-vips` 2.3.0 in Mastodon's `Gemfile.lock`; no TRUE POSITIVE was lost.
+
+| file:line | constant | verdict and proof |
+|---|---|---|
+| `lib/paperclip/vips_lazy_thumbnail.rb:74` | `Terrapin::CommandNotFoundError` | FALSE POSITIVE repaired — `terrapin` 1.1.1 in the lockfile. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:38` | `TempfileFactory` | FALSE POSITIVE repaired — `Paperclip::TempfileFactory` is supplied by `kt-paperclip` 8.0.0. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:73` | `Paperclip::Error` | FALSE POSITIVE repaired — `kt-paperclip` 8.0.0 defines the Paperclip error surface. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:75` | `Paperclip::Errors::CommandNotFoundError` | FALSE POSITIVE repaired — `kt-paperclip` 8.0.0 error namespace. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:27` | `Geometry` | FALSE POSITIVE repaired — `Paperclip::Geometry` from `kt-paperclip` 8.0.0, inherited inside `module Paperclip`. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:65` | `Terrapin::CommandLine` | FALSE POSITIVE repaired — `terrapin` 1.1.1 in the lockfile. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:4` | `Paperclip::Processor` | FALSE POSITIVE repaired — `kt-paperclip` 8.0.0 superclass. |
+| `lib/paperclip/lazy_thumbnail.rb:4` | `Paperclip::Thumbnail` | FALSE POSITIVE repaired — `kt-paperclip` 8.0.0 superclass. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:72` | `Terrapin::ExitStatusError` | FALSE POSITIVE repaired — `terrapin` 1.1.1 in the lockfile. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:26` | `Geometry` | FALSE POSITIVE repaired — `Paperclip::Geometry` from `kt-paperclip` 8.0.0. |
+| `lib/paperclip/lazy_thumbnail.rb:17` | `Paperclip::Thumbnail` | FALSE POSITIVE repaired — `kt-paperclip` 8.0.0 superclass. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:100` | `Vips::Image` | FALSE POSITIVE repaired — `ruby-vips` 2.3.0 in the lockfile. |
+| `lib/paperclip/vips_lazy_thumbnail.rb:94` | `Vips::Image` | FALSE POSITIVE repaired — `ruby-vips` 2.3.0 in the lockfile. |
+
+### Family verdicts and count
+
+| corpus | family | gone | verdict |
+|---|---|---:|---|
+| rails | Dalli / Dalli::Protocol | 13 | 12 FALSE POSITIVE repaired (constants of the locked `dalli` 5.0.6) + 1 unreachable reference (`Dalli::Protocol::Binary`, version-guarded) |
+| rails | project ancestor helpers (`InTimeZone`, `SQLSubscriber`) | 3 | 3 FALSE POSITIVE repaired; definitions read in `activerecord/test/cases/helper.rb` |
+| rails | logger severity (`ActiveSupport::Logger::Severity`, `WARN`, `INFO`, `FATAL`, `ERROR`) | 13 | 13 FALSE POSITIVE repaired; included severity module |
+| rails | Rack test | 1 | 1 FALSE POSITIVE repaired; locked `rack-test` gem |
+| rails | runtime `const_set` (`FirmOnTheFly`, `IncorporealModel`) | 3 | 3 FALSE POSITIVE repaired; writes precede the flagged reads |
+| mastodon | Paperclip / kt-paperclip | 7 | 7 FALSE POSITIVE repaired; locked `kt-paperclip` gem |
+| mastodon | Terrapin | 4 | 4 FALSE POSITIVE repaired; locked `terrapin` gem |
+| mastodon | Vips | 2 | 2 FALSE POSITIVE repaired; locked `ruby-vips` gem |
+
+**TRUE POSITIVES lost: 0.** No silenced line was a reachable NameError: 45
+are repaired false positives and 1 is a version-guarded reference that the
+lock never evaluates. This regeneration changes warning baselines only, not
+the error count.
+
+The regenerated sets come from the gate's own normalized artifacts
+(`public-<id>-fresh.txt`), produced by a checked release build at `05a282e`
+(crate sources are byte-identical to this branch tip). Each file keeps its
+previous line order: the gate compares `sort -u` sets, so the order is
+cosmetic, and keeping it makes both diffs pure deletions (rails −33,
+mastodon −13). The final gate measurement used the same pinned clone shas
+and left Discourse untouched.

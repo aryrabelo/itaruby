@@ -33,8 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     2026-09-29, turning the fail-closed public gate red on m5), fetched by
     the new `scripts/public-corpora-fetch.sh` — depth 1 at each pinned sha,
     only for repos with a baseline, the same fetcher CI now calls.
+- Public baselines re-recorded for rails (−33 lines) and mastodon (−13)
+  after a checked-build bisect and a line-by-line audit
+  (`scripts/public-baseline/README.md`, "Regeneration 2026-10-05"). Every
+  removed line is an E0104 warning that `1341582` silenced on 2026-09-22:
+  its superclass reconciliation reads ambiguous ancestry as a constant
+  that may exist. 45 were false positives and 1 is a version-guarded
+  reference the lock never evaluates. No true positive was lost and the
+  error counts are unchanged.
 
 ### Fixed
+- The CI `public` job can fail again. Its verdict step piped
+  `public-gate.sh` into `tee` under GitHub's default step shell (`bash -e`,
+  no pipefail), so the job reported tee's status: main's run 35762883001
+  logged `RESULT: FAIL` and passed. Every workflow step now runs under
+  `shell: bash` (`-eo pipefail`). `scripts/public-gate-selftest.sh` runs
+  the extracted verdict block under the step's effective shell, resolved
+  from the workflow, and accuses a copy with the default removed.
 - Class-object flip regression fixtures now distinguish the missing `sig`
   provider from the missing instance method in the no-RBI lookup control.
   Existing return-inference fixtures declare `extend T::Sig` without

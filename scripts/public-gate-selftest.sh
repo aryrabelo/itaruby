@@ -243,49 +243,130 @@ for entry in "${mutants[@]}"; do
 done
 
 # Exercise the workflow's actual shell blocks, not a second implementation of
-# its skip policy. Extract only by step name/indentation; no behavior needles.
+# its skip policy. Resolve its effective shell as GitHub does, not the shell
+# running this selftest. Extract by key names/indentation; no PyYAML dependency.
 say 'workflow controls — only the intentional GitLab SKIP may pass'
 wf=$LAB/workflow
 mkdir -p "$wf/scripts/public-baseline" "$wf/fakebin"
-python3 - "$ROOT/.github/workflows/gauntlet.yml" "$wf" <<'PY'
-import pathlib, sys
-workflow = pathlib.Path(sys.argv[1]).read_text().splitlines()
-# The fetch step is found by its NAME, like the verdict block below, and its
-# single-line `run:` is what CI executes.
-step = "      - name: Restore pinned public corpora"
-if step not in workflow:
-    sys.exit("public job has no 'Restore pinned public corpora' step")
-at = workflow.index(step) + 1
-fetch_command = None
-while at < len(workflow) and not workflow[at].startswith("      - "):
-    stripped = workflow[at].strip()
-    if stripped.startswith("run: "):
-        fetch_command = stripped[len("run: "):]
-        break
-    at += 1
-if fetch_command is None:
+extract_workflow() {
+  python3 - "$@" <<'PY'
+import json, pathlib, re, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+
+def scalar(value):
+    value = value.strip()
+    if value.startswith("'"):
+        match = re.fullmatch(r"'((?:[^']|'')*)'\s*(?:#.*)?", value)
+        if match:
+            return match[1].replace("''", "'")
+    elif value.startswith('"'):
+        match = re.fullmatch(r'("(?:[^"\\]|\\.)*")\s*(?:#.*)?', value)
+        if match:
+            return json.loads(match[1])
+    else:
+        return re.split(r"\s+#", value, maxsplit=1)[0].strip()
+    sys.exit("workflow extraction: unsupported quoted scalar: " + value)
+
+def end_of_block(start, limit, indent):
+    for at in range(start + 1, limit):
+        if lines[at].strip():
+            if len(lines[at]) - len(lines[at].lstrip()) <= indent:
+                return at
+    return limit
+
+def field(scope, key):
+    start, end, indent = scope
+    for at in range(start + 1, end):
+        match = re.fullmatch(" " * indent + re.escape(key) + r":(?:\s+(.*))?", lines[at])
+        if match:
+            return at, scalar(match[1] or "")
+    return None
+
+def block(scope, key):
+    found = field(scope, key)
+    if found is None:
+        return None
+    at, value = found
+    if value and not value.startswith("#"):
+        sys.exit("workflow extraction: expected indented block: " + key)
+    return at, end_of_block(at, scope[1], scope[2]), scope[2] + 2
+
+def default_shell(scope):
+    for key in ("defaults", "run"):
+        scope = block(scope, key)
+        if scope is None:
+            return None
+    return field(scope, "shell")
+
+root = (-1, len(lines), 0)
+jobs = block(root, "jobs")
+public = block(jobs, "public") if jobs else None
+steps = block(public, "steps") if public else None
+if steps is None:
+    sys.exit("workflow extraction: missing public job steps")
+
+def step(name):
+    start, end, indent = steps
+    for at in range(start + 1, end):
+        match = re.fullmatch(" " * indent + r"- name:\s+(.*)", lines[at])
+        if match and scalar(match[1]) == name:
+            return at, end_of_block(at, end, indent), indent + 2
+    sys.exit("public job has no step: " + name)
+
+fetch = field(step("Restore pinned public corpora"), "run")
+if fetch is None:
     sys.exit("public job does not invoke scripts/public-corpora-fetch.sh")
-lines = workflow
 name = "Public corpus gate (only GitLab baseline may be absent)"
-start = lines.index("      - name: " + name) + 1
-while start < len(lines) and not lines[start].startswith("      - "):
-    if lines[start] == "        run: |":
-        start += 1
-        break
-    start += 1
-body = []
-for line in lines[start:]:
-    if not line.startswith("          "):
-        break
-    body.append(line[10:])
-if not body:
+verdict = step(name)
+run = field(verdict, "run")
+if run is None or run[1] != "|":
     sys.exit("missing shell block: " + name)
-pathlib.Path(sys.argv[2], "verdict.sh").write_text("\n".join(body) + "\n")
-pathlib.Path(sys.argv[2], "clone.sh").write_text(fetch_command + "\n")
+body_end = end_of_block(run[0], verdict[1], verdict[2])
+body = [line[verdict[2] + 2:] for line in lines[run[0] + 1:body_end]]
+if not body:
+    sys.exit("empty shell block: " + name)
+
+# Most specific wins, including an unsupported override (fail closed).
+selected = field(verdict, "shell")
+if selected is None:
+    selected = default_shell(public)
+if selected is None:
+    selected = default_shell(root)
+shell = selected[1] if selected else None
+templates = {None: "bash -e {0}", "bash": "bash --noprofile --norc -eo pipefail {0}",
+             "sh": "sh -e {0}"}
+if shell in templates:
+    template = templates[shell]
+elif "{0}" in shell:
+    template = shell
+else:
+    sys.exit("workflow extraction: unsupported shell: " + repr(shell))
+destination = pathlib.Path(sys.argv[2])
+destination.mkdir(parents=True, exist_ok=True)
+(destination / "verdict.sh").write_text("\n".join(body) + "\n")
+(destination / "verdict-shell.txt").write_text(template + "\n")
+(destination / "clone.sh").write_text(fetch[1] + "\n")
 PY
+}
+extract_workflow "$ROOT/.github/workflows/gauntlet.yml" "$wf"
 if [[ $? != 0 ]]; then
   bad 'workflow extraction failed'
 else
+  ok "workflow effective shell: $(cat "$wf/verdict-shell.txt")"
+  shell_mutant="$LAB/gauntlet-no-workflow-shell.yml"
+  shell_mutant_wf="$LAB/workflow-no-workflow-shell"
+  shell_needle=$'defaults:\n  run:\n    shell: bash\n'
+  if ! mutate "$ROOT/.github/workflows/gauntlet.yml" "$shell_mutant" "$shell_needle" '' ||
+      cmp -s "$ROOT/.github/workflows/gauntlet.yml" "$shell_mutant"; then
+    bad 'INVALIDO-cmp: workflow shell mutant'
+  elif ! extract_workflow "$shell_mutant" "$shell_mutant_wf"; then
+    bad 'workflow shell mutant extraction failed'
+  elif grep -Fxq 'bash --noprofile --norc -eo pipefail {0}' \
+      "$shell_mutant_wf/verdict-shell.txt"; then
+    bad 'INVALIDO: workflow shell mutant still resolves to pipefail'
+  else
+    ok 'workflow shell mutant resolves without pipefail'
+  fi
   if grep -Fq './scripts/public-corpora-fetch.sh' "$wf/clone.sh"; then
     ok 'workflow public step invokes the shared corpus fetcher'
   else
@@ -302,17 +383,23 @@ SH
   expected_skip='public corpus gate skipped (not judged on this machine): public corpus (gitlab-foss)'
   run_verdict() {
     ( cd "$wf" && WORKFLOW_RC="$2" WORKFLOW_TRANSCRIPT="$3" \
-        bash -eo pipefail "$1" >"$wf/verdict.log" 2>&1 )
+        python3 - "$1" "${4:-$wf/verdict-shell.txt}" >"$wf/verdict.log" 2>&1 <<'PY'
+import os, pathlib, shlex, sys
+template = pathlib.Path(sys.argv[2]).read_text().strip()
+command = [arg.replace("{0}", sys.argv[1]) for arg in shlex.split(template)]
+os.execvp(command[0], command)
+PY
+    )
   }
   verdict_holds() {
-    local script=$1 name=$2 rc=0
+    local script=$1 name=$2 shell=${3:-$wf/verdict-shell.txt} rc=0
     case $name in
-      complete) run_verdict "$script" 0 'RESULT: PASS' || rc=$?; (( rc == 0 )) ;;
-      intentional) run_verdict "$script" 2 "$expected_skip" || rc=$?; (( rc == 0 )) ;;
-      failed) run_verdict "$script" 1 "$expected_skip" || rc=$?; (( rc != 0 )) ;;
-      crashed) run_verdict "$script" 7 "$expected_skip" || rc=$?; (( rc != 0 )) ;;
+      complete) run_verdict "$script" 0 'RESULT: PASS' "$shell" || rc=$?; (( rc == 0 )) ;;
+      intentional) run_verdict "$script" 2 "$expected_skip" "$shell" || rc=$?; (( rc == 0 )) ;;
+      failed) run_verdict "$script" 1 "$expected_skip" "$shell" || rc=$?; (( rc != 0 )) ;;
+      crashed) run_verdict "$script" 7 "$expected_skip" "$shell" || rc=$?; (( rc != 0 )) ;;
       other-skip)
-        run_verdict "$script" 2 "${expected_skip} public corpus (rails)" || rc=$?
+        run_verdict "$script" 2 "${expected_skip} public corpus (rails)" "$shell" || rc=$?
         (( rc != 0 )) ;;
     esac
   }
@@ -320,6 +407,21 @@ SH
     if verdict_holds "$wf/verdict.sh" "$name"; then ok "workflow $name";
     else bad "workflow $name"; fi
   done
+  if [[ -f "$shell_mutant_wf/verdict.sh" ]]; then
+    for name in failed crashed; do
+      if verdict_holds "$shell_mutant_wf/verdict.sh" "$name" \
+          "$shell_mutant_wf/verdict-shell.txt"; then
+        bad "workflow shell mutant not accused by $name"
+      elif verdict_holds "$shell_mutant_wf/verdict.sh" intentional \
+          "$shell_mutant_wf/verdict-shell.txt" &&
+          verdict_holds "$shell_mutant_wf/verdict.sh" complete \
+          "$shell_mutant_wf/verdict-shell.txt"; then
+        ok "workflow shell mutant accused by $name (allowed outcomes survive)"
+      else
+        bad "workflow shell mutant broke an allowed outcome for $name"
+      fi
+    done
+  fi
   for name in failed other-skip; do
     case $name in
       failed) needle='"$rc" -eq 2'; replacement='"$rc" -ne 0' ;;

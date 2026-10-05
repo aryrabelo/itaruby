@@ -299,6 +299,25 @@ found, and the launch bar is winning on both.
   producer that can lie makes every gate downstream of it decorative.
   `scripts/instrument-mutants.sh` now re-injects each defect as a mutant
   and demands it reproduce, and runs as gate c2b.
+- A CI step's shell is part of the instrument, and a selftest that picks
+  its own shell judges a different program (learned 2026-10-05, binding,
+  measured): the `public` job ran `public-gate.sh | tee ...` under the
+  shell GitHub uses for a step that names none, `bash -e {0}`, which has no
+  pipefail. The pipeline's status was tee's 0, so the job could not fail.
+  Main's run 35762883001 printed `RESULT: FAIL` (rails 33 gone, mastodon
+  13 gone) and concluded success, and the drift sat unseen from 2026-09-22
+  to 2026-10-04. `public-gate-selftest.sh` executed that very block, but
+  under `bash -eo pipefail`, so it stayed green on a job that could not
+  fail. The workflow now defaults every step to `shell: bash` (`-eo
+  pipefail`). The selftest resolves the verdict step's EFFECTIVE shell by
+  GitHub's precedence (step, job `defaults`, workflow `defaults`, else
+  `bash -e`) and accuses a workflow copy with the default removed. Any
+  selftest that executes a workflow block runs it under the shell CI would
+  use, never one it chose. The same audit found the disk-diet workflow
+  reading `${{ runner.temp }}` in a job-level `env`, where GitHub has no
+  `runner` context and rejects the whole file. Run `actionlint` on every
+  workflow edit, because a workflow that GitHub refuses to start fails
+  nowhere locally.
 - A probe that fails for the wrong reason proves nothing, and the wrong
   reason is usually the fixture (learned 2026-09-17, binding, measured):
   the positive-control run of the harness above — a deliberately blind

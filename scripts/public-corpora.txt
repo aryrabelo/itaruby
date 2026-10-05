@@ -15,10 +15,14 @@
 # Format: one repo per line, whitespace-separated:
 #   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>]
 # `<pinned-sha>` is the exact default-branch HEAD these numbers were measured
-# against, pinned so a repo rename/rebase cannot silently move the corpus
-# under a baseline. Clone the repo into $PUBLIC_CORPORA_ROOT/<id>; a missing
-# clone is a SKIP unless PUBLIC_GATE_CLONE=1 clones it (gitlab-foss is
-# multi-GB, so the human decides).
+# against, pinned so a repo rename/rebase cannot silently move the corpus under
+# a baseline. Clones live in `$PUBLIC_CORPORA_ROOT` (default
+# `$HOME/.local/share/itaruby/public-corpora`); a missing clone is a SKIP unless
+# PUBLIC_GATE_CLONE=1 restores it. The default moved because `~/Sites/temp-files`
+# is a swept scratch area: libera-hd archived and deleted the corpora on
+# 2026-09-29, which turned the fail-closed gate red on m5. `~/.local/share`
+# holds durable user data that no sweeper touches. The shared fetcher uses a
+# depth-1 pinned fetch with no history, the same method CI already used.
 #
 # `<clone-dir>` is OPTIONAL and defaults to `<id>`. It exists for a RE-PIN:
 # the fresh revision is measured in a linked `git worktree` of the canonical

@@ -1,0 +1,16 @@
+scripts/mutant_lab.py
+  h_b156936c57c455 1-69
+scripts/sorbet-contracts-mutants.py
+  h_b156936c57c455 2,23-27,917,928,937-939,975-983,991
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "2b99ac162c260dacab8bc6a98f2b190f2991e521",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

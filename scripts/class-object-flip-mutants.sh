@@ -77,6 +77,27 @@
 #            fail its diagnostic assertion: Widget.load_nmae gets E0101.
 #         The shipped test also requires E0101 for the same typo on a
 #         closed receiver, so blanket silence cannot pass.
+#   CO-S  the namespace-only pass (issue #6, FP-B) is not run
+#         -> namespace_only_module_stays_open must fail: forem's
+#            `Honeycomb.add_field` shape reads as a closed, empty module
+#            again and accuses at 10:15 and 15:9
+#   CO-T  that pass loses its TOP-LEVEL check: it collects every proper
+#         prefix of a nested path instead of only the first segment
+#         -> nested_namespace_module_still_accuses must fail: the
+#            project's own `Sigil::Util` stops accusing (the shape of
+#            discourse's audited `DiffUtils` true positives)
+#   CO-U  it loses its NESTED-DEFINITION check: every top-level path is
+#         a candidate, nested or not
+#         -> constants_only_module_still_accuses must fail: a constant
+#            holder reads as a reopened namespace
+#   CO-V  it loses its MODULE check
+#         -> namespace_only_class_still_accuses must fail
+#   CO-W1..W5  `carries_own_surface` stops counting one surface kind
+#         each (instance methods, module methods, include, prepend,
+#         extend)
+#         -> namespace_module_with_own_methods_still_accuses (W1, W2) or
+#            namespace_module_with_mixins_still_accuses (W3..W5) must
+#            fail: each fixture module carries exactly one kind
 #
 # CO-R's former emission-blocker mutation was BLIND: Widget's unknown
 # class-body call sets `open`, so lookup_singleton returns Inconclusive
@@ -344,6 +365,76 @@ mutant CO-R "$IDX" \
   '            if let Some(m) = class.singleton_methods.get(name) {' \
   unrecognized_class_body_call_keeps_the_receiver_open \
   'THE LOOKUP GATE: an open singleton ancestor is treated as closed and emits E0101'
+
+mutant CO-S "$IDX" \
+  '    apply_namespace_only_modules(&mut index);' \
+  '' \
+  namespace_only_module_stays_open \
+  'the namespace-only pass never runs: a reopened gem module reads as closed and empty'
+
+mutant CO-T "$IDX" \
+  '        if let Some(at) = path.find("::") {
+            namespaces.insert(&path[..at]);
+        }' \
+  '        let mut end = 0;
+        while let Some(at) = path[end..].find("::") {
+            end += at;
+            namespaces.insert(&path[..end]);
+            end += 2;
+        }' \
+  nested_namespace_module_still_accuses \
+  'the namespace-only pass collects every proper prefix, not only the first segment: a nested project namespace stops accusing'
+
+mutant CO-U "$IDX" \
+  '        if let Some(at) = path.find("::") {
+            namespaces.insert(&path[..at]);
+        }' \
+  '        namespaces.insert(&path[..path.find("::").unwrap_or(path.len())]);' \
+  constants_only_module_still_accuses \
+  'the namespace-only pass takes every top-level path, nested or not: a constant holder reads as a namespace'
+
+mutant CO-V "$IDX" \
+  '            class.is_module && !carries_own_surface(class)' \
+  '            !carries_own_surface(class)' \
+  namespace_only_class_still_accuses \
+  'the namespace-only pass loses its module check: a class holding only nested definitions stops accusing'
+
+mutant CO-W1 "$IDX" \
+  '    !class.methods.is_empty()
+        || !class.singleton_methods.is_empty()' \
+  '    !class.singleton_methods.is_empty()' \
+  namespace_module_with_own_methods_still_accuses \
+  'the surface check stops counting instance methods: Vaultbox reads as namespace-only'
+
+mutant CO-W2 "$IDX" \
+  '        || !class.singleton_methods.is_empty()
+        || !class.includes.is_empty()' \
+  '        || !class.includes.is_empty()' \
+  namespace_module_with_own_methods_still_accuses \
+  'the surface check stops counting module methods: Ledgerline reads as namespace-only'
+
+mutant CO-W3 "$IDX" \
+  '        || !class.includes.is_empty()
+        || !class.prepends.is_empty()' \
+  '        || !class.prepends.is_empty()' \
+  namespace_module_with_mixins_still_accuses \
+  'the surface check stops counting include edges: Kitbag reads as namespace-only'
+
+mutant CO-W4 "$IDX" \
+  '        || !class.prepends.is_empty()
+        || !class.extends.is_empty()' \
+  '        || !class.extends.is_empty()' \
+  namespace_module_with_mixins_still_accuses \
+  'the surface check stops counting prepend edges: Gearbox reads as namespace-only'
+
+mutant CO-W5 "$IDX" \
+  '        || !class.prepends.is_empty()
+        || !class.extends.is_empty()
+}' \
+  '        || !class.prepends.is_empty()
+}' \
+  namespace_module_with_mixins_still_accuses \
+  'the surface check stops counting extend edges: Toolkit reads as namespace-only'
 
 echo
 if (( fail )); then

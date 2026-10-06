@@ -3798,8 +3798,13 @@ impl Checker<'_> {
             // `merge_declared_fragment`). No allowlist closes this; the
             // ancestor is real Ruby code this checker never modeled.
             // `anc_other` bucket: same "any other reason" catch-all as
-            // every non-DSL/meta/missing project open.
-            Some(Blocker::Project(OpenReason::ReopenedExternal)) => s.anc_other += 1,
+            // every non-DSL/meta/missing project open. Issue #6's
+            // namespace-only reopening of a gem module is the same kind of
+            // blocker found by shape instead of by path, so it lands here
+            // too.
+            Some(Blocker::Project(
+                OpenReason::ReopenedExternal | OpenReason::NamespaceOnlyModule,
+            )) => s.anc_other += 1,
             // Unreachable by `inconclusive_reason`'s own contract:
             // `merge_declared_fragment` always sets a declared fragment's
             // `Blocker` to `External`, never `Project(DeclaredExternal)`.

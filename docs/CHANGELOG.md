@@ -43,6 +43,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   error counts are unchanged.
 
 ### Fixed
+- Issue #6, FP-B: a project that reopens a gem's top-level module only to
+  put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
+  no longer makes every call on that module an E0101. Since the
+  class-object flip such a module read as closed and empty, so
+  `Honeycomb.add_field` was a "certain" NoMethodError. Measured
+  2026-10-06 on six pinned public clones: 2534 such E0101 on 13 receivers
+  (zammad `RSpec` 2053, gitlab-foss `Arel` 329, forem `Arel` 98, forem
+  `Honeycomb` 24, gitlab-foss `Fog` 9, forem `Ahoy` 5, redmine
+  `ActiveRecord` 4, gitlab-foss `Glql` 4, forem `AlgoliaSearch` 3, spree
+  `Typelizer` 2, zammad `EmailAddressValidator`, spree `FriendlyId`,
+  solidus `SolidusPaypalCommercePlatform`). Every silenced method was
+  found defined in the gem's own source, at the version the project's lock
+  names or, without a lock, at the oldest and newest its pin allows. The new
+  `OpenReason::NamespaceOnlyModule` opens a module only when it is top
+  level, nests at least one definition, and has no method or mixin edge
+  of its own; a class, a nested namespace, a constants-only module and a
+  module with its own surface keep accusing, each pinned by a
+  `dark_singleton.rs` control and a mutant (CO-S..CO-V, CO-W1..CO-W5).
+  All 2534 removed lines were predicted by shape and nothing new appeared;
+  rails, mastodon and discourse output is byte-identical. The
+  `queue_classic` fixture gained a module method of its own, because the
+  new pass also opened its namespace-only `QC` and blinded CO-L.
 - The CI `public` job can fail again. Its verdict step piped
   `public-gate.sh` into `tee` under GitHub's default step shell (`bash -e`,
   no pipefail), so the job reported tee's status: main's run 35762883001

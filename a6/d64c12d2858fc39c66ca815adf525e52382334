@@ -1,0 +1,40 @@
+AGENTS.md
+  h_b156936c57c455 187-194,475,578-585
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 3801-3807
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 137-146,5024-5028,6042-6115,6348-6349,6374
+crates/itaruby_semantic/tests/dark_singleton.rs
+  h_b156936c57c455 13-17,129-218
+crates/itaruby_semantic/tests/gem_reopen_lockfile.rs
+  h_b156936c57c455 132-135
+docs/CHANGELOG.md
+  h_b156936c57c455 46-67
+scripts/class-object-flip-mutants.sh
+  h_b156936c57c455 80-100,369-438
+testdata/dark_singleton/constants_only_module_still_accuses.rb
+  h_b156936c57c455 1-9
+testdata/dark_singleton/namespace_module_with_mixins_accuses.rb
+  h_b156936c57c455 1-35
+testdata/dark_singleton/namespace_module_with_own_methods_accuses.rb
+  h_b156936c57c455 1-26
+testdata/dark_singleton/namespace_only_class_still_accuses.rb
+  h_b156936c57c455 1-11
+testdata/dark_singleton/namespace_only_module_stays_open.rb
+  h_b156936c57c455 1-15
+testdata/dark_singleton/nested_namespace_module_still_accuses.rb
+  h_b156936c57c455 1-17
+testdata/gem_reopen_lockfile/silent_queue_classic_reopen.rb
+  h_b156936c57c455 9-14,16-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a6d64c12d2858fc39c66ca815adf525e52382334",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

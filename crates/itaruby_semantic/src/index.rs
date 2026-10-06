@@ -134,6 +134,16 @@ pub enum OpenReason {
     /// own): a real, fleshed-out class that merely appears in a
     /// generator template keeps its whole surface checkable.
     StringSourceDefined,
+    /// Issue #6, FP-B: a TOP-LEVEL module this tree writes only as a
+    /// namespace — nested definitions and constants, never a method or a
+    /// mixin edge of its own. That is how a project reopens a gem's
+    /// namespace to put its own code under it (forem's
+    /// `app/lib/honeycomb/noise_cancelling_sampler.rb` reopens
+    /// `honeycomb-beeline`'s `Honeycomb`), and such a reopening says
+    /// nothing about the module object's surface, which lives in the gem.
+    /// Set by `apply_namespace_only_modules`; see its doc comment for the
+    /// four conditions and the measurement behind them.
+    NamespaceOnlyModule,
 }
 
 /// What actually blocks a `MethodLookup::Inconclusive` from concluding
@@ -5011,6 +5021,11 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // `apply_concern_class_methods` above has already added its own
     // `ClassMethods` edges to the same field this pass walks).
     apply_extended_hooks(&mut index);
+    // Issue #6, FP-B: a top-level module the project only ever wrote as a
+    // namespace is a reopened gem namespace by shape. Runs last of the
+    // merge passes because it reads each module's FINAL surface — see
+    // `apply_namespace_only_modules`.
+    apply_namespace_only_modules(&mut index);
     build_subclass_map(&mut index);
     build_methods_by_name(&mut index);
     index
@@ -6024,6 +6039,80 @@ fn apply_string_source_definitions(index: &mut ProjectIndex) {
     }
 }
 
+/// Issue #6, FP-B: open every TOP-LEVEL module this tree writes only as a
+/// namespace, so its class object stops reading as a closed, empty surface.
+///
+/// `module Honeycomb; class NoiseCancellingSampler ... end; end` is how a
+/// project reopens a gem's namespace to put its own code under it, and the
+/// reopening declares nothing about the module object itself: the gem's
+/// `def self.add_field` lives in the gem, not in this tree. Since the
+/// class-object flip (2026-09-21) singleton lookup saw a closed module with
+/// no methods and read every `Honeycomb.add_field` as a certain
+/// `NoMethodError`. Measured 2026-10-06 on six pinned public clones
+/// (forem, zammad, spree, redmine, solidus, gitlab-foss): 2534 E0101 on 13
+/// such receivers, every one a method the gem defines (zammad's `RSpec`
+/// 2053, gitlab's and forem's `Arel` 329 and 98, forem's `Honeycomb` 24,
+/// ...). `apply_gem_reopenings` misses them because no lock name camelizes
+/// to the namespace (`honeycomb-beeline`, `rspec-core`, `ahoy_matey`), and
+/// `apply_undeclared_namespace_reopenings` leaves the module itself closed
+/// because the project DID wrap it bare.
+///
+/// Four conditions, all required, each pinned by a `dark_singleton.rs`
+/// control that still accuses:
+///
+/// * a module, the only shape the measurement found: a class holding only
+///   nested definitions keeps accusing;
+/// * top-level: a namespace-only module nested under the project's own
+///   namespace is that project's organization (discourse's
+///   `DiscourseAi::Utils::DiffUtils`, whose misses are audited true
+///   positives in the public baseline), so only the FIRST segment of a
+///   nested path is ever a candidate;
+/// * nests at least one definition (it is the first segment of some
+///   indexed `Path::...`): a module holding only constants is a constant
+///   holder, not a namespace;
+/// * no surface of its own (`carries_own_surface`): once this tree writes
+///   a method or a mixin edge into the module, the tree is where that
+///   module's surface comes from, and a miss on it stays conclusive.
+///
+/// Runs after every other merge pass because it reads each module's FINAL
+/// surface: `class << X` patches, attributed mixin edges, concern
+/// `ClassMethods` edges and extended-hook installs all land after the
+/// fragments merge. Additive only, like every opening: it can stand a
+/// lookup down, never create a diagnostic.
+fn apply_namespace_only_modules(index: &mut ProjectIndex) {
+    // The first segment of every nested indexed path: `A::B::C` makes `A`
+    // a candidate and never `A::B`. Collecting only that segment is both
+    // the top-level condition and the nests-a-definition condition.
+    let mut namespaces: FxHashSet<&str> = FxHashSet::default();
+    for path in index.by_path.keys() {
+        if let Some(at) = path.find("::") {
+            namespaces.insert(&path[..at]);
+        }
+    }
+    let targets: Vec<ClassId> = namespaces
+        .into_iter()
+        .filter_map(|path| index.by_path.get(path).copied())
+        .filter(|id| {
+            let class = &index.classes[id.0 as usize];
+            class.is_module && !carries_own_surface(class)
+        })
+        .collect();
+    for id in targets {
+        merge_open(index, id, OpenReason::NamespaceOnlyModule);
+    }
+}
+
+/// Did this tree write any method or mixin edge into `class`, on either
+/// track? One line per kind, each pinned by its own control in
+/// `dark_singleton.rs`.
+fn carries_own_surface(class: &ClassDef) -> bool {
+    !class.methods.is_empty()
+        || !class.singleton_methods.is_empty()
+        || !class.includes.is_empty()
+        || !class.prepends.is_empty()
+        || !class.extends.is_empty()
+}
+
 /// Singleton-track step N+1, shape (1): apply every held-aside by-name
 /// singleton patch (`X.singleton_class.prepend M`, `class << X`) to the
 /// class it names — and ONLY if the project already declares that class.
@@ -6256,7 +6345,8 @@ fn core_fragment_candidates(index: &ProjectIndex) -> Vec<(ClassId, String)> {
 ///
 /// `Yes` for every shape that runs unreadable code at definition time.
 /// `No` for the reasons that say only "this class lives outside the
-/// project" (`ReopenedExternal`, `DeclaredExternal`, `DynamicSuperclass`)
+/// project" (`ReopenedExternal`, `DeclaredExternal`, `DynamicSuperclass`,
+/// `NamespaceOnlyModule`)
 /// — those are why a core reopening is open AT ALL, and reading them as
 /// unreadable makes the whole name-keying inert. `MethodMissing` is
 /// `No` on purpose and loses nothing: the method is in the class's own
@@ -6281,6 +6371,7 @@ fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
         ) => true,
         Some(
             OpenReason::ReopenedExternal
+            | OpenReason::NamespaceOnlyModule
             | OpenReason::DeclaredExternal
             | OpenReason::DynamicSuperclass
             | OpenReason::MethodMissing,

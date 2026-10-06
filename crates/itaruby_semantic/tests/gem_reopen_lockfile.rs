@@ -129,7 +129,10 @@ fn unmapped_gem_reopen_still_covered_by_undeclared_namespace_fallback() {
 /// own source (`lib/queue_classic.rb:5`, version 4.0.0, the version this
 /// directory's `Gemfile.lock` declares), never inferred from the rails
 /// reopening it silences (`activejob/test/support/queue_classic/
-/// inline.rb:4`, 2 census residue records).
+/// inline.rb:4`, 2 census residue records). The fixture's `QC` also
+/// writes a module method of its own (issue #6): a reopening that only
+/// nests definitions is opened by the namespace-only pass too, and CO-L
+/// went blind on it.
 #[test]
 fn queue_classic_reopen_needs_the_exception_table_and_stays_silent() {
     let d = check_fixture("silent_queue_classic_reopen.rb");

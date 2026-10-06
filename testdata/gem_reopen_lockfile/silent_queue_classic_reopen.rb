@@ -6,7 +6,17 @@
 # so `gem_namespace_key` cannot pair them; the override table carries the
 # mapping, read out of the gem's own source (`lib/queue_classic.rb:5`,
 # version 4.0.0, the version this directory's `Gemfile.lock` declares).
+#
+# Issue #6 (2026-10-06): rails' exact shape - a module this tree writes only
+# as a namespace - is now also opened by the namespace-only pass, which made
+# CO-L (the override entry cut) BLIND. This reopening therefore also writes
+# a module method of its own, the shape where the tree owns part of `QC`'s
+# surface and only the lockfile mapping can say the rest lives in the gem.
 module QC
+  def self.inline?
+    true
+  end
+
   class Queue
     def enqueue(method)
       method

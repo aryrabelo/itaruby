@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that may exist. 45 were false positives and 1 is a version-guarded
   reference the lock never evaluates. No true positive was lost and the
   error counts are unchanged.
+- Private corpus pins moved to each corpus's newest main (2026-10-07):
+  corpus-a 251 -> 270 warnings, corpus-b 48 -> 53, errors unchanged. The
+  same checker (4c24ff1) run on a `git archive` of each revision reproduces
+  the old ceiling at the old pin and today's count at the new one, so the
+  rise is content. Every warning that exists only at the new revision sits
+  in a changed file and was read at its site: all are E0104 false
+  positives for constants defined outside the mapped subdirectory or in an
+  undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
 - Issue #6, FP-B: a project that reopens a gem's top-level module only to

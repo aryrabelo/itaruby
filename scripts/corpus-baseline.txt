@@ -116,7 +116,7 @@
 # 6 activeresource, 3 flipper, 1 activestorage), errors byte-identical (the
 # same single hash before and after). Slack is debt: tightened in the same
 # commit as the measurement.
-# corpus_rev 038a25ea4 — the corpus HEAD the 251 was measured against
+# Previous corpus_rev 038a25ea4 — the corpus HEAD the 251 was measured against
 # (clean tree, 2026-09-18). A bare git sha names no client. The previous pin
 # was 3acfe772 (its last commit on or before 2026-08-26, when 284 was taken);
 # it is superseded because 251 was measured on today's content, and pinning
@@ -131,7 +131,25 @@
 # New 99eef7d0416dd48f is a distinct, source-audited E0101: a singleton
 # call remained after its implementation moved to the instance surface.
 # This is not a message/column substitution. The E0102 hash is unchanged.
-corpus corpus-a warn_ceiling=251
+# 251 -> 270 (2026-10-07): re-pinned to the corpus's newest main on the
+# owner's request, measured on work with checker 4c24ff1. The rise is
+# content, proved by one instrument on both revisions: each revision
+# extracted with `git archive` (the whole repo, the checker run on the
+# mapped subdirectory inside it) — the old pin reproduces exactly 251, the
+# new one 270, and the new extraction matches the live checkout key for
+# key. All 19 warnings that exist only at the new revision sit in .rb files
+# changed between the two (223 changed), none disappeared, and errors are
+# byte-identical (the same 2 hashes). Each of the 19 was read at its site:
+# all are E0104 false positives in two families this checker already
+# carries, none a true positive — 5 name a constant the repo defines in a
+# library file OUTSIDE the mapped subdirectory (only the subdirectory is
+# indexed), and 14 name a constant from a locked gem with no declaration
+# here (10 from three public gems, 4 from a private gem whose source was
+# read to confirm the constants exist). Measured, not tightened: 270 is
+# today's exact count.
+# corpus_rev aea609d80 — the corpus HEAD the 270 was measured against
+# (clean tree, 2026-10-07).
+corpus corpus-a warn_ceiling=270
 err corpus-a 639b38e1e239db52
 err corpus-a 99eef7d0416dd48f
 
@@ -143,17 +161,28 @@ err corpus-a 99eef7d0416dd48f
 # 92 -> 65 (anchored 2026-08-26, sha 0b7ede7, same run as corpus-a above):
 # zero errors before and after, so the drop is warnings only.
 # 65 -> 61 (wave 10) -> 48 (wave 11+12, sha 2c5c5c0, same anchor run).
-# corpus_rev 4e538a69 — same measurement rule as corpus-a above (last commit
-# on or before 2026-08-26, recovered 2026-09-18). On 2026-09-18 this corpus
-# had advanced 38 commits / 21 .rb files past this revision.
-# Wave 14 (2026-09-18): measured 51 at corpus_rev cb612198 with the
+# Previous corpus_rev 4e538a69 — same measurement rule as corpus-a above
+# (last commit on or before 2026-08-26, recovered 2026-09-18). On
+# 2026-09-18 this corpus had advanced 38 commits / 21 .rb files past it.
+# Wave 14 (2026-09-18): measured 51 at revision cb612198 with the
 # wave-14 declarations — 1 warning silenced (activestorage), errors still
-# zero. 51 is still ABOVE this ceiling, so the number below is deliberately
-# NOT touched and NOT relaxed: the residual is content drift (38 commits
-# past the pin) plus first-party private-gem namespaces no public
-# declaration file may carry. The pin below therefore still describes the
-# 48 measurement, not today's run.
-corpus corpus-b warn_ceiling=48
+# zero. 51 was ABOVE the ceiling and the number was deliberately left at 48
+# until the drift could be attributed.
+# 48 -> 53 (2026-10-07): re-pinned to the corpus's newest main on the
+# owner's request, same instrument and checker (4c24ff1) as corpus-a's
+# 2026-10-07 entry. The old pin's extraction measures 47 today (the
+# activestorage warning wave 14 silenced), the new revision 53, and the new
+# extraction matches the live checkout key for key. All 6 warnings that
+# exist only at the new revision sit in .rb files changed between the two
+# (24 changed), none disappeared, and errors stay zero. Each was read at
+# its site: all are E0104 false positives, none a true positive — 4 name a
+# constant the repo defines OUTSIDE the mapped subdirectory (2 in a gem
+# vendored under the repo, 2 in an initializer), and 2 name a constant of
+# a locked private gem that the app's boot-time routing file also loads.
+# Measured, not tightened: 53 is today's exact count.
+# corpus_rev fd19ad23 — the corpus HEAD the 53 was measured against
+# (clean tree, 2026-10-07).
+corpus corpus-b warn_ceiling=53
 
 # measured 2026-08-22 @ 2363 .rb files
 # 2298 -> 1525 (bead ita-exc, -773 / -33.6%): constants written inside a

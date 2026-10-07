@@ -1,0 +1,16 @@
+docs/CHANGELOG.md
+  h_b156936c57c455 44-51
+scripts/corpus-baseline.txt
+  h_b156936c57c455 119,134-152,164-167,169-185
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b91e986ae968ca010848a34426409ce5e34ace0f",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

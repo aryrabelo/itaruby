@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Disk diet for the development workflow (2026-10-04, measured on m5):
+  every worktree that ran the gauntlet used to grow its own `target/`
+  (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet
+  writes ~35 GiB.
+  - `./scripts/dev gates` now runs the gauntlet in ONE gate box
+    (`$ITA_GATE_BOX`, default `~/.cache/itaruby/gate-box`): the calling
+    tree's HEAD plus its uncommitted delta, proved equal by a temp-index
+    `write-tree`, one run at a time under a lock (exit 75 while busy,
+    `--wait` to queue). `--at <rev>` gates a committed revision and
+    `--run <script>` runs one script there. `scripts/gate-box-selftest.sh`
+    (gate c2b, CI `instruments`) proves the mirror, the lock, the
+    corpora-map copy and the env cleanup two-sided.
+  - Lean dev profile: `debug = "line-tables-only"`, dependencies without
+    debuginfo, `incremental = false` — full test target 2.91 → 1.74 GiB,
+    bytes written per mutant rebuild 0.160 → 0.105 GiB.
+  - The Python mutant families share `scripts/mutant_lab.py`: a persistent
+    lab per family (`target/mutant-lab/<name>/`) recopied with fresh mtimes,
+    held under a lock, and aborted `INVALID-stale` unless the run rebuilt
+    `itaruby_semantic` — no more full dependency rebuild per run. Proved by
+    the `mutant-lab-fresh-build` case in `scripts/instrument-mutants.sh`.
+  - Public corpora move to `~/.local/share/itaruby/public-corpora` (their
+    old `~/Sites/temp-files` home is swept: it was archived and deleted on
+    2026-09-29, turning the fail-closed public gate red on m5), fetched by
+    the new `scripts/public-corpora-fetch.sh` — depth 1 at each pinned sha,
+    only for repos with a baseline, the same fetcher CI now calls.
+- Public baselines re-recorded for rails (−33 lines) and mastodon (−13)
+  after a checked-build bisect and a line-by-line audit
+  (`scripts/public-baseline/README.md`, "Regeneration 2026-10-05"). Every
+  removed line is an E0104 warning that `1341582` silenced on 2026-09-22:
+  its superclass reconciliation reads ambiguous ancestry as a constant
+  that may exist. 45 were false positives and 1 is a version-guarded
+  reference the lock never evaluates. No true positive was lost and the
+  error counts are unchanged.
+- Private corpus pins moved to each corpus's newest main (2026-10-07):
+  corpus-a 251 -> 270 warnings, corpus-b 48 -> 53, errors unchanged. The
+  same checker (4c24ff1) run on a `git archive` of each revision reproduces
+  the old ceiling at the old pin and today's count at the new one, so the
+  rise is content. Every warning that exists only at the new revision sits
+  in a changed file and was read at its site: all are E0104 false
+  positives for constants defined outside the mapped subdirectory or in an
+  undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
+
 ### Fixed
 - The sorbet-runtime enforcement gates can no longer be evaded (r4,
   review 5), and they read the whole project root, not only the checked
@@ -249,6 +292,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or
   post parameter drops its whole contract, the return included, so neither
   E0103 nor E0109 fires for it.
+- Issue #6, FP-B: a project that reopens a gem's top-level module only to
+  put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
+  no longer makes every call on that module an E0101. Since the
+  class-object flip such a module read as closed and empty, so
+  `Honeycomb.add_field` was a "certain" NoMethodError. Measured
+  2026-10-06 on six pinned public clones: 2534 such E0101 on 13 receivers
+  (zammad `RSpec` 2053, gitlab-foss `Arel` 329, forem `Arel` 98, forem
+  `Honeycomb` 24, gitlab-foss `Fog` 9, forem `Ahoy` 5, redmine
+  `ActiveRecord` 4, gitlab-foss `Glql` 4, forem `AlgoliaSearch` 3, spree
+  `Typelizer` 2, zammad `EmailAddressValidator`, spree `FriendlyId`,
+  solidus `SolidusPaypalCommercePlatform`). Every silenced method was
+  found defined in the gem's own source, at the version the project's lock
+  names or, without a lock, at the oldest and newest its pin allows. The new
+  `OpenReason::NamespaceOnlyModule` opens a module only when it is top
+  level, nests at least one definition, and has no method or mixin edge
+  of its own; a class, a nested namespace, a constants-only module and a
+  module with its own surface keep accusing, each pinned by a
+  `dark_singleton.rs` control and a mutant (CO-S..CO-V, CO-W1..CO-W5).
+  All 2534 removed lines were predicted by shape and nothing new appeared;
+  rails, mastodon and discourse output is byte-identical. The
+  `queue_classic` fixture gained a module method of its own, because the
+  new pass also opened its namespace-only `QC` and blinded CO-L.
+- The CI `public` job can fail again. Its verdict step piped
+  `public-gate.sh` into `tee` under GitHub's default step shell (`bash -e`,
+  no pipefail), so the job reported tee's status: main's run 35762883001
+  logged `RESULT: FAIL` and passed. Every workflow step now runs under
+  `shell: bash` (`-eo pipefail`). `scripts/public-gate-selftest.sh` runs
+  the extracted verdict block under the step's effective shell, resolved
+  from the workflow, and accuses a copy with the default removed.
 - Class-object flip regression fixtures now distinguish the missing `sig`
   provider from the missing instance method in the no-RBI lookup control.
   Existing return-inference fixtures declare `extend T::Sig` without

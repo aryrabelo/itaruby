@@ -25,9 +25,12 @@ reports which verification gates this machine can run.
 ./scripts/dev gates
 ```
 
-This runs `sf check`, `cargo test --workspace`, and the mutation probes
-under `testdata/`. Every one of those requires only this repository — no
-external data.
+This mirrors your tree (HEAD plus uncommitted changes) into a single gate
+box under `~/.cache/itaruby/gate-box` and runs `sf check`,
+`cargo test --workspace`, and the mutation probes under `testdata/` there,
+one run at a time, so a worktree never grows a cargo `target/` of its own
+for the full gauntlet. Every one of those requires only this repository —
+no external data.
 
 A second class of gate diffs a checked-out corpus of real-world Ruby code
 against `scripts/corpus-baseline.txt` (warning ceilings, error-hash

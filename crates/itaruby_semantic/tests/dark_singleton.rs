@@ -10,7 +10,11 @@
 //! * a receiver stood down by a dynamic-definer mark stays silent and
 //!   buckets `open`; removing the singleton lookup's open-ancestor guard
 //!   must produce a false E0101, not merely change a census label;
-//! * resolved calls and non-project receivers record nothing at all.
+//! * resolved calls and non-project receivers record nothing at all;
+//! * a top-level module this tree writes only as a namespace (issue #6,
+//!   FP-B) stays silent and buckets `open(Project(NamespaceOnlyModule))`,
+//!   while every shape the rule leaves out (methods or mixins of its own,
+//!   a nested module, a constants-only module, a class) still accuses.
 //!
 //! Diagnostics are checked alongside the census labels: an open receiver
 //! must stay silent, while a closed receiver with the same typo must accuse.
@@ -120,6 +124,96 @@ fn unrecognized_class_body_call_keeps_the_receiver_open() {
         "without the unknown DSL, the same typo must accuse"
     );
     assert_eq!(closed_recs, vec!["Widget load_nmae closed_notfound"]);
+}
+
+/// Issue #6, FP-B (CO-S): a top-level module this tree writes only as a
+/// namespace, nesting its own definitions and nothing else, says nothing
+/// about the module object's surface. forem reopens `honeycomb-beeline`'s
+/// `Honeycomb` exactly this way, and every `Honeycomb.add_field` read as a
+/// conclusive miss on code that runs. Both calls must stay silent and
+/// bucket open with the reason that names this rule.
+#[test]
+fn namespace_only_module_stays_open() {
+    let (diags, recs) = dark_fixture("namespace_only_module_stays_open.rb");
+    assert!(diags.is_empty(), "a namespace-only module never diagnoses: {diags:?}");
+    assert_eq!(
+        recs,
+        vec![
+            "Beeline add_field open(Project(NamespaceOnlyModule))",
+            "Beeline add_field open(Project(NamespaceOnlyModule))",
+        ],
+        "both calls bucket open with this rule's reason, and nothing reads closed"
+    );
+}
+
+/// The surface half of the rule (CO-W): a module this tree gives methods of
+/// its own is a module whose surface this tree writes. `Ledgerline`'s module
+/// method and `Vaultbox`'s instance method each keep their module closed, so
+/// both misses accuse (MRI raises `NoMethodError` on each line).
+#[test]
+fn namespace_module_with_own_methods_still_accuses() {
+    let (diags, _recs) = dark_fixture("namespace_module_with_own_methods_accuses.rb");
+    assert_eq!(
+        diags,
+        vec![
+            "25:12:E0101 undefined method `entires` for class `Ledgerline`".to_string(),
+            "26:10:E0101 undefined method `seal` for class `Vaultbox`".to_string(),
+        ]
+    );
+}
+
+/// Mixin edges are surface too: `extend`, `include` and `prepend` each keep
+/// their module closed. One module per edge kind, so dropping any one kind
+/// from the surface check silences exactly one of these lines.
+#[test]
+fn namespace_module_with_mixins_still_accuses() {
+    let (diags, _recs) = dark_fixture("namespace_module_with_mixins_accuses.rb");
+    assert_eq!(
+        diags,
+        vec![
+            "33:9:E0101 undefined method `asist` for class `Toolkit`".to_string(),
+            "34:8:E0101 undefined method `asist` for class `Kitbag`".to_string(),
+            "35:9:E0101 undefined method `asist` for class `Gearbox`".to_string(),
+        ]
+    );
+}
+
+/// CO-T: the rule stops at the top level. `Sigil::Util` nests a class and
+/// writes nothing else, like the reopened gem module above, but it sits
+/// under the project's own `Sigil`: the shape of discourse's
+/// `DiscourseAi::Utils::DiffUtils`, whose misses are audited true positives.
+#[test]
+fn nested_namespace_module_still_accuses() {
+    let (diags, recs) = dark_fixture("nested_namespace_module_still_accuses.rb");
+    assert_eq!(
+        diags,
+        vec!["17:13:E0101 undefined method `parse` for class `Sigil::Util`".to_string()]
+    );
+    assert_eq!(recs, vec!["Sigil::Util parse closed_notfound"]);
+}
+
+/// CO-U: a module holding only constants nests no definition. It is a
+/// constant holder, not a namespace this tree reopened, so its miss accuses.
+#[test]
+fn constants_only_module_still_accuses() {
+    let (diags, recs) = dark_fixture("constants_only_module_still_accuses.rb");
+    assert_eq!(
+        diags,
+        vec!["9:8:E0101 undefined method `interval` for class `Beacon`".to_string()]
+    );
+    assert_eq!(recs, vec!["Beacon interval closed_notfound"]);
+}
+
+/// CO-V: modules only, the one shape the FP-B measurement found. A class
+/// that nests nothing but its own error class keeps accusing.
+#[test]
+fn namespace_only_class_still_accuses() {
+    let (diags, recs) = dark_fixture("namespace_only_class_still_accuses.rb");
+    assert_eq!(
+        diags,
+        vec!["11:7:E0101 undefined method `connect` for class `Relay`".to_string()]
+    );
+    assert_eq!(recs, vec!["Relay connect closed_notfound"]);
 }
 
 /// Resolved calls never enter the residue bucket. (`Page.extend` itself

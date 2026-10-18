@@ -354,6 +354,15 @@ class ContractReturnControls
       1
     end
   end
+  # A `return` inside a block leaves the method with that value, and the
+  # walk does not enter closures: the only return point it can see is the
+  # String tail, so only the `uncertain` guard keeps this silent. MRI
+  # returns 1 here.
+  sig { returns(Integer) }
+  def returns_from_a_block
+    [1].each { return 1 }
+    "fallback"
+  end
 end
 "#, None);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");

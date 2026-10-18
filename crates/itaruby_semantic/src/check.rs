@@ -4944,12 +4944,10 @@ impl Checker<'_> {
     /// accused only when NO leaf fits, because this checker cannot tell a
     /// dead branch from a live one. A project whose runtime is not proven
     /// to raise on a broken sig (`ProjectIndex::sorbet_runtime_unchecked`)
-    /// accuses nothing: source contracts never get here
-    /// (`effective_sorbet`), and this also holds an RBI-only declaration's
-    /// arguments.
+    /// never reaches here: every contract comes from `effective_sorbet`,
+    /// which hands out none in that project, and an RBI is never one.
     fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
-        !self.index.sorbet_runtime_unchecked
-            && !leaves.is_empty()
+        !leaves.is_empty()
             && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))
     }
 

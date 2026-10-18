@@ -190,10 +190,11 @@ MUTATIONS = [
      "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,",
      "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Float,",
      "source_line_and_exotic_numerics_type_their_consumers"),
-    ("literal-only default_checked_level never still accuses", CHECK,
-     "        !self.index.sorbet_runtime_unchecked\n            && !leaves.is_empty()",
-     "        !leaves.is_empty()",
-     "default_checked_level_other_than_always_makes_sigs_inert"),
+    # removed: "literal-only default_checked_level never still accuses" — the
+    # unchecked guard it cut from `contract_breaks` was an equivalent copy of
+    # the one in `effective_sorbet` (measured BLIND after 7144dc0 made an RBI
+    # never a contract), so the copy is gone; the `effective_sorbet` mutant
+    # below still holds the decision.
     ("literal-only multi-argument mixin keeps its contract", INDEX,
      "    poison_ambiguous_mixin_contracts(&mut index);\n",
      "",

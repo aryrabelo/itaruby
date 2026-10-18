@@ -1168,12 +1168,19 @@ reopen.enumerable_echo([1])
 ///
 /// A module-typed contract never accuses anyway (see
 /// `module_typed_contracts_never_accuse`), so the `Unknown` is observable on
-/// the consumer: the call's result keeps what the body proves (`Integer`)
-/// instead of an instance of the module.
+/// the consumer. A sig types a consumer only where inference knows nothing,
+/// so `pass` returns its (never bound) param: the declared module is all
+/// that reaches `pass(-1)`. As an instance of the module, `.abs` would
+/// resolve to the mixin's String-returning `abs` and accuse the RBS-comment
+/// call — but `Integer#abs` shadows the mixin on MRI (sorbet-runtime
+/// included) and returns `1`.
 #[test]
 fn project_module_mixed_into_core_never_accuses_core_values() {
-    let source = r"
+    let source = r#"
 module ContractCoreMixin
+  def abs
+    "a mixin method Integer#abs always shadows"
+  end
 end
 class Integer
   include ContractCoreMixin
@@ -1186,17 +1193,25 @@ class ContractMixinUser
   def echo(value)
     1
   end
+  sig { params(value: ContractCoreMixin).returns(ContractCoreMixin) }
+  def pass(value)
+    value
+  end
+  #: (Integer) -> void
+  def take_integer(number); end
   sig { returns(ContractMixinTarget) }
   def target
     2
   end
 end
 ContractMixinUser.new.echo(1)
-";
+ContractMixinUser.new.take_integer(ContractMixinUser.new.pass(-1).abs)
+"#;
     let diags = check("core-mixin", source, None);
     assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
     assert_eq!(contract_names(source, &diags), ["target"], "{diags:?}");
     assert_eq!(ty_at("core-mixin", source, "ContractMixinUser.new", "echo(1)").as_deref(), Some("Integer"));
+    assert_eq!(ty_at("core-mixin", source, "ContractMixinUser.new.pass(-1)", "pass"), None);
 }
 
 /// Ruby looks a constant up in the ancestors of the cref before the top
@@ -1722,6 +1737,38 @@ end
 
     let control = check_files("extended-hook-control", &[&TARGET.replace("EXTENSION", ""), hook]);
     assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the extend: {control:?}");
+
+    // `def base.echo` in the hook is read by the extend-hook harvest alone
+    // (`apply_extended_hooks`): no install pass records a `def` through
+    // the hook's own parameter, so only the harvest's redefinition rule
+    // takes the singleton contract off. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036: with the `extend` the call returns
+    // "text"; without it, sorbet-runtime raises `TypeError`.
+    const SINGLETON: &str = r#"
+class ContractHookSingleton
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def self.echo(value)
+    value
+  end
+  EXTENSION
+end
+ContractHookSingleton.echo("text")
+"#;
+    let definer = r"
+module ContractHookDefiner
+  def self.extended(base)
+    def base.echo(value)
+      value.to_s
+    end
+  end
+end
+";
+    let diags = check_files("extended-hook-def", &[&SINGLETON.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let target = SINGLETON.replace("EXTENSION", "");
+    let control = check_files("extended-hook-def-control", &[&target, definer]);
+    assert_eq!(contract_names(&target, &control), ["\"text\""], "control must accuse without the extend: {control:?}");
 }
 
 /// A block reopening in another file redefines the method: like any other
@@ -1864,8 +1911,49 @@ end
     let macro_first = concern.replace("  included do", "  contract_setting :flag\n  included do");
     let diags = check_files("included-macro-first", &[&TARGET.replace("INCLUSION", "include ContractIncludedConcern"), &macro_first]);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // A hook that installs through a dynamic `send` records no definition
+    // (`hidden_definer_sources`), so no install pass knows its names: only
+    // the include-time rule, reading the hook method itself, takes the
+    // contract off. Measured on ruby 3.4.2 with sorbet-runtime 0.6.13036:
+    // with the `include` the call returns "text"; without it, `TypeError`.
+    let dynamic = r"
+module ContractIncludedSend
+  def self.included(base)
+    definer = :define_method
+    base.send(definer, :echo) { |value| value.to_s }
+  end
+end
+";
+    let diags = check_files("included-dynamic-send", &[&TARGET.replace("INCLUSION", "include ContractIncludedSend"), dynamic]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // An open module's include-time block also replaces the includer's
+    // own body, whose literal return no call-site lookup guards: only the
+    // include-time rule keeps E0109 off it. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036 and activesupport 8.1.3: with the
+    // `include` `label` returns 1; without it, `TypeError`.
+    const RETURNING: &str = r#"
+class ContractIncludedReturn
+  extend T::Sig
+  sig { returns(Integer) }
+  def label
+    "text"
+  end
+  INCLUSION
+end
+ContractIncludedReturn.new.label
+"#;
+    let relabel = "module ContractIncludedRelabel\n  extend ActiveSupport::Concern\n  included do\n    def label\n      1\n    end\n  end\nend\n";
+    let relabel_macro_first = relabel.replace("  included do", "  contract_setting :flag\n  included do");
+    for (i, module) in [relabel, relabel_macro_first.as_str()].iter().enumerate() {
+        let diags = check_files(&format!("included-relabel-{i}"), &[&RETURNING.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
+        assert!(contract_codes(&diags).is_empty(), "{module}: {diags:?}");
+    }
+    let returning = RETURNING.replace("INCLUSION", "");
+    let control = check_files("included-relabel-control", &[&returning, relabel]);
+    assert_eq!(contract_codes(&control), ["E0109"], "control must accuse without the include: {control:?}");
+    assert_eq!(contract_names(&returning, &control), ["label"], "{control:?}");
 
-    let control = check_files("included-hook-control", &[&TARGET.replace("INCLUSION", ""), hook, concern]);
+    let control = check_files("included-hook-control", &[&TARGET.replace("INCLUSION", ""), hook, concern, dynamic]);
     assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
 }
 
@@ -2253,6 +2341,10 @@ end
 /// An instance is never a literal, so the Sorbet sigs below judge none of
 /// it; the rule lives on in `compatible`, which the RBS-comment E0103
 /// (`#: (String, ...) -> void`) still applies to inferred instances.
+/// `ContractReopenParams.new` infers nothing (its reopened `Hash` ancestor
+/// is open), so the reopen's rule is held by `self` inside the subclass:
+/// an inferred instance whose complete ancestry names only the OPEN
+/// reopen of `Hash`.
 #[test]
 fn core_subclass_instances_satisfy_core_contracts() {
     let source = r#"
@@ -2266,6 +2358,9 @@ class Hash
   def contract_nominal_touch; self; end
 end
 class ContractReopenParams < Hash
+  def contract_pass_on
+    ContractCoreSubclasses.new.take(ContractSafeStr.new("b"), self, ContractRows.new)
+  end
 end
 class ContractGemBuffer
   def contract_gem_touch; self; end
@@ -2307,6 +2402,7 @@ class ContractCoreSubclasses
 end
 ContractCoreSubclasses.new.take(ContractSafeStr.new("a"), ContractParams.new, ContractRows.new)
 ContractCoreSubclasses.new.take(ContractGemChild.new, ContractReopenParams.new, ContractRows.new)
+ContractReopenParams.new.contract_pass_on
 "#;
     let diags = check("core-subclasses", source, Some(r"
 class ContractGemBuffer < String
@@ -2557,9 +2653,14 @@ fn def_on_a_constant_redefines_its_singleton_contract() {
 /// proves no instance either.
 #[test]
 fn singleton_prepend_takes_the_shadowed_contract_off() {
-    // The last shape's module answers no `scale` itself: its `prepended`
-    // hook defines one on the singleton class it lands on.
-    let shapes: [(&str, &str); 6] = [
+    // The last two shapes' module answers no `scale` itself: its
+    // `prepended` hook defines one on the singleton class it lands on. The
+    // last does it through a dynamic `send`, which records no definition
+    // (`hidden_definer_sources`), so only `known_mixin_names` reading the
+    // hook takes the contract off. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036: with the prepend `scale("text")` returns
+    // "text" while `grow("text")` still raises `TypeError`.
+    let shapes: [(&str, &str); 7] = [
         ("class << self\n    prepend ContractStringScale\n  end", ""),
         ("", "ContractScaleCfg.singleton_class.prepend(ContractStringScale)\n"),
         (
@@ -2571,6 +2672,10 @@ fn singleton_prepend_takes_the_shadowed_contract_off() {
         (
             "class << self\n    prepend ContractScaleHooked\n  end",
             "module ContractScaleHooked\n  def self.prepended(base)\n    base.define_method(:scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+        (
+            "class << self\n    prepend ContractScaleHooked\n  end",
+            "module ContractScaleHooked\n  def self.prepended(base)\n    definer = :define_method\n    base.send(definer, :scale) { |x| x.to_s }\n  end\nend\n",
         ),
     ];
     for (i, (body, outside)) in shapes.iter().enumerate() {
@@ -2938,6 +3043,12 @@ ContractInPlaceSink.new.take(arr.last)
     let evaled = check("in-place-eval", evaled_source, None);
     assert!(evaled.is_empty(), "{evaled:?}");
     assert_eq!(ty_at("in-place-eval", evaled_source, "ContractInPlaceSink.new.take", "last"), None);
+    // A block handed to `eval` is ignored: it is still a string `eval`
+    // (MRI: `arr = [1]; eval("arr << 's'") { }; arr.last # => "s"`).
+    let evaled_block = evaled_source.replace("eval(\"arr << 's'\")", "eval(\"arr << 's'\") { }");
+    let evaled = check("in-place-eval-block", &evaled_block, None);
+    assert!(evaled.is_empty(), "{evaled:?}");
+    assert_eq!(ty_at("in-place-eval-block", &evaled_block, "ContractInPlaceSink.new.take", "last"), None);
 
     // Reads that neither change nor hand out the collection keep it: a
     // query, and an iteration whose value is dropped. The value is inferred,
@@ -3969,6 +4080,27 @@ fn project_root_hazards_reach_a_partial_check() {
         let diags = run(&format!("enforced-{i}"), rel, text);
         assert_eq!(gate_codes(&diags), ENFORCED, "{rel}: {diags:?}");
     }
+    // An ignore file ABOVE the project root says nothing about the
+    // project: Ruby still loads the hazard, so the sig stays inert. The
+    // layout is built under this test's own directory, the `.ignore`
+    // (honoured with or without git) one level above the `Gemfile`.
+    let outer = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("sorbet-contract-root-parent-ignore");
+    let _ = std::fs::remove_dir_all(&outer);
+    let project = outer.join("project");
+    let app = project.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(project.join("config/initializers")).unwrap();
+    std::fs::write(outer.join(".ignore"), "sorbet.rb\n").unwrap();
+    std::fs::write(project.join("Gemfile"), "source \"https://rubygems.org\"\n").unwrap();
+    std::fs::write(project.join("config/initializers/sorbet.rb"), "T::Configuration.default_checked_level = :never\n")
+        .unwrap();
+    let mut db = Db::default();
+    itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&app));
+    let file = SourceFile::new(&db, app.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+    ProjectFiles::new(&db, vec![file]);
+    ClosedWorld::new(&db, true);
+    let diags = check_file(&db, file).clone();
+    assert!(gate_codes(&diags).is_empty(), "parent .ignore: {diags:?}");
 }
 
 /// F4: sorbet-runtime checks a generic's category, never its type

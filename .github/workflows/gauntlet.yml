@@ -8,13 +8,13 @@ name: gauntlet
 # ~5 h in series.
 #
 # What is NOT here, on purpose:
-#   gate d  - the three private corpora never leave the machines that host
-#             them; the local `./scripts/dev gates` + `anchor` stay the only
-#             proof of corpus-a/b/c.
+#   gate d  - the private corpus (corpus-c) never leaves the machine that
+#             hosts it; the local `./scripts/dev gates` on m5 stays its only
+#             proof.
 #   gate c  - the testdata mutation probe is inline in gauntlet-gates.sh and
 #             runs there (two seconds; not worth a second convention).
 # So a green run here is the gauntlet's `PASS (incomplete)` by construction,
-# never a full proof. The corpus anchor still decides a merge.
+# never a full proof. The m5 gate run still decides a merge.
 
 on:
   pull_request:
@@ -184,7 +184,8 @@ jobs:
       - run: ./scripts/inference-bench-selftest.sh
       - run: ./scripts/inference-gate.sh
 
-  # Gate f: the four public Rails apps, each at its pinned sha, cloned
+  # Gate f: the declared public corpora (scripts/public-corpora.txt), each
+  # at its pinned sha, cloned
   # shallow and cached by the declaration's hash. The script never clones
   # here (PUBLIC_GATE_CLONE unset): a missing clone is this job's bug, not
   # a skip. PUBLIC_COLUMN selects measured hosted-runner ceilings explicitly;

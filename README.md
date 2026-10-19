@@ -117,6 +117,14 @@ winning on both, on every one of the four repos.
 [discourse]: https://github.com/discourse/discourse
 [gitlab-foss]: https://gitlab.com/gitlab-org/gitlab-foss
 
+Since 2026-10-19 two more public corpora, [zammad] (a Rails monolith) and
+[Homebrew/brew] (checked at `Library/Homebrew`, where `sorbet tc` runs as a
+mechanical oracle), are gated as drift detectors and sources of findings.
+They were not part of the Sorbet round below.
+
+[zammad]: https://github.com/zammad/zammad
+[Homebrew/brew]: https://github.com/Homebrew/brew
+
 As of the last measurement round: itaruby is faster on 2 of the 4 repos
 (discourse, gitlab-foss) and slower on the other 2 (rails, mastodon) against
 `srb tc --typed true`. A reciprocal false-negative audit (240 sampled

@@ -619,3 +619,49 @@ would never have shown.
 corpora is a false positive with a named mechanism, so each family above is
 a fix with a known size; a fix re-baselines downward and its GONE lines are
 ledgered against these families.
+
+## Regeneration 2026-10-19 — brew B1: mixins of a core reopening reach class objects
+
+The fix: the class-object track's core consult
+(`core_object_instance_surface`, the `Class`/`Module`/`Object`/`Kernel`/
+`BasicObject` chain) now also reads the MIXINS a project reopening of
+those names wrote, in MRO order (prepends, own defs, includes). It reads
+literal definitions only and answers `Found` or nothing. An unresolved or
+open mixin is skipped, as it was before mixins were read at all, so the
+only verdict that moves is `NotFound` -> `Found`, and only for a name that
+some such mixin literally defines. Brew's `class Module; include T::Sig`
+(`extend/module.rb:1-2`) resolves because `T::Sig#sig` is literal in the
+vendored sorbet-runtime (`vendor/bundle/ruby/4.0.0/gems/sorbet-runtime-0.6.13544/lib/types/sig.rb:98`),
+even though `T::Sig` is declared open by `declarations/gems.rbi`.
+
+A fail-closed variant was measured first and rejected. It made an open or
+unresolved mixin answer `Inconclusive`, and on rails it took the class-object
+track down wholesale: rails' own `class Object; include
+ActiveSupport::Tryable` (`activesupport/lib/active_support/core_ext/object/try.rb:33`)
+names a module the index holds open, so every class-object lookup went
+Inconclusive. It silenced the reachable NoMethodError at
+`activesupport/test/autoloading_fixtures/raises_no_method_error.rb` (the
+fixture's whole point; constantize tests expect that raise). Brew also lost
+its 18 B2 lines, for that blanket reason rather than B2's own mechanism.
+The shipped variant leaves both in place.
+
+Measured with the gate's own normalization against the pinned clones:
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 1196 |
+
+### Brew GONE: 1196 lines, all family B1, all FALSE POSITIVE
+
+| family | gone | verdict |
+|---|---:|---|
+| B1 `sig` undefined on class/module bodies | 1196 | FALSE POSITIVE repaired. Every line is E0101 ``undefined method `sig` `` in 197 files, none under `vendor/` and 4 under `test/`. Sites read: `api/cask_download.rb:11` (module body), `keg_only_reason.rb:7` (class body), `bundle/dumper.rb:12` (`module Homebrew::Bundle::Dumper`), `test_runner_formula.rb:7`, `api/packages_index.rb:269` and `build_environment.rb:17`; none of these files extends `T::Sig` itself, and all of them reach `sig` through `class Module; include T::Sig`. |
+
+**TRUE POSITIVES lost: 0.** brew's error set goes 1240 -> 44 (B2 18, B5 18,
+B3 7, B4 1, all unchanged); warnings are unchanged. `brew.jsonl` keeps its
+previous line order, so the diff is a pure deletion of 1196 lines, and its
+`sort -u` set equals the gate's fresh artifact byte-for-byte.

@@ -92,8 +92,12 @@ gitlab-foss https://gitlab.com/gitlab-org/gitlab-foss.git 4a42053c3a8274a18d5d71
 # five consecutive runs each, the slowest (the first, cold) x1.5 rounded up:
 #   zammad 1.018s (median 0.618s) -> 2s
 #   brew   2.829s (median 2.660s) -> 5s
-# CI column: MEASUREMENT PROBE, not a ceiling. `0` makes the hosted public
-# job print each run's wall time and fail; the next commit replaces it with
-# that job's measured time under the same x1.5/round-up contract.
-zammad https://github.com/zammad/zammad 228b456174a989a2f9b5b33de2189a5808499150 2:0
-brew https://github.com/Homebrew/brew d78c1943dc2b77930691102481df0d9e9bf7e257 5:0 check=Library/Homebrew
+# CI column: ubuntu-latest public job 118164694899, release build at
+# 98d70a6a1e7c0702ec4ae6229817f0b27d335174, 2026-10-19, which ran with a
+# deliberate `0` CI ceiling so it printed each wall time and failed:
+# https://github.com/aryrabelo/itaruby/actions/runs/39283999477
+# Official job log measured zammad 2.343s, brew 10.854s (both baselines
+# matched exactly in the same job). The SAME x1.5/round-up contract gives
+# 4s and 17s.
+zammad https://github.com/zammad/zammad 228b456174a989a2f9b5b33de2189a5808499150 2:4
+brew https://github.com/Homebrew/brew d78c1943dc2b77930691102481df0d9e9bf7e257 5:17 check=Library/Homebrew

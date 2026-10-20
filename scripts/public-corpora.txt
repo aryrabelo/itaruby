@@ -1,8 +1,9 @@
 # Public-corpus declaration — the launch bar, as a versioned file.
 #
-# The project is benchmarked against Sorbet on four PUBLIC Rails apps
-# (rails/rails, mastodon/mastodon, discourse/discourse, gitlab-org/gitlab-foss)
-# on both speed and true errors found, and the launch bar is winning on both.
+# The project is benchmarked against Sorbet on PUBLIC Ruby codebases
+# (rails/rails, mastodon/mastodon, discourse/discourse, gitlab-org/gitlab-foss,
+# zammad/zammad, Homebrew/brew) on both speed and true errors found, and the
+# launch bar is winning on both.
 # This file makes that measurement an exit code: scripts/public-gate.sh reads
 # one repo per line, clones it when the operator allows, runs
 # `ita check <clone> --format=json`, and compares the SORTED diagnostic set
@@ -13,7 +14,10 @@
 # the diffs are written in the clear).
 #
 # Format: one repo per line, whitespace-separated:
-#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>]
+#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>] [check=<path>]
+# `check=<path>` names the directory inside the clone that `ita check` is
+# pointed at (brew: `Library/Homebrew`); it is fail-closed in the gate and
+# baseline paths stay relative to the clone root.
 # `<pinned-sha>` is the exact default-branch HEAD these numbers were measured
 # against, pinned so a repo rename/rebase cannot silently move the corpus under
 # a baseline. Clones live in `$PUBLIC_CORPORA_ROOT` (default
@@ -76,3 +80,24 @@ rails https://github.com/rails/rails 6610cb45b39b6a2c1f260f90bbe920b5899f844b 3:
 mastodon https://github.com/mastodon/mastodon 2c92a56e5d0fb490cc2e49a0dd9652499000fcb4 2:2 mastodon-head
 discourse https://github.com/discourse/discourse eff621544daf344ce70e470b7f54f27bc75b68d9 10:35 discourse-head
 gitlab-foss https://gitlab.com/gitlab-org/gitlab-foss.git 4a42053c3a8274a18d5d71fff2f88ba23e5a69e9 600
+#
+# 2026-10-19  zammad 228b456174a989a2f9b5b33de2189a5808499150 (ls-remote HEAD)
+#             brew   d78c1943dc2b77930691102481df0d9e9bf7e257 (ls-remote HEAD
+#             at the 2026-10-19 triage; the remote has moved since, and the
+#             pin holds the triaged tree)
+# These two replace the retired private corpora as the source of findings
+# (scripts/public-baseline/README.md has the ledger). Baselines generated on
+# m5 with the release binary at 295e213 (cargo build --release, exit 0).
+# Dev ceilings, m5, load average 3.5-5.2 on 10 cores (other agents running):
+# five consecutive runs each, the slowest (the first, cold) x1.5 rounded up:
+#   zammad 1.018s (median 0.618s) -> 2s
+#   brew   2.829s (median 2.660s) -> 5s
+# CI column: ubuntu-latest public job 118164694899, release build at
+# 98d70a6a1e7c0702ec4ae6229817f0b27d335174, 2026-10-19, which ran with a
+# deliberate `0` CI ceiling so it printed each wall time and failed:
+# https://github.com/aryrabelo/itaruby/actions/runs/39283999477
+# Official job log measured zammad 2.343s, brew 10.854s (both baselines
+# matched exactly in the same job). The SAME x1.5/round-up contract gives
+# 4s and 17s.
+zammad https://github.com/zammad/zammad 228b456174a989a2f9b5b33de2189a5808499150 2:4
+brew https://github.com/Homebrew/brew d78c1943dc2b77930691102481df0d9e9bf7e257 5:17 check=Library/Homebrew

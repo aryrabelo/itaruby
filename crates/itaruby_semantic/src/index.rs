@@ -9185,8 +9185,58 @@ impl ProjectIndex {
         };
         for path in object_class {
             if let Some(&cid) = self.by_path.get(*path) {
-                if let Some(m) = self.class(cid).methods.get(name) {
+                let core = self.class(cid);
+                if let Some(found) = self.core_mixin_definition(core, core.prepends.iter().rev(), name) {
+                    return Some(found);
+                }
+                if let Some(m) = core.methods.get(name) {
                     return Some(MethodLookup::Found(m, cid));
+                }
+                if let Some(found) = self.core_mixin_definition(core, core.includes.iter().rev(), name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// A method a project reopening of a core receiver-chain class
+    /// (`Class`/`Module`/`Object`/`Kernel`/`BasicObject`) puts on every
+    /// class object THROUGH A MIXIN, read as literal definitions only.
+    ///
+    /// 2026-10-19, measured on Homebrew/brew (`Library/Homebrew`):
+    /// `extend/module.rb` is `class Module; include T::Sig; end`, and
+    /// `T::Sig#sig` is defined in the vendored sorbet-runtime
+    /// (`lib/types/sig.rb:98`). Reading only the reopening's own method
+    /// map left 1196 class-body `sig { ... }` calls as false E0101.
+    ///
+    /// Found-only, keyed on the method NAME: each mixin's linearized
+    /// ancestry is searched for a literal `def name`, and openness,
+    /// unresolved names and incomplete chains are skipped rather than
+    /// answered `Inconclusive`. That is deliberate and measured: the
+    /// fail-closed variant (the `extend` consult's arms) turned EVERY
+    /// class-object lookup in rails Inconclusive, because rails' own
+    /// `class Object; include ActiveSupport::Tryable` names a module the
+    /// index holds open (its `try` bodies `instance_eval`), and it
+    /// silenced the true positive at
+    /// `activesupport/test/autoloading_fixtures/raises_no_method_error.rb`.
+    /// Skipping an unreadable mixin is the verdict this consult gave
+    /// before it read mixins at all, so the only verdict that moves is
+    /// `NotFound` -> `Found` (invariant #1), and only for a name some
+    /// mixin of a core reopening literally defines.
+    fn core_mixin_definition<'m>(
+        &self,
+        core: &ClassDef,
+        mixins: impl Iterator<Item = &'m String>,
+        name: &str,
+    ) -> Option<MethodLookup<'_>> {
+        for mixin in mixins {
+            let Some(mid) = self.resolve_const(&core.nesting, mixin) else {
+                continue;
+            };
+            for a in self.ancestors(mid).0 {
+                if let Some(m) = self.class(a).methods.get(name) {
+                    return Some(MethodLookup::Found(m, a));
                 }
             }
         }

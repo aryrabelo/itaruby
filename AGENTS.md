@@ -20,9 +20,10 @@ Sorbet/Steep) and its roadmap asks for "Allow the Ruby LSP to connect to a
 typechecker add-on" — an aspiration, not an implementation. The gem in
 `scripts/ruby-lsp-itaruby/` is that add-on; the VS Code extension in
 `scripts/vscode/` is a reference client, never the main channel. Sorbet is the
-precision adversary: itaruby is benchmarked against it on public Rails apps
-(rails/rails, mastodon, discourse, gitlab-foss) on both speed and true errors
-found, and the launch bar is winning on both.
+precision adversary: itaruby is benchmarked against it on public Ruby
+codebases (rails/rails, mastodon, discourse, gitlab-foss, zammad,
+Homebrew/brew) on both speed and true errors found, and the launch bar is
+winning on both.
 
 ## Core Contract
 
@@ -177,7 +178,8 @@ found, and the launch bar is winning on both.
   levels) fails closed to "couldn't tell, treat as present" rather than
   "confirmed absent, diagnose" — an unresolvable result is never license to
   accuse.
-- The private benchmark corpora (corpus-a, corpus-b, corpus-c) are sacred:
+- The private benchmark corpus (corpus-c; corpus-a and corpus-b were retired
+  2026-10-19, see "Machines" below) is sacred:
   their expected error sets are recorded in `scripts/corpus-baseline.txt` as
   SHA-256 hashes only — never a path, class, method, table, or column name in
   clear text. Any new diagnostic on a corpus must be proven a true positive by
@@ -361,13 +363,27 @@ found, and the launch bar is winning on both.
   `method_missing` target and one of them poisons every lookup on its track.
   The name-keyed form closed the intended cluster with zero collateral. When
   a mechanism cannot see the receiver, only the name can carry the proof.
-- The anchor worktree needs the corpora declaration copied in (learned
+- Fail-closed on a link EVERY receiver shares is the same poison (learned
+  2026-10-19, binding, measured): reading the mixins of a project
+  `class Object`/`class Module` reopening with the `extend` consult's
+  arms (open or unresolved mixin -> `Inconclusive`) made every class-object
+  lookup in rails Inconclusive, because rails' `class Object; include
+  ActiveSupport::Tryable` names a module the index holds open. It cost
+  the true positive at
+  `activesupport/test/autoloading_fixtures/raises_no_method_error.rb`.
+  A link on the shared core chain is receiver-blind by position, so the
+  consult there is Found-only and keyed on a literal definition of the
+  name; an unreadable mixin is skipped, which is the verdict that link
+  gave before it was read at all (`core_mixin_definition`, mutants
+  CO-X3/CO-X4).
+- A fresh worktree needs the corpora declaration copied in (learned
   2026-08-26, binding): `scripts/corpora-local.txt` is machine-local, so a
   fresh detached worktree has none and the corpus gate SKIPs every corpus
   while still printing `RESULT: PASS (incomplete)`. That is the wave-9 trap
-  in a new shape — absence of proof reading as the expected absence. Copy the
-  file from the machine's own checkout into the worktree before trusting an
-  anchor, and check the `corpus gate proved:` line names what you expected.
+  in a new shape — absence of proof reading as the expected absence. The
+  gate box copies the file from the machine's own checkout (proved by
+  `scripts/gate-box-selftest.sh`); still check that the `corpus gate
+  proved:` line names what you expected.
 - Same-wave work touching the same file needs an explicit disjoint-region
   note in the brief (learned, binding): two same-wave workstreams once
   edited the same function in the same file and produced a real merge
@@ -593,7 +609,7 @@ green but at least one declared corpus could not be checked on this machine
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin, mutant-lab fresh build): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/gate-box-selftest.sh` — the gate box that runs the gauntlet: mirror exact (HEAD + uncommitted delta), lock exclusive, corpora map copied, the caller's `CARGO_TARGET_DIR` dropped; each step removed as a mutant and accused by its named case | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
-| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-a/corpus-b: **only `work`**; corpus-c: **only `m5`** |
+| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-c: **only `m5`** |
 | Navigation oracle vs `scripts/navfixture/oracle.jsonl` | only the repo | **any machine** |
 | `scripts/public-gate.sh` vs `scripts/public-corpora.txt` + `scripts/public-baseline/<id>.jsonl` | a depth-1 clone of each declared public repo at its pinned sha under `$HOME/.local/share/itaruby/public-corpora`, fetched by `scripts/public-corpora-fetch.sh` (never auto-fetched by the gate; `PUBLIC_GATE_CLONE=1` opts in); error sets are **drift detectors, unaudited** until `scripts/public-baseline/README.md`'s ledger has a verdict per family | **any machine with the clones** |
 | `scripts/inference-gate.sh` — the inference bench (`scripts/inference-bench.jsonl`), guarded by `scripts/inference-bench-selftest.sh` | only the repo; `ruby` for the ground truth, `srb` at the pinned version for the comparison leg (missing/mismatched → that leg skips) | **any machine** |
@@ -608,7 +624,7 @@ future model call in this repository inherits the same three rules and the same
 two-sided proof, and its state is built from the digest or from files this
 repository already versions in the clear — never from a private corpus artifact.
 
-The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall still covers the three private corpora unchanged.
+The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall still covers the private corpus unchanged.
 
 The inference bench (`scripts/inference-bench-README.md`) answers a different
 question from every corpus gate: on twelve self-contained, gem-free fixtures,
@@ -753,20 +769,21 @@ target from 2.91 to 1.74 GiB and the bytes written per mutant rebuild from
 for locals under lldb, `CARGO_PROFILE_DEV_DEBUG=true`. The release
 profile's `debug = true` is untouched.
 
-Full proof today needs two machines — `./scripts/dev gates` on `m5` (proves
-corpus-c) plus the anchor on `work` (proves corpus-a and corpus-b) — because
-no single machine holds all three corpora.
+Full proof today is one machine: `./scripts/dev gates` on `m5` proves
+corpus-c, the only private corpus still declared, and every public corpus.
 
-## Multi-machine: corpora on both, full proof needs both
+## Machines: the private corpus lives on m5
 
-Machines (tailnet): `work` (100.86.40.27, corpora corpus-a and corpus-b) and
-`m5`/`m5-de-ary` (100.88.227.102, the strong machine, corpus-c). SSH aliases:
-`ssh m5-ary` from here, `ssh work` from there (pinned key, `IdentitiesOnly
-yes`). The `work` host's own tailnet name is deliberately not written here: it
-is named after one of the private corpora's owners, so spelling it out would
-name a client through the back door — the same wall that keeps corpus ids
-generic (learned 2026-08-26, binding). Resolve it from `~/.ssh/config`, which
-is machine-local and unversioned.
+`m5`/`m5-de-ary` (100.88.227.102, the strong machine) holds corpus-c and the
+public clones; `ssh m5-ary` reaches it. The machine that held corpus-a and
+corpus-b is gone for good, and both corpora were retired on 2026-10-19: no
+machine can ever check them again, so their declarations were removed
+instead of left to SKIP forever, and zammad/zammad and Homebrew/brew replace
+them as public sources of findings (learned 2026-10-19, binding: a corpus
+that lives on exactly one machine dies with it, so a declaration nobody
+can measure is deleted, never kept as a permanent SKIP; the replacement is
+a public corpus whose clone any machine can fetch). Their history stays in
+`docs/CHANGELOG.md` and git; their names and paths never entered it.
 
 The performance ceiling is per-machine in the same way the corpora are, and
 is honest about it: `scripts/perf-baseline.txt`'s `dev` column is an `m5`
@@ -775,80 +792,41 @@ asks for the column via `PERF_COLUMN` and NEVER infers it — keying off `$CI`
 was tried and is a trap, because agent harnesses and plenty of local shells
 export `CI`, and the failure is silent in the wrong direction: a dev machine
 quietly judged against the loose ceiling passes exactly the regression the
-gate exists to catch (learned 2026-08-26, binding). Until `work` has a
-measured column of its own, run the anchor there with `PERF_COLUMN=ci`; a
-ceiling copied between machines is a fabricated measurement, and raising the
-`m5` column to fit a slower machine is the loosening this repository forbids.
+gate exists to catch (learned 2026-08-26, binding). A machine without a
+measured column of its own uses none: a ceiling copied between machines is
+a fabricated measurement, and raising the `m5` column to fit a slower
+machine is the loosening this repository forbids.
 
 The public-corpus gate uses the same explicit selection: `PUBLIC_COLUMN`
 defaults to `dev`; `ci` reads the second number in `scripts/public-corpora.txt`.
 Both columns use that file's measured-time x1.5/round-up contract; a missing
-selected ceiling fails, never borrows another machine's number. The hosted
-workflow accepts exit 2 only when the complete skip list is the intentionally
-unbaselined GitLab corpus. Any other skip, drift, or failure remains red.
-
-Anchor flow (run gates on `work` against an exact sha, in a disposable
-worktree — never disturb the checkout another agent may be using):
-
-```sh
-ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q origin main && \
-  git worktree add -f --detach ~/Sites/worktrees/ita-anchor-<slug> <sha> && \
-  cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt \
-     ~/Sites/worktrees/ita-anchor-<slug>/scripts/corpora-local.txt && \
-  cd ~/Sites/worktrees/ita-anchor-<slug> && \
-  PERF_COLUMN=ci PATH="/opt/homebrew/opt/ruby/bin:$HOME/.cargo/bin:$PATH" ./scripts/gauntlet-gates.sh; \
-  cd ~/Sites/personal-team/itaruby && git worktree remove --force ~/Sites/worktrees/ita-anchor-<slug>'
-```
-
-The host checkout on `work` is `~/Sites/personal-team/itaruby` — the one that
-holds `scripts/corpora-local.txt`. `~/Sites/itaruby` there is a different
-checkout on another branch with no map, and following it silently SKIPs both
-corpora while the transcript still ends in `PASS (incomplete)` (learned
-2026-09-18, binding, measured). Read the `corpus gate proved:` line and
-require it to name `corpus-a` AND `corpus-b` before calling an anchor green.
+selected ceiling fails, never borrows another machine's number. The `ci`
+number comes from the hosted public job's own log on a pushed branch, never
+from a dev run. The hosted workflow accepts exit 2 only when the complete
+skip list is the intentionally unbaselined GitLab corpus. Any other skip,
+drift, or failure remains red.
 
 The split is over (2026-09-22): `aryrabelo/itaruby` (public) is THE
 repository; `aryrabelo/itaruby-private` is an archive that receives nothing
 new. On 2026-09-22 the 21 commits the public lacked were cherry-picked onto
 it with their original messages after a mechanical secrecy audit (every
-segment of the corpus path and of the anchor host's name counted across
+segment of the corpus path and of the corpus host's name counted across
 messages and tree: zero new hits), and the trees were proved byte-identical
-before each push. Until then the two repos shared no ancestor, `origin` on
-`work` fetched nothing this repository committed, and the anchor failed
-with `fatal: invalid reference: <sha>` — twice in one night before the
-remote was read (learned 2026-09-21, binding, measured). `scripts/dev
-anchor` fetches from `$ANCHOR_REMOTE`, default `origin`; on `work` the
-`private` remote may still exist and is never the answer. Every commit
-message, PR title and PR body is a public surface from the first byte — the
-secrecy wall's five surfaces above are no longer "audited before sync",
-they are live.
+before each push (learned 2026-09-21, binding, measured: until then the two
+repos shared no ancestor and a remote gate run failed with `fatal: invalid
+reference: <sha>`). Every commit message, PR title and PR body is a public
+surface from the first byte — the secrecy wall's five surfaces above are no
+longer "audited before sync", they are live.
 
-Explicit `PATH` because a non-interactive ssh shell does not load
-`~/.cargo/bin` — without it `sf` and friends "don't exist" on `work` even when
-installed (learned 2026-08-20, binding). The same trap one layer down, for
-`ruby` (learned 2026-09-18, binding, measured): a non-interactive ssh shell
-resolves `ruby` to `/usr/bin/ruby` 2.6, which cannot parse an endless method
-definition, so gates a, c1 and g fail on the interpreter and not on the code —
-identical run with brew's ruby 4.0.6 turns all three green, every other verdict
-byte-identical. And `$(brew --prefix ruby)` does NOT reach it: `brew` itself
-is not on a non-interactive ssh PATH, so the substitution expands to the empty
-string and the PATH prefix becomes `/bin:...`, landing right back on
-`/usr/bin/ruby` 2.6 — the anchor block and `scripts/dev` therefore hardcode
-`/opt/homebrew/opt/ruby/bin` on `work` (learned 2026-09-21, measured: one
-full anchor run wasted, gate 0b naming ruby 2.6.10 under a `PATH` that was
-supposed to prepend brew's ruby). It is a PATH trap, not an ssh trap, and it
-fires locally too
-(learned 2026-09-19, binding, measured): a local `./scripts/dev gates` whose
-environment put `/usr/bin` before mise's shims ran gate a on ruby 2.6, and the
-red surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,
-unexpected '='` INSIDE a fixture — ~70 minutes into gate c1, with the two
-mutant families that run the operand-types suite aborting on `baseline is not
-green` (the harness's own guard, correct, against a baseline red for the wrong
-reason). Gate 0b now names the interpreter before anything runs it (`PASS
-ruby 3.x`, or a FAIL with the version and the path), so that verdict costs two
-seconds instead of a mutation pass. On `m5` the 3.x ruby is mise's shim under
-`~/.local/share/mise/shims`, and there is no brew ruby at
-`/opt/homebrew/opt/ruby/bin` to reach for.
+Gate 0b names the interpreter before anything runs it (`PASS ruby 3.x`, or
+a FAIL with the version and the path), because `ruby` resolving to
+`/usr/bin/ruby` 2.6 is a PATH trap that turns gates a, c1 and g red on the
+interpreter and not on the code (learned 2026-09-18/19, binding, measured:
+once over a non-interactive ssh shell, which also lacks `~/.cargo/bin`, and
+once locally, where an environment that put `/usr/bin` before mise's shims
+surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,
+unexpected '='` INSIDE a fixture ~70 minutes into gate c1). On `m5` the 3.x
+ruby is mise's shim under `~/.local/share/mise/shims`.
 
 ## Bootstrap on a new machine
 
@@ -869,15 +847,14 @@ The public corpora (~1 GB, depth 1 at the pinned shas, into
 `scripts/public-corpora-fetch.sh`.
 
 `./scripts/dev setup` is the one-line idempotent equivalent and also prints
-which gates this machine can run (see `scripts/dev` for the other verbs,
-`gates` and `anchor`).
+which gates this machine can run (see `scripts/dev` for the other verb,
+`gates`).
 
 ## Verification
 
 ```sh
 ./scripts/dev gates            # the gauntlet in the gate box, mirroring this tree; exit 2 = declared corpus(es) absent here (named in transcript), 75 = box busy
 ./scripts/dev gates --at <rev> # the same, for a committed revision (clean, no delta)
-./scripts/dev anchor           # gates on work, at the local HEAD sha
 ```
 
 `gates` never builds in the calling tree: it mirrors it into the gate box
@@ -886,10 +863,6 @@ there, and prints the box's artifacts dir and the
 `scripts/gate-triage --digest <box>/target/gauntlet/digest.json` command.
 `--run <script>` runs one repo-relative script in the box instead (a single
 mutant family, for instance).
-
-`anchor` checks out the local sha on `work` on purpose: an anchor run against
-whatever the remote happened to have on disk is a false green. It requires the
-commit to already be on a remote (exit 65 otherwise).
 
 `ita check --dark-singletons=<file> <path>` runs the dark singleton census: a
 measurement instrument (never a gate) whose JSONL records what the class-object
@@ -1107,8 +1080,8 @@ the judge always calls TypeSafe's default endpoint, `https://api.typesafe.ai`
 — the fleet-wide `TYPESAFE_BASE_URL` shim is dropped for this call. The
 request leaves the machine, so nothing private may enter the report — `closing-evidence` strips
 corpus revisions and error-set hashes and the corpus ids are the generic ones.
-It proves corpus-c on this machine only; corpus-a/b still need
-`./scripts/dev anchor` on `work`, exactly as before.
+It proves corpus-c, the only private corpus left since corpus-a and corpus-b
+were retired on 2026-10-19, so it closes only on `m5`, the machine that holds it.
 
 To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.

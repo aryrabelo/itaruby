@@ -40,149 +40,25 @@
 # exactly the day that got burned on 2026-09-18 (see AGENTS.md's Rules of
 # proof). Every ratchet updates it in the same commit as the number.
 #
-# Corpus ids are generic (corpus-a, corpus-b, corpus-c) on purpose: their
-# real paths are client-identifying and live only in the gitignored,
-# machine-local scripts/corpora-local.txt — never in this file, never in git
-# history. A corpus is checked only on a machine whose
-# scripts/corpora-local.txt maps its id to an existing directory; absent
-# corpora (missing mapping file, or no line for that id) are skipped
-# individually, by id — see AGENTS.md's Gates table for why full proof needs
-# two machines (m5 + work).
+# Corpus ids are generic (corpus-c) on purpose: their real paths are
+# client-identifying and live only in the gitignored, machine-local
+# scripts/corpora-local.txt — never in this file, never in git history. A
+# corpus is checked only on a machine whose scripts/corpora-local.txt maps
+# its id to an existing directory; an absent corpus (missing mapping file,
+# or no line for that id) is skipped by id. corpus-c lives only on m5.
+#
+# Retired 2026-10-19: corpus-a and corpus-b lived only on a machine that is
+# gone for good, so no machine can ever check them again; their declarations
+# were removed rather than left to SKIP forever. zammad/zammad and
+# Homebrew/brew replace them as public corpora (scripts/public-corpora.txt).
 #
 # Format: one `corpus <id> warn_ceiling=<n>` line declares a corpus,
 # followed by zero or more `err <id> <hash>` lines (its expected error-hash
-# set). A corpus with zero expected errors (corpus-b) has no `err` lines at
-# all.
+# set). A corpus with zero expected errors has no `err` lines at all.
 #
 # The hashes on record were regenerated 2026-08-25 under the `<id>/`
-# normalization (corpus-a: 2 errors, corpus-b: 0, corpus-c: 3 — same sets
-# as the previous path-based hashes, re-derived from clean `ita check`
-# runs on the machines holding each corpus).
-
-# measured 2026-08-21 @ 2188 .rb files (was 526 @ 2083 — corpus grew, ita-vbj)
-# a corpus-a error hash — full round trip on 2026-08-21, all inside bead
-# ita-uye's branch. REMOVED (bead ita-4xy: self-sends in blocks made never
-# conclusive, because instance_exec can rebind self, which silenced this
-# real dormant NameError too; invariant #1 ranked that trade correct at the
-# time — 3 FPs died for it on another corpus). Then RESTORED by admitting a
-# `Ty::Unknown`-receiver arm (an allowlisted iteration method on an untyped
-# receiver keeps lexical self, on the argument that Enumerable#each's
-# published contract forbids rebinding). Then REMOVED AGAIN at review: that
-# argument is not proof — it stands on the method NAME, never on knowing who
-# runs it — and invariant #1 forbids shipping unproven conclusiveness even
-# for a 1-site gain. This site is a read-verified true positive and is now
-# a DELIBERATE false negative, not an oversight; do not "fix" this baseline
-# by deleting this note.
-#
-# The site, read directly (not inferred from the bead's own notes): a name
-# assigned as a local inside an INNER block and read after that block
-# closed, still inside an OUTER block — the block-local scope is gone, so
-# Ruby parses the read as a self-send, and the class defines no such method.
-# It fires on the successful path, every time.
-#
-# The Unknown-receiver arm that recovered it briefly, measured before it was
-# adopted and before it was reverted: it produced exactly ONE new
-# diagnostic across the 5866 .rb files of all three corpora, this one, with
-# every other error hash and all three warning ceilings unchanged. That
-# single-site measurement is why it was adopted at all, and why it still
-# wasn't enough to survive review once weighed against invariant #1.
-#
-# warn_ceiling unchanged by bead ita-exc, and that ZERO is itself the
-# finding: ita-exc audited this corpus for E0104 false positives (up to 11
-# roots looked app-defined under a nesting-blind awk) and found NONE — every
-# candidate was a gem-name collision on the root segment, or a genuinely
-# renamed/dead reference, correctly warned. Two real FP mechanisms WERE
-# found and fixed on the other two corpora; this corpus not moving by a
-# single warning is the independent confirmation that its 11 were phantom.
-#
-# This corpus's mapped path on its host has moved twice historically (one
-# level deeper, then into a different parent directory after a fleet
-# reorg) — both times identity was confirmed by re-hashing the same two
-# sites under the new location and getting the same two hashes back (under
-# the OLD normalization, which kept the corpus's own path segment in the
-# hash input). Under the normalization this file now documents — strip the
-# mapped path, replace it with `corpus-a/` — a path move on the host no
-# longer touches this file at all: only scripts/corpora-local.txt needs
-# updating.
-# 603 -> 328 (anchored 2026-08-26 on the machine holding corpus-a/corpus-b,
-# sha 0b7ede7): wave 7/8/9 gains never anchored here — errors byte-identical
-# to the two hashes below, so the whole drop is warnings that stopped being
-# emitted. Slack is debt: tightened in the same commit as the anchor.
-# 328 -> 312 (wave 10, sha 05470dc) -> 284 (wave 11+12, sha 2c5c5c0): 16 curated gem
-# namespaces + 17 more collection gems in the pack; errors byte-identical.
-# 284 -> 251 (wave 14, 2026-09-18, anchored on the machine holding
-# corpus-a/corpus-b at repo sha 8135e83 + the wave-14 gems.rbi patch): 11
-# curated public gem namespaces silenced 39 warnings (23 money, 6 karafka,
-# 6 activeresource, 3 flipper, 1 activestorage), errors byte-identical (the
-# same single hash before and after). Slack is debt: tightened in the same
-# commit as the measurement.
-# Previous corpus_rev 038a25ea4 — the corpus HEAD the 251 was measured against
-# (clean tree, 2026-09-18). A bare git sha names no client. The previous pin
-# was 3acfe772 (its last commit on or before 2026-08-26, when 284 was taken);
-# it is superseded because 251 was measured on today's content, and pinning
-# the old revision next to a new number is exactly the unattributable state
-# this field exists to prevent. The 71-commit / 158-.rb-file drift between
-# those two revisions is why gate d was red on 2026-09-18 with zero
-# detection change (see AGENTS.md's Rules of proof).
-# Re-audited 2026-09-22 on work at checker fa6dd22, same corpus revision.
-# The old df454e7f1dccfb54 site was removed before this pin; its original
-# diagnostic was recovered and re-hashed, and Git history confirms removal.
-# The pin had moved without correcting that stale error-set entry.
-# New 99eef7d0416dd48f is a distinct, source-audited E0101: a singleton
-# call remained after its implementation moved to the instance surface.
-# This is not a message/column substitution. The E0102 hash is unchanged.
-# 251 -> 270 (2026-10-07): re-pinned to the corpus's newest main on the
-# owner's request, measured on work with checker 4c24ff1. The rise is
-# content, proved by one instrument on both revisions: each revision
-# extracted with `git archive` (the whole repo, the checker run on the
-# mapped subdirectory inside it) — the old pin reproduces exactly 251, the
-# new one 270, and the new extraction matches the live checkout key for
-# key. All 19 warnings that exist only at the new revision sit in .rb files
-# changed between the two (223 changed), none disappeared, and errors are
-# byte-identical (the same 2 hashes). Each of the 19 was read at its site:
-# all are E0104 false positives in two families this checker already
-# carries, none a true positive — 5 name a constant the repo defines in a
-# library file OUTSIDE the mapped subdirectory (only the subdirectory is
-# indexed), and 14 name a constant from a locked gem with no declaration
-# here (10 from three public gems, 4 from a private gem whose source was
-# read to confirm the constants exist). Measured, not tightened: 270 is
-# today's exact count.
-# corpus_rev aea609d80 — the corpus HEAD the 270 was measured against
-# (clean tree, 2026-10-07).
-corpus corpus-a warn_ceiling=270
-err corpus-a 639b38e1e239db52
-err corpus-a 99eef7d0416dd48f
-
-# measured 2026-08-21 @ 315 .rb files
-# 103 -> 92 (bead ita-exc): 11 occurrences over 2 roots were a real FP — a
-# top-level `Name = Class.new(StandardError)` custom-exception constant was
-# invisible to const_exists, because a top-level constant write never
-# reached any bucket resolution consults.
-# 92 -> 65 (anchored 2026-08-26, sha 0b7ede7, same run as corpus-a above):
-# zero errors before and after, so the drop is warnings only.
-# 65 -> 61 (wave 10) -> 48 (wave 11+12, sha 2c5c5c0, same anchor run).
-# Previous corpus_rev 4e538a69 — same measurement rule as corpus-a above
-# (last commit on or before 2026-08-26, recovered 2026-09-18). On
-# 2026-09-18 this corpus had advanced 38 commits / 21 .rb files past it.
-# Wave 14 (2026-09-18): measured 51 at revision cb612198 with the
-# wave-14 declarations — 1 warning silenced (activestorage), errors still
-# zero. 51 was ABOVE the ceiling and the number was deliberately left at 48
-# until the drift could be attributed.
-# 48 -> 53 (2026-10-07): re-pinned to the corpus's newest main on the
-# owner's request, same instrument and checker (4c24ff1) as corpus-a's
-# 2026-10-07 entry. The old pin's extraction measures 47 today (the
-# activestorage warning wave 14 silenced), the new revision 53, and the new
-# extraction matches the live checkout key for key. All 6 warnings that
-# exist only at the new revision sit in .rb files changed between the two
-# (24 changed), none disappeared, and errors stay zero. Each was read at
-# its site: all are E0104 false positives, none a true positive — 4 name a
-# constant the repo defines OUTSIDE the mapped subdirectory (2 in a gem
-# vendored under the repo, 2 in an initializer), and 2 name a constant of
-# a locked private gem that the app's boot-time routing file also loads.
-# Measured, not tightened: 53 is today's exact count.
-# corpus_rev fd19ad23 — the corpus HEAD the 53 was measured against
-# (clean tree, 2026-10-07).
-corpus corpus-b warn_ceiling=53
+# normalization (corpus-c: 3 errors then — the same set as the previous
+# path-based hashes, re-derived from a clean `ita check` run on m5).
 
 # measured 2026-08-22 @ 2363 .rb files
 # 2298 -> 1525 (bead ita-exc, -773 / -33.6%): constants written inside a

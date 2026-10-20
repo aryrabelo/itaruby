@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A mixin written into a project reopening of `Class`, `Module`, `Object`,
+  `Kernel` or `BasicObject` now reaches every class object (2026-10-19).
+  Homebrew/brew's `class Module; include T::Sig` (`extend/module.rb`)
+  left 1196 class-body `sig { ... }` calls as false E0101. The class-object
+  track reads those mixins in MRO order and answers `Found` only for a
+  name one of them literally defines. An open or unresolved mixin is
+  skipped, never treated as unreadable, because the fail-closed variant
+  silenced rails' whole class-object track through `include
+  ActiveSupport::Tryable` and cost a true positive. Brew's baseline drops
+  1240 -> 44 errors; no line is new on any public corpus. Five mutants
+  (CO-X1..X5) in `scripts/class-object-flip-mutants.sh`, each accused by a
+  named `singleton_track` test.
+
+### Added
+- Two public corpora, zammad/zammad (repo root) and Homebrew/brew
+  (`Library/Homebrew`), join the public gate at pinned shas (2026-10-19).
+  Baselines from the release binary at `295e213`: zammad 275 errors + 1072
+  warnings, brew 1240 errors + 156 warnings. The ledger in
+  `scripts/public-baseline/README.md` gives every family a verdict read at
+  its sites: zammad carries 4 TRUE POSITIVES and 271 false positives in six
+  named families, brew 1240 false positives in five (B1 `sig` on class
+  bodies alone is 1196), confirmed by brew's own `sorbet tc` oracle. The
+  vendored gems under `Library/Homebrew/vendor` stay walked and baselined.
+  Dev ceilings on m5: zammad 2 s, brew 5 s; CI ceilings from the hosted
+  public job.
+- `scripts/public-corpora.txt` takes an optional `check=<relative path>`
+  field: the gate points `ita check` at that directory inside the clone,
+  keeps the clone-root normalization, and fails closed on a malformed or
+  missing path. Proved two-sided in `scripts/public-gate-selftest.sh`
+  (three cases, three gate mutants, two fetcher mutants).
+
+### Removed
+- corpus-a and corpus-b are retired (2026-10-19): the only machine that
+  held them is gone for good, so no run can ever check them again. Their
+  declarations left `scripts/corpus-baseline.txt`, and the
+  `scripts/dev anchor` and `scripts/dev prove` verbs (gates over ssh on
+  that machine, and the union of both machines' proof) are deleted.
+  corpus-c on m5 is the one private corpus; full proof is one
+  `./scripts/dev gates` run there. The gate-digest and gate-triage
+  fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
+
 ### Changed
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`
@@ -292,6 +334,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or
   post parameter drops its whole contract, the return included, so neither
   E0103 nor E0109 fires for it.
+- Bead H1: 16 sorbet-runtime `T::*` namespaces itaruby had never seen
+  gave a false E0104 "unresolved constant" on correct code —
+  `extend T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
+  `final!` class or module), every `T::Enum`, every `T::Generic`, every
+  `T::Class[...]` (52x in brew per the sorbet-parity matrix's TRIAGE
+  W5), and every `T::Range`/`T::Enumerator[::Lazy|::Chain]`/
+  `T::ImmutableStruct`/`T::InexactStruct`/`T::Utils`/`T::Configuration`/
+  `T::Types::Simple`/`T::Props::{Serializable,Constructor,CustomType}`
+  reference. Found via `~/.local/share/itaruby/sorbet-parity/MATRIX.md`'s
+  16 HARMFUL rows; existence and kind (class vs module) verified against
+  sorbet-runtime 0.6.13036 under MRI 3.4.2 via `T.constants` reflection,
+  the version MATRIX.md itself pins. Added to `declarations/gems.rbi`'s
+  curated allowlist, same open/empty-namespace contract as every other
+  entry: resolves the constant, never closes ancestry. A typo under any
+  of the 16 (`T::Class::NoSuchThing`, `T::NotACuratedName`, …) still
+  warns E0104 — this is an exact-path allowlist, never a `T::`-prefix
+  suppressor. Measured on the 8 public Sorbet corpora
+  (serveme/planningalerts/morph/brew/ruby-lsp/tapioca/packwerk/spoom):
+  7 false E0104 removed (serveme 2, morph 2, planningalerts 3), zero new
+  diagnostics anywhere; rails/mastodon/discourse public-gate output
+  stayed byte-identical.
 - Issue #6, FP-B: a project that reopens a gem's top-level module only to
   put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
   no longer makes every call on that module an E0101. Since the

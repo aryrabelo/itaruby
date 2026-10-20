@@ -18,8 +18,8 @@ PASS evidence instruments (each defect reproduces under mutation, shipped script
 === gate c3 — performance ceiling
 PASS performance ceiling (2 bench(es) under ceiling; see target/gauntlet/perf.txt)
 === gate d — corpus diff
-FAIL corpus errors drifted (corpus-a): 1 new, 0 missing [rev aaa1111, baseline pinned aaa1111] (see target/gauntlet/corpus-corpus-a-drift.txt)
-PASS warning ceiling (corpus-a): 3 <= 5 [rev aaa1111, baseline pinned aaa1111]
+FAIL corpus errors drifted (corpus-c): 1 new, 0 missing [rev aaa1111, baseline pinned aaa1111] (see target/gauntlet/corpus-corpus-c-drift.txt)
+PASS warning ceiling (corpus-c): 3 <= 5 [rev aaa1111, baseline pinned aaa1111]
 === gate e — navigation oracle
 PASS navigation oracle: scripts/navfixture/oracle.jsonl (ita definition matches the runtime)
 === gate f — public corpus
@@ -28,5 +28,5 @@ PASS public time ceiling (rails): 12.500s <= 30.0s
 === gate g — inference bench (annotation-free, MRI as ground truth)
 PASS inference bench
 === summary
-corpus gate proved: corpus-a
+corpus gate proved: corpus-c
 RESULT: FAIL

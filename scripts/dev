@@ -13,16 +13,14 @@
 #
 #   setup   idempotent machine prep + prints which gates this machine can run
 #   gates   mirror this tree into the gate box, then run the gates
-#   anchor  runs the gates on the corpora machine (work) over ssh
-#   prove   local gates + anchor, and demands their union cover every corpus
 #
 # Corpus paths are machine-local and never versioned: scripts/corpora-local.txt
 # (gitignored) maps each generic id from scripts/corpus-baseline.txt to a real
 # path on this machine, one `<id> <path>` line per corpus — `<path>` is either
 # absolute, or relative to $CORPORA_ROOT (default $HOME/Sites). The `anchor`
-# verb ssh's to $WORK_HOST and runs scripts/gauntlet-gates.sh there, which
-# reads that machine's OWN scripts/corpora-local.txt — the mapping never
-# travels over ssh.
+# and `prove` verbs (gates over ssh on the machine that held corpus-a and
+# corpus-b, and the union of both machines' proof) were removed 2026-10-19
+# with that machine: the one remaining private corpus lives on m5.
 #
 # ponytail: bash with subcommands, not `cargo xtask`/cargo-make/a Makefile.
 # xtask is the right idiom when contributors are cross-platform and shouldn't
@@ -39,11 +37,10 @@ cd "$(dirname "$0")/.."
 ROOT=$PWD
 CORPORA_ROOT=${CORPORA_ROOT:-$HOME/Sites}
 CORPORA_MAP=$ROOT/scripts/corpora-local.txt
-WORK_HOST=${WORK_HOST:-work}
 
 usage() {
   cat >&2 <<EOF
-usage: scripts/dev <setup|gates|anchor|prove> [options]
+usage: scripts/dev <setup|gates> [options]
 
   setup   prepare this machine (idempotent), report which gates it can run
   gates   mirror into the serialized gate box, then run a script
@@ -51,8 +48,6 @@ usage: scripts/dev <setup|gates|anchor|prove> [options]
           --run <path>    run this repo-relative script (default: scripts/gauntlet-gates.sh)
           --wait          wait for a busy gate box instead of exiting 75
           --              forward all following arguments to the script
-  anchor  run the gates on \$WORK_HOST (default: work) over ssh
-  prove   gates + anchor; exit 0 only if every declared corpus was proved
 EOF
 }
 
@@ -377,8 +372,7 @@ cmd_setup() {
   fi
   if (( ${#missing[@]} )); then
     echo "corpus diff + warning ceilings: NO for: ${missing[*]}"
-    echo 'this machine cannot prove those corpora. the anchor run is the proof:'
-    echo '  ./scripts/dev anchor'
+    echo 'every private corpus lives on exactly one machine; run the gates there to prove it'
   fi
 }
 
@@ -440,94 +434,9 @@ cmd_gates() {
   acquire_gate_box_lock "${helper_args[@]}"
 }
 
-# Captures the remote run so the union of proved corpora can be checked. Exit 2
-# is legitimate here: no single machine holds every corpus, so "incomplete" is
-# the normal remote answer. What is NOT legitimate is a remote run that proved
-# nothing — that means the corpora machine lost its corpora, and the whole
-# anchor is theatre.
-cmd_anchor() {
-  local branch sha out status
-  branch=$(git rev-parse --abbrev-ref HEAD)
-  sha=$(git rev-parse HEAD)
-  if [[ -z $(git branch -r --contains "$sha" 2>/dev/null) ]]; then
-    # The remote machine can only fetch what a remote already has; without this
-    # the failure surfaces as a cryptic `git checkout` error over ssh.
-    echo "commit ${sha:0:7} is not on any remote: push before anchoring" >&2
-    exit 65
-  fi
-  say "anchor run on $WORK_HOST — $branch @ ${sha:0:7}"
-  # Checking out the local HEAD there is the point: an anchor run against
-  # whatever the remote machine happened to have checked out is a false green.
-  #
-  # The remote command mirrors AGENTS.md's anchor block exactly, because each
-  # piece is a measured trap (2026-09-18/21): the checkout that holds the
-  # corpora map is ~/Sites/personal-team/itaruby (~/Sites/itaruby has none and
-  # SKIPs both corpora green); the run happens in a disposable worktree so
-  # another agent's checkout never moves; the map is COPIED into it (a fresh
-  # worktree has none); the sha is fetched from $ANCHOR_REMOTE, default
-  # `origin` (the public repo IS the repository since 2026-09-22; before
-  # that, `private`); PERF_COLUMN=ci because work has no measured
-  # dev column and a copied ceiling is a fabricated measurement; ruby by
-  # ABSOLUTE path, because `brew` itself is not on a non-interactive ssh
-  # PATH — `$(brew --prefix ruby)` expands to nothing there and gate 0b
-  # names /usr/bin/ruby 2.6 (measured 2026-09-21, one run wasted). The
-  # artifacts are copied out BEFORE the worktree goes: a red anchor whose
-  # evidence died with its tree is a verdict nobody can read.
-  local wt="~/Sites/worktrees/ita-anchor-${sha:0:7}"
-  local keep="~/Sites/temp-files/ita-anchor-${sha:0:7}-\$(date +%Y%m%d-%H%M%S)"
-  out=$(ssh "$WORK_HOST" "cd ~/Sites/personal-team/itaruby \
-    && git fetch -q ${ANCHOR_REMOTE:-origin} \
-    && git worktree add -f --detach $wt $sha \
-    && cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt $wt/scripts/corpora-local.txt \
-    && cd $wt \
-    && PERF_COLUMN=ci PATH=\"/opt/homebrew/opt/ruby/bin:\$HOME/.cargo/bin:\$PATH\" ./scripts/gauntlet-gates.sh; \
-    s=\$?; keep=$keep; mkdir -p \$keep && cp -R $wt/target/gauntlet/. \$keep/ && echo \"anchor artifacts: \$keep\"; \
-    cd ~/Sites/personal-team/itaruby && git worktree remove --force $wt; exit \$s" 2>&1)
-  status=$?
-  printf '%s\n' "$out"
-  if [[ $status -ne 0 && $status -ne 2 ]]; then
-    echo "anchor failed at ${sha:0:7}: exit $status" >&2
-    exit "$status"
-  fi
-  ANCHOR_PROVED=$(printf '%s\n' "$out" | sed -n 's/^corpus gate proved: //p' | tail -1)
-  if [[ -z ${ANCHOR_PROVED// /} ]]; then
-    echo "anchor proved zero corpora on $WORK_HOST: did its corpora disappear?" >&2
-    exit 1
-  fi
-}
-
-# The only command that answers "is this commit actually proved?". Neither
-# machine holds every corpus, so a single green run never means full coverage:
-# this unions what each machine proved and demands it cover every corpus the
-# baseline declares.
-cmd_prove() {
-  local declared local_proved union missing
-  declared=$(sed -n 's/^corpus \([^ ]*\) .*/\1/p' scripts/corpus-baseline.txt | sort)
-  local_out=$(cmd_gates 2>&1); local_status=$?
-  printf '%s\n' "$local_out"
-  if [[ $local_status -ne 0 && $local_status -ne 2 ]]; then
-    echo "local gates failed: exit $local_status" >&2
-    exit "$local_status"
-  fi
-  local_proved=$(printf '%s\n' "$local_out" | sed -n 's/^corpus gate proved: //p' | tail -1)
-  cmd_anchor
-  union=$(printf '%s %s' "$local_proved" "$ANCHOR_PROVED" | tr ' ' '\n' | sed '/^$/d' | sort -u)
-  missing=$(comm -23 <(printf '%s\n' "$declared") <(printf '%s\n' "$union") | tr '\n' ' ')
-  say 'proof'
-  echo "declared: $(printf '%s' "$declared" | tr '\n' ' ')"
-  echo "proved:   $(printf '%s' "$union" | tr '\n' ' ')"
-  if [[ -n ${missing// /} ]]; then
-    echo "PROOF INCOMPLETE — no machine proved: $missing" >&2
-    exit 1
-  fi
-  echo 'PROOF COMPLETE — every declared corpus was proved on some machine'
-}
-
 case "${1:-}" in
   setup)  cmd_setup ;;
   gates)  shift; cmd_gates "$@" ;;
-  anchor) cmd_anchor ;;
-  prove)  cmd_prove ;;
   # 64 (EX_USAGE, sysexits.h) so it never collides with gates' own 0/1/2 space.
   *)      usage; exit 64 ;;
 esac

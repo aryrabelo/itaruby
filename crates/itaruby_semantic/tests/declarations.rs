@@ -372,7 +372,7 @@ fn wave14_undeclared_siblings_under_curated_namespaces_still_warn_e0104() {
 /// `module`/`class ...; end` lines this bead added to `gems.rbi`
 /// re-emits E0104 for exactly that one constant. Manually verified
 /// 2026-10-20: reverting the `T::Helpers` line alone reproduces
-/// `E0104 unresolved constant \`T::Helpers\`` and nothing else changes in
+/// ``E0104 unresolved constant `T::Helpers` `` and nothing else changes in
 /// this fixture's diagnostics; same for `T::Enumerator` (which also
 /// breaks `T::Enumerator::Lazy`/`::Chain`, since the resolution walk
 /// needs the owner namespace first).

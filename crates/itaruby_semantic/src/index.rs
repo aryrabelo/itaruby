@@ -3557,7 +3557,13 @@ impl DefWalker<'_> {
                         }
                     } else if call.name().as_slice() == b"sig" && call.receiver().is_none() {
                         let sig = crate::sorbet_sig::extract_sig(node);
-                        let recognized = sig.is_some();
+                        // Opening the class is about whether the block can
+                        // define anything, not about whether it is a
+                        // contract: a builder chain ending in `returns(X)`
+                        // or `void` is type metadata even when the contract
+                        // grammar refuses a clause (`type_parameters`,
+                        // `bind`, ...), exactly as on `main`.
+                        let recognized = sig.is_some() || sig_block_is_recognized(&call);
                         let stacked = self.pending_sorbet_sig.is_some();
                         // A sig sorbet-runtime does not check at run time
                         // (`.checked(:never)`/`.checked(:tests)`) is
@@ -4408,6 +4414,46 @@ impl PendingSig {
             Self::Parsed(sig) => Some(sig),
             Self::Unusable => None,
         }
+    }
+}
+
+/// The block's single statement of a `sig { ... }` call, or `None` for a
+/// call with no block, an empty block, or more than one statement.
+fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
+    let block = call.block()?.as_block_node()?;
+    let body = block.body()?;
+    match body.as_statements_node() {
+        Some(stmts) => {
+            let mut iter = stmts.body().iter();
+            let first = iter.next()?;
+            if iter.next().is_some() {
+                return None;
+            }
+            Some(first)
+        }
+        None => Some(body),
+    }
+}
+
+/// Bead ita-4xy: is `call`'s block a RECOGNIZED sig shape, one whose
+/// outermost builder call is `returns` with exactly one argument or a
+/// bare `void`? Such a block is Sorbet type metadata and never itself
+/// defines a method, so it does not open its class even when
+/// `sorbet_sig::extract_sig` refuses one of its clauses (that sig is
+/// simply no contract). Anything else — several statements, no block, or
+/// another outermost call — still opens it. This decides only whether
+/// the class opens, never a type or a contract.
+fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
+        return false;
+    };
+    match outer.name().as_slice() {
+        b"returns" => outer.arguments().is_some_and(|args| {
+            let mut iter = args.arguments().iter();
+            iter.next().is_some() && iter.next().is_none()
+        }),
+        b"void" => true,
+        _ => false,
     }
 }
 

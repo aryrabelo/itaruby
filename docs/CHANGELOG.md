@@ -93,6 +93,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
+- A `sig` the contract grammar refuses no longer blinds its class when its
+  shape is one `main` already read as type metadata (an outermost
+  `returns(X)` or `void`): `sig { type_parameters(:U).params(...).void }`
+  is still no contract, but it defines nothing, so the class stays closed
+  as on `main` (bead ita-4xy's carve-out). On this branch any refused
+  clause (`type_parameters`, ...) opened the class, and Homebrew/brew lost
+  3 E0101 lines on `module Utils` (`utils/git_repository.rb:16,28,39`,
+  ledger family B2) because one `type_parameters` sig in `utils.rb`
+  silenced every call on `Utils` project-wide. A block of any other shape
+  still opens its class. Test:
+  `uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed`, mutant
+  "uncontracted sig shape opens its class".
 - The sorbet-runtime enforcement gates can no longer be evaded (r4,
   review 5), and they read the whole project root, not only the checked
   paths: `ita check app/` now also reads `config/initializers`, `lib/`, a

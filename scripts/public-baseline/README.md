@@ -786,11 +786,13 @@ Mechanism: on `main` the receiver is typed `Options` only by the declared
 `returns(Options)`, which `main` uses when body inference answers nothing.
 This branch lets a sig type a consumer only where sorbet-runtime is proven to
 enforce it (AGENTS.md, "A project's Sorbet `sig { ... }` is a contract, not a
-hint"). In brew it is not proven. `standalone/sorbet.rb:109-123` redefines
-`T::Sig#sig` as a no-op and installs no-op `call_validation_error_handler`/
-`inline_type_error_handler` for non-test runs. So the receiver is `Unknown`
-and the B3 lookup gap (a project `module Enumerable` reopening shadowing the
-core module) is no longer reached from these two sites. It is still reached
+hint"). In the full brew tree it is not proven, so the receiver is `Unknown`.
+`standalone/sorbet.rb:109-123` (a no-op `T::Sig#sig`, plus no-op validation
+handlers for non-test runs) is one hazard. It is not the only one: blanking
+those lines in a copy of the tree still leaves both lines silent, and the
+remaining trigger has not been pinned down. Either way, the B3 lookup gap
+(a project `module Enumerable` reopening that shadows the core module)
+is no longer reached from these two sites. It is still reached
 from inside `Options` itself (`options/options.rb:75,89,94,106`, unchanged).
 A three-file reduction confirms that the declared type is the only source:
 `tab/tab.rb` + `options/options.rb` + `extend/enumerable.rb` loses

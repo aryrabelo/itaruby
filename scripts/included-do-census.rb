@@ -7,9 +7,9 @@
 # question behind `DefWalker::open_class(.., OpenReason::ClassBodyBlock)` in
 # crates/itaruby_semantic/src/index.rs — it changes no product code.
 #
-# Needs Ruby >= 3.4 (prism ships with it). Measured 2026-08-22: the `work`
-# machine has only system Ruby 2.6, where `require "prism"` fails — the
-# corpus-a/corpus-b numbers in AGENTS.md therefore come from the Rust
+# Needs Ruby >= 3.4 (prism ships with it). Measured 2026-08-22: the machine
+# that then held two of the private corpora had only system Ruby 2.6, where
+# `require "prism"` fails — their numbers in AGENTS.md came from the Rust
 # probe's call-site counts, not from this script.
 #
 # Usage:

@@ -30,6 +30,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mastodon, discourse, and all 8 Sorbet corpora (serveme,
   planningalerts, morph, brew, ruby-lsp, tapioca, packwerk, spoom).
 
+### Added
+- Two public corpora, zammad/zammad (repo root) and Homebrew/brew
+  (`Library/Homebrew`), join the public gate at pinned shas (2026-10-19).
+  Baselines from the release binary at `295e213`: zammad 275 errors + 1072
+  warnings, brew 1240 errors + 156 warnings. The ledger in
+  `scripts/public-baseline/README.md` gives every family a verdict read at
+  its sites: zammad carries 4 TRUE POSITIVES and 271 false positives in six
+  named families, brew 1240 false positives in five (B1 `sig` on class
+  bodies alone is 1196), confirmed by brew's own `sorbet tc` oracle. The
+  vendored gems under `Library/Homebrew/vendor` stay walked and baselined.
+  Dev ceilings on m5: zammad 2 s, brew 5 s; CI ceilings from the hosted
+  public job.
+- `scripts/public-corpora.txt` takes an optional `check=<relative path>`
+  field: the gate points `ita check` at that directory inside the clone,
+  keeps the clone-root normalization, and fails closed on a malformed or
+  missing path. Proved two-sided in `scripts/public-gate-selftest.sh`
+  (three cases, three gate mutants, two fetcher mutants).
+
+### Removed
+- corpus-a and corpus-b are retired (2026-10-19): the only machine that
+  held them is gone for good, so no run can ever check them again. Their
+  declarations left `scripts/corpus-baseline.txt`, and the
+  `scripts/dev anchor` and `scripts/dev prove` verbs (gates over ssh on
+  that machine, and the union of both machines' proof) are deleted.
+  corpus-c on m5 is the one private corpus; full proof is one
+  `./scripts/dev gates` run there. The gate-digest and gate-triage
+  fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
+
 ### Changed
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`

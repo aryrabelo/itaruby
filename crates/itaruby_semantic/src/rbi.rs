@@ -151,7 +151,7 @@ pub fn scan_toplevel_const_write(line: &str) -> Option<&str> {
         Some('=') => match chars.next() {
             // `==` (comparison), `=~` (regex match), `=>` (hash rocket,
             // rescue-clause/pattern-match binding) are never assignment.
-            Some('=') | Some('~') | Some('>') => None,
+            Some('=' | '~' | '>') => None,
             _ => Some(name),
         },
         _ => None,

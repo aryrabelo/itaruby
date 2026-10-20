@@ -271,6 +271,19 @@ winning on both.
   `method_missing` target and one of them poisons every lookup on its track.
   The name-keyed form closed the intended cluster with zero collateral. When
   a mechanism cannot see the receiver, only the name can carry the proof.
+- Fail-closed on a link EVERY receiver shares is the same poison (learned
+  2026-10-19, binding, measured): reading the mixins of a project
+  `class Object`/`class Module` reopening with the `extend` consult's
+  arms (open or unresolved mixin -> `Inconclusive`) made every class-object
+  lookup in rails Inconclusive, because rails' `class Object; include
+  ActiveSupport::Tryable` names a module the index holds open. It cost
+  the true positive at
+  `activesupport/test/autoloading_fixtures/raises_no_method_error.rb`.
+  A link on the shared core chain is receiver-blind by position, so the
+  consult there is Found-only and keyed on a literal definition of the
+  name; an unreadable mixin is skipped, which is the verdict that link
+  gave before it was read at all (`core_mixin_definition`, mutants
+  CO-X3/CO-X4).
 - A fresh worktree needs the corpora declaration copied in (learned
   2026-08-26, binding): `scripts/corpora-local.txt` is machine-local, so a
   fresh detached worktree has none and the corpus gate SKIPs every corpus

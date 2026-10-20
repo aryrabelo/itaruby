@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A mixin written into a project reopening of `Class`, `Module`, `Object`,
+  `Kernel` or `BasicObject` now reaches every class object (2026-10-19).
+  Homebrew/brew's `class Module; include T::Sig` (`extend/module.rb`)
+  left 1196 class-body `sig { ... }` calls as false E0101. The class-object
+  track reads those mixins in MRO order and answers `Found` only for a
+  name one of them literally defines. An open or unresolved mixin is
+  skipped, never treated as unreadable, because the fail-closed variant
+  silenced rails' whole class-object track through `include
+  ActiveSupport::Tryable` and cost a true positive. Brew's baseline drops
+  1240 -> 44 errors; no line is new on any public corpus. Five mutants
+  (CO-X1..X5) in `scripts/class-object-flip-mutants.sh`, each accused by a
+  named `singleton_track` test.
+
 ### Added
 - Two public corpora, zammad/zammad (repo root) and Homebrew/brew
   (`Library/Homebrew`), join the public gate at pinned shas (2026-10-19).

@@ -748,3 +748,58 @@ audit. brew's error set goes 44 -> 26 (B2 18, B3 7, B4 1, unchanged);
 warnings 156 -> 113 (the 113 project rows, unchanged). `brew.jsonl` keeps
 its previous line order, so the diff is a pure deletion of 61 lines, and its
 `sort -u` set equals the gate's fresh artifact byte-for-byte.
+
+## Regeneration 2026-10-20 — task/sig-rbi (Sorbet sig contracts) merged with main at `cb12bbe`
+
+Measured with the gate's own normalization (`PUBLIC_COLUMN=ci`) against the
+pinned clones, release build of the branch merged with main at `cb12bbe`
+(H4/H4b and H5 included):
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 2 |
+
+Before this branch's last fix the brew drift was 0 new / 5 gone. Three of
+the five were `Pathname` E0101 on `module Utils`
+(`utils/git_repository.rb:16,28,39`, family B2). They went silent because
+one `sig { type_parameters(:Item, :Result).params(...).returns(...) }` in
+`utils.rb:83-89` opened `Utils`: this branch opened a class for every sig
+its contract grammar refused, where `main` reads any sig whose outermost call
+is `returns(X)`/`void` as type metadata (bead ita-4xy). That was a blind
+spot, not a correction, and it is fixed in source: such a sig is still no
+contract, but its class stays closed
+(`uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed`, mutant
+"uncontracted sig shape opens its class"). The 3 lines are back.
+
+### Brew GONE: 2 lines, family B3, FALSE POSITIVE
+
+| line | verdict |
+|---|---|
+| `tab/tab.rb:500` `used_options.to_a` | FALSE POSITIVE (B3). `Tab#used_options` (`tab/tab.rb:335-338`) is `sig { returns(Options) }` over `Options.create(@used_options)`, and `Options` (`options/options.rb:6`) does `include Enumerable` with `def each`, so `to_a` exists. |
+| `formula_installer.rb:884` `effective_build_options_for(formula).used_options.to_a` | FALSE POSITIVE (B3), same receiver: `BuildOptions#used_options` (`build_options.rb:110-113`) is `sig { returns(Options) }`. |
+
+Mechanism: on `main` the receiver is typed `Options` only by the declared
+`returns(Options)`, which `main` uses when body inference answers nothing.
+This branch lets a sig type a consumer only where sorbet-runtime is proven to
+enforce it (AGENTS.md, "A project's Sorbet `sig { ... }` is a contract, not a
+hint"). In brew it is not proven. `standalone/sorbet.rb:109-123` redefines
+`T::Sig#sig` as a no-op and installs no-op `call_validation_error_handler`/
+`inline_type_error_handler` for non-test runs. So the receiver is `Unknown`
+and the B3 lookup gap (a project `module Enumerable` reopening shadowing the
+core module) is no longer reached from these two sites. It is still reached
+from inside `Options` itself (`options/options.rb:75,89,94,106`, unchanged).
+A three-file reduction confirms that the declared type is the only source:
+`tab/tab.rb` + `options/options.rb` + `extend/enumerable.rb` loses
+`tab.rb:500` under this branch. It returns once a `Gemfile.lock` locks
+`sorbet-runtime` and `class Module; include T::Sig` is present, which is
+when a sig counts as enforced.
+
+**TRUE POSITIVES lost: 0.** Both lines were FALSE POSITIVE in the
+first-baseline audit (B3). brew's error set goes 26 -> 24 (B2 18, B3 5, B4
+1); warnings are unchanged. `brew.jsonl` keeps its previous line order, so
+the diff is a pure deletion of 2 lines, and its `sort -u` set equals the
+gate's fresh artifact byte-for-byte.

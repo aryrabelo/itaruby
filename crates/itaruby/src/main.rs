@@ -4,9 +4,9 @@ use std::process::ExitCode;
 
 use itaruby_semantic::{
     call_stats, check_file, check_file_dark, constraint_report, definition_at, find_upward_dir,
-    hover_at, wire_declaration_sources, CallStats, ConstraintCall, ConstraintOutcome,
+    hover_at, path_is_ignored, sorbet_ignore_entries, wire_declaration_sources, CallStats, ConstraintCall, ConstraintOutcome,
     ConstraintProof, DarkSingleton, DarkVerdict, Db, Diagnostic, DiscoveredSources, LineIndex,
-    ProjectFiles, Severity, SourceFile,
+    IgnoredFiles, ProjectFiles, Severity, SourceFile,
 };
 
 // bead ita-ufi hotspot 1: the platform allocator (Apple's `libsystem_malloc`)
@@ -94,7 +94,7 @@ fn run_definition(arg: &str) -> ExitCode {
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut rb_files = Vec::new();
-    discover_rb_files(&root, &[], &mut rb_files);
+    discover_rb_files(&root, &[], &mut rb_files, &mut Vec::new());
     if !rb_files.contains(&abs_path) {
         rb_files.push(abs_path.clone());
     }
@@ -157,7 +157,7 @@ fn run_hover(arg: &str) -> ExitCode {
         .parent()
         .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
     let mut rb_files = Vec::new();
-    discover_rb_files(&root, &[], &mut rb_files);
+    discover_rb_files(&root, &[], &mut rb_files, &mut Vec::new());
     if !rb_files.contains(&abs_path) {
         rb_files.push(abs_path.clone());
     }
@@ -590,10 +590,11 @@ fn announce_discovered_sources(discovered: &DiscoveredSources) {
 /// ita-2a9).
 fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
     let mut rb_files = Vec::new();
+    let mut ignored_files = Vec::new();
     for p in paths {
         let root = Path::new(p);
         let ignore_list = sorbet_ignore_entries(root);
-        discover_rb_files(root, &ignore_list, &mut rb_files);
+        discover_rb_files(root, &ignore_list, &mut rb_files, &mut ignored_files);
     }
 
     let mut db = Db::new();
@@ -617,6 +618,17 @@ fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
         sources.push(SourceFile::new(&db, path.clone(), text));
     }
     ProjectFiles::new(&db, sources.clone());
+    // H4: `--ignore`d files are read, never checked — suppression-only
+    // evidence (see `IgnoredFiles`). Absent when nothing matched, so a
+    // project without `sorbet/config` takes the exact old code path.
+    let ignored: Vec<SourceFile> = ignored_files
+        .iter()
+        .filter(|p| !rb_files.contains(p))
+        .filter_map(|p| std::fs::read_to_string(p).ok().map(|t| SourceFile::new(&db, p.clone(), t)))
+        .collect();
+    if !ignored.is_empty() {
+        IgnoredFiles::new(&db, ignored);
+    }
 
     wire_closed_world(&db, paths);
 
@@ -1267,8 +1279,9 @@ fn render_excerpt(db: &Db, index: &LineIndex, text: &str, diag: &Diagnostic, out
 /// except `build_project`'s (`ita check`'s own root) — `run_definition`/
 /// `run_hover` pass `&[]` and keep their pre-existing, unfiltered walk;
 /// only the checked command's own discovery honors the project's own
-/// ignore list.
-fn discover_rb_files(root: &Path, ignore_list: &[String], out: &mut Vec<PathBuf>) {
+/// ignore list. H4: a matching file goes to `ignored_out` (indexed as
+/// suppression-only `IgnoredFiles`), never dropped and never checked.
+fn discover_rb_files(root: &Path, ignore_list: &[String], out: &mut Vec<PathBuf>, ignored_out: &mut Vec<PathBuf>) {
     if root.is_file() {
         if root.extension().and_then(|e| e.to_str()) == Some("rb") {
             out.push(root.to_path_buf());
@@ -1285,78 +1298,13 @@ fn discover_rb_files(root: &Path, ignore_list: &[String], out: &mut Vec<PathBuf>
         if !ignore_list.is_empty() {
             if let Ok(rel) = entry.path().strip_prefix(root) {
                 if path_is_ignored(rel, ignore_list) {
+                    ignored_out.push(entry.path().to_path_buf());
                     continue;
                 }
             }
         }
         out.push(entry.path().to_path_buf());
     }
-}
-
-/// bead ita-9d4: sorbet's own `sorbet/config` can list `--ignore=<path>`
-/// entries (also written as the two-token `--ignore <path>` form,
-/// argv-style — sorbet's config file is one flag/value per line) that
-/// exclude a subtree from typechecking. Honoring it removes a source of
-/// noise-only diagnostics from paths the project itself declared out of
-/// scope (vendored code, generated fixtures, ...).
-///
-/// LSP is explicitly OUT of scope: an editor already knows which files
-/// are open and sends exactly those; `--ignore` is a check-TIME concept
-/// about which files enter a typechecking run in the first place, not
-/// something `ita server`'s per-file requests need to consult. This is
-/// the documented ceiling of this bead — `ita check` only, never wired
-/// into `itaruby_server::main_loop`'s own `discover_rb_files`.
-///
-/// No `sorbet/config` (missing, unreadable, or simply empty of `--ignore`
-/// lines) returns `vec![]`: the anti-overreach control
-/// (`tests/sorbet_ignore_cli.rs`'s absent-config test) leans on this —
-/// an empty list makes `discover_rb_files`'s filtering a pure no-op, so
-/// "no config" and "old behavior" are the same code path, not merely
-/// close to it.
-fn sorbet_ignore_entries(root: &Path) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(root.join("sorbet").join("config")) else {
-        return Vec::new();
-    };
-    let mut tokens = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
-    let mut entries = Vec::new();
-    while let Some(tok) = tokens.next() {
-        if let Some(path) = tok.strip_prefix("--ignore=") {
-            entries.push(normalize_ignore_entry(path));
-        } else if tok == "--ignore" {
-            if let Some(path) = tokens.next() {
-                entries.push(normalize_ignore_entry(path));
-            }
-        }
-    }
-    entries
-}
-
-/// Strips one trailing `/` so `--ignore=test/fixtures/` and
-/// `--ignore=test/fixtures` (I2: "without trailing slash still excludes
-/// the directory it names") normalize to the same entry before
-/// `path_is_ignored` compares path components.
-fn normalize_ignore_entry(path: &str) -> String {
-    path.strip_suffix('/').unwrap_or(path).to_string()
-}
-
-/// Component-boundary match (I2) for one discovered file's root-relative
-/// path against `sorbet/config`'s `--ignore` entries: entry `test/fix`
-/// must NOT exclude `test/fixtures2/x.rb`. Comparing `Path::components()`
-/// rather than raw string prefixes gets this right for free — `test/fix`
-/// is `["test", "fix"]`, which is not a prefix of `test/fixtures2/x.rb`'s
-/// `["test", "fixtures2", "x.rb"]`, whereas `test/fixtures` (`["test",
-/// "fixtures"]`) IS a prefix of `["test", "fixtures", "x.rb"]` — so it
-/// excludes the directory it names whether or not it had a trailing `/`
-/// (already stripped by `normalize_ignore_entry`).
-fn path_is_ignored(rel: &Path, ignore_list: &[String]) -> bool {
-    let rel_components: Vec<_> = rel.components().collect();
-    ignore_list.iter().any(|entry| {
-        let entry_components: Vec<_> = Path::new(entry).components().collect();
-        !entry_components.is_empty() && rel_components.starts_with(&entry_components)
-    })
 }
 
 /// bead ita-2ve: same 4-level upward walk as `find_upward`, but for the

@@ -665,3 +665,71 @@ Measured with the gate's own normalization against the pinned clones:
 B3 7, B4 1, all unchanged); warnings are unchanged. `brew.jsonl` keeps its
 previous line order, so the diff is a pure deletion of 1196 lines, and its
 `sort -u` set equals the gate's fresh artifact byte-for-byte.
+
+## Regeneration 2026-10-20 — brew H4/H4b: `sorbet/config --ignore` honored the way Sorbet matches it
+
+The change: `--ignore` entries now match the way sorbet 0.6.13437 was
+observed to match them (a `/`-leading entry is an anchored prefix of
+`/<path relative to the input dir>`, any other entry matches anywhere, whole
+names only), and an ignored `.rb` is read as SUPPRESSION-ONLY evidence
+(`IgnoredFiles`) and never checked or reported. Brew's
+`Library/Homebrew/sorbet/config` lists `--ignore=/vendor/bundle`,
+`/vendor/gems`, `/vendor/ruby`, `/vendor/portable-ruby`, `/test/.gem`,
+`/spec/stub`, `Formula` and `Casks`. Before this change the matcher compared
+`Path::components()`, so `/vendor/bundle` began with a root component that
+no relative path has, and every `/`-leading entry was dead: brew's vendored
+gems were checked and reported. Now 397 `.rb` under `vendor/bundle`, 2
+under `vendor/gems` and 203 under test-fixture `Casks/`/`Formula/` dirs
+are ignored (the other entries match no file at the pin).
+
+Measured with the gate's own normalization (`PUBLIC_COLUMN=ci`) against the
+pinned clones, release build of the branch merged with main at
+`cb9b0be` (B1 included):
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 61 |
+
+(Measured against main before B1 the brew drift was 0 new / 67 gone: the
+extra 6 were `sig` E0101 on a module that `extend T::Helpers`, which B1's
+regeneration above already removed.)
+
+### Brew GONE: 61 lines, every one inside the ignored `/vendor/bundle`
+
+One mechanism covers all 61: the line's file is under
+`brew/Library/Homebrew/vendor/bundle/`, which brew's own `sorbet/config`
+ignores, and nothing inside an ignored path is reported. Checked
+mechanically: 61 of 61 gone paths start with that prefix, 0 gone lines lie
+outside it, and the fresh set holds 0 `vendor/` rows (the old baseline
+held exactly 61, the vendored rows counted in "Vendored gems stay in the
+baseline" above). No gone line comes from the two other H4 mechanisms
+(a constant defined only in an ignored file, `OpenReason::IgnoredReopening`):
+those could only move project rows, and none moved.
+
+| family (first-baseline ledger) | gone | verdict |
+|---|---:|---|
+| B5 class reopened through a conditional constant alias (`value`/`value=` for `Concurrent::LockLocalVar`, `concurrent/atomic/reentrant_read_write_lock.rb:163-337`) | 18 E0101 | FALSE POSITIVE, now out of scope. Re-read `concurrent/atomic/lock_local_var.rb:19-28`: `LockLocalVar = ThreadLocalVar` / `= FiberLocalVar`, then `class LockLocalVar; end`. |
+| V1 platform-guarded constants (`::Zstd`/`::Brotli`/`::LZ4`/`::XZ` in `bindata-3.0.1/lib/bindata/transform/*.rb:17,31`; `LZFSE` in `ruby-macho-7.0.0/lib/macho/macho_file.rb:542,546`; `JRuby*`/`TruffleRuby*`/`Java*`/`C*` in concurrent-ruby) | 31 E0104 | FALSE POSITIVE, now out of scope. Re-read `concurrent/atomic/atomic_fixnum.rb:99-105` (`case when on_cruby? && c_extensions_loaded? then CAtomicFixnum when on_jruby? then JavaAtomicFixnum`) and `bindata/transform/zstd.rb:17` (optional codec gem). |
+| V2 constants through ancestry / conditional superclass alias (`DEFAULT_THREAD_IDLETIMEOUT` ×3, `DEFAULT_MAX_QUEUE_SIZE` ×2, `DEFAULT_MAX_POOL_SIZE`, `FALLBACK_POLICY_CLASSES`, `DEBUG` ×3, `ERROR`, `WARN`) | 12 E0104 | FALSE POSITIVE, now out of scope. Re-read `concurrent/executor/cached_thread_pool.rb:40-43`; the constants are defined on `RubyThreadPoolExecutor`, reached through `ThreadPoolExecutorImplementation = case …`. |
+
+**These families are NOT repaired in the checker.** B5's alias reopening
+and V2's conditional-superclass lookup are still gaps; they leave the
+baseline because brew declares its vendored gems out of scope, exactly as
+`srb tc` treats them (its 11 errors at the pin include none in `vendor/`).
+A project that does not ignore its vendored code still sees them.
+
+**Vendored gems are still read.** The paragraph "Vendored gems stay in the
+baseline" above is superseded for reporting only: `vendor/bundle` is still
+walked and still defines `T::*` (now as suppression-only evidence), so the
+65 `T::Class`/`T::Range`/… E0104 that the triage's `.ignore` exclusion
+produced in project code do NOT appear — the run adds 0 lines.
+
+**TRUE POSITIVES lost: 0.** All 61 were FALSE POSITIVE in the first-baseline
+audit. brew's error set goes 44 -> 26 (B2 18, B3 7, B4 1, unchanged);
+warnings 156 -> 113 (the 113 project rows, unchanged). `brew.jsonl` keeps
+its previous line order, so the diff is a pure deletion of 61 lines, and its
+`sort -u` set equals the gate's fresh artifact byte-for-byte.

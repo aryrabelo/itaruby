@@ -58,6 +58,28 @@ winning on both.
   `conflicting_superclasses`, `ancestry_review_controls`, and
   `scripts/conflicting-superclasses-mutants.py` (gate c1 and CI); public
   baselines require a fresh measured audit after source changes.
+- `sorbet/config` `--ignore` means "don't typecheck", never "doesn't exist"
+  (learned 2026-10-20, binding). An ignored `.rb` is read into
+  `IgnoredFiles`, never `ProjectFiles`, by `ita check` AND `ita server`
+  (shared `discovery::sorbet_ignore_entries`/`path_is_ignored`). Its evidence
+  is SUPPRESSION-ONLY: a constant it defines only silences E0104 through
+  `index::ignored_aware_index` (asked "exists?" and nothing else, the
+  reference still types `Unknown`); a project/declared class it reopens is
+  forced open (`OpenReason::IgnoredReopening`) and the name joins
+  `eval_polluted_core`; it never interns a class into `project_index`, so a
+  fixture stub named like a gem or project class can never close a name.
+  Nothing inside an ignored path is ever reported, parse errors included.
+  Measured: indexing ignored trees like project code turns closed fixture
+  stubs into conclusive misses (`Faraday.get` against a two-line stub);
+  dropping them turns a Rails initializer's constant into E0104 in `app/`.
+  Proof: `crates/itaruby/tests/sorbet_ignore_indexing.rs`,
+  `testdata/sorbet_ignore_indexing/`, `scripts/ignore-indexing-mutants.sh`
+  (gate c1). Entries match exactly as sorbet 0.6.13437 was OBSERVED to
+  match them (2026-10-20, `srb tc --ignore` over a planted tree): against
+  `/<path relative to the input dir>`, a `/`-leading entry is a prefix, any
+  other entry matches anywhere, both only on whole names (`foo` never
+  `foo.rb`/`foo2/`), compared as text (`./foo` matches nothing). Proof:
+  `tests/sorbet_ignore_matching.rs`, mutant IG-G.
 - A code path that turns silence into an error must never read absence of
   evidence as evidence of absence (learned 2026-08-24, binding): a gate that
   finds no signal on an upward search (e.g. no Gemfile discovered within N

@@ -2657,26 +2657,44 @@ impl Checker<'_> {
         )
     }
 
+    /// Every suppression-only channel that can still prove `path` exists
+    /// after the project index failed. A hit only silences E0104; none of
+    /// them changes what `infer_const` types the reference as (invariant
+    /// #1). Split out of `check_const_ref` (H4) to keep that choke point
+    /// under the complexity ceiling.
+    fn const_proven_elsewhere(&self, scope: &[String], path: &str) -> bool {
+        // Bead ita-r8k: `path` is the exact same literal text an
+        // enclosing `defined?(path)` guard already proved exists in the
+        // branch currently being walked (`self.defined_guards`, pushed by
+        // the `IfNode`/`UnlessNode` arms above).
+        if self.defined_guards.iter().any(|g| g == path) {
+            return true;
+        }
+        if self.const_missing_namespace(scope, path) {
+            return true;
+        }
+        if let Some(map) = self.rbi_map {
+            if self.rbi_fallback_declares(scope, path, map) {
+                return true;
+            }
+        }
+        // H4: a definition living only in a `sorbet/config`-`--ignore`d
+        // file is real at runtime. The wider index is asked "does it
+        // exist?" and nothing else.
+        if let Some(wide) = crate::index::ignored_aware_index(self.db) {
+            if wide.resolve_const_through_aliases(scope, path).is_some() || wide.const_exists(scope, path) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn check_const_ref(&mut self, scope: &[String], path: &str, node: &Node<'_>) {
         if self.index.resolve_const_through_aliases(scope, path).is_some() || self.index.const_exists(scope, path) {
             return;
         }
-        // Bead ita-r8k: `path` is the exact same literal text an
-        // enclosing `defined?(path)` guard already proved exists in the
-        // branch currently being walked (`self.defined_guards`, pushed by
-        // the `IfNode`/`UnlessNode` arms above). Suppression-only, same
-        // contract as every RBI channel below: a hit never changes what
-        // `infer_const` types the reference as (invariant #1).
-        if self.defined_guards.iter().any(|g| g == path) {
+        if self.const_proven_elsewhere(scope, path) {
             return;
-        }
-        if self.const_missing_namespace(scope, path) {
-            return;
-        }
-        if let Some(map) = self.rbi_map {
-            if self.rbi_fallback_declares(scope, path, map) {
-                return;
-            }
         }
         // Bead ita-yh1: `path` may itself be cbase-prefixed (`::Foo::BAR`)
         // now that `infer_const` no longer trims it before calling here —
@@ -3809,7 +3827,7 @@ impl Checker<'_> {
             // blocker found by shape instead of by path, so it lands here
             // too.
             Some(Blocker::Project(
-                OpenReason::ReopenedExternal | OpenReason::NamespaceOnlyModule,
+                OpenReason::ReopenedExternal | OpenReason::NamespaceOnlyModule | OpenReason::IgnoredReopening,
             )) => s.anc_other += 1,
             // Unreachable by `inconclusive_reason`'s own contract:
             // `merge_declared_fragment` always sets a declared fragment's

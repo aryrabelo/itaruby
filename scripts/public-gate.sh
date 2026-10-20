@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Public-corpus gate. The launch bar for this project is beating Sorbet on
-# speed and true errors on four PUBLIC Rails apps (rails/rails, mastodon,
-# discourse, gitlab-foss — see AGENTS.md's "benchmarked against it"). Today
+# speed and true errors on PUBLIC Ruby codebases (rails/rails, mastodon,
+# discourse, gitlab-foss, zammad, Homebrew/brew — see AGENTS.md's
+# "benchmarked against it"). Today
 # that measurement is ad hoc; this gate makes it an exit code.
 #
 #   0  every declared repo cloneable + at baseline, under its time ceiling
@@ -12,12 +13,22 @@
 #      missing baseline, or a broken ita binary — the summary names which
 #
 # Repos are declared one per line in scripts/public-corpora.txt:
-#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>]
-# (ids: rails, mastodon, discourse, gitlab-foss — public code, so no
-# secrecy wall here; the diagnostic baseline for each id is stored IN THE
-# CLEAR in scripts/public-baseline/<id>.jsonl, normalized by stripping each
-# repo's clone root and replacing it with `<id>/` so the baseline is
+#   <id> <git-url> <pinned-sha> <dev_ceiling_s>[:<ci_ceiling_s>] [<clone-dir>] [check=<path>]
+# (ids: rails, mastodon, discourse, gitlab-foss, zammad, brew — public code,
+# so no secrecy wall here; the diagnostic baseline for each id is stored IN
+# THE CLEAR in scripts/public-baseline/<id>.jsonl, normalized by stripping
+# each repo's clone root and replacing it with `<id>/` so the baseline is
 # machine-independent).
+#
+# `check=<path>` is OPTIONAL and names the directory INSIDE the clone that
+# `ita check` is pointed at (brew's Ruby lives under `Library/Homebrew`). It
+# is relative, segment by segment (no `/` prefix, no `.`/`..` segment, so it
+# can never leave the clone), and FAIL-CLOSED: a malformed value or a path
+# missing at the pinned sha FAILS the repo — measuring the clone root
+# instead would be a measurement of a tree the declaration never named.
+# Normalization still strips the CLONE root, so baseline paths stay
+# repo-relative (`brew/Library/Homebrew/...`) and point at the file a reader
+# opens on GitHub.
 #
 # <clone-dir> is OPTIONAL and names the directory under
 # $PUBLIC_CORPORA_ROOT that holds the pinned revision; without it the
@@ -33,7 +44,8 @@
 #
 # Every judged repo prints `public revision (<id>): tree <path> at sha <sha>`
 # before anything is compared, so no number in the transcript (or in
-# scripts/gate-digest's read of it) can belong to an unnamed tree.
+# scripts/gate-digest's read of it) can belong to an unnamed tree; a
+# declared check path adds `public check path (<id>): <path>` right after.
 #
 # Unlike the private corpora (which the project never writes), the public
 # corpora DO get restored on demand — but never automatically. gitlab-foss
@@ -132,10 +144,30 @@ if [[ ! -f $CORPORA_FILE ]]; then
   bad "public corpus: $CORPORA_FILE missing; a gate with no declared repos proves nothing"
 fi
 
-while read -r id url sha ceiling clone_dir; do
+# One relative path segment by segment: every segment starts with a letter,
+# digit or `_`, so `.`/`..`, a leading `/` and an empty segment cannot match.
+CHECK_PATH_RE='^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$'
+
+while read -r id url sha ceiling opts; do
   [[ -z $id || $id == \#* ]] && continue
   if [[ ! $sha =~ ^[0-9a-f]{40}$ ]]; then
     bad "public corpus: malformed repo line (bad pinned sha) in $CORPORA_FILE: $id"
+    continue
+  fi
+  # Optional fields, in this order: [<clone-dir>] [check=<path>].
+  clone_dir= check_path= check_set=0 opts_ok=1
+  read -r -a opt_fields <<<"${opts:-}"
+  for opt in ${opt_fields[@]+"${opt_fields[@]}"}; do
+    case $opt in
+      check=*) (( ! check_set )) || opts_ok=0; check_set=1; check_path=${opt#check=} ;;
+      *) [[ -z $clone_dir ]] && (( ! check_set )) || opts_ok=0; clone_dir=$opt ;;
+    esac
+  done
+  if (( check_set )) && [[ ! $check_path =~ $CHECK_PATH_RE ]]; then
+    opts_ok=0
+  fi
+  if (( ! opts_ok )); then
+    bad "public corpus: malformed repo line (optional fields must be [<clone-dir>] [check=<relative path inside the clone>]) in $CORPORA_FILE: $id"
     continue
   fi
   base="$BASELINE_DIR/$id.jsonl"
@@ -203,12 +235,21 @@ while read -r id url sha ceiling clone_dir; do
   # Name the measured tree before any number is printed. Every sha the gate
   # utters from here on belongs to this path.
   ok "public revision ($id): tree $clone at sha $head"
+  target=$clone
+  if (( check_set )); then
+    target=$clone/$check_path
+    if [[ ! -d $target ]]; then
+      bad "public corpus ($id): declared check path $check_path is missing in $clone at $head — refusing to measure another tree (fail-closed)"
+      continue
+    fi
+    printf 'public check path (%s): %s\n' "$id" "$target"
+  fi
 
   out="$ART/public-$id.txt"
   clear_artifacts "$out" "$ART/public-$id-fresh.txt" "$ART/public-$id-expected.txt" \
     "$ART/public-$id-new.txt" "$ART/public-$id-gone.txt" "$ART/public-$id-drift.txt"
   start=$(python3 -c 'import time; print(time.time())')
-  "$ITA" check "$clone" --format=json >"$out" 2>&1
+  "$ITA" check "$target" --format=json >"$out" 2>&1
   end=$(python3 -c 'import time; print(time.time())')
   elapsed=$(python3 -c "print(f'{$end - $start:.3f}')")
 

@@ -179,7 +179,7 @@ say 'secrecy side — state is a pure function of digest.json'
 j=$(digest_case green)
 pdir=$(dirname "$j")
 "$TRIAGE" state --digest "$j" >"$pdir/s1.json" 2>/dev/null
-printf 'SEKRIT_FIXTURE_TOKEN gone=zzz new=yyy\n' >>"$pdir/corpus-corpus-a.txt"
+printf 'SEKRIT_FIXTURE_TOKEN gone=zzz new=yyy\n' >>"$pdir/corpus-corpus-c.txt"
 "$TRIAGE" state --digest "$j" >"$pdir/s2.json" 2>/dev/null
 if cmp -s "$pdir/s1.json" "$pdir/s2.json" && ! grep -q SEKRIT_FIXTURE_TOKEN "$pdir/s2.json"; then
   ok "state unmoved by artifact mutation, token never leaves (secrecy wall holds)"
@@ -219,7 +219,7 @@ mutants=(
   'load_blind|case:loaded|s/load1 > 8\.0/load1 > 999.0/'
   'answers_unvalidated|exit2|s/unknown = ans.keys - ALLOWED_ANSWERS/unknown = []/'
   'transport_fail_closed|exit4|s/EXIT_TRANSPORT = 4/EXIT_TRANSPORT = 1/'
-  'state_leaks_artifacts|purity|s/prune_digest(digest)/prune_digest(digest).merge("leak" => File.read(File.join(File.dirname(digest_path), "corpus-corpus-a.txt")))/'
+  'state_leaks_artifacts|purity|s/prune_digest(digest)/prune_digest(digest).merge("leak" => File.read(File.join(File.dirname(digest_path), "corpus-corpus-c.txt")))/'
 )
 green_ctrl() { # bin -> 0 when the green case still routes empty
   local jg
@@ -257,7 +257,7 @@ for entry in "${mutants[@]}"; do
       jx=$(digest_case green)
       pdir=$(dirname "$jx")
       "$mbin" state --digest "$jx" >"$pdir/m1.json" 2>/dev/null
-      printf 'SEKRIT_FIXTURE_TOKEN gone=zzz new=yyy\n' >>"$pdir/corpus-corpus-a.txt"
+      printf 'SEKRIT_FIXTURE_TOKEN gone=zzz new=yyy\n' >>"$pdir/corpus-corpus-c.txt"
       "$mbin" state --digest "$jx" >"$pdir/m2.json" 2>/dev/null
       # The mutant is accused when the silence breaks: state moved with the
       # artifact, or the token itself reached the state.

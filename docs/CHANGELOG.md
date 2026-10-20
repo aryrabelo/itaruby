@@ -93,6 +93,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
+- Bead H1: 16 sorbet-runtime `T::*` namespaces itaruby had never seen
+  gave a false E0104 "unresolved constant" on correct code —
+  `extend T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
+  `final!` class or module), every `T::Enum`, every `T::Generic`, every
+  `T::Class[...]` (52x in brew per the sorbet-parity matrix's TRIAGE
+  W5), and every `T::Range`/`T::Enumerator[::Lazy|::Chain]`/
+  `T::ImmutableStruct`/`T::InexactStruct`/`T::Utils`/`T::Configuration`/
+  `T::Types::Simple`/`T::Props::{Serializable,Constructor,CustomType}`
+  reference. Found via `~/.local/share/itaruby/sorbet-parity/MATRIX.md`'s
+  16 HARMFUL rows; existence and kind (class vs module) verified against
+  sorbet-runtime 0.6.13036 under MRI 3.4.2 via `T.constants` reflection,
+  the version MATRIX.md itself pins. Added to `declarations/gems.rbi`'s
+  curated allowlist, same open/empty-namespace contract as every other
+  entry: resolves the constant, never closes ancestry. A typo under any
+  of the 16 (`T::Class::NoSuchThing`, `T::NotACuratedName`, …) still
+  warns E0104 — this is an exact-path allowlist, never a `T::`-prefix
+  suppressor. Measured on the 8 public Sorbet corpora
+  (serveme/planningalerts/morph/brew/ruby-lsp/tapioca/packwerk/spoom):
+  7 false E0104 removed (serveme 2, morph 2, planningalerts 3), zero new
+  diagnostics anywhere; rails/mastodon/discourse public-gate output
+  stayed byte-identical.
 - Issue #6, FP-B: a project that reopens a gem's top-level module only to
   put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
   no longer makes every call on that module an E0101. Since the

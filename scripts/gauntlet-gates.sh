@@ -323,8 +323,8 @@ fi
 # in a versioned file, hence the generic ids and the gitignored, per-machine
 # scripts/corpora-local.txt that maps them to real paths). Each declared
 # corpus is checked only where its id has a mapped, existing path on this
-# machine; unmapped or absent corpora are skipped individually, by id — full
-# proof needs both m5 and work, see AGENTS.md's Gates section.
+# machine; unmapped or absent corpora are skipped individually, by id — the
+# one private corpus (corpus-c) lives on m5, see AGENTS.md's Gates section.
 say 'gate d — corpus diff'
 corpus_proved=()
 corpus_skipped=()

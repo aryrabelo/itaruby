@@ -30,6 +30,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mastodon, discourse, and all 8 Sorbet corpora (serveme,
   planningalerts, morph, brew, ruby-lsp, tapioca, packwerk, spoom).
 
+### Fixed
+- A mixin written into a project reopening of `Class`, `Module`, `Object`,
+  `Kernel` or `BasicObject` now reaches every class object (2026-10-19).
+  Homebrew/brew's `class Module; include T::Sig` (`extend/module.rb`)
+  left 1196 class-body `sig { ... }` calls as false E0101. The class-object
+  track reads those mixins in MRO order and answers `Found` only for a
+  name one of them literally defines. An open or unresolved mixin is
+  skipped, never treated as unreadable, because the fail-closed variant
+  silenced rails' whole class-object track through `include
+  ActiveSupport::Tryable` and cost a true positive. Brew's baseline drops
+  1240 -> 44 errors; no line is new on any public corpus. Five mutants
+  (CO-X1..X5) in `scripts/class-object-flip-mutants.sh`, each accused by a
+  named `singleton_track` test.
+
 ### Added
 - Two public corpora, zammad/zammad (repo root) and Homebrew/brew
   (`Library/Homebrew`), join the public gate at pinned shas (2026-10-19).
@@ -102,6 +116,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
+- Bead H1: 16 sorbet-runtime `T::*` namespaces itaruby had never seen
+  gave a false E0104 "unresolved constant" on correct code —
+  `extend T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
+  `final!` class or module), every `T::Enum`, every `T::Generic`, every
+  `T::Class[...]` (52x in brew per the sorbet-parity matrix's TRIAGE
+  W5), and every `T::Range`/`T::Enumerator[::Lazy|::Chain]`/
+  `T::ImmutableStruct`/`T::InexactStruct`/`T::Utils`/`T::Configuration`/
+  `T::Types::Simple`/`T::Props::{Serializable,Constructor,CustomType}`
+  reference. Found via `~/.local/share/itaruby/sorbet-parity/MATRIX.md`'s
+  16 HARMFUL rows; existence and kind (class vs module) verified against
+  sorbet-runtime 0.6.13036 under MRI 3.4.2 via `T.constants` reflection,
+  the version MATRIX.md itself pins. Added to `declarations/gems.rbi`'s
+  curated allowlist, same open/empty-namespace contract as every other
+  entry: resolves the constant, never closes ancestry. A typo under any
+  of the 16 (`T::Class::NoSuchThing`, `T::NotACuratedName`, …) still
+  warns E0104 — this is an exact-path allowlist, never a `T::`-prefix
+  suppressor. Measured on the 8 public Sorbet corpora
+  (serveme/planningalerts/morph/brew/ruby-lsp/tapioca/packwerk/spoom):
+  7 false E0104 removed (serveme 2, morph 2, planningalerts 3), zero new
+  diagnostics anywhere; rails/mastodon/discourse public-gate output
+  stayed byte-identical.
 - Issue #6, FP-B: a project that reopens a gem's top-level module only to
   put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
   no longer makes every call on that module an E0101. Since the

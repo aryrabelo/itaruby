@@ -2936,7 +2936,12 @@ impl Checker<'_> {
     /// doc comment (`rbi_ancestor_declares` is W3 require/autoload: the
     /// reference may resolve through an EXTERNAL ancestor the project
     /// index can't see, like graphql's `GraphQLTypeNames` mixin behind
-    /// `Types::BaseObject < GraphQL::Schema::Object`).
+    /// `Types::BaseObject < GraphQL::Schema::Object`). Bead ita-h5s:
+    /// `rbi_toplevel_const_declares` is the BARE top-level value-constant
+    /// channel (planningalerts' real `ElasticSearchClient` shim shape) —
+    /// tried directly beside `rbi_declares`/`rbi_qualified_const_declares`,
+    /// never through the nesting/alias-expansion helpers below: a bare
+    /// top-level write has no qualifying scope or alias chain to expand.
     fn rbi_fallback_declares(
         &self,
         scope: &[String],
@@ -2945,6 +2950,7 @@ impl Checker<'_> {
     ) -> bool {
         crate::index::rbi_declares(path, map)
             || crate::index::rbi_qualified_const_declares(path, map)
+            || crate::index::rbi_toplevel_const_declares(path, map)
             || self.alias_rbi_leaf_declares(scope, path, map)
             || crate::index::rbi_ancestor_declares(self.index, scope, path, map)
             || self.nesting_expanded_rbi_declares(scope, path, map)
@@ -3005,26 +3011,44 @@ impl Checker<'_> {
         )
     }
 
+    /// Every suppression-only channel that can still prove `path` exists
+    /// after the project index failed. A hit only silences E0104; none of
+    /// them changes what `infer_const` types the reference as (invariant
+    /// #1). Split out of `check_const_ref` (H4) to keep that choke point
+    /// under the complexity ceiling.
+    fn const_proven_elsewhere(&self, scope: &[String], path: &str) -> bool {
+        // Bead ita-r8k: `path` is the exact same literal text an
+        // enclosing `defined?(path)` guard already proved exists in the
+        // branch currently being walked (`self.defined_guards`, pushed by
+        // the `IfNode`/`UnlessNode` arms above).
+        if self.defined_guards.iter().any(|g| g == path) {
+            return true;
+        }
+        if self.const_missing_namespace(scope, path) {
+            return true;
+        }
+        if let Some(map) = self.rbi_map {
+            if self.rbi_fallback_declares(scope, path, map) {
+                return true;
+            }
+        }
+        // H4: a definition living only in a `sorbet/config`-`--ignore`d
+        // file is real at runtime. The wider index is asked "does it
+        // exist?" and nothing else.
+        if let Some(wide) = crate::index::ignored_aware_index(self.db) {
+            if wide.resolve_const_through_aliases(scope, path).is_some() || wide.const_exists(scope, path) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn check_const_ref(&mut self, scope: &[String], path: &str, node: &Node<'_>) {
         if self.index.resolve_const_through_aliases(scope, path).is_some() || self.index.const_exists(scope, path) {
             return;
         }
-        // Bead ita-r8k: `path` is the exact same literal text an
-        // enclosing `defined?(path)` guard already proved exists in the
-        // branch currently being walked (`self.defined_guards`, pushed by
-        // the `IfNode`/`UnlessNode` arms above). Suppression-only, same
-        // contract as every RBI channel below: a hit never changes what
-        // `infer_const` types the reference as (invariant #1).
-        if self.defined_guards.iter().any(|g| g == path) {
+        if self.const_proven_elsewhere(scope, path) {
             return;
-        }
-        if self.const_missing_namespace(scope, path) {
-            return;
-        }
-        if let Some(map) = self.rbi_map {
-            if self.rbi_fallback_declares(scope, path, map) {
-                return;
-            }
         }
         // Bead ita-yh1: `path` may itself be cbase-prefixed (`::Foo::BAR`)
         // now that `infer_const` no longer trims it before calling here —
@@ -4226,7 +4250,7 @@ impl Checker<'_> {
             // blocker found by shape instead of by path, so it lands here
             // too.
             Some(Blocker::Project(
-                OpenReason::ReopenedExternal | OpenReason::NamespaceOnlyModule,
+                OpenReason::ReopenedExternal | OpenReason::NamespaceOnlyModule | OpenReason::IgnoredReopening,
             )) => s.anc_other += 1,
             // Unreachable by `inconclusive_reason`'s own contract:
             // `merge_declared_fragment` always sets a declared fragment's

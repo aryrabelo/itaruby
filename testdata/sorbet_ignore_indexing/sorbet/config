@@ -1,0 +1,4 @@
+--dir
+.
+--ignore=config/
+--ignore=spec/fixtures/

@@ -169,6 +169,12 @@ pub enum OpenReason {
     /// Set by `apply_namespace_only_modules`; see its doc comment for the
     /// four conditions and the measurement behind them.
     NamespaceOnlyModule,
+    /// H4: a file `sorbet/config` `--ignore`s (`IgnoredFiles`) reopens
+    /// this class. Those files are never merged into the index — their
+    /// surface is unread by design — but they exist at runtime, so the
+    /// class they reopen cannot conclude a miss. Set by
+    /// `apply_ignored_openness`.
+    IgnoredReopening,
 }
 
 /// What actually blocks a `MethodLookup::Inconclusive` from concluding
@@ -5580,6 +5586,32 @@ pub struct ProjectIndex {
 /// Merge all files' `file_defs` into the global class table.
 #[salsa::tracked]
 pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
+    build_index(db, false)
+}
+
+/// H4: the project index WITH every `sorbet/config`-`--ignore`d file
+/// (`crate::IgnoredFiles`) merged in like a project file. Suppression-only
+/// by construction: its single consumer is `check.rs`'s
+/// `check_const_ref`, which asks it only "does this constant exist?" right
+/// before emitting E0104 — nothing ever types, resolves a method, or
+/// closes a class through it, so a fixture stub named like a real class
+/// can never enable a new accusation. `None` (zero cost) when no file was
+/// ignored; built lazily, at most once, and only when some E0104 was
+/// about to fire.
+#[salsa::tracked(returns(ref))]
+pub fn ignored_aware_index(db: &dyn salsa::Database) -> Option<ProjectIndex> {
+    let ignored = crate::IgnoredFiles::try_get(db)?;
+    if ignored.files(db).is_empty() {
+        return None;
+    }
+    Some(build_index(db, true))
+}
+
+/// `merge_ignored`: `false` builds the real `project_index`, where an
+/// ignored file contributes only stand-down evidence
+/// (`merge_ignored_pollution` now, `apply_ignored_openness` at the end);
+/// `true` builds `ignored_aware_index`, where it merges like project code.
+fn build_index(db: &dyn salsa::Database, merge_ignored: bool) -> ProjectIndex {
     let mut index = ProjectIndex::default();
     let mut qualified_writes: Vec<(String, String)> = Vec::new();
     if let Some(project) = ProjectFiles::try_get(db) {
@@ -5587,6 +5619,7 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
             merge_file_fragments(db, file, &mut index, &mut qualified_writes);
         }
     }
+    merge_ignored_files(db, &mut index, &mut qualified_writes, merge_ignored);
     // bead ita-3gs: curated external gem declarations, embedded in the
     // binary — merged last, and only into names the project itself never
     // defined (see `merge_declared_fragment`), so `ita check`/`ita
@@ -5712,6 +5745,9 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // merge passes because it reads each module's FINAL surface — see
     // `apply_namespace_only_modules`.
     apply_namespace_only_modules(&mut index);
+    if !merge_ignored {
+        apply_ignored_openness(db, &mut index);
+    }
     build_subclass_map(&mut index);
     build_mixer_map(&mut index);
     poison_include_time_redefinitions(&mut index);
@@ -5723,6 +5759,63 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     poison_alias_reopen_redefinitions(&mut index);
     build_methods_by_name(&mut index);
     index
+}
+
+/// H4: every `IgnoredFiles` entry, merged per `build_index`'s mode — like
+/// project code for `ignored_aware_index`, stand-down flags only for the
+/// real `project_index`.
+fn merge_ignored_files(
+    db: &dyn salsa::Database,
+    index: &mut ProjectIndex,
+    qualified_writes: &mut Vec<(String, String)>,
+    merge_ignored: bool,
+) {
+    let Some(ignored) = crate::IgnoredFiles::try_get(db) else {
+        return;
+    };
+    for &file in ignored.files(db) {
+        if merge_ignored {
+            merge_file_fragments(db, file, index, qualified_writes);
+        } else {
+            merge_ignored_pollution(index, file_defs(db, file));
+        }
+    }
+}
+
+/// H4: the whole-index stand-down flags an ignored file raises — the
+/// core-pollution half of `merge_file_accumulators` and nothing else.
+/// Every one of these only ever turns a conclusive core lookup
+/// inconclusive; none adds a class, method or constant, so none can
+/// enable an accusation.
+fn merge_ignored_pollution(index: &mut ProjectIndex, defs: &FileDefs) {
+    index.core_mixin |= defs.core_mixin;
+    index.refine_raw.extend(defs.refine_targets.iter().cloned());
+    index.refined_unknown |= defs.refined_unknown;
+    index.eval_raw.extend(defs.eval_targets.iter().cloned());
+    index.eval_polluted_unknown |= defs.eval_unknown;
+    index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
+}
+
+/// H4: every class/module an ignored file writes a body for, by its full
+/// path. A project (or curated-declaration) class of that exact path is
+/// forced open — the ignored body is real at runtime and this index never
+/// reads it — and the name joins `eval_polluted_core`, so a core class an
+/// ignored file reopens stands its closed-world lookup down exactly like
+/// an eval body nobody showed this checker. A path the index does not
+/// know is NOT interned: an ignored-only definition never becomes a class
+/// here (see `ignored_aware_index` for the E0104 side).
+fn apply_ignored_openness(db: &dyn salsa::Database, index: &mut ProjectIndex) {
+    let Some(ignored) = crate::IgnoredFiles::try_get(db) else {
+        return;
+    };
+    for &file in ignored.files(db) {
+        for frag in &file_defs(db, file).fragments {
+            if let Some(&id) = index.by_path.get(&frag.path) {
+                merge_open(index, id, OpenReason::IgnoredReopening);
+            }
+            index.eval_polluted_core.insert(frag.path.clone());
+        }
+    }
 }
 
 /// Qualified value-constant name -> where it's assigned (w12 closure):
@@ -7157,7 +7250,8 @@ fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
             | OpenReason::Unattributed
             | OpenReason::NestedDefOwner
             | OpenReason::BlockNestedDefinition
-            | OpenReason::StringSourceDefined,
+            | OpenReason::StringSourceDefined
+            | OpenReason::IgnoredReopening,
         ) => true,
         Some(
             OpenReason::ReopenedExternal
@@ -7372,6 +7466,70 @@ pub fn rbi_qualified_const_declares<S: std::hash::BuildHasher>(qualified: &str, 
                 .fragments
                 .iter()
                 .any(|f| f.path == owner && f.consts.iter().any(|c| c == simple))
+    })
+}
+
+/// Bead ita-h5s: does the client's `sorbet/rbi` declare `name` as a BARE,
+/// unqualified top-level value-constant write — `XClient =
+/// T.let(T.unsafe(nil), T.nilable(Integer))`, planningalerts' real
+/// `sorbet/rbi/shims/elasticsearch_client.rbi` shape
+/// (`ElasticSearchClient = T.let(T.unsafe(nil),
+/// T.nilable(Elasticsearch::Client))`), or Tapioca's own compact-alias
+/// rendering (`DRbIdConv = DRb::DRbIdConv`)? Neither existing RBI
+/// channel ever reads this shape: `rbi_declares` only matches a
+/// `class`/`module` header, and `rbi_qualified_const_declares` requires
+/// `qualified.rsplit_once("::")` to succeed, so it returns `false`
+/// immediately for a name with no `::` at all — confirmed by the
+/// monotonicity report's minimal probe (`v1-asis` vs `v3-noshim`:
+/// removing the shim changed nothing, proving it was never consulted).
+///
+/// Consulted only from `check.rs::Checker::rbi_fallback_declares`, only
+/// after the project's own index has already failed to resolve a BARE
+/// reference. Candidates come from the SAME shared `rbi_map`
+/// `rbi_declares`/`rbi_qualified_const_declares` use
+/// (`rbi.rs::scan_toplevel_const_write` unions its hits into that same
+/// map under the same key/union discipline as a class/module header —
+/// see `RbiIndex::constants`'s doc comment) — phase 1 is a coarse
+/// locator only; the real check below is phase 2's `parse_defs_text`
+/// parse, exactly like every other RBI channel, so a comment or a
+/// string/heredoc body line that merely LOOKS like `NAME = ...` (phase
+/// 1 candidate) is correctly rejected here (it never lands in
+/// `FileDefs::toplevel_consts`, which only records a real
+/// `ConstantWriteNode`/`ConstantOrWriteNode`/`ConstantTargetNode` at
+/// true file scope).
+///
+/// Two shapes count: a genuinely top-level write (`FileDefs
+/// ::toplevel_consts`, `frag_idx == None` in `DefWalker`), or one
+/// nested directly inside a `class Object`/`module Kernel` block — the
+/// shim author's alternative spelling of "define this constant where a
+/// bare reference from anywhere finds it" (Ruby resolves an unqualified
+/// constant through `Object`'s own ancestry as the last resort). No
+/// other owner is tried: a bare query has no qualifying scope to widen
+/// into, unlike `rbi_qualified_const_declares`'s owner-based nested
+/// check.
+///
+/// Suppression-only, the same contract as every other RBI channel (see
+/// `rbi_declares`'s doc comment): a hit only silences `E0104`; the
+/// reference still types as `Ty::Unknown` in `infer_const` (invariant
+/// #1) — this project's `ProjectIndex` is never touched, so no new
+/// E0101/E0102/E0103/E0108/E0109 diagnostic becomes reachable because of
+/// this channel. `name` carrying a `::` always returns `false`
+/// immediately: that shape is `rbi_qualified_const_declares`'s alone.
+pub fn rbi_toplevel_const_declares<S: std::hash::BuildHasher>(name: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> bool {
+    let name = name.trim_start_matches("::");
+    if name.contains("::") {
+        return false;
+    }
+    let Some(paths) = rbi_map.get(name) else {
+        return false;
+    };
+    paths.iter().any(|path| {
+        let defs = rbi_file_defs(path);
+        defs.toplevel_consts.iter().any(|c| c == name)
+            || defs
+                .fragments
+                .iter()
+                .any(|f| (f.path == "Object" || f.path == "Kernel") && f.consts.iter().any(|c| c == name))
     })
 }
 

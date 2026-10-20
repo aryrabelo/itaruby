@@ -32,8 +32,9 @@ use lsp_types::{
     TextDocumentSyncCapability, TextDocumentSyncKind, Uri,
 };
 use itaruby_semantic::{
-    check_file, definition_at, hover_at, wire_declaration_sources, Db, Diagnostic as SemDiagnostic,
-    DiscoveredSources, LineIndex, ProjectFiles, Severity, SourceFile,
+    check_file, definition_at, hover_at, path_is_ignored, sorbet_ignore_entries,
+    wire_declaration_sources, Db, Diagnostic as SemDiagnostic, DiscoveredSources, IgnoredFiles,
+    LineIndex, ProjectFiles, Severity, SourceFile,
 };
 use salsa::Setter as _;
 
@@ -95,7 +96,7 @@ fn message_loop(connection: Connection) -> Result<()> {
     let project_root = ProjectRoot::new(&root);
     let mut warned_out_of_root: HashSet<PathBuf> = HashSet::new();
 
-    let (mut db, mut files, declarations_only) = load_workspace(&connection, &root)?;
+    let (mut db, mut files, declarations_only) = load_workspace(&connection, &project_root)?;
 
     let mut open: HashMap<PathBuf, i32> = HashMap::new();
 
@@ -195,22 +196,35 @@ fn message_loop(connection: Connection) -> Result<()> {
 /// proves every checked root gem-safe first (see `ClosedWorld`'s doc
 /// comment in `itaruby_semantic`); the server keeps v0's exact silent
 /// behavior for core-class monkeypatches.
+///
+/// H4: a file `sorbet/config` `--ignore`s (`ProjectRoot::is_ignored`) is
+/// read exactly like `ita check` reads it — into `IgnoredFiles`
+/// (suppression-only evidence), never `ProjectFiles` — and joins
+/// `declarations_only`, so it is never published or pulled either.
 fn load_workspace(
     connection: &Connection,
-    root: &Path,
+    project_root: &ProjectRoot,
 ) -> Result<(Db, HashMap<PathBuf, SourceFile>, HashSet<PathBuf>)> {
+    let root = project_root.original.as_path();
     let mut db = Db::new();
     let mut files: HashMap<PathBuf, SourceFile> = HashMap::new();
+    let mut ignored: Vec<SourceFile> = Vec::new();
+    let mut ignored_paths: HashSet<PathBuf> = HashSet::new();
     for path in discover_rb_files(root) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
         let file = SourceFile::new(&db, path.clone(), text);
-        files.insert(path, file);
+        if project_root.is_ignored(&path) {
+            ignored.push(file);
+            ignored_paths.insert(path);
+        } else {
+            files.insert(path, file);
+        }
     }
 
     let discovered = wire_declaration_sources(&mut db, &[root.to_path_buf()]);
-    let declarations_only: HashSet<PathBuf> =
+    let mut declarations_only: HashSet<PathBuf> =
         discovered.declarations_only.iter().cloned().collect();
     for schema in &discovered.declarations_only {
         if !files.contains_key(schema) {
@@ -223,6 +237,18 @@ fn load_workspace(
     send_discovery_log(connection, &discovered)?;
 
     ProjectFiles::new(&db, files.values().copied().collect());
+    if !ignored.is_empty() {
+        IgnoredFiles::new(&db, ignored.clone());
+    }
+    // Ignored files ride in `files` only AFTER `ProjectFiles` is built, so
+    // `didOpen`/`didChange` update their text; `declarations_only` keeps
+    // them out of every publish/pull, and `didOpen`'s new-file branch
+    // (the only other `ProjectFiles` writer) never sees them as new.
+    for file in ignored {
+        let path = file.path(&db).clone();
+        files.insert(path, file);
+    }
+    declarations_only.extend(ignored_paths);
 
     Ok((db, files, declarations_only))
 }
@@ -509,6 +535,9 @@ struct ProjectRoot {
     original: PathBuf,
     canonical: PathBuf,
     normalized: PathBuf,
+    /// H4: `sorbet/config`'s `--ignore` entries, the same list `ita check`
+    /// honors (`itaruby_semantic::sorbet_ignore_entries`).
+    ignore: Vec<String>,
 }
 
 impl ProjectRoot {
@@ -519,7 +548,26 @@ impl ProjectRoot {
             original: root.to_path_buf(),
             canonical,
             normalized,
+            ignore: sorbet_ignore_entries(root),
         }
+    }
+
+    /// H4: does `path` fall under one of `sorbet/config`'s `--ignore`
+    /// entries? Same component-boundary match as `ita check`; tried
+    /// against every spelling of the root this struct already holds.
+    fn is_ignored(&self, path: &Path) -> bool {
+        if self.ignore.is_empty() {
+            return false;
+        }
+        let canonical = path.canonicalize().ok();
+        [&self.original, &self.canonical, &self.normalized]
+            .iter()
+            .filter_map(|root| {
+                path.strip_prefix(root)
+                    .ok()
+                    .or_else(|| canonical.as_deref().and_then(|c| c.strip_prefix(root).ok()))
+            })
+            .any(|rel| path_is_ignored(rel, &self.ignore))
     }
 
     /// True when `path` is the root itself or lives under it.
@@ -640,8 +688,31 @@ fn handle_notification(note: lsp_server::Notification, ctx: &mut NotificationCtx
                 file.set_text(&mut *ctx.db).to(text);
             } else {
                 let file = SourceFile::new(&*ctx.db, path.clone(), text);
+                if ctx.root.is_ignored(&path) {
+                    // H4: a file created under an `--ignore`d path after
+                    // startup joins `IgnoredFiles` (suppression-only),
+                    // never `ProjectFiles`, and is never published. Kept
+                    // out of `ctx.files` so no later notification can
+                    // schedule it; its text stays as first opened.
+                    let mut ignored = IgnoredFiles::try_get(&*ctx.db)
+                        .map(|i| i.files(&*ctx.db).clone())
+                        .unwrap_or_default();
+                    ignored.push(file);
+                    match IgnoredFiles::try_get(&*ctx.db) {
+                        Some(input) => {
+                            input.set_files(&mut *ctx.db).to(ignored);
+                        }
+                        None => {
+                            IgnoredFiles::new(&*ctx.db, ignored);
+                        }
+                    }
+                    return Ok(());
+                }
                 ctx.files.insert(path.clone(), file);
-                let all: Vec<SourceFile> = ctx.files.values().copied().collect();
+                let ignored: HashSet<SourceFile> = IgnoredFiles::try_get(&*ctx.db)
+                    .map(|i| i.files(&*ctx.db).iter().copied().collect())
+                    .unwrap_or_default();
+                let all: Vec<SourceFile> = ctx.files.values().copied().filter(|f| !ignored.contains(f)).collect();
                 match ProjectFiles::try_get(&*ctx.db) {
                     Some(project) => {
                         project.set_files(&mut *ctx.db).to(all);

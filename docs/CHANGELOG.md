@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- A bare, unqualified top-level value-constant write in a client's
+  `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,
+  no `::` anywhere in the LHS — planningalerts' real
+  `sorbet/rbi/shims/elasticsearch_client.rbi`:
+  `ElasticSearchClient = T.let(T.unsafe(nil),
+  T.nilable(Elasticsearch::Client))`) was never read by any RBI channel:
+  `rbi_declares` only matches a `class`/`module` header, and
+  `rbi_qualified_const_declares` requires a `::` to split on, so it
+  returned `false` immediately for a bare name — a reference to such a
+  constant falsely warned `E0104` even though the shim genuinely
+  declares it. Fix: `rbi.rs::scan_toplevel_const_write` (phase 1) unions
+  bare value-constant-write candidates into the existing RBI locator
+  map, and `index.rs::rbi_toplevel_const_declares` (phase 2) verifies
+  via a real Prism parse (`FileDefs::toplevel_consts`, or a nested
+  `class Object`/`module Kernel` write), wired into
+  `check.rs::Checker::rbi_fallback_declares` beside the other direct RBI
+  channels. Suppression-only (invariant #1): a hit silences `E0104` but
+  the reference still types `Ty::Unknown`, never interned into
+  `ProjectIndex`. Measured: planningalerts loses exactly its 3
+  `ElasticSearchClient` E0104s; zero added diagnostics across rails,
+  mastodon, discourse, and all 8 Sorbet corpora (serveme,
+  planningalerts, morph, brew, ruby-lsp, tapioca, packwerk, spoom).
 
 ### Fixed
 - A mixin written into a project reopening of `Class`, `Module`, `Object`,
@@ -50,6 +73,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
 
 ### Changed
+- `sorbet/config` `--ignore` no longer hides definitions (H4, 2026-10-20).
+  Ignored files are still never checked or reported (parse errors
+  included), but they are read as suppression-only evidence: a constant
+  defined only there (a Rails initializer's `Client = if ... end`) no
+  longer reads as E0104 elsewhere, and a class they reopen is open. They
+  never resolve a name to a closed class, so a test-fixture stub sharing a
+  gem's name cannot cause a new E0101. `ita server` now honors the same
+  `--ignore` list as `ita check` (previously it ignored `sorbet/config`
+  entirely). Public corpora (no `sorbet/config`): byte-identical. Proof:
+  `tests/sorbet_ignore_indexing.rs`, `scripts/ignore-indexing-mutants.sh`
+  (6 mutants, gate c1).
+- `--ignore` entries now match the way Sorbet does (H4b, observed on sorbet
+  0.6.13437): `/`-leading entries are anchored prefixes, others match
+  anywhere, whole names only. brew's `/vendor/...` entries now take effect:
+  against main with B1 merged, -61 diagnostics and 0 added, all 61 inside
+  `vendor/bundle` (18 E0101 + 43 E0104), now never reported. Measured
+  before B1, the drift was -67: the extra 6 were `sig` E0101 on a module
+  that `extend T::Helpers` (open once the vendored sorbet-runtime's
+  reopening of `T::Helpers` was read), which B1 already removes. brew
+  baseline regenerated, ledger in `scripts/public-baseline/README.md`.
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`
   (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet

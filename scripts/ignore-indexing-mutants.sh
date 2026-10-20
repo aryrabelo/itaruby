@@ -24,6 +24,11 @@
 #         -> ignored_only_constant_resolves_without_e0104 must fail
 #   IG-F  the LSP stops routing ignored files to `IgnoredFiles`
 #         -> lsp_honors_ignore_like_the_cli must fail
+#   IG-G  `path_is_ignored` reverts to whole-components-from-the-root
+#         matching (pre-H4b)
+#         -> unanchored_entry_matches_anywhere must fail: `foo` stops
+#            ignoring bar/foo/baz.rb and its planted
+#            `unresolved constant `H4bNestedFoo`` comes back
 #
 # Builds/tests go to $ROOT/target (AGENTS.md: the 2026-09-17 stale-binary
 # and cross-worktree rmeta defects).
@@ -35,6 +40,7 @@ MAIN=crates/itaruby/src/main.rs
 IDX=crates/itaruby_semantic/src/index.rs
 CHK=crates/itaruby_semantic/src/check.rs
 SRV=crates/itaruby_server/src/main_loop.rs
+DIS=crates/itaruby_semantic/src/discovery.rs
 BAK=$ROOT/target/ignore-indexing-mutants.orig
 LOG=$ROOT/target/ignore-indexing-mutants-test.txt
 
@@ -43,9 +49,9 @@ ok()  { printf 'PASS %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fail=1; }
 
 mkdir -p "$BAK"
-for f in "$MAIN" "$IDX" "$CHK" "$SRV"; do cp "$f" "$BAK/$(basename "$f")"; done
+for f in "$MAIN" "$IDX" "$CHK" "$SRV" "$DIS"; do cp "$f" "$BAK/$(basename "$f")"; done
 restore() {
-  for f in "$MAIN" "$IDX" "$CHK" "$SRV"; do cp "$BAK/$(basename "$f")" "$f"; done
+  for f in "$MAIN" "$IDX" "$CHK" "$SRV" "$DIS"; do cp "$BAK/$(basename "$f")" "$f"; done
 }
 trap restore EXIT
 
@@ -56,7 +62,7 @@ failing=
 # from silently not running.
 run_suite() {
   CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby --no-fail-fast \
-    --test sorbet_ignore_indexing --test sorbet_ignore_cli >"$LOG" 2>&1
+    --test sorbet_ignore_indexing --test sorbet_ignore_cli --test sorbet_ignore_matching >"$LOG" 2>&1
   if grep -q 'could not compile' "$LOG"; then compiles=0; else compiles=1; fi
   failing=$(grep -oE '^test [a-z0-9_]+ \.\.\. FAILED' "$LOG" | awk '{print $2}' | sort -u)
 }
@@ -144,10 +150,21 @@ mutant IG-F "$SRV" \
   lsp_honors_ignore_like_the_cli \
   'the LSP indexes ignored files as project code'
 
+mutant IG-G "$DIS" \
+  '    let path = format!("/{}", rel.to_string_lossy());
+    ignore_list.iter().any(|entry| ignore_entry_matches(&path, entry))' \
+  '    let rel_components: Vec<_> = rel.components().collect();
+    ignore_list.iter().any(|entry| {
+        let entry_components: Vec<_> = Path::new(entry).components().collect();
+        !entry_components.is_empty() && rel_components.starts_with(&entry_components)
+    })' \
+  unanchored_entry_matches_anywhere \
+  'the matcher reverts to whole components from the root (pre-H4b)'
+
 echo
 echo '--- restore and prove the shipped source is byte-identical'
 restore
-for f in "$MAIN" "$IDX" "$CHK" "$SRV"; do
+for f in "$MAIN" "$IDX" "$CHK" "$SRV" "$DIS"; do
   cmp -s "$f" "$BAK/$(basename "$f")" && ok "$f restored byte-identical" || bad "$f NOT restored"
 done
 run_suite

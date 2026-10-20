@@ -19,6 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entirely). Public corpora (no `sorbet/config`): byte-identical. Proof:
   `tests/sorbet_ignore_indexing.rs`, `scripts/ignore-indexing-mutants.sh`
   (6 mutants, gate c1).
+- `--ignore` entries now match the way Sorbet does (H4b, observed on sorbet
+  0.6.13437): `/`-leading entries are anchored prefixes, others match
+  anywhere, whole names only. brew's `/vendor/...` entries now take effect
+  (-67 diagnostics, 0 added: 61 inside `vendor/`, now never reported, and
+  6 `sig` E0101 false positives on a module that `extend T::Helpers`,
+  now open because the vendored sorbet-runtime reopens `T::Helpers`).
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`
   (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet

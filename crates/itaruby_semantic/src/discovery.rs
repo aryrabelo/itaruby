@@ -462,24 +462,43 @@ pub fn sorbet_ignore_entries(root: &Path) -> Vec<String> {
 /// Strips one trailing `/` so `--ignore=test/fixtures/` and
 /// `--ignore=test/fixtures` (I2: "without trailing slash still excludes
 /// the directory it names") normalize to the same entry before
-/// `path_is_ignored` compares path components.
+/// `path_is_ignored` compares it.
 fn normalize_ignore_entry(path: &str) -> String {
     path.strip_suffix('/').unwrap_or(path).to_string()
 }
 
-/// Component-boundary match (I2) for one discovered file's root-relative
-/// path against `sorbet/config`'s `--ignore` entries: entry `test/fix`
-/// must NOT exclude `test/fixtures2/x.rb`. Comparing `Path::components()`
-/// rather than raw string prefixes gets this right for free — `test/fix`
-/// is `["test", "fix"]`, which is not a prefix of `test/fixtures2/x.rb`'s
-/// `["test", "fixtures2", "x.rb"]`, whereas `test/fixtures` (`["test",
-/// "fixtures"]`) IS a prefix of `["test", "fixtures", "x.rb"]` — so it
-/// excludes the directory it names whether or not it had a trailing `/`
-/// (already stripped by `normalize_ignore_entry`).
+/// H4b (2026-10-20): Sorbet's own `--ignore` matching, as OBSERVED on
+/// sorbet 0.6.13437 (`srb tc --no-config --dir . --ignore=<e>` over a
+/// planted tree, not the docs). The file's path relative to the input dir
+/// is written `/<rel>` (`/bar/foo/baz.rb`):
+/// - an entry starting with `/` must be a PREFIX of it (`/foo` ignores
+///   `foo/bar.rb`, never `bar/foo/baz.rb`);
+/// - any other entry may match ANYWHERE (`foo` ignores `foo/bar.rb` and
+///   `bar/foo/baz.rb`; `a/b` ignores `x/a/b/c.rb`; `foo.rb` ignores
+///   `bar/foo.rb`);
+/// - either way the match must start right after a `/` and end at a `/`
+///   or the end of the path: whole names only (`foo` never ignores
+///   `foo.rb` or `foo2/bar.rb`, `oo` ignores nothing, `Formula` never
+///   `FormulaX/`);
+/// - an entry is compared as text: `./foo` ignores nothing.
+///
+/// A trailing `/` is already stripped by `normalize_ignore_entry`, which
+/// Sorbet agrees with (`foo/` ignores exactly what `foo` does).
 pub fn path_is_ignored(rel: &Path, ignore_list: &[String]) -> bool {
-    let rel_components: Vec<_> = rel.components().collect();
-    ignore_list.iter().any(|entry| {
-        let entry_components: Vec<_> = Path::new(entry).components().collect();
-        !entry_components.is_empty() && rel_components.starts_with(&entry_components)
-    })
+    let path = format!("/{}", rel.to_string_lossy());
+    ignore_list.iter().any(|entry| ignore_entry_matches(&path, entry))
+}
+
+/// One `--ignore` entry against one `/`-prefixed relative path; see
+/// `path_is_ignored` for the observed rules.
+fn ignore_entry_matches(path: &str, entry: &str) -> bool {
+    let ends_at_boundary = |end: usize| end == path.len() || path.as_bytes()[end] == b'/';
+    if entry.is_empty() || entry == "/" {
+        return false;
+    }
+    if entry.starts_with('/') {
+        return path.starts_with(entry) && ends_at_boundary(entry.len());
+    }
+    path.match_indices(entry)
+        .any(|(at, _)| path.as_bytes()[at - 1] == b'/' && ends_at_boundary(at + entry.len()))
 }

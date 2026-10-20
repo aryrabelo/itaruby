@@ -73,7 +73,12 @@ found, and the launch bar is winning on both.
   dropping them turns a Rails initializer's constant into E0104 in `app/`.
   Proof: `crates/itaruby/tests/sorbet_ignore_indexing.rs`,
   `testdata/sorbet_ignore_indexing/`, `scripts/ignore-indexing-mutants.sh`
-  (gate c1).
+  (gate c1). Entries match exactly as sorbet 0.6.13437 was OBSERVED to
+  match them (2026-10-20, `srb tc --ignore` over a planted tree): against
+  `/<path relative to the input dir>`, a `/`-leading entry is a prefix, any
+  other entry matches anywhere, both only on whole names (`foo` never
+  `foo.rb`/`foo2/`), compared as text (`./foo` matches nothing). Proof:
+  `tests/sorbet_ignore_matching.rs`, mutant IG-G.
 - A code path that turns silence into an error must never read absence of
   evidence as evidence of absence (learned 2026-08-24, binding): a gate that
   finds no signal on an upward search (e.g. no Gemfile discovered within N

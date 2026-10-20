@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- A bare, unqualified top-level value-constant write in a client's
+  `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,
+  no `::` anywhere in the LHS — planningalerts' real
+  `sorbet/rbi/shims/elasticsearch_client.rbi`:
+  `ElasticSearchClient = T.let(T.unsafe(nil),
+  T.nilable(Elasticsearch::Client))`) was never read by any RBI channel:
+  `rbi_declares` only matches a `class`/`module` header, and
+  `rbi_qualified_const_declares` requires a `::` to split on, so it
+  returned `false` immediately for a bare name — a reference to such a
+  constant falsely warned `E0104` even though the shim genuinely
+  declares it. Fix: `rbi.rs::scan_toplevel_const_write` (phase 1) unions
+  bare value-constant-write candidates into the existing RBI locator
+  map, and `index.rs::rbi_toplevel_const_declares` (phase 2) verifies
+  via a real Prism parse (`FileDefs::toplevel_consts`, or a nested
+  `class Object`/`module Kernel` write), wired into
+  `check.rs::Checker::rbi_fallback_declares` beside the other direct RBI
+  channels. Suppression-only (invariant #1): a hit silences `E0104` but
+  the reference still types `Ty::Unknown`, never interned into
+  `ProjectIndex`. Measured: planningalerts loses exactly its 3
+  `ElasticSearchClient` E0104s; zero added diagnostics across rails,
+  mastodon, discourse, and all 8 Sorbet corpora (serveme,
+  planningalerts, morph, brew, ruby-lsp, tapioca, packwerk, spoom).
 
 ### Fixed
 - A mixin written into a project reopening of `Class`, `Module`, `Object`,

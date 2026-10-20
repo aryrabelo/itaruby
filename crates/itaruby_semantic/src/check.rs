@@ -2582,7 +2582,12 @@ impl Checker<'_> {
     /// doc comment (`rbi_ancestor_declares` is W3 require/autoload: the
     /// reference may resolve through an EXTERNAL ancestor the project
     /// index can't see, like graphql's `GraphQLTypeNames` mixin behind
-    /// `Types::BaseObject < GraphQL::Schema::Object`).
+    /// `Types::BaseObject < GraphQL::Schema::Object`). Bead ita-h5s:
+    /// `rbi_toplevel_const_declares` is the BARE top-level value-constant
+    /// channel (planningalerts' real `ElasticSearchClient` shim shape) —
+    /// tried directly beside `rbi_declares`/`rbi_qualified_const_declares`,
+    /// never through the nesting/alias-expansion helpers below: a bare
+    /// top-level write has no qualifying scope or alias chain to expand.
     fn rbi_fallback_declares(
         &self,
         scope: &[String],
@@ -2591,6 +2596,7 @@ impl Checker<'_> {
     ) -> bool {
         crate::index::rbi_declares(path, map)
             || crate::index::rbi_qualified_const_declares(path, map)
+            || crate::index::rbi_toplevel_const_declares(path, map)
             || self.alias_rbi_leaf_declares(scope, path, map)
             || crate::index::rbi_ancestor_declares(self.index, scope, path, map)
             || self.nesting_expanded_rbi_declares(scope, path, map)

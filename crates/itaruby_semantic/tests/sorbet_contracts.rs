@@ -1744,7 +1744,7 @@ end
     // takes the singleton contract off. Measured on ruby 3.4.2 with
     // sorbet-runtime 0.6.13036: with the `extend` the call returns
     // "text"; without it, sorbet-runtime raises `TypeError`.
-    const SINGLETON: &str = r#"
+    let singleton = r#"
 class ContractHookSingleton
   extend T::Sig
   sig { params(value: Integer).returns(Integer) }
@@ -1764,9 +1764,9 @@ module ContractHookDefiner
   end
 end
 ";
-    let diags = check_files("extended-hook-def", &[&SINGLETON.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
+    let diags = check_files("extended-hook-def", &[&singleton.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
-    let target = SINGLETON.replace("EXTENSION", "");
+    let target = singleton.replace("EXTENSION", "");
     let control = check_files("extended-hook-def-control", &[&target, definer]);
     assert_eq!(contract_names(&target, &control), ["\"text\""], "control must accuse without the extend: {control:?}");
 }
@@ -1931,7 +1931,7 @@ end
     // include-time rule keeps E0109 off it. Measured on ruby 3.4.2 with
     // sorbet-runtime 0.6.13036 and activesupport 8.1.3: with the
     // `include` `label` returns 1; without it, `TypeError`.
-    const RETURNING: &str = r#"
+    let returning_template = r#"
 class ContractIncludedReturn
   extend T::Sig
   sig { returns(Integer) }
@@ -1945,10 +1945,10 @@ ContractIncludedReturn.new.label
     let relabel = "module ContractIncludedRelabel\n  extend ActiveSupport::Concern\n  included do\n    def label\n      1\n    end\n  end\nend\n";
     let relabel_macro_first = relabel.replace("  included do", "  contract_setting :flag\n  included do");
     for (i, module) in [relabel, relabel_macro_first.as_str()].iter().enumerate() {
-        let diags = check_files(&format!("included-relabel-{i}"), &[&RETURNING.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
+        let diags = check_files(&format!("included-relabel-{i}"), &[&returning_template.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
         assert!(contract_codes(&diags).is_empty(), "{module}: {diags:?}");
     }
-    let returning = RETURNING.replace("INCLUSION", "");
+    let returning = returning_template.replace("INCLUSION", "");
     let control = check_files("included-relabel-control", &[&returning, relabel]);
     assert_eq!(contract_codes(&control), ["E0109"], "control must accuse without the include: {control:?}");
     assert_eq!(contract_names(&returning, &control), ["label"], "{control:?}");

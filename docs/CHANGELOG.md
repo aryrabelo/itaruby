@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- `sorbet/config` `--ignore` no longer hides definitions (H4, 2026-10-20).
+  Ignored files are still never checked or reported (parse errors
+  included), but they are read as suppression-only evidence: a constant
+  defined only there (a Rails initializer's `Client = if ... end`) no
+  longer reads as E0104 elsewhere, and a class they reopen is open. They
+  never resolve a name to a closed class, so a test-fixture stub sharing a
+  gem's name cannot cause a new E0101. `ita server` now honors the same
+  `--ignore` list as `ita check` (previously it ignored `sorbet/config`
+  entirely). Public corpora (no `sorbet/config`): byte-identical. Proof:
+  `tests/sorbet_ignore_indexing.rs`, `scripts/ignore-indexing-mutants.sh`
+  (6 mutants, gate c1).
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`
   (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet

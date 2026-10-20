@@ -6585,6 +6585,70 @@ pub fn rbi_qualified_const_declares<S: std::hash::BuildHasher>(qualified: &str, 
     })
 }
 
+/// Bead ita-h5s: does the client's `sorbet/rbi` declare `name` as a BARE,
+/// unqualified top-level value-constant write — `XClient =
+/// T.let(T.unsafe(nil), T.nilable(Integer))`, planningalerts' real
+/// `sorbet/rbi/shims/elasticsearch_client.rbi` shape
+/// (`ElasticSearchClient = T.let(T.unsafe(nil),
+/// T.nilable(Elasticsearch::Client))`), or Tapioca's own compact-alias
+/// rendering (`DRbIdConv = DRb::DRbIdConv`)? Neither existing RBI
+/// channel ever reads this shape: `rbi_declares` only matches a
+/// `class`/`module` header, and `rbi_qualified_const_declares` requires
+/// `qualified.rsplit_once("::")` to succeed, so it returns `false`
+/// immediately for a name with no `::` at all — confirmed by the
+/// monotonicity report's minimal probe (`v1-asis` vs `v3-noshim`:
+/// removing the shim changed nothing, proving it was never consulted).
+///
+/// Consulted only from `check.rs::Checker::rbi_fallback_declares`, only
+/// after the project's own index has already failed to resolve a BARE
+/// reference. Candidates come from the SAME shared `rbi_map`
+/// `rbi_declares`/`rbi_qualified_const_declares` use
+/// (`rbi.rs::scan_toplevel_const_write` unions its hits into that same
+/// map under the same key/union discipline as a class/module header —
+/// see `RbiIndex::constants`'s doc comment) — phase 1 is a coarse
+/// locator only; the real check below is phase 2's `parse_defs_text`
+/// parse, exactly like every other RBI channel, so a comment or a
+/// string/heredoc body line that merely LOOKS like `NAME = ...` (phase
+/// 1 candidate) is correctly rejected here (it never lands in
+/// `FileDefs::toplevel_consts`, which only records a real
+/// `ConstantWriteNode`/`ConstantOrWriteNode`/`ConstantTargetNode` at
+/// true file scope).
+///
+/// Two shapes count: a genuinely top-level write (`FileDefs
+/// ::toplevel_consts`, `frag_idx == None` in `DefWalker`), or one
+/// nested directly inside a `class Object`/`module Kernel` block — the
+/// shim author's alternative spelling of "define this constant where a
+/// bare reference from anywhere finds it" (Ruby resolves an unqualified
+/// constant through `Object`'s own ancestry as the last resort). No
+/// other owner is tried: a bare query has no qualifying scope to widen
+/// into, unlike `rbi_qualified_const_declares`'s owner-based nested
+/// check.
+///
+/// Suppression-only, the same contract as every other RBI channel (see
+/// `rbi_declares`'s doc comment): a hit only silences `E0104`; the
+/// reference still types as `Ty::Unknown` in `infer_const` (invariant
+/// #1) — this project's `ProjectIndex` is never touched, so no new
+/// E0101/E0102/E0103/E0108/E0109 diagnostic becomes reachable because of
+/// this channel. `name` carrying a `::` always returns `false`
+/// immediately: that shape is `rbi_qualified_const_declares`'s alone.
+pub fn rbi_toplevel_const_declares<S: std::hash::BuildHasher>(name: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> bool {
+    let name = name.trim_start_matches("::");
+    if name.contains("::") {
+        return false;
+    }
+    let Some(paths) = rbi_map.get(name) else {
+        return false;
+    };
+    paths.iter().any(|path| {
+        let defs = rbi_file_defs(path);
+        defs.toplevel_consts.iter().any(|c| c == name)
+            || defs
+                .fragments
+                .iter()
+                .any(|f| (f.path == "Object" || f.path == "Kernel") && f.consts.iter().any(|c| c == name))
+    })
+}
+
 /// Bead ita-4wq: guard against a pathological RBI alias cycle
 /// (`A = B` / `B = A`, both written INSIDE a vendored `.rbi`) — same
 /// role as `ProjectIndex::CONST_ALIAS_CHAIN_CAP` for the project-side

@@ -103,6 +103,61 @@ pub fn scan_class_name(line: &str) -> Option<&str> {
     }
 }
 
+/// Bead ita-h5s: the constant a BARE top-level value-constant write line
+/// declares — `XClient = T.let(...)`, `DRbIdConv = DRb::DRbIdConv`,
+/// `MODULES = T.let(T.unsafe(nil), T::Array[T.untyped])` — the shape
+/// `scan_class_name` above never sees at all (it only ever matches a
+/// `class `/`module ` keyword prefix). Measured against all 8 Sorbet
+/// corpora under `corpus-candidates/`: every real project ships this
+/// shape either as a hand-written shim (planningalerts'
+/// `sorbet/rbi/shims/elasticsearch_client.rbi`:
+/// `ElasticSearchClient = T.let(T.unsafe(nil), T.nilable(Elasticsearch
+/// ::Client))`) or as Tapioca's own compact-alias rendering under
+/// `gems/*.rbi` (`DRbIdConv = DRb::DRbIdConv`, `FileList =
+/// Rake::FileList`, ...). A QUALIFIED write (`Foo::Bar = ...`) is
+/// deliberately NOT matched here — the identifier scan stops at the
+/// first `:`, so `rest` after the name never starts with `=` for one,
+/// and that shape is already the separate `qualified_writes`/`consts`
+/// channel `rbi_qualified_const_declares` (`index.rs`) owns; this
+/// function exists only for the BARE, unqualified shape no channel
+/// reads today.
+///
+/// Same discipline as `scan_class_name`: leading whitespace trimmed (so
+/// a const written inside a `class Object`/`module Kernel` block is
+/// still caught by this coarse locator — phase 2's real parse,
+/// `index.rs::rbi_toplevel_const_declares`, is what actually tells a
+/// true top-level write from one nested in an arbitrary class/module
+/// body), never a phantom name: `==`/`=~`/`=>` right after the
+/// identifier are explicitly excluded so a comparison, pattern match, or
+/// hash-rocket line is never mistaken for an assignment. This is a
+/// cheap LOCATOR ONLY — a comment (`# FakeConst = 1`) or a string/heredoc
+/// body line that merely LOOKS like `NAME = ...` can still produce a
+/// false-positive candidate here; `rbi_toplevel_const_declares`'s real
+/// Prism parse (`FileDefs::toplevel_consts`) is the source of truth that
+/// rejects those, exactly like every other RBI channel's phase 1/phase 2
+/// split.
+pub fn scan_toplevel_const_write(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let end = trimmed
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(trimmed.len());
+    let name = &trimmed[..end];
+    let rest = trimmed[end..].trim_start();
+    let mut chars = rest.chars();
+    match chars.next() {
+        Some('=') => match chars.next() {
+            // `==` (comparison), `=~` (regex match), `=>` (hash rocket,
+            // rescue-clause/pattern-match binding) are never assignment.
+            Some('=') | Some('~') | Some('>') => None,
+            _ => Some(name),
+        },
+        _ => None,
+    }
+}
+
 /// What phase 1 harvests from one RBI tree: the `constant name -> EVERY
 /// declaring file` map (bead ita-k9j.3: exhaustive, never first-wins — a
 /// stub reopening (`class ActiveRecord::Base; include Flipper::Adapters
@@ -128,7 +183,15 @@ pub fn scan_class_name(line: &str) -> Option<&str> {
 /// `ActiveSupport`'s `String#squish` reaches a core receiver, and a
 /// first-wins map there would silently drop the second gem that also
 /// reopens `String` (a missed declaration would mean a false E0101, so
-/// that map must be exhaustive too).
+/// that map must be exhaustive too). Bead ita-h5s: `constants` also
+/// harvests `scan_toplevel_const_write`'s bare value-constant-write hits
+/// under the SAME key/union discipline — a value write and a
+/// class/module header never collide in practice (Ruby forbids reusing
+/// one name as both), and every consumer (`rbi_declares`,
+/// `rbi_qualified_const_declares`, `rbi_toplevel_const_declares`) already
+/// refilters its own candidates by a file-specific, phase-2-verified
+/// shape, so widening this shared locator map costs nothing but an
+/// extra candidate file a consumer's own exact check rejects.
 #[derive(Default)]
 pub struct RbiIndex {
     pub constants: HashMap<String, Vec<PathBuf>>,
@@ -144,7 +207,8 @@ pub fn build_rbi_index(files: &[PathBuf]) -> RbiIndex {
         let Ok(f) = std::fs::File::open(path) else { continue };
         for line in std::io::BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
-            if let Some(name) = scan_class_name(&line) {
+            let name = scan_class_name(&line).or_else(|| scan_toplevel_const_write(&line));
+            if let Some(name) = name {
                 // bead ita-k9j.3: every declaring file, not just the
                 // first — same `.entry(..).or_default().push(..)` shape
                 // `core_reopenings` already used below. `files` is sorted
@@ -184,6 +248,46 @@ mod tests {
         assert_eq!(scan_class_name("# class Foo"), None);
         assert_eq!(scan_class_name(""), None);
         assert_eq!(scan_class_name("classify(foo)"), None);
+    }
+
+    #[test]
+    fn scans_bare_toplevel_const_writes() {
+        assert_eq!(scan_toplevel_const_write("XClient = T.let(T.unsafe(nil), T.nilable(Integer))"), Some("XClient"));
+        assert_eq!(scan_toplevel_const_write("DRbIdConv = DRb::DRbIdConv"), Some("DRbIdConv"));
+        assert_eq!(scan_toplevel_const_write("  MODULES = T.let(T.unsafe(nil), T::Array[T.untyped])"), Some("MODULES"));
+    }
+
+    #[test]
+    fn ignores_non_assignment_and_qualified_toplevel_lines() {
+        assert_eq!(scan_toplevel_const_write("Foo::Bar = 1"), None, "qualified writes are a separate channel");
+        assert_eq!(scan_toplevel_const_write("FOO == 1"), None);
+        assert_eq!(scan_toplevel_const_write("FOO =~ /x/"), None);
+        assert_eq!(scan_toplevel_const_write("FOO => bar"), None);
+        assert_eq!(scan_toplevel_const_write("# FakeConst = 1"), None);
+        assert_eq!(scan_toplevel_const_write("class Foo"), None);
+        assert_eq!(scan_toplevel_const_write(""), None);
+    }
+
+    #[test]
+    fn build_rbi_index_unions_bare_toplevel_const_writes() {
+        // ponytail: crate target dir, not system temp — same
+        // machine-local/wiped-with-clean contract as the other
+        // filesystem-backed test below.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/itaruby-rbi-toplevel-const-test");
+        std::fs::create_dir_all(&dir).expect("create test rbi dir");
+        std::fs::write(
+            dir.join("shim.rbi"),
+            "# typed: true\nXClient = T.let(T.unsafe(nil), T.nilable(Integer))\n",
+        )
+        .expect("write shim.rbi");
+        let files = discover_rbi_files(&dir);
+        let index = build_rbi_index(&files);
+        assert!(
+            index.constants.contains_key("XClient"),
+            "bare top-level value-constant write must be a phase-1 candidate, got: {:?}",
+            index.constants.keys().collect::<Vec<_>>()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

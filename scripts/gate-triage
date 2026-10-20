@@ -144,7 +144,7 @@ def classify(digest, answers)
   skipped = digest.dig('corpus', 'skipped') || []
   unless skipped.empty?
     actions << Action.new('corpus_skipped_here',
-                          "skipped here: #{skipped.join(', ')} — full proof needs the anchor on the machine that hosts them; a SKIP where the machine should host the corpus is a rotted path, not absence")
+                          "skipped here: #{skipped.join(', ')} — full proof needs a gate run on the machine that hosts them; a SKIP where the machine should host the corpus is a rotted path, not absence")
   end
 
   corpora = gate(digest, 'd')&.dig('numbers', 'corpora') || []

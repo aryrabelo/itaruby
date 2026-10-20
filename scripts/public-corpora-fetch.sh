@@ -59,12 +59,23 @@ clones=()
 while IFS= read -r raw || [[ -n $raw ]]; do
   [[ $raw =~ ^[[:space:]]*(#|$) ]] && continue
   read -r -a fields <<<"$raw"
-  if (( ${#fields[@]} != 4 && ${#fields[@]} != 5 )); then
+  if (( ${#fields[@]} < 4 || ${#fields[@]} > 6 )); then
     printf 'FAIL public corpus restore: malformed repo line in %s\n' "$CORPORA_FILE" >&2
     exit 64
   fi
-  id=${fields[0]}; url=${fields[1]}; sha=${fields[2]}; clone_dir=${fields[4]-$id}
-  if [[ ! $id =~ ^[A-Za-z0-9._-]+$ || -z $url || ! $sha =~ ^[0-9a-f]{40}$ ||
+  id=${fields[0]}; url=${fields[1]}; sha=${fields[2]}
+  # Optional fields, in this order: [<clone-dir>] [check=<path>]. The check
+  # path is the gate's business (which dir inside the clone is measured); the
+  # fetcher only must not mistake it for the clone dir.
+  clone_dir=$id clone_set=0 check_set=0 opts_ok=1
+  for opt in "${fields[@]:4}"; do
+    case $opt in
+      check=*) (( ! check_set )) || opts_ok=0; check_set=1
+        [[ ${opt#check=} =~ ^[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*$ ]] || opts_ok=0 ;;
+      *) (( ! clone_set && ! check_set )) || opts_ok=0; clone_set=1; clone_dir=$opt ;;
+    esac
+  done
+  if (( ! opts_ok )) || [[ ! $id =~ ^[A-Za-z0-9._-]+$ || -z $url || ! $sha =~ ^[0-9a-f]{40}$ ||
         ! ${fields[3]} =~ ^[0-9]+([.][0-9]+)?(:[0-9]+([.][0-9]+)?)?$ ||
         -z $clone_dir || $clone_dir == /* || $clone_dir == . || $clone_dir == .. ]]; then
     printf 'FAIL public corpus restore: malformed repo line for %q in %s\n' "$id" "$CORPORA_FILE" >&2

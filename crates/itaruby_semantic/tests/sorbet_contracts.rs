@@ -4934,7 +4934,7 @@ o.alias(1)
 /// return of `T::Set[X]`, `T.class_of(X)`, `T.noreturn` types nothing.
 #[test]
 fn sig_only_types_never_type_a_consumer() {
-    let source = r#"
+    let source = r"
 class ContractSigOnlyReturn
   extend T::Sig
   sig { returns(T::Set[Integer]) }
@@ -4942,7 +4942,7 @@ class ContractSigOnlyReturn
 end
 made = ContractSigOnlyReturn.new.set
 made
-"#;
+";
     assert_eq!(ty_at("sig-only-ret", source, "\nmade\n", "made"), None);
 }
 
@@ -4989,7 +4989,7 @@ o.failing(1)
 /// T::Sig` included. Any hidden `new` keeps it off.
 #[test]
 fn new_checks_the_initialize_contract() {
-    const TARGET: &str = r#"
+    const TARGET: &str = r"
 PRELUDE
 class ContractInit
   extend T::Sig
@@ -5000,7 +5000,7 @@ end
 OUTSIDE
 ContractInit.new(:literal)
 ContractInit.new(1)
-"#;
+";
     let render = |prelude: &str, body: &str, outside: &str| {
         TARGET.replace("PRELUDE", prelude).replace("BODY", body).replace("OUTSIDE", outside)
     };
@@ -5029,7 +5029,7 @@ ContractInit.new(1)
 /// fit the method are no contract, and the sig never reaches a later def.
 #[test]
 fn attr_sigs_are_contracts() {
-    let source = r#"
+    let source = r"
 class ContractAttr
   extend T::Sig
   sig { params(w: Integer).void }
@@ -5054,7 +5054,7 @@ o.bad.upcase
 o.a.upcase
 o.acc.upcase
 o.later(:later)
-"#;
+";
     let diags = check("attr-sigs", source, None);
     assert_eq!(contract_names(source, &diags), [":writer"], "{diags:?}");
     let e0101: Vec<&str> = diags.iter().filter(|d| d.code == "E0101").map(|d| &source[d.start..d.end]).collect();

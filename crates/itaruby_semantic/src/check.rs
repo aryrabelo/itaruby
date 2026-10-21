@@ -30,6 +30,7 @@ use crate::types::{
 type Env = FxHashMap<String, Ty>;
 type KeywordArg = (String, Ty, (usize, usize));
 type PositionalArg = (Ty, (usize, usize), Option<String>);
+type WrittenLiteral = ((usize, usize), LiteralClass);
 
 struct CallTypeArgs<'a> {
     positional: &'a [PositionalArg],
@@ -5233,7 +5234,7 @@ fn harvest_answers(h: &crate::open_world::Harvest, chain: &[&str], keys: &[&str]
         &mut self,
         call: &CallNode<'_>,
         name: &str,
-        (positional, literals): (&[PositionalArg], &[((usize, usize), LiteralClass)]),
+        (positional, literals): (&[PositionalArg], &[WrittenLiteral]),
         scope: &[String],
     ) -> Option<Ty> {
         let nodes = self.assertion_arguments(call, name, positional.len(), scope)?;

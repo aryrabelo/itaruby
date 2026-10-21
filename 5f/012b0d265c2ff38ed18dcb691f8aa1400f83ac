@@ -1,0 +1,18 @@
+.software-factory/evidence/closing-run.json
+  h_b156936c57c455 1-184
+scripts/closing-evidence
+  h_b156936c57c455 128-147,223-224
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 75-84,89-90
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5f012b0d265c2ff38ed18dcb691f8aa1400f83ac",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

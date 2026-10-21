@@ -1,0 +1,16 @@
+AGENTS.md
+  h_b156936c57c455 1105-1111,1117
+scripts/closing-evidence
+  h_b156936c57c455 10-14,17-20,36-37,40-43,117-128,134-152,154-160,163-164,166-169,192,195-197,199,201-208
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "f700bc6f33ca911df41cb210626eb49d8f2f8be8",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

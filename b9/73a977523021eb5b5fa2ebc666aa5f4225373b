@@ -1,0 +1,74 @@
+AGENTS.md
+  h_b156936c57c455 175-196,629
+crates/itaruby/src/main.rs
+  h_b156936c57c455 7,9,97,160,593,597,621-631,1282-1284,1301
+crates/itaruby/tests/sorbet_ignore_indexing.rs
+  h_b156936c57c455 1-272
+crates/itaruby/tests/sorbet_ignore_matching.rs
+  h_b156936c57c455 1-120
+crates/itaruby_semantic/src/check.rs
+  h_b156936c57c455 2939-2944,2953,3014-3019,3023,3025,3028,3032-3040,3043-3052,4253
+crates/itaruby_semantic/src/discovery.rs
+  h_b156936c57c455 526-609
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 172-177,5589-5614,5622,5748-5750,5764-5820,7253-7254,7472-7535
+crates/itaruby_semantic/src/lib.rs
+  h_b156936c57c455 20,39-60
+crates/itaruby_semantic/src/rbi.rs
+  h_b156936c57c455 106-160,186-194,210-211,253-292
+crates/itaruby_semantic/tests/rbi_bare_toplevel_const.rs
+  h_b156936c57c455 1-145
+crates/itaruby_server/src/main_loop.rs
+  h_b156936c57c455 35-37,99,199-203,206,208,211-212,218-223,227,240-251,538-540,551-560,562-570,691-710,712-715
+docs/CHANGELOG.md
+  h_b156936c57c455 9-31,76-95
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 200
+scripts/ignore-indexing-mutants.sh
+  h_b156936c57c455 1-179
+scripts/public-baseline/README.md
+  h_b156936c57c455 683-750
+scripts/rbi-bare-toplevel-const-mutants.sh
+  h_b156936c57c455 1-171
+testdata/rbi_bare_toplevel_const/bare_const_resolves.rb
+  h_b156936c57c455 1-15
+testdata/rbi_bare_toplevel_const/control_heredoc_body_const_still_accuses.rb
+  h_b156936c57c455 1-14
+testdata/rbi_bare_toplevel_const/method_call_stays_unknown.rb
+  h_b156936c57c455 1-10
+testdata/rbi_bare_toplevel_const/sorbet/rbi/shims/x_client.rbi
+  h_b156936c57c455 1-19
+testdata/sorbet_ignore_indexing/app/gadget.rb
+  h_b156936c57c455 1-6
+testdata/sorbet_ignore_indexing/app/http.rb
+  h_b156936c57c455 1-5
+testdata/sorbet_ignore_indexing/app/search_indexer.rb
+  h_b156936c57c455 1-5
+testdata/sorbet_ignore_indexing/app/typo.rb
+  h_b156936c57c455 1-5
+testdata/sorbet_ignore_indexing/app/widget.rb
+  h_b156936c57c455 1-7
+testdata/sorbet_ignore_indexing/config/initializers/search_client.rb
+  h_b156936c57c455 1-7
+testdata/sorbet_ignore_indexing/config/initializers/widget_ext.rb
+  h_b156936c57c455 1-7
+testdata/sorbet_ignore_indexing/sorbet/config
+  h_b156936c57c455 1-4
+testdata/sorbet_ignore_indexing/spec/fixtures/broken.rb
+  h_b156936c57c455 1-3
+testdata/sorbet_ignore_indexing/spec/fixtures/faraday_stub.rb
+  h_b156936c57c455 1-8
+testdata/sorbet_ignore_indexing/spec/fixtures/typo_inside.rb
+  h_b156936c57c455 1-6
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "b973a977523021eb5b5fa2ebc666aa5f4225373b",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

@@ -34,4 +34,3 @@ scripts/bug-replay/results/
 # sf's local trail of attempts per finding; machine-local, never evidence.
 .software-factory/escapes/
 scripts/__pycache__/
-.software-factory/evidence/closing-run.json

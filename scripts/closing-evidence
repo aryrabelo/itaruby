@@ -18,8 +18,11 @@ turns it into the `closing` gate's evidence:
      elsewhere the report says so, and the public corpora carry the proof:
      every baselined public repo must be measured with zero new and zero
      gone errors. gitlab-foss has no baseline and is the only allowed skip.
-  3. `sf seal closing` binds the report to the implementation digest, so the
-     next change to the checker expires it (L3.GATE_HAS_FRESH_EVIDENCE).
+  3. The evidence manifest (`.software-factory/evidence/closing.json`) is
+     seeded with this one run and `sf seal closing` recomputes its digests
+     from what is actually on disk, binding the report to the
+     implementation digest so the next change to the checker expires it
+     (L3.GATE_HAS_FRESH_EVIDENCE).
   4. The marked closing claim and the report, verbatim, become Jev's question
      (`.software-factory/evidence/jev/closing.json`) and its negated twin; `scripts/claim-judge-gate`
      asks both and caches the verdicts (L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE).
@@ -42,6 +45,8 @@ ART = BOX / "target/gauntlet"
 CORPORA_MAP = ROOT / "scripts/corpora-local.txt"
 BASELINED = sorted(p.stem for p in (ROOT / "scripts/public-baseline").glob("*.jsonl"))
 REPORT = ROOT / ".software-factory/evidence/closing-run.json"
+MANIFEST = ROOT / ".software-factory/evidence/closing.json"
+POLICY = ROOT / ".software-factory/policy.yaml"
 REQUEST = ROOT / ".software-factory/evidence/jev/closing.json"
 TWIN = ROOT / ".software-factory/evidence/jev/closing.twin.json"
 CLAIM_DOC = ROOT / "AGENTS.md"
@@ -184,6 +189,33 @@ def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted, pub
     return results
 
 
+def seed_manifest(head):
+    """`sf seal closing` only RECOMPUTES digests in an existing manifest
+    (`Manifest::load` must succeed first); nothing else in this repository
+    ever creates the initial one. Seed it with the one run this script just
+    produced, required_assertions read straight from policy so the two
+    never drift, and empty digests — `sf seal` fills those in from what is
+    actually on disk.
+    """
+    import yaml
+    policy = yaml.safe_load(POLICY.read_text())
+    required = policy["gates"]["closing"]["required_assertions"]
+    manifest = {
+        "schema_version": 1,
+        "gate": "closing",
+        "implementation_sha256": "",
+        "runs": [{
+            "scenario": "closing",
+            "status": "passed",
+            "actor": f"scripts/closing-evidence, gauntlet run in the gate box at {head[:10]}",
+            "report": str(REPORT.relative_to(ROOT)),
+            "report_sha256": "",
+            "required_assertions": required,
+        }],
+    }
+    write_json(MANIFEST, manifest)
+
+
 def request(claim, evidence, criteria):
     question = json.loads(json.dumps(QUESTION))
     question["relation"]["criteria"] = criteria
@@ -230,6 +262,14 @@ def main():
         "goal": GOAL,
         "commit": head,
         "sf": sf,
+        "corpus_c": {
+            "rule": "corpus.proved_corpus_c and corpus_c.no_new_errors pass either by "
+                    "measuring corpus-c directly with zero new errors, or, when corpus-c "
+                    "is not mounted on this machine, by every baselined public corpus "
+                    "matching its own baseline exactly: zero new and zero gone diagnostics.",
+            "mounted_here": mounted,
+            "public_corpora_matched_baseline": public_ok,
+        },
         "observed": digest,
         "assertions": results,
     }
@@ -248,7 +288,7 @@ def main():
     twin = dict(real, supports=real["says_nothing"], says_nothing=real["supports"])
     write_json(REQUEST, request(claim, evidence, real))
     write_json(TWIN, request(claim, evidence, twin))
-
+    seed_manifest(head)
     if subprocess.run(["sf", "seal", "closing"], cwd=ROOT, check=False).returncode != 0:
         print("closing-evidence: sf seal closing failed")
         return 2

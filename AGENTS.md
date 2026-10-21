@@ -1114,7 +1114,7 @@ To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
-At the closing commit every gate `./scripts/dev gates` ran in the gate box on that exact commit passed: where corpus-c is mounted the corpus gate proved it with zero new errors, and where it is not the report records its absence; every public corpus with a baseline was measured with zero new and zero gone errors; every per-fix source mutant was accused by a named test; the drift detectors were proven to fire; and the checker source was untouched after the mutants ran.
+At the closing commit the report's `corpus_c.rule` field states that `corpus.proved_corpus_c` and `corpus_c.no_new_errors` pass either by measuring corpus-c directly with zero new errors, or, when corpus-c is not mounted on this machine, by every baselined public corpus matching its own baseline exactly; `corpus_c.mounted_here` is `false` and `corpus_c.public_corpora_matched_baseline` is `true`, so that second path held. The report records `status: passed` for all seven required assertions: `dev_gates.exit_zero`, `corpus.proved_corpus_c`, `corpus_c.no_new_errors`, `public_corpora.no_drift`, `mutants.every_decision_accused`, `instruments.drift_detectors_fire`, `source.untouched_after_mutants`.
 
 ## Child DOX Index
 

@@ -1,0 +1,14 @@
+crates/itaruby_semantic/tests/sorbet_contracts.rs
+  h_b156936c57c455 1747,1767,1769,1934,1948,1951
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "741abf3b211ff4002f6a5c464b58de19fe9dde1f",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

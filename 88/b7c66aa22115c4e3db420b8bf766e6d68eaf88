@@ -1,0 +1,20 @@
+crates/itaruby_semantic/src/index.rs
+  h_b156936c57c455 3560-3566,4420-4459
+crates/itaruby_semantic/tests/project_sigs.rs
+  h_b156936c57c455 241-286
+docs/CHANGELOG.md
+  h_b156936c57c455 96-107
+scripts/sorbet-contracts-mutants.py
+  h_b156936c57c455 49-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "88b7c66aa22115c4e3db420b8bf766e6d68eaf88",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

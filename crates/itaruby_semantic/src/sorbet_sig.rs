@@ -10,7 +10,7 @@
 use ruby_prism::{CallNode, Node};
 
 use crate::index::{ConstFallback, ProjectIndex};
-use crate::types::{ClassId, Ty};
+use crate::types::{ClassId, SigOnly, Ty};
 
 /// A single, unambiguous Sorbet contract. Parameter names are Ruby names, never
 /// positional guesses. `void` discards the result; it does not promise `nil`.
@@ -102,14 +102,26 @@ fn extract_clause(call: &CallNode<'_>, sig: &mut SorbetSig) -> Option<u8> {
             sig.params = extract_params(call)?;
             Some(2)
         }
-        b"abstract" if no_args(call) => Some(4),
-        b"override" if no_args(call) => Some(8),
-        b"overridable" if no_args(call) => Some(16),
-        b"final" if no_args(call) => Some(32),
         b"checked" if symbol_arg_is(call, &[b"always", b"tests", b"never"]) => {
             sig.unchecked = !symbol_arg_is(call, &[b"always"]);
             Some(64)
         }
+        _ => modifier_clause(call),
+    }
+}
+
+/// Argument-free modifiers: metadata, never a type.
+fn modifier_clause(call: &CallNode<'_>) -> Option<u8> {
+    match call.name().as_slice() {
+        b"abstract" if no_args(call) => Some(4),
+        b"override" if no_args(call) => Some(8),
+        b"overridable" if no_args(call) => Some(16),
+        b"final" if no_args(call) => Some(32),
+        // `.on_failure(...)` (W7) only hands its arguments to
+        // `T::Configuration.call_validation_error_handler`, whose default
+        // raises; a project that installs another handler references
+        // `T::Configuration` and is project-wide inert already.
+        b"on_failure" => Some(128),
         _ => None,
     }
 }
@@ -165,42 +177,76 @@ fn extract_params(call: &CallNode<'_>) -> Option<Vec<(String, String)>> {
 /// Index-blind mapping retained for consumers that only know core types.
 /// Nominal project types and every unsupported shape remain `Unknown`.
 pub fn sorbet_ret_ty(expr: &str) -> Ty {
-    parse_ty_leaf(expr, &|_| None)
+    consumer_ty(parse_ty_leaf(expr, &|_| None))
 }
 
 /// Root-scoped return mapping for consumers without declaration nesting.
+/// A consumer never sees a `Ty::Contract`: it types no receiver.
 pub fn resolve_ret_ty(expr: Option<&str>, index: &ProjectIndex) -> Ty {
-    expr.map_or(Ty::Unknown, |expr| resolve_sig_ty(expr, index, &[]))
+    expr.map_or(Ty::Unknown, |expr| consumer_ty(resolve_sig_ty(expr, index, &[])))
 }
+
+/// What a consumer may learn from a declared type: every `Ty::Contract`
+/// (W6) is `Unknown`, and an `Unknown` union member absorbs the union.
+pub fn consumer_ty(t: Ty) -> Ty {
+    match t {
+        Ty::Contract(_) => Ty::Unknown,
+        Ty::Union(parts) => parts.into_iter().map(consumer_ty).reduce(Ty::union).unwrap_or(Ty::Unknown),
+        Ty::Array(e) => Ty::Array(Box::new(consumer_ty(*e))),
+        Ty::Hash(k, v) => Ty::Hash(Box::new(consumer_ty(*k)), Box::new(consumer_ty(*v))),
+        other => other,
+    }
+}
+
+/// `T.type_alias { X }` chains longer than this are `Unknown`.
+const TYPE_ALIAS_DEPTH: usize = 8;
 
 /// Resolve supported type expressions in the declaration's lexical scope.
 /// Absolute `::` names bypass nesting, including inside compounds. Only literal
 /// constant paths reach the index; calls, generics and Sorbet special types do
 /// not become nominal classes just because a similarly named class exists.
+/// A constant written as `T.type_alias { X }` (W6) resolves to `X`, read in
+/// the alias's own lexical scope: sorbet-runtime checks the aliased type.
 pub fn resolve_sig_ty(expr: &str, index: &ProjectIndex, nesting: &[String]) -> Ty {
+    resolve_sig_ty_at(expr, index, nesting, 0)
+}
+
+fn resolve_sig_ty_at(expr: &str, index: &ProjectIndex, nesting: &[String], depth: usize) -> Ty {
     parse_ty_leaf(expr, &|name| {
         let bare = name.strip_prefix("::").unwrap_or(name);
         if !constant_path(bare) || bare.starts_with("T::") {
             return None;
         }
-        // A qualified path still looks up its FIRST segment lexically.
-        // resolve_const's dynamic-constant guard only covers simple names,
-        // so reject a shadowed prefix before accepting its global fallback.
-        if !name.starts_with("::") && shadowed_prefix(bare, index, nesting) {
-            return Some(Ty::Unknown);
+        if let Some((alias_nesting, body)) = index.find_type_alias(nesting, name) {
+            return Some(if depth < TYPE_ALIAS_DEPTH {
+                resolve_sig_ty_at(body, index, alias_nesting, depth + 1)
+            } else {
+                Ty::Unknown
+            });
         }
-        let ty = match index.resolve_const(nesting, name) {
-            Some(id) => nominal_ty(id, index),
-            None => scalar_ty(bare)?,
-        };
-        if ty == Ty::Unknown || name.starts_with("::") {
-            return Some(ty);
-        }
-        Some(match inherited_fallback(bare, index, nesting) {
-            ConstFallback::Shadowed => Ty::Unknown,
-            ConstFallback::Opaque if matches!(ty, Ty::Instance(_)) => Ty::Unknown,
-            _ => ty,
-        })
+        named_const_ty(name, bare, index, nesting)
+    })
+}
+
+/// A literal constant path that is not a type alias.
+fn named_const_ty(name: &str, bare: &str, index: &ProjectIndex, nesting: &[String]) -> Option<Ty> {
+    // A qualified path still looks up its FIRST segment lexically.
+    // resolve_const's dynamic-constant guard only covers simple names,
+    // so reject a shadowed prefix before accepting its global fallback.
+    if !name.starts_with("::") && shadowed_prefix(bare, index, nesting) {
+        return Some(Ty::Unknown);
+    }
+    let ty = match index.resolve_const(nesting, name) {
+        Some(id) => nominal_ty(id, index),
+        None => scalar_ty(bare)?,
+    };
+    if ty == Ty::Unknown || name.starts_with("::") {
+        return Some(ty);
+    }
+    Some(match inherited_fallback(bare, index, nesting) {
+        ConstFallback::Shadowed => Ty::Unknown,
+        ConstFallback::Opaque if matches!(ty, Ty::Instance(_)) => Ty::Unknown,
+        _ => ty,
     })
 }
 
@@ -302,7 +348,71 @@ fn compound_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option<Ty>
             _ => Ty::Unknown,
         });
     }
-    container_ty_leaf(s, resolve).or_else(|| union_ty_leaf(s, resolve))
+    container_ty_leaf(s, resolve)
+        .or_else(|| union_ty_leaf(s, resolve))
+        .or_else(|| intersection_ty_leaf(s, resolve))
+        .or_else(|| sig_only_leaf(s))
+        .or_else(|| literal_shape_leaf(s))
+}
+
+/// `T.all(A, B, ...)` (W6): sorbet-runtime requires EVERY member, so any
+/// one readable member is a sound stand-in — a value failing it raises, and
+/// a value that passed is one. The first member that is not `Unknown` is
+/// taken; a single member is not an intersection and stays `Unknown`.
+fn intersection_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option<Ty> {
+    let parts = split_top_level(strip_call(s, "T.all")?, ',')?;
+    if parts.len() < 2 {
+        return Some(Ty::Unknown);
+    }
+    Some(parts.into_iter().map(|part| parse_ty_leaf(part, resolve)).find(|t| *t != Ty::Unknown).unwrap_or(Ty::Unknown))
+}
+
+/// The Sorbet types sorbet-runtime enforces that no value type models
+/// (W6): `T.noreturn`, the class-object types, and the core categories
+/// whose type arguments the runtime erases (`T::Set[X]` checks
+/// `is_a?(Set)` and nothing about `X`). A wrong member count is `Unknown`.
+fn sig_only_leaf(s: &str) -> Option<Ty> {
+    if s == "T.noreturn" {
+        return Some(Ty::Contract(SigOnly::NoReturn));
+    }
+    let one = |inner: &str| split_top_level(inner, ',').is_some_and(|parts| parts.len() == 1);
+    if let Some(inner) = strip_call(s, "T.class_of")
+        .or_else(|| strip_index(s, "T::Class"))
+        .or_else(|| strip_index(s, "T::Module"))
+    {
+        return Some(if one(inner) { Ty::Contract(SigOnly::ClassObject) } else { Ty::Unknown });
+    }
+    const CORE: [(&str, &str); 5] = [
+        ("T::Set", "Set"),
+        ("T::Range", "Range"),
+        ("T::Enumerable", "Enumerable"),
+        ("T::Enumerator::Lazy", "Enumerator::Lazy"),
+        ("T::Enumerator", "Enumerator"),
+    ];
+    CORE.iter().find_map(|(spelling, class)| {
+        let inner = strip_index(s, spelling)?;
+        Some(if one(inner) { Ty::Contract(SigOnly::Core(class)) } else { Ty::Unknown })
+    })
+}
+
+/// A tuple `[A, B]` or a shape `{a: A}` (W6). sorbet-runtime checks the
+/// members too, but only the category is kept here: an `Array` / a `Hash`
+/// with unknown contents, exactly what `T::Array[X]` / `T::Hash[K, V]`
+/// already give.
+fn literal_shape_leaf(s: &str) -> Option<Ty> {
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return Some(if inner.trim().is_empty() || split_top_level(inner, ',').is_some() {
+            Ty::Array(Box::new(Ty::Unknown))
+        } else {
+            Ty::Unknown
+        });
+    }
+    let inner = s.strip_prefix('{')?.strip_suffix('}')?;
+    Some(if inner.trim().is_empty() || split_top_level(inner, ',').is_some() {
+        Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
+    } else {
+        Ty::Unknown
+    })
 }
 
 /// The two bracketed containers. A member count the spelling does not

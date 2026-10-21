@@ -235,6 +235,27 @@ found, and the launch bar is winning on both.
   ThreadSanitizer job). Read a ratchet entry's SCOPE, never just its
   presence: `- rust` and `- path/to/one.rs:hash` are not the same kind of
   debt.
+- sorbet-runtime assertions and the wider `sig` grammar are contracts on
+  the same terms (W5/W6/W7, learned 2026-10-21, binding, measured by the
+  sorbet-parity probes). W5: `T.let`/`T.cast`/`T.assert_type!` on a
+  WRITTEN literal that breaks the type, and `T.must`/`T.must_because` on a
+  literal `nil` (`NilClass#==` unpatched), emit E0103 - only on a lexical
+  `T` with no project `T.<name>`, runtime enforced. The value they answer
+  is the erased declared type ONLY when inference says `Ty::Unknown`
+  (never overrides `T.cast(1, String)`'s Integer); `T.unsafe`/`T.bind`
+  answer `Unknown`; `T.must` strips nil. W6: `T.all` (first readable
+  member), `T.class_of`/`T::Class`/`T::Module`, `T::Set`/`Range`/
+  `Enumerable`/`Enumerator`/`Enumerator::Lazy` (category), tuples (Array)
+  and shapes (Hash), `T.noreturn`, and single-write `T.type_alias { X }`
+  constants. Sig-only types (`Ty::Contract`) judge literals and are
+  `Unknown` to every consumer. W7: `.on_failure` is metadata; sigs above
+  a one-name `attr_reader`/`attr_writer` are contracts; `*rest`/
+  `**kwrest`/`&blk` keep their contract (each rest element and extra
+  keyword checked); `X.new(...)` checks `initialize`'s sig unless
+  `singleton_new_hidden`. Divergence: `void` consumers stay silent
+  (`void_unknown_and_uncertain_return_paths_stay_silent` wins; the VOID
+  sentinel is not modeled). Proof: `sorbet_contracts.rs` +
+  `scripts/sorbet-contracts-mutants.py` (W5/W6/W7 families).
 - Core-receiver E0101 in a Bundler project needs COMPLETE evidence, and a
   Tapioca RBI alone is NOT complete for core reopenings (W11, learned
   2026-10-20, binding, measured): `json_expressions` 0.9.0 does

@@ -187,21 +187,19 @@ fn unknown_members_are_retained_without_erasing_collection_categories() {
     );
 }
 
+/// A proc stays unknown inside its known collection. A shape `{foo: X}`
+/// is a `Hash` (W6: sorbet-runtime requires one), its members unknown.
 #[test]
 fn unsupported_shapes_and_procs_retain_the_known_collection_category() {
-    for expression in [
-        "T::Array[{foo: Integer}]",
-        "T::Array[T.proc.params(value: {foo: Integer}).void]",
-    ] {
-        assert_eq!(
-            sorbet_ret_ty(expression),
-            Ty::Array(Box::new(Ty::Unknown)),
-            "{expression}"
-        );
-    }
+    let unknown_hash = Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown));
+    assert_eq!(
+        sorbet_ret_ty("T::Array[T.proc.params(value: {foo: Integer}).void]"),
+        Ty::Array(Box::new(Ty::Unknown))
+    );
+    assert_eq!(sorbet_ret_ty("T::Array[{foo: Integer}]"), Ty::Array(Box::new(unknown_hash.clone())));
     assert_eq!(
         sorbet_ret_ty("T::Hash[Symbol, {foo: Integer}]"),
-        Ty::Hash(Box::new(Ty::Sym), Box::new(Ty::Unknown))
+        Ty::Hash(Box::new(Ty::Sym), Box::new(unknown_hash))
     );
 }
 

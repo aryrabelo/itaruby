@@ -138,6 +138,13 @@ class T::Types::Base; end
 module T::Sig::WithoutRuntime; end
 module T::Set; end
 module T::Enumerable; end
+# sorbet-runtime's generic type constructors written in a `sig` (W6,
+# measured 2026-10-21 by the sorbet-parity MATRIX rows 37/40/42/43: each
+# was a false E0104 on code MRI + sorbet-runtime runs clean).
+module T::Class; end
+module T::Range; end
+module T::Enumerator; end
+module T::Enumerator::Lazy; end
 
 module Rails; end
 class ActiveRecord::Base; end

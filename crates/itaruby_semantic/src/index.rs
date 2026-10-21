@@ -314,6 +314,8 @@ pub struct MethodDef {
     pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
     /// Ruby positional names, only for an unambiguous parameter layout.
     pub positional_names: Option<Vec<String>>,
+    /// W7: the `*rest` and `**kwrest` parameter names, when written named.
+    pub splat_names: (Option<String>, Option<String>),
     /// If true, arity/args are unchecked (synthetic: `define_method`, alias).
     pub arity_unknown: bool,
     /// The def body contains `raise NotImplementedError` — an abstract
@@ -339,6 +341,7 @@ impl MethodDef {
             sig: None,
             sorbet_sig: None,
             positional_names: Some(Vec::new()),
+            splat_names: (None, None),
             arity_unknown: false,
             abstract_stub: false,
             name_span: span,
@@ -548,6 +551,10 @@ pub struct FileDefs {
     /// resolution contract (suppression-only, chased from `const_exists`,
     /// never from `resolve_const`).
     pub const_aliases: Vec<(String, Vec<String>, String)>,
+    /// W6: `X = T.type_alias { <type> }` writes — `(full path, lexical
+    /// nesting at the write, the block's single statement as written)`.
+    /// See `ProjectIndex::find_type_alias`.
+    pub type_aliases: Vec<(String, Vec<String>, String)>,
     /// Bead ita-o8l.1: literal-constant `include`/`extend`/`prepend`
     /// targets reached through a DYNAMIC receiver (present, not a
     /// constant path, not literal `self` — the exact shape bead ita-a8z's
@@ -675,6 +682,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         toplevel_consts: Vec::new(),
         qualified_writes: Vec::new(),
         const_aliases: Vec::new(),
+        type_aliases: Vec::new(),
         pending_sorbet_sig: None,
     };
     w.walk_body("", &[], false, &parse.node());
@@ -721,6 +729,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         toplevel_consts: w.toplevel_consts,
         qualified_writes: w.qualified_writes,
         const_aliases: w.const_aliases,
+        type_aliases: w.type_aliases,
         dynamic_mixin_targets: scan.targets,
         attributed_mixin_edges: scan.attributed_mixin_edges,
         const_returning_methods: scan.const_returning_methods,
@@ -2393,6 +2402,8 @@ struct DefWalker<'a> {
     qualified_writes: Vec<(String, String)>,
     /// See `FileDefs::const_aliases`.
     const_aliases: Vec<(String, Vec<String>, String)>,
+    /// See `FileDefs::type_aliases`.
+    type_aliases: Vec<(String, Vec<String>, String)>,
     /// See `PendingSig`. Only an immediately adjacent def consumes it.
     pending_sorbet_sig: Option<PendingSig>,
 }
@@ -3114,10 +3125,16 @@ impl DefWalker<'_> {
             for stmt in &stmts.body() {
                 // Adjacency is statement-local; an overloaded sig sequence
                 // is retained as poison rather than choosing its last overload.
-                if !is_sig_call_or_def(&stmt) {
+                // An `attr_*` macro consumes the sig above it (W7) and
+                // never passes it on.
+                let attr = is_attr_macro(&stmt);
+                if !is_sig_call_or_def(&stmt) && !attr {
                     self.pending_sorbet_sig = None;
                 }
                 self.walk_stmt(scope, nesting, frag_idx, in_singleton, &stmt);
+                if attr {
+                    self.pending_sorbet_sig = None;
+                }
             }
         } else if let Some(begin) = node.as_begin_node() {
             self.walk_begin_arms(scope, nesting, frag_idx, in_singleton, &begin);
@@ -3430,6 +3447,9 @@ impl DefWalker<'_> {
                         nesting.to_vec(),
                         target,
                     ));
+                }
+                if let Some(body) = type_alias_body(&cw.value()) {
+                    self.type_aliases.push((join_path(scope, &name), nesting.to_vec(), body));
                 }
             }
             Node::ConstantPathWriteNode { .. } => {
@@ -3901,6 +3921,10 @@ impl DefWalker<'_> {
                     // `Config.new.stats`).
                     "attr_reader" | "attr_writer" | "attr_accessor" => {
                         let mut all_symbols = true;
+                        // W7: a `sig` right above wraps the one method the
+                        // macro defines (sorbet-runtime's `method_added`).
+                        let pending = self.pending_sorbet_sig.take().and_then(PendingSig::parsed);
+                        let single = call.arguments().is_some_and(|a| a.arguments().iter().count() == 1);
                         if let Some(args) = call.arguments() {
                             for arg in &args.arguments() {
                                 if let Some(sym) = arg.as_symbol_node() {
@@ -3917,6 +3941,11 @@ impl DefWalker<'_> {
                                             1,
                                             aspan,
                                         ));
+                                    }
+                                    if single && name != "attr_accessor" {
+                                        if let (Some(sig), [def]) = (pending.clone(), defs.as_mut_slice()) {
+                                            attach_attr_sig(def, &attr, sig);
+                                        }
                                     }
                                     let frag = &mut self.fragments[i];
                                     let track = if in_singleton {
@@ -4453,6 +4482,7 @@ fn build_method_def(
             sig: None,
             sorbet_sig: pending_sorbet_sig.and_then(PendingSig::parsed),
             positional_names: Some(Vec::new()),
+            splat_names: (None, None),
             arity_unknown: false,
             abstract_stub: false,
             name_span: (name_loc.start_offset(), name_loc.end_offset()),
@@ -4463,10 +4493,15 @@ fn build_method_def(
             fill_def_params(&mut md, &params);
         }
         // Do not turn Sorbet's named params into a guessed positional zip.
+        // A `*rest`, `**kwrest` or `&block` param is named too (W7): the
+        // runtime checks each rest element and keyword, and the return.
+        let block_name = def.parameters().and_then(|p| p.block()).and_then(|b| b.name())
+            .map(|n| String::from_utf8_lossy(n.as_slice()).into_owned());
         if let Some(sig) = &md.sorbet_sig {
             let matches = md.positional_names.as_ref().is_some_and(|names| {
                 sig.params.iter().all(|(name, _)| {
                         names.contains(name) || md.keywords.iter().any(|(kw, _)| kw == name)
+                            || [&md.splat_names.0, &md.splat_names.1, &block_name].iter().any(|n| n.as_ref() == Some(name))
                     })
             });
             if !matches {
@@ -4526,7 +4561,16 @@ fn fill_def_params(md: &mut MethodDef, params: &ruby_prism::ParametersNode<'_>) 
     }
     md.kwrest = params.keyword_rest().is_some();
     md.block = params.block().is_some();
-    md.positional_names = if md.rest || md.kwrest || md.block || params.posts().iter().next().is_some() {
+    // W7: a named `*rest`/`**kwrest` still binds by name. Forwarding
+    // (`...`) and post params leave no provable correspondence.
+    let forwarding = params.keyword_rest().is_some_and(|kr| kr.as_forwarding_parameter_node().is_some());
+    md.splat_names = (
+        params.rest().and_then(|r| r.as_rest_parameter_node()).and_then(|r| r.name())
+            .map(|n| String::from_utf8_lossy(n.as_slice()).into_owned()),
+        params.keyword_rest().and_then(|r| r.as_keyword_rest_parameter_node()).and_then(|r| r.name())
+            .map(|n| String::from_utf8_lossy(n.as_slice()).into_owned()),
+    );
+    md.positional_names = if forwarding || params.posts().iter().next().is_some() {
         None
     } else {
         params.requireds().iter().map(|p| {
@@ -4550,6 +4594,29 @@ fn is_sig_call_or_def(node: &Node<'_>) -> bool {
         || node.as_call_node().is_some_and(|c| {
             c.name().as_slice() == b"sig" && c.receiver().is_none() && c.block().is_some()
         })
+}
+
+/// A receiverless `attr_reader`/`attr_writer`/`attr_accessor` call.
+fn is_attr_macro(node: &Node<'_>) -> bool {
+    node.as_call_node().is_some_and(|c| {
+        c.receiver().is_none() && matches!(c.name().as_slice(), b"attr_reader" | b"attr_writer" | b"attr_accessor")
+    })
+}
+
+/// W7: the sig above a one-name `attr_reader`/`attr_writer` governs the
+/// method it defines — a reader's sig names no param, a writer's names
+/// exactly the attribute (sorbet-runtime's check of `x=`'s argument).
+/// Any other layout is not a contract.
+fn attach_attr_sig(def: &mut MethodDef, attr: &str, sig: crate::sorbet_sig::SorbetSig) {
+    let writer = def.name.ends_with('=');
+    let fits = if writer { matches!(sig.params.as_slice(), [(p, _)] if p == attr) } else { sig.params.is_empty() };
+    if !fits {
+        return;
+    }
+    if writer {
+        def.positional_names = Some(vec![attr.to_owned()]);
+    }
+    def.sorbet_sig = Some(sig);
 }
 
 
@@ -4978,6 +5045,30 @@ fn singleton_class_owner(call: &ruby_prism::CallNode<'_>) -> Option<String> {
     const_path_str(&inner.receiver()?)
 }
 
+/// W6: the aliased type of `T.type_alias { <type> }` as written — a
+/// receiver spelled `T`/`::T`, no arguments, a parameterless block with
+/// exactly one statement. Anything else is no alias.
+fn type_alias_body(node: &Node<'_>) -> Option<String> {
+    let call = node.as_call_node()?;
+    if call.name().as_slice() != b"type_alias" || call.arguments().is_some() {
+        return None;
+    }
+    if !call.receiver().and_then(|r| const_path_str(&r)).is_some_and(|r| r == "T" || r == "::T") {
+        return None;
+    }
+    let block = call.block()?.as_block_node()?;
+    if block.parameters().is_some() {
+        return None;
+    }
+    let body = block.body()?.as_statements_node()?;
+    let mut statements = body.body().iter();
+    let only = statements.next()?;
+    if statements.next().is_some() {
+        return None;
+    }
+    Some(std::str::from_utf8(only.location().as_slice()).ok()?.trim().to_owned())
+}
+
 /// Literal constant path (`Foo`, `Foo::Bar`, `::Foo`) as a string; None for
 /// dynamic expressions.
 pub fn const_path_str(node: &Node<'_>) -> Option<String> {
@@ -5206,6 +5297,8 @@ pub struct MethodSig {
     pub sig: Option<RbsSig>,
     pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
     pub positional_names: Option<Vec<String>>,
+    /// See `MethodDef::splat_names`.
+    pub splat_names: (Option<String>, Option<String>),
     /// Definition-site lexical scope, not the caller's Module.nesting.
     pub nesting: Vec<String>,
     pub arity_unknown: bool,
@@ -5435,6 +5528,9 @@ pub struct ProjectIndex {
     /// only its `Resolved` outcome may produce a type. The lower-level
     /// `resolve_const` remains lexical-only and never chases an alias.
     pub const_aliases: FxHashMap<String, (Vec<String>, String)>,
+    /// W6: every `T.type_alias { X }` constant by full path, first write
+    /// kept; `find_type_alias` refuses a path written more than once.
+    pub type_aliases: FxHashMap<String, (Vec<String>, String)>,
     /// Bead ita-o8l.1: raw `(track, name, nesting)` entries collected
     /// from every merged file's `FileDefs::dynamic_mixin_targets`, not
     /// yet resolved to a `ClassId` — resolution needs the FULL merged
@@ -5870,6 +5966,12 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
             .const_aliases
             .entry(name.clone())
             .or_insert_with(|| (write_nesting.clone(), target.clone()));
+    }
+    for (name, write_nesting, body) in &defs.type_aliases {
+        index
+            .type_aliases
+            .entry(name.clone())
+            .or_insert_with(|| (write_nesting.clone(), body.clone()));
     }
 }
 
@@ -6421,6 +6523,7 @@ fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
         sig: None,
         sorbet_sig: None,
         positional_names: None,
+        splat_names: (None, None),
         nesting: Vec::new(),
         arity_unknown: true,
         abstract_stub: false,
@@ -8184,6 +8287,7 @@ fn method_sig(md: &MethodDef, file: SourceFile, nesting: &[String]) -> MethodSig
         sig: md.sig.clone(),
         sorbet_sig: md.sorbet_sig.clone(),
         positional_names: md.positional_names.clone(),
+        splat_names: md.splat_names.clone(),
         nesting: nesting.to_vec(),
         arity_unknown: md.arity_unknown,
         abstract_stub: md.abstract_stub,
@@ -9726,6 +9830,41 @@ impl ProjectIndex {
             // no consumer chain to continue from, so no navigable target.
             None => MethodLookup::Inconclusive,
         }
+    }
+    /// W6: the `T.type_alias { X }` constant `name` names from lexical
+    /// `nesting` — `(alias's own nesting, X as written)`. Innermost level
+    /// outward, then the top level, as `find_const_alias`; a level holding
+    /// the name as a class or as any other constant shadows outer ones,
+    /// and a name written more than once there proves no single alias.
+    pub fn find_type_alias(&self, nesting: &[String], name: &str) -> Option<(&[String], &str)> {
+        let found = |path: &str, writes: usize| {
+            if writes != 1 {
+                return None;
+            }
+            self.type_aliases.get(path).map(|(n, body)| (n.as_slice(), body.as_str()))
+        };
+        if let Some(rest) = name.strip_prefix("::") {
+            return found(rest, self.toplevel_consts.iter().filter(|c| *c == rest).count());
+        }
+        if name.contains("::") {
+            return None;
+        }
+        for level in nesting.iter().rev() {
+            let candidate = format!("{level}::{name}");
+            if self.by_path.contains_key(&candidate) {
+                return None;
+            }
+            if let Some(&sid) = self.by_path.get(level) {
+                let writes = self.class(sid).consts.iter().filter(|c| *c == name).count();
+                if writes > 0 {
+                    return found(&candidate, writes);
+                }
+            }
+        }
+        if self.by_path.contains_key(name) || self.conflicting_const_scope(nesting) {
+            return None;
+        }
+        found(name, self.toplevel_consts.iter().filter(|c| *c == name).count())
     }
     /// Bead ita-54k: does `name`, referenced from lexical `nesting`, name
     /// a constant written as an alias (`X = Y`, or qualified `A::B =

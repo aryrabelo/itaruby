@@ -1,0 +1,14 @@
+scripts/public-baseline/README.md
+  h_b156936c57c455 751-805
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "c6371ccd935c10cea56a4ff2e082d46c0939ff05",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

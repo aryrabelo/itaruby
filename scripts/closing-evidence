@@ -18,8 +18,11 @@ turns it into the `closing` gate's evidence:
      elsewhere the report says so, and the public corpora carry the proof:
      every baselined public repo must be measured with zero new and zero
      gone errors. gitlab-foss has no baseline and is the only allowed skip.
-  3. `sf seal closing` binds the report to the implementation digest, so the
-     next change to the checker expires it (L3.GATE_HAS_FRESH_EVIDENCE).
+  3. The evidence manifest (`.software-factory/evidence/closing.json`) is
+     seeded with this one run and `sf seal closing` recomputes its digests
+     from what is actually on disk, binding the report to the
+     implementation digest so the next change to the checker expires it
+     (L3.GATE_HAS_FRESH_EVIDENCE).
   4. The marked closing claim and the report, verbatim, become Jev's question
      (`.software-factory/evidence/jev/closing.json`) and its negated twin; `scripts/claim-judge-gate`
      asks both and caches the verdicts (L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE).
@@ -42,6 +45,8 @@ ART = BOX / "target/gauntlet"
 CORPORA_MAP = ROOT / "scripts/corpora-local.txt"
 BASELINED = sorted(p.stem for p in (ROOT / "scripts/public-baseline").glob("*.jsonl"))
 REPORT = ROOT / ".software-factory/evidence/closing-run.json"
+MANIFEST = ROOT / ".software-factory/evidence/closing.json"
+POLICY = ROOT / ".software-factory/policy.yaml"
 REQUEST = ROOT / ".software-factory/evidence/jev/closing.json"
 TWIN = ROOT / ".software-factory/evidence/jev/closing.twin.json"
 CLAIM_DOC = ROOT / "AGENTS.md"
@@ -125,16 +130,31 @@ def corpus_c_mounted():
     return bool(paths) and Path(paths[0]).is_dir()
 
 
-def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted):
+def public_corpora_clean():
+    """Every baselined repo's own verdict line in the artifact, not the
+    digest's transcript-derived summary: gate-digest only ever sees the
+    one-line `ok`/`skip` `gauntlet-gates.sh` logs for gate f, never the
+    per-repo detail `public-gate.sh` writes straight to `public.txt` — so a
+    structured read of the digest can never see individual repos (measured
+    2026-10-21: `numbers.repos` is always `[]`). Read the artifact itself.
+    A repo is clean only if its own exact-match line is present; a drifted
+    or skipped-for-cause line, or no line at all, fails it.
+    """
+    try:
+        lines = (ART / "public.txt").read_text().splitlines()
+    except OSError:
+        return False
+    clean = {m.group(1) for line in lines
+             if (m := re.search(r"^PASS public errors match baseline exactly \((\w[\w-]*)\):", line))}
+    return bool(BASELINED) and all(rid in clean for rid in BASELINED)
+
+
+def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted, public_ok):
     corpus_c = next(
         (c for c in gate(digest, "d").get("numbers", {}).get("corpora", []) if c.get("id") == "corpus-c"),
         None,
     )
     c1 = gate(digest, "c1").get("numbers", {})
-    repos = {r.get("id"): r for r in gate(digest, "f").get("numbers", {}).get("repos", [])}
-    public_ok = gate(digest, "f").get("status") in ("PASS", "SKIP") and bool(BASELINED) and all(
-        rid in repos and repos[rid].get("new") == 0 and repos[rid].get("gone") == 0 for rid in BASELINED
-    )
     # A SKIP is allowed only where its reason is one of the two declared
     # absences; every other gate must PASS.
     allowed_skip = {"f"} | ({"d"} if not mounted else set())
@@ -167,6 +187,33 @@ def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted):
     for kind, (ok, basis) in checks.items():
         results.append({"type": kind, "status": "passed" if ok else "failed", **({"basis": basis} if basis else {})})
     return results
+
+
+def seed_manifest(head):
+    """`sf seal closing` only RECOMPUTES digests in an existing manifest
+    (`Manifest::load` must succeed first); nothing else in this repository
+    ever creates the initial one. Seed it with the one run this script just
+    produced, required_assertions read straight from policy so the two
+    never drift, and empty digests — `sf seal` fills those in from what is
+    actually on disk.
+    """
+    import yaml
+    policy = yaml.safe_load(POLICY.read_text())
+    required = policy["gates"]["closing"]["required_assertions"]
+    manifest = {
+        "schema_version": 1,
+        "gate": "closing",
+        "implementation_sha256": "",
+        "runs": [{
+            "scenario": "closing",
+            "status": "passed",
+            "actor": f"scripts/closing-evidence, gauntlet run in the gate box at {head[:10]}",
+            "report": str(REPORT.relative_to(ROOT)),
+            "report_sha256": "",
+            "required_assertions": required,
+        }],
+    }
+    write_json(MANIFEST, manifest)
 
 
 def request(claim, evidence, criteria):
@@ -205,7 +252,8 @@ def main():
     src_clean = subprocess.run([*box_git, "diff", "--quiet", "HEAD", "--", "crates"]).returncode == 0
 
     mounted = corpus_c_mounted()
-    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted)
+    public_ok = public_corpora_clean()
+    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted, public_ok)
     passed = all(a["status"] == "passed" for a in results)
     sf = subprocess.run(["sf", "--version"], text=True, capture_output=True, check=False).stdout.strip()
     report = {
@@ -214,6 +262,14 @@ def main():
         "goal": GOAL,
         "commit": head,
         "sf": sf,
+        "corpus_c": {
+            "rule": "corpus.proved_corpus_c and corpus_c.no_new_errors pass either by "
+                    "measuring corpus-c directly with zero new errors, or, when corpus-c "
+                    "is not mounted on this machine, by every baselined public corpus "
+                    "matching its own baseline exactly: zero new and zero gone diagnostics.",
+            "mounted_here": mounted,
+            "public_corpora_matched_baseline": public_ok,
+        },
         "observed": digest,
         "assertions": results,
     }
@@ -232,7 +288,7 @@ def main():
     twin = dict(real, supports=real["says_nothing"], says_nothing=real["supports"])
     write_json(REQUEST, request(claim, evidence, real))
     write_json(TWIN, request(claim, evidence, twin))
-
+    seed_manifest(head)
     if subprocess.run(["sf", "seal", "closing"], cwd=ROOT, check=False).returncode != 0:
         print("closing-evidence: sf seal closing failed")
         return 2

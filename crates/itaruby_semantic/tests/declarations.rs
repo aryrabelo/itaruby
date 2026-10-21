@@ -357,3 +357,104 @@ fn wave14_undeclared_siblings_under_curated_namespaces_still_warn_e0104() {
         );
     }
 }
+
+/// Bead H1 (sorbet-parity MATRIX.md rows 37/40/42/43/67/68/69/71/74):
+/// 16 more sorbet-runtime `T::*` namespaces, each measured HARMFUL in the
+/// parity matrix — `T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
+/// `final!`), `T::Enum`, `T::Generic`, `T::Class`, `T::Range`,
+/// `T::Enumerator`/`::Lazy`/`::Chain`, `T::ImmutableStruct`,
+/// `T::InexactStruct`, `T::Utils`, `T::Configuration`, `T::Types::Simple`
+/// and `T::Props::{Serializable,Constructor,CustomType}` all produced a
+/// false E0104 on correct, sorbet-runtime-defined code. `h1_t_inventory.rb`
+/// references all 16 directly; every read must stay silent.
+///
+/// MUTANT THIS TEST MUST CATCH: removing any single one of the 16
+/// `module`/`class ...; end` lines this bead added to `gems.rbi`
+/// re-emits E0104 for exactly that one constant. Manually verified
+/// 2026-10-20: reverting the `T::Helpers` line alone reproduces
+/// ``E0104 unresolved constant `T::Helpers` `` and nothing else changes in
+/// this fixture's diagnostics; same for `T::Enumerator` (which also
+/// breaks `T::Enumerator::Lazy`/`::Chain`, since the resolution walk
+/// needs the owner namespace first).
+#[test]
+fn h1_sorbet_runtime_t_inventory_resolves_and_stays_silent() {
+    let diags = check_fixture("h1_t_inventory.rb");
+    assert!(
+        diags.is_empty(),
+        "the 16 H1 T::* names are curated declarations: no E0104, got: {diags:?}"
+    );
+}
+
+/// Control (mirrors `sorbet_runtime_undeclared_name_still_warns_e0104`):
+/// one typo per new H1 namespace, plus the pre-existing
+/// `T::NotACuratedName` control repeated here so this fixture does not
+/// silently stop proving anything if the shared control fixture above
+/// ever changes shape. A control asserting a name is ABSENT has an
+/// expiry date — re-check all 16 mechanically against `gems.rbi`
+/// whenever it grows a new `T::` entry one of these could alias into.
+#[test]
+fn h1_sorbet_runtime_t_inventory_undeclared_siblings_still_warn_e0104() {
+    let diags = check_fixture("h1_t_inventory_control.rb");
+    let expected = [
+        "T::Class::NoSuchThing",
+        "T::Configuration::NoSuchThing",
+        "T::Enum::NoSuchThing",
+        "T::Enumerator::NoSuchThing",
+        "T::Enumerator::Lazy::NoSuchThing",
+        "T::Enumerator::Chain::NoSuchThing",
+        "T::Generic::NoSuchThing",
+        "T::ImmutableStruct::NoSuchThing",
+        "T::InexactStruct::NoSuchThing",
+        "T::Range::NoSuchThing",
+        "T::Types::Simple::NoSuchThing",
+        "T::Utils::NoSuchThing",
+        "T::Props::Serializable::NoSuchThing",
+        "T::Props::Constructor::NoSuchThing",
+        "T::Props::CustomType::NoSuchThing",
+        "T::NotACuratedName",
+    ];
+    assert_eq!(diags.len(), expected.len(), "expected exactly {} diagnostics, got: {diags:?}", expected.len());
+    for name in expected {
+        assert!(
+            diags.iter().any(|d| d.contains("E0104") && d.contains(name)),
+            "expected an E0104 naming {name}, got: {diags:?}"
+        );
+    }
+}
+
+/// The 16 new entries stay permanently open, same contract as every
+/// other curated declaration — checked on the two deepest ones
+/// (`T::Enumerator::Lazy`/`::Chain`, which also prove the owner
+/// (`T::Enumerator`) resolves first).
+#[test]
+fn h1_sorbet_runtime_t_inventory_stays_open() {
+    let db = itaruby_semantic::Db::default();
+    itaruby_semantic::ProjectFiles::new(&db, Vec::new());
+    let index = itaruby_semantic::project_index(&db);
+    for name in [
+        "T::Helpers",
+        "T::Enum",
+        "T::Generic",
+        "T::Class",
+        "T::Range",
+        "T::Enumerator",
+        "T::Enumerator::Lazy",
+        "T::Enumerator::Chain",
+        "T::ImmutableStruct",
+        "T::InexactStruct",
+        "T::Utils",
+        "T::Configuration",
+        "T::Types::Simple",
+        "T::Props::Serializable",
+        "T::Props::Constructor",
+        "T::Props::CustomType",
+    ] {
+        let id = index
+            .resolve_const(&[], name)
+            .unwrap_or_else(|| panic!("curated declaration must resolve `{name}`"));
+        assert!(
+            index.class(id).open,
+            "curated declaration `{name}` must stay open (unknown real method surface)"
+        );
+    }
+}

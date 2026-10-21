@@ -20,9 +20,10 @@ Sorbet/Steep) and its roadmap asks for "Allow the Ruby LSP to connect to a
 typechecker add-on" — an aspiration, not an implementation. The gem in
 `scripts/ruby-lsp-itaruby/` is that add-on; the VS Code extension in
 `scripts/vscode/` is a reference client, never the main channel. Sorbet is the
-precision adversary: itaruby is benchmarked against it on public Rails apps
-(rails/rails, mastodon, discourse, gitlab-foss) on both speed and true errors
-found, and the launch bar is winning on both.
+precision adversary: itaruby is benchmarked against it on public Ruby
+codebases (rails/rails, mastodon, discourse, gitlab-foss, zammad,
+Homebrew/brew) on both speed and true errors found, and the launch bar is
+winning on both.
 
 ## Core Contract
 
@@ -181,13 +182,36 @@ found, and the launch bar is winning on both.
   whole contract, the return included. Claim only what the suites prove, never
   Sorbet parity. Focused proof: `sorbet_contracts`, `sorbet_contract_parser`,
   `project_sigs`, and `scripts/sorbet-contracts-mutants.py` (gate c1 and CI).
+- `sorbet/config` `--ignore` means "don't typecheck", never "doesn't exist"
+  (learned 2026-10-20, binding). An ignored `.rb` is read into
+  `IgnoredFiles`, never `ProjectFiles`, by `ita check` AND `ita server`
+  (shared `discovery::sorbet_ignore_entries`/`path_is_ignored`). Its evidence
+  is SUPPRESSION-ONLY: a constant it defines only silences E0104 through
+  `index::ignored_aware_index` (asked "exists?" and nothing else, the
+  reference still types `Unknown`); a project/declared class it reopens is
+  forced open (`OpenReason::IgnoredReopening`) and the name joins
+  `polluted_opaque`; it never interns a class into `project_index`, so a
+  fixture stub named like a gem or project class can never close a name.
+  Nothing inside an ignored path is ever reported, parse errors included.
+  Measured: indexing ignored trees like project code turns closed fixture
+  stubs into conclusive misses (`Faraday.get` against a two-line stub);
+  dropping them turns a Rails initializer's constant into E0104 in `app/`.
+  Proof: `crates/itaruby/tests/sorbet_ignore_indexing.rs`,
+  `testdata/sorbet_ignore_indexing/`, `scripts/ignore-indexing-mutants.sh`
+  (gate c1). Entries match exactly as sorbet 0.6.13437 was OBSERVED to
+  match them (2026-10-20, `srb tc --ignore` over a planted tree): against
+  `/<path relative to the input dir>`, a `/`-leading entry is a prefix, any
+  other entry matches anywhere, both only on whole names (`foo` never
+  `foo.rb`/`foo2/`), compared as text (`./foo` matches nothing). Proof:
+  `tests/sorbet_ignore_matching.rs`, mutant IG-G.
 - A code path that turns silence into an error must never read absence of
   evidence as evidence of absence (learned 2026-08-24, binding): a gate that
   finds no signal on an upward search (e.g. no Gemfile discovered within N
   levels) fails closed to "couldn't tell, treat as present" rather than
   "confirmed absent, diagnose" — an unresolvable result is never license to
   accuse.
-- The private benchmark corpora (corpus-a, corpus-b, corpus-c) are sacred:
+- The private benchmark corpus (corpus-c; corpus-a and corpus-b were retired
+  2026-10-19, see "Machines" below) is sacred:
   their expected error sets are recorded in `scripts/corpus-baseline.txt` as
   SHA-256 hashes only — never a path, class, method, table, or column name in
   clear text. Any new diagnostic on a corpus must be proven a true positive by
@@ -433,13 +457,27 @@ found, and the launch bar is winning on both.
   `method_missing` target and one of them poisons every lookup on its track.
   The name-keyed form closed the intended cluster with zero collateral. When
   a mechanism cannot see the receiver, only the name can carry the proof.
-- The anchor worktree needs the corpora declaration copied in (learned
+- Fail-closed on a link EVERY receiver shares is the same poison (learned
+  2026-10-19, binding, measured): reading the mixins of a project
+  `class Object`/`class Module` reopening with the `extend` consult's
+  arms (open or unresolved mixin -> `Inconclusive`) made every class-object
+  lookup in rails Inconclusive, because rails' `class Object; include
+  ActiveSupport::Tryable` names a module the index holds open. It cost
+  the true positive at
+  `activesupport/test/autoloading_fixtures/raises_no_method_error.rb`.
+  A link on the shared core chain is receiver-blind by position, so the
+  consult there is Found-only and keyed on a literal definition of the
+  name; an unreadable mixin is skipped, which is the verdict that link
+  gave before it was read at all (`core_mixin_definition`, mutants
+  CO-X3/CO-X4).
+- A fresh worktree needs the corpora declaration copied in (learned
   2026-08-26, binding): `scripts/corpora-local.txt` is machine-local, so a
   fresh detached worktree has none and the corpus gate SKIPs every corpus
   while still printing `RESULT: PASS (incomplete)`. That is the wave-9 trap
-  in a new shape — absence of proof reading as the expected absence. Copy the
-  file from the machine's own checkout into the worktree before trusting an
-  anchor, and check the `corpus gate proved:` line names what you expected.
+  in a new shape — absence of proof reading as the expected absence. The
+  gate box copies the file from the machine's own checkout (proved by
+  `scripts/gate-box-selftest.sh`); still check that the `corpus gate
+  proved:` line names what you expected.
 - Same-wave work touching the same file needs an explicit disjoint-region
   note in the brief (learned, binding): two same-wave workstreams once
   edited the same function in the same file and produced a real merge
@@ -660,12 +698,12 @@ green but at least one declared corpus could not be checked on this machine
 | Gate 0b — MRI interpreter (`ruby -v` ≥ 3.x; a missing ruby is fine, the MRI legs skip) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, the namespace-only module pass (issue #6) and each of its conditions — top level, a module, nests a definition, no method or mixin edge of its own — plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-V and CO-W1..CO-W5) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) and `scripts/sorbet-contracts-mutants.py` (the Sorbet `sig` contract decisions: which definition a signature governs, an RBI-only return typing its consumer only outside silent walks, declared type arguments erased for every consumer (sig return, bound param, RBI return), instance/singleton separation, the E0109 body check and its silent paths, by-name param correspondence, stacked sigs never picking an overload, every redefinition path poisoning the contract, the family dispatch walk, and the per-definition cost bounds; builds an isolated temporary source copy, never the checkout, and `--anchors` counts its needles without building; run against the `sorbet_contracts`, `sorbet_contract_parser`, `project_sigs` and `sorbet_sig` suites) and `scripts/open-world-mutants.sh` (W11 Tapioca open world, O1–O39: installed-source harvest of chain-touching gems, per-class fail-closed for a missing source, gap gems covered by source, native extensions, `Reach`, top-level includes and literal core definers name-keyed, and each fail-closed condition of the core-receiver E0101 under Tapioca evidence — finality, RBI/project/unloaded type-test overrides, missing/stale RBI, unaudited Tapioca-ignored version, PATH gem, unloaded files, the ancestor list, `BasicObject`, include/prepend, `method_missing`, unreadable and readable reopenings, refinement, stdlib, audited names, the one-gap-closes-all opt-in, the E0108/E0107 siblings, and the shapes Tapioca really writes - unparsed annotation sigs, restated core inclusions and their limit; run against the `open_world_cli` and `tapioca_closed_world_cli` suites) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, the namespace-only module pass (issue #6) and each of its conditions — top level, a module, nests a definition, no method or mixin edge of its own — plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-V and CO-W1..CO-W5) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch), plus `scripts/rbi-bare-toplevel-const-mutants.sh` (bead ita-h5s: the bare top-level RBI value-constant channel — `rbi.rs`'s phase-1 scanner, `index.rs`'s phase-2 verifier, `check.rs`'s fallback wiring; mutants MUT-A/B/C) and `scripts/sorbet-contracts-mutants.py` (the Sorbet `sig` contract decisions: which definition a signature governs, an RBI-only return typing its consumer only outside silent walks, declared type arguments erased for every consumer (sig return, bound param, RBI return), instance/singleton separation, the E0109 body check and its silent paths, by-name param correspondence, stacked sigs never picking an overload, every redefinition path poisoning the contract, the family dispatch walk, and the per-definition cost bounds; builds an isolated temporary source copy, never the checkout, and `--anchors` counts its needles without building; run against the `sorbet_contracts`, `sorbet_contract_parser`, `project_sigs` and `sorbet_sig` suites) and `scripts/open-world-mutants.sh` (W11 Tapioca open world, O1–O39: installed-source harvest of chain-touching gems, per-class fail-closed for a missing source, gap gems covered by source, native extensions, `Reach`, top-level includes and literal core definers name-keyed, and each fail-closed condition of the core-receiver E0101 under Tapioca evidence — finality, RBI/project/unloaded type-test overrides, missing/stale RBI, unaudited Tapioca-ignored version, PATH gem, unloaded files, the ancestor list, `BasicObject`, include/prepend, `method_missing`, unreadable and readable reopenings, refinement, stdlib, audited names, the one-gap-closes-all opt-in, the E0108/E0107 siblings, and the shapes Tapioca really writes - unparsed annotation sigs, restated core inclusions and their limit; run against the `open_world_cli` and `tapioca_closed_world_cli` suites) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin, mutant-lab fresh build): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/gate-box-selftest.sh` — the gate box that runs the gauntlet: mirror exact (HEAD + uncommitted delta), lock exclusive, corpora map copied, the caller's `CARGO_TARGET_DIR` dropped; each step removed as a mutant and accused by its named case | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
-| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-a/corpus-b: **only `work`**; corpus-c: **only `m5`** |
+| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-c: **only `m5`** |
 | Navigation oracle vs `scripts/navfixture/oracle.jsonl` | only the repo | **any machine** |
 | `scripts/public-gate.sh` vs `scripts/public-corpora.txt` + `scripts/public-baseline/<id>.jsonl` | a depth-1 clone of each declared public repo at its pinned sha under `$HOME/.local/share/itaruby/public-corpora`, fetched by `scripts/public-corpora-fetch.sh` (never auto-fetched by the gate; `PUBLIC_GATE_CLONE=1` opts in); error sets are **drift detectors, unaudited** until `scripts/public-baseline/README.md`'s ledger has a verdict per family | **any machine with the clones** |
 | `scripts/inference-gate.sh` — the inference bench (`scripts/inference-bench.jsonl`), guarded by `scripts/inference-bench-selftest.sh` | only the repo; `ruby` for the ground truth, `srb` at the pinned version for the comparison leg (missing/mismatched → that leg skips) | **any machine** |
@@ -680,7 +718,7 @@ future model call in this repository inherits the same three rules and the same
 two-sided proof, and its state is built from the digest or from files this
 repository already versions in the clear — never from a private corpus artifact.
 
-The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall still covers the three private corpora unchanged.
+The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall still covers the private corpus unchanged.
 
 The inference bench (`scripts/inference-bench-README.md`) answers a different
 question from every corpus gate: on twelve self-contained, gem-free fixtures,
@@ -825,20 +863,21 @@ target from 2.91 to 1.74 GiB and the bytes written per mutant rebuild from
 for locals under lldb, `CARGO_PROFILE_DEV_DEBUG=true`. The release
 profile's `debug = true` is untouched.
 
-Full proof today needs two machines — `./scripts/dev gates` on `m5` (proves
-corpus-c) plus the anchor on `work` (proves corpus-a and corpus-b) — because
-no single machine holds all three corpora.
+Full proof today is one machine: `./scripts/dev gates` on `m5` proves
+corpus-c, the only private corpus still declared, and every public corpus.
 
-## Multi-machine: corpora on both, full proof needs both
+## Machines: the private corpus lives on m5
 
-Machines (tailnet): `work` (100.86.40.27, corpora corpus-a and corpus-b) and
-`m5`/`m5-de-ary` (100.88.227.102, the strong machine, corpus-c). SSH aliases:
-`ssh m5-ary` from here, `ssh work` from there (pinned key, `IdentitiesOnly
-yes`). The `work` host's own tailnet name is deliberately not written here: it
-is named after one of the private corpora's owners, so spelling it out would
-name a client through the back door — the same wall that keeps corpus ids
-generic (learned 2026-08-26, binding). Resolve it from `~/.ssh/config`, which
-is machine-local and unversioned.
+`m5`/`m5-de-ary` (100.88.227.102, the strong machine) holds corpus-c and the
+public clones; `ssh m5-ary` reaches it. The machine that held corpus-a and
+corpus-b is gone for good, and both corpora were retired on 2026-10-19: no
+machine can ever check them again, so their declarations were removed
+instead of left to SKIP forever, and zammad/zammad and Homebrew/brew replace
+them as public sources of findings (learned 2026-10-19, binding: a corpus
+that lives on exactly one machine dies with it, so a declaration nobody
+can measure is deleted, never kept as a permanent SKIP; the replacement is
+a public corpus whose clone any machine can fetch). Their history stays in
+`docs/CHANGELOG.md` and git; their names and paths never entered it.
 
 The performance ceiling is per-machine in the same way the corpora are, and
 is honest about it: `scripts/perf-baseline.txt`'s `dev` column is an `m5`
@@ -847,80 +886,41 @@ asks for the column via `PERF_COLUMN` and NEVER infers it — keying off `$CI`
 was tried and is a trap, because agent harnesses and plenty of local shells
 export `CI`, and the failure is silent in the wrong direction: a dev machine
 quietly judged against the loose ceiling passes exactly the regression the
-gate exists to catch (learned 2026-08-26, binding). Until `work` has a
-measured column of its own, run the anchor there with `PERF_COLUMN=ci`; a
-ceiling copied between machines is a fabricated measurement, and raising the
-`m5` column to fit a slower machine is the loosening this repository forbids.
+gate exists to catch (learned 2026-08-26, binding). A machine without a
+measured column of its own uses none: a ceiling copied between machines is
+a fabricated measurement, and raising the `m5` column to fit a slower
+machine is the loosening this repository forbids.
 
 The public-corpus gate uses the same explicit selection: `PUBLIC_COLUMN`
 defaults to `dev`; `ci` reads the second number in `scripts/public-corpora.txt`.
 Both columns use that file's measured-time x1.5/round-up contract; a missing
-selected ceiling fails, never borrows another machine's number. The hosted
-workflow accepts exit 2 only when the complete skip list is the intentionally
-unbaselined GitLab corpus. Any other skip, drift, or failure remains red.
-
-Anchor flow (run gates on `work` against an exact sha, in a disposable
-worktree — never disturb the checkout another agent may be using):
-
-```sh
-ssh work 'cd ~/Sites/personal-team/itaruby && git fetch -q origin main && \
-  git worktree add -f --detach ~/Sites/worktrees/ita-anchor-<slug> <sha> && \
-  cp ~/Sites/personal-team/itaruby/scripts/corpora-local.txt \
-     ~/Sites/worktrees/ita-anchor-<slug>/scripts/corpora-local.txt && \
-  cd ~/Sites/worktrees/ita-anchor-<slug> && \
-  PERF_COLUMN=ci PATH="/opt/homebrew/opt/ruby/bin:$HOME/.cargo/bin:$PATH" ./scripts/gauntlet-gates.sh; \
-  cd ~/Sites/personal-team/itaruby && git worktree remove --force ~/Sites/worktrees/ita-anchor-<slug>'
-```
-
-The host checkout on `work` is `~/Sites/personal-team/itaruby` — the one that
-holds `scripts/corpora-local.txt`. `~/Sites/itaruby` there is a different
-checkout on another branch with no map, and following it silently SKIPs both
-corpora while the transcript still ends in `PASS (incomplete)` (learned
-2026-09-18, binding, measured). Read the `corpus gate proved:` line and
-require it to name `corpus-a` AND `corpus-b` before calling an anchor green.
+selected ceiling fails, never borrows another machine's number. The `ci`
+number comes from the hosted public job's own log on a pushed branch, never
+from a dev run. The hosted workflow accepts exit 2 only when the complete
+skip list is the intentionally unbaselined GitLab corpus. Any other skip,
+drift, or failure remains red.
 
 The split is over (2026-09-22): `aryrabelo/itaruby` (public) is THE
 repository; `aryrabelo/itaruby-private` is an archive that receives nothing
 new. On 2026-09-22 the 21 commits the public lacked were cherry-picked onto
 it with their original messages after a mechanical secrecy audit (every
-segment of the corpus path and of the anchor host's name counted across
+segment of the corpus path and of the corpus host's name counted across
 messages and tree: zero new hits), and the trees were proved byte-identical
-before each push. Until then the two repos shared no ancestor, `origin` on
-`work` fetched nothing this repository committed, and the anchor failed
-with `fatal: invalid reference: <sha>` — twice in one night before the
-remote was read (learned 2026-09-21, binding, measured). `scripts/dev
-anchor` fetches from `$ANCHOR_REMOTE`, default `origin`; on `work` the
-`private` remote may still exist and is never the answer. Every commit
-message, PR title and PR body is a public surface from the first byte — the
-secrecy wall's five surfaces above are no longer "audited before sync",
-they are live.
+before each push (learned 2026-09-21, binding, measured: until then the two
+repos shared no ancestor and a remote gate run failed with `fatal: invalid
+reference: <sha>`). Every commit message, PR title and PR body is a public
+surface from the first byte — the secrecy wall's five surfaces above are no
+longer "audited before sync", they are live.
 
-Explicit `PATH` because a non-interactive ssh shell does not load
-`~/.cargo/bin` — without it `sf` and friends "don't exist" on `work` even when
-installed (learned 2026-08-20, binding). The same trap one layer down, for
-`ruby` (learned 2026-09-18, binding, measured): a non-interactive ssh shell
-resolves `ruby` to `/usr/bin/ruby` 2.6, which cannot parse an endless method
-definition, so gates a, c1 and g fail on the interpreter and not on the code —
-identical run with brew's ruby 4.0.6 turns all three green, every other verdict
-byte-identical. And `$(brew --prefix ruby)` does NOT reach it: `brew` itself
-is not on a non-interactive ssh PATH, so the substitution expands to the empty
-string and the PATH prefix becomes `/bin:...`, landing right back on
-`/usr/bin/ruby` 2.6 — the anchor block and `scripts/dev` therefore hardcode
-`/opt/homebrew/opt/ruby/bin` on `work` (learned 2026-09-21, measured: one
-full anchor run wasted, gate 0b naming ruby 2.6.10 under a `PATH` that was
-supposed to prepend brew's ruby). It is a PATH trap, not an ssh trap, and it
-fires locally too
-(learned 2026-09-19, binding, measured): a local `./scripts/dev gates` whose
-environment put `/usr/bin` before mise's shims ran gate a on ruby 2.6, and the
-red surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,
-unexpected '='` INSIDE a fixture — ~70 minutes into gate c1, with the two
-mutant families that run the operand-types suite aborting on `baseline is not
-green` (the harness's own guard, correct, against a baseline red for the wrong
-reason). Gate 0b now names the interpreter before anything runs it (`PASS
-ruby 3.x`, or a FAIL with the version and the path), so that verdict costs two
-seconds instead of a mutation pass. On `m5` the 3.x ruby is mise's shim under
-`~/.local/share/mise/shims`, and there is no brew ruby at
-`/opt/homebrew/opt/ruby/bin` to reach for.
+Gate 0b names the interpreter before anything runs it (`PASS ruby 3.x`, or
+a FAIL with the version and the path), because `ruby` resolving to
+`/usr/bin/ruby` 2.6 is a PATH trap that turns gates a, c1 and g red on the
+interpreter and not on the code (learned 2026-09-18/19, binding, measured:
+once over a non-interactive ssh shell, which also lacks `~/.cargo/bin`, and
+once locally, where an environment that put `/usr/bin` before mise's shims
+surfaced as `refined_integer_plus_silent.rb must run clean: syntax error,
+unexpected '='` INSIDE a fixture ~70 minutes into gate c1). On `m5` the 3.x
+ruby is mise's shim under `~/.local/share/mise/shims`.
 
 ## Bootstrap on a new machine
 
@@ -941,15 +941,14 @@ The public corpora (~1 GB, depth 1 at the pinned shas, into
 `scripts/public-corpora-fetch.sh`.
 
 `./scripts/dev setup` is the one-line idempotent equivalent and also prints
-which gates this machine can run (see `scripts/dev` for the other verbs,
-`gates` and `anchor`).
+which gates this machine can run (see `scripts/dev` for the other verb,
+`gates`).
 
 ## Verification
 
 ```sh
 ./scripts/dev gates            # the gauntlet in the gate box, mirroring this tree; exit 2 = declared corpus(es) absent here (named in transcript), 75 = box busy
 ./scripts/dev gates --at <rev> # the same, for a committed revision (clean, no delta)
-./scripts/dev anchor           # gates on work, at the local HEAD sha
 ```
 
 `gates` never builds in the calling tree: it mirrors it into the gate box
@@ -958,10 +957,6 @@ there, and prints the box's artifacts dir and the
 `scripts/gate-triage --digest <box>/target/gauntlet/digest.json` command.
 `--run <script>` runs one repo-relative script in the box instead (a single
 mutant family, for instance).
-
-`anchor` checks out the local sha on `work` on purpose: an anchor run against
-whatever the remote happened to have on disk is a false green. It requires the
-commit to already be on a remote (exit 65 otherwise).
 
 `ita check --dark-singletons=<file> <path>` runs the dark singleton census: a
 measurement instrument (never a gate) whose JSONL records what the class-object
@@ -1179,14 +1174,19 @@ the judge always calls TypeSafe's default endpoint, `https://api.typesafe.ai`
 — the fleet-wide `TYPESAFE_BASE_URL` shim is dropped for this call. The
 request leaves the machine, so nothing private may enter the report — `closing-evidence` strips
 corpus revisions and error-set hashes and the corpus ids are the generic ones.
-It proves corpus-c on this machine only; corpus-a/b still need
-`./scripts/dev anchor` on `work`, exactly as before.
+It reads the digest from the gate box (`$ITA_GATE_BOX`) and requires the box's
+HEAD to be the closing commit and the digest newer than the run. corpus-c is
+proved where it is mounted (mapped AND on disk); where it is not — measured
+2026-10-21: m5's mapped path no longer exists — the two corpus-c assertions
+carry `basis: not_mounted_here` and pass only if gate d really skipped and
+every baselined public corpus (rails, mastodon, discourse, zammad, brew)
+measured zero new and zero gone errors (decided by the owner 2026-10-21).
 
 To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
-At the closing commit every gate `./scripts/dev gates` runs on this machine passed: the corpus gate proved corpus-c with zero new errors, the public corpora showed no drift, every per-fix source mutant was accused by a named test, the drift detectors were proven to fire, and the checker source was untouched after the mutants ran.
+At the closing commit every gate `./scripts/dev gates` ran in the gate box on that exact commit passed: where corpus-c is mounted the corpus gate proved it with zero new errors, and where it is not the report records its absence; every public corpus with a baseline was measured with zero new and zero gone errors; every per-fix source mutant was accused by a named test; the drift detectors were proven to fire; and the checker source was untouched after the mutants ran.
 
 ## Child DOX Index
 

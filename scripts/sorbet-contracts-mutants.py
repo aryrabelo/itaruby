@@ -46,6 +46,10 @@ MUTATIONS = [
      "        method.sorbet_sig = None;\n    }\n    methods.insert(definition.name.clone(), method);",
      "    }\n    methods.insert(definition.name.clone(), method);",
      "duplicate_source_definitions_do_not_pick_a_signature"),
+    ("uncontracted sig shape opens its class", INDEX,
+     "                        let recognized = sig.is_some() || sig_block_is_recognized(&call);\n",
+     "                        let recognized = sig.is_some();\n",
+     "uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed"),
     # -- RBI: never checked at runtime, so never a contract (F6)
     # removed: stale RBI layout accepted — F6: no RBI is ever a source method's contract, so there is no layout match left to skip
     # removed: RBI positional names ignored — F6: `RbiMethod::matches_source` is gone with the RBI contract path

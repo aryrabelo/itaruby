@@ -169,6 +169,12 @@ pub enum OpenReason {
     /// Set by `apply_namespace_only_modules`; see its doc comment for the
     /// four conditions and the measurement behind them.
     NamespaceOnlyModule,
+    /// H4: a file `sorbet/config` `--ignore`s (`IgnoredFiles`) reopens
+    /// this class. Those files are never merged into the index — their
+    /// surface is unread by design — but they exist at runtime, so the
+    /// class they reopen cannot conclude a miss. Set by
+    /// `apply_ignored_openness`.
+    IgnoredReopening,
 }
 
 /// What actually blocks a `MethodLookup::Inconclusive` from concluding
@@ -3566,7 +3572,13 @@ impl DefWalker<'_> {
                         }
                     } else if call.name().as_slice() == b"sig" && call.receiver().is_none() {
                         let sig = crate::sorbet_sig::extract_sig(node);
-                        let recognized = sig.is_some();
+                        // Opening the class is about whether the block can
+                        // define anything, not about whether it is a
+                        // contract: a builder chain ending in `returns(X)`
+                        // or `void` is type metadata even when the contract
+                        // grammar refuses a clause (`type_parameters`,
+                        // `bind`, ...), exactly as on `main`.
+                        let recognized = sig.is_some() || sig_block_is_recognized(&call);
                         let stacked = self.pending_sorbet_sig.is_some();
                         // A sig sorbet-runtime does not check at run time
                         // (`.checked(:never)`/`.checked(:tests)`) is
@@ -4421,6 +4433,46 @@ impl PendingSig {
             Self::Parsed(sig) => Some(sig),
             Self::Unusable => None,
         }
+    }
+}
+
+/// The block's single statement of a `sig { ... }` call, or `None` for a
+/// call with no block, an empty block, or more than one statement.
+fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
+    let block = call.block()?.as_block_node()?;
+    let body = block.body()?;
+    match body.as_statements_node() {
+        Some(stmts) => {
+            let mut iter = stmts.body().iter();
+            let first = iter.next()?;
+            if iter.next().is_some() {
+                return None;
+            }
+            Some(first)
+        }
+        None => Some(body),
+    }
+}
+
+/// Bead ita-4xy: is `call`'s block a RECOGNIZED sig shape, one whose
+/// outermost builder call is `returns` with exactly one argument or a
+/// bare `void`? Such a block is Sorbet type metadata and never itself
+/// defines a method, so it does not open its class even when
+/// `sorbet_sig::extract_sig` refuses one of its clauses (that sig is
+/// simply no contract). Anything else — several statements, no block, or
+/// another outermost call — still opens it. This decides only whether
+/// the class opens, never a type or a contract.
+fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
+        return false;
+    };
+    match outer.name().as_slice() {
+        b"returns" => outer.arguments().is_some_and(|args| {
+            let mut iter = args.arguments().iter();
+            iter.next().is_some() && iter.next().is_none()
+        }),
+        b"void" => true,
+        _ => false,
     }
 }
 
@@ -5500,6 +5552,32 @@ pub struct ProjectIndex {
 /// Merge all files' `file_defs` into the global class table.
 #[salsa::tracked]
 pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
+    build_index(db, false)
+}
+
+/// H4: the project index WITH every `sorbet/config`-`--ignore`d file
+/// (`crate::IgnoredFiles`) merged in like a project file. Suppression-only
+/// by construction: its single consumer is `check.rs`'s
+/// `check_const_ref`, which asks it only "does this constant exist?" right
+/// before emitting E0104 — nothing ever types, resolves a method, or
+/// closes a class through it, so a fixture stub named like a real class
+/// can never enable a new accusation. `None` (zero cost) when no file was
+/// ignored; built lazily, at most once, and only when some E0104 was
+/// about to fire.
+#[salsa::tracked(returns(ref))]
+pub fn ignored_aware_index(db: &dyn salsa::Database) -> Option<ProjectIndex> {
+    let ignored = crate::IgnoredFiles::try_get(db)?;
+    if ignored.files(db).is_empty() {
+        return None;
+    }
+    Some(build_index(db, true))
+}
+
+/// `merge_ignored`: `false` builds the real `project_index`, where an
+/// ignored file contributes only stand-down evidence
+/// (`merge_ignored_pollution` now, `apply_ignored_openness` at the end);
+/// `true` builds `ignored_aware_index`, where it merges like project code.
+fn build_index(db: &dyn salsa::Database, merge_ignored: bool) -> ProjectIndex {
     let mut index = ProjectIndex::default();
     let mut qualified_writes: Vec<(String, String)> = Vec::new();
     if let Some(project) = ProjectFiles::try_get(db) {
@@ -5507,6 +5585,7 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
             merge_file_fragments(db, file, &mut index, &mut qualified_writes);
         }
     }
+    merge_ignored_files(db, &mut index, &mut qualified_writes, merge_ignored);
     // bead ita-3gs: curated external gem declarations, embedded in the
     // binary — merged last, and only into names the project itself never
     // defined (see `merge_declared_fragment`), so `ita check`/`ita
@@ -5631,6 +5710,9 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // merge passes because it reads each module's FINAL surface — see
     // `apply_namespace_only_modules`.
     apply_namespace_only_modules(&mut index);
+    if !merge_ignored {
+        apply_ignored_openness(db, &mut index);
+    }
     build_subclass_map(&mut index);
     build_mixer_map(&mut index);
     poison_include_time_redefinitions(&mut index);
@@ -5642,6 +5724,63 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     poison_alias_reopen_redefinitions(&mut index);
     build_methods_by_name(&mut index);
     index
+}
+
+/// H4: every `IgnoredFiles` entry, merged per `build_index`'s mode — like
+/// project code for `ignored_aware_index`, stand-down flags only for the
+/// real `project_index`.
+fn merge_ignored_files(
+    db: &dyn salsa::Database,
+    index: &mut ProjectIndex,
+    qualified_writes: &mut Vec<(String, String)>,
+    merge_ignored: bool,
+) {
+    let Some(ignored) = crate::IgnoredFiles::try_get(db) else {
+        return;
+    };
+    for &file in ignored.files(db) {
+        if merge_ignored {
+            merge_file_fragments(db, file, index, qualified_writes);
+        } else {
+            merge_ignored_pollution(index, file_defs(db, file));
+        }
+    }
+}
+
+/// H4: the whole-index stand-down flags an ignored file raises — the
+/// core-pollution half of `merge_file_accumulators` and nothing else.
+/// Every one of these only ever turns a conclusive core lookup
+/// inconclusive; none adds a class, method or constant, so none can
+/// enable an accusation.
+fn merge_ignored_pollution(index: &mut ProjectIndex, defs: &FileDefs) {
+    index.core_mixin |= defs.core_mixin;
+    index.refine_raw.extend(defs.refine_targets.iter().cloned());
+    index.refined_unknown |= defs.refined_unknown;
+    index.eval_polluted_unknown |= defs.eval_unknown;
+    index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
+}
+
+/// H4: every class/module an ignored file writes a body for, by its full
+/// path. A project (or curated-declaration) class of that exact path is
+/// forced open — the ignored body is real at runtime and this index never
+/// reads it — and the name joins `polluted_opaque` (any method name, that
+/// class only), so a core class an ignored file reopens stands its
+/// core lookups down exactly like an eval body nobody showed this checker.
+/// A path the index does not know is NOT interned: an ignored-only
+/// definition never becomes a class
+/// here (see `ignored_aware_index` for the E0104 side).
+fn apply_ignored_openness(db: &dyn salsa::Database, index: &mut ProjectIndex) {
+    let Some(ignored) = crate::IgnoredFiles::try_get(db) else {
+        return;
+    };
+    for &file in ignored.files(db) {
+        for frag in &file_defs(db, file).fragments {
+            if let Some(&id) = index.by_path.get(&frag.path) {
+                merge_open(index, id, OpenReason::IgnoredReopening);
+            }
+            index.polluted_opaque.insert(frag.path.clone());
+        }
+    }
 }
 
 /// Qualified value-constant name -> where it's assigned (w12 closure):
@@ -7059,7 +7198,8 @@ fn pollution_is_unreadable(reason: Option<OpenReason>) -> bool {
             | OpenReason::Unattributed
             | OpenReason::NestedDefOwner
             | OpenReason::BlockNestedDefinition
-            | OpenReason::StringSourceDefined,
+            | OpenReason::StringSourceDefined
+            | OpenReason::IgnoredReopening,
         ) => true,
         Some(
             OpenReason::ReopenedExternal
@@ -7273,6 +7413,70 @@ pub fn rbi_qualified_const_declares<S: std::hash::BuildHasher>(qualified: &str, 
                 .fragments
                 .iter()
                 .any(|f| f.path == owner && f.consts.iter().any(|c| c == simple))
+    })
+}
+
+/// Bead ita-h5s: does the client's `sorbet/rbi` declare `name` as a BARE,
+/// unqualified top-level value-constant write — `XClient =
+/// T.let(T.unsafe(nil), T.nilable(Integer))`, planningalerts' real
+/// `sorbet/rbi/shims/elasticsearch_client.rbi` shape
+/// (`ElasticSearchClient = T.let(T.unsafe(nil),
+/// T.nilable(Elasticsearch::Client))`), or Tapioca's own compact-alias
+/// rendering (`DRbIdConv = DRb::DRbIdConv`)? Neither existing RBI
+/// channel ever reads this shape: `rbi_declares` only matches a
+/// `class`/`module` header, and `rbi_qualified_const_declares` requires
+/// `qualified.rsplit_once("::")` to succeed, so it returns `false`
+/// immediately for a name with no `::` at all — confirmed by the
+/// monotonicity report's minimal probe (`v1-asis` vs `v3-noshim`:
+/// removing the shim changed nothing, proving it was never consulted).
+///
+/// Consulted only from `check.rs::Checker::rbi_fallback_declares`, only
+/// after the project's own index has already failed to resolve a BARE
+/// reference. Candidates come from the SAME shared `rbi_map`
+/// `rbi_declares`/`rbi_qualified_const_declares` use
+/// (`rbi.rs::scan_toplevel_const_write` unions its hits into that same
+/// map under the same key/union discipline as a class/module header —
+/// see `RbiIndex::constants`'s doc comment) — phase 1 is a coarse
+/// locator only; the real check below is phase 2's `parse_defs_text`
+/// parse, exactly like every other RBI channel, so a comment or a
+/// string/heredoc body line that merely LOOKS like `NAME = ...` (phase
+/// 1 candidate) is correctly rejected here (it never lands in
+/// `FileDefs::toplevel_consts`, which only records a real
+/// `ConstantWriteNode`/`ConstantOrWriteNode`/`ConstantTargetNode` at
+/// true file scope).
+///
+/// Two shapes count: a genuinely top-level write (`FileDefs
+/// ::toplevel_consts`, `frag_idx == None` in `DefWalker`), or one
+/// nested directly inside a `class Object`/`module Kernel` block — the
+/// shim author's alternative spelling of "define this constant where a
+/// bare reference from anywhere finds it" (Ruby resolves an unqualified
+/// constant through `Object`'s own ancestry as the last resort). No
+/// other owner is tried: a bare query has no qualifying scope to widen
+/// into, unlike `rbi_qualified_const_declares`'s owner-based nested
+/// check.
+///
+/// Suppression-only, the same contract as every other RBI channel (see
+/// `rbi_declares`'s doc comment): a hit only silences `E0104`; the
+/// reference still types as `Ty::Unknown` in `infer_const` (invariant
+/// #1) — this project's `ProjectIndex` is never touched, so no new
+/// E0101/E0102/E0103/E0108/E0109 diagnostic becomes reachable because of
+/// this channel. `name` carrying a `::` always returns `false`
+/// immediately: that shape is `rbi_qualified_const_declares`'s alone.
+pub fn rbi_toplevel_const_declares<S: std::hash::BuildHasher>(name: &str, rbi_map: &HashMap<String, Vec<PathBuf>, S>) -> bool {
+    let name = name.trim_start_matches("::");
+    if name.contains("::") {
+        return false;
+    }
+    let Some(paths) = rbi_map.get(name) else {
+        return false;
+    };
+    paths.iter().any(|path| {
+        let defs = rbi_file_defs(path);
+        defs.toplevel_consts.iter().any(|c| c == name)
+            || defs
+                .fragments
+                .iter()
+                .any(|f| (f.path == "Object" || f.path == "Kernel") && f.consts.iter().any(|c| c == name))
     })
 }
 
@@ -9239,8 +9443,58 @@ impl ProjectIndex {
         };
         for path in object_class {
             if let Some(&cid) = self.by_path.get(*path) {
-                if let Some(m) = self.class(cid).methods.get(name) {
+                let core = self.class(cid);
+                if let Some(found) = self.core_mixin_definition(core, core.prepends.iter().rev(), name) {
+                    return Some(found);
+                }
+                if let Some(m) = core.methods.get(name) {
                     return Some(MethodLookup::Found(m, cid));
+                }
+                if let Some(found) = self.core_mixin_definition(core, core.includes.iter().rev(), name) {
+                    return Some(found);
+                }
+            }
+        }
+        None
+    }
+
+    /// A method a project reopening of a core receiver-chain class
+    /// (`Class`/`Module`/`Object`/`Kernel`/`BasicObject`) puts on every
+    /// class object THROUGH A MIXIN, read as literal definitions only.
+    ///
+    /// 2026-10-19, measured on Homebrew/brew (`Library/Homebrew`):
+    /// `extend/module.rb` is `class Module; include T::Sig; end`, and
+    /// `T::Sig#sig` is defined in the vendored sorbet-runtime
+    /// (`lib/types/sig.rb:98`). Reading only the reopening's own method
+    /// map left 1196 class-body `sig { ... }` calls as false E0101.
+    ///
+    /// Found-only, keyed on the method NAME: each mixin's linearized
+    /// ancestry is searched for a literal `def name`, and openness,
+    /// unresolved names and incomplete chains are skipped rather than
+    /// answered `Inconclusive`. That is deliberate and measured: the
+    /// fail-closed variant (the `extend` consult's arms) turned EVERY
+    /// class-object lookup in rails Inconclusive, because rails' own
+    /// `class Object; include ActiveSupport::Tryable` names a module the
+    /// index holds open (its `try` bodies `instance_eval`), and it
+    /// silenced the true positive at
+    /// `activesupport/test/autoloading_fixtures/raises_no_method_error.rb`.
+    /// Skipping an unreadable mixin is the verdict this consult gave
+    /// before it read mixins at all, so the only verdict that moves is
+    /// `NotFound` -> `Found` (invariant #1), and only for a name some
+    /// mixin of a core reopening literally defines.
+    fn core_mixin_definition<'m>(
+        &self,
+        core: &ClassDef,
+        mixins: impl Iterator<Item = &'m String>,
+        name: &str,
+    ) -> Option<MethodLookup<'_>> {
+        for mixin in mixins {
+            let Some(mid) = self.resolve_const(&core.nesting, mixin) else {
+                continue;
+            };
+            for a in self.ancestors(mid).0 {
+                if let Some(m) = self.class(a).methods.get(name) {
+                    return Some(MethodLookup::Found(m, a));
                 }
             }
         }

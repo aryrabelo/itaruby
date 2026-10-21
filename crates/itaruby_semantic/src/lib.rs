@@ -18,7 +18,7 @@ pub use check::{
     call_stats, check_file, check_file_dark, constraint_report, definition_at, hover_at, ty_name,
     CallStats, ConstraintOutcome, DarkSingleton, DarkVerdict, DefSite, HoverInfo, MethodHover,
 };
-pub use discovery::{find_upward_dir, upward_start, wire_declaration_sources, DiscoveredSources};
+pub use discovery::{find_upward_dir, path_is_ignored, sorbet_ignore_entries, upward_start, wire_declaration_sources, DiscoveredSources};
 pub use index::{ancestor_walks, core_methods_of, file_defs, project_consts, project_index, rbi_core_methods, rbi_files_parsed_count, stdlib_singleton_method, Blocker, FileDefs, OpenReason, ProjectIndex};
 pub use itaruby_syntax::{LineIndex, SourceFile};
 pub use types::{
@@ -33,6 +33,28 @@ pub type Db = salsa::DatabaseImpl;
 /// derives from this; the server updates it on file create/delete.
 #[salsa::input(singleton)]
 pub struct ProjectFiles {
+    #[returns(ref)]
+    pub files: Vec<SourceFile>,
+}
+
+/// Singleton input (H4): the `.rb` files `sorbet/config`'s `--ignore`
+/// excludes from TYPECHECKING. Sorbet's `--ignore` means "don't check
+/// these", never "they don't exist at runtime", so they are still read —
+/// but as SUPPRESSION-ONLY evidence, never as `ProjectFiles`:
+/// - never checked, so no diagnostic (parse errors included) is ever
+///   reported inside them;
+/// - a constant they define only silences E0104 elsewhere
+///   (`index::ignored_aware_index`, consulted by `check_const_ref` right
+///   before it would emit) and keeps typing as `Ty::Unknown`;
+/// - a project class/module they reopen, and any core class they reopen
+///   or pollute, is forced open (`index::apply_ignored_openness`).
+///
+/// They never intern a class into `project_index`, so a fixture stub
+/// named like a gem or project class can never close a name and enable a
+/// new E0101/E0102/E0103/E0108/E0109. Absent (no `sorbet/config`, or no
+/// `--ignore` match) is zero cost and byte-identical to before.
+#[salsa::input(singleton)]
+pub struct IgnoredFiles {
     #[returns(ref)]
     pub files: Vec<SourceFile>,
 }

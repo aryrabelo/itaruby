@@ -98,6 +98,27 @@
 #         -> namespace_module_with_own_methods_still_accuses (W1, W2) or
 #            namespace_module_with_mixins_still_accuses (W3..W5) must
 #            fail: each fixture module carries exactly one kind
+#   CO-X1 the core-reopening consult stops reading the reopening's
+#         INCLUDES (brew's `class Module; include T::Sig`, 2026-10-19)
+#         -> core_reopening_mixin_resolves_on_the_class_object_track must
+#            fail: `MrmPlank.mrm_sig` reaches the method only through
+#            `class Module; include MrmSigs`
+#   CO-X2 it stops reading the reopening's PREPENDS
+#         -> core_reopening_mixin_resolves_on_the_class_object_track must
+#            fail on `MrmPlank.mrm_first`
+#   CO-X3 it goes fail-closed: an unresolved or OPEN mixin answers
+#         Inconclusive (the variant measured to blind rails' whole
+#         class-object track through `include ActiveSupport::Tryable`)
+#         -> core_reopening_open_mixin_never_blinds_the_class_object_track
+#            must fail: the name nothing defines goes silent
+#   CO-X4 it skips an OPEN mixin instead of reading its literal defs
+#         (brew's declared-open `T::Sig`, whose `sig` is literal in the
+#         vendored sorbet-runtime)
+#         -> core_reopening_open_mixin_never_blinds_the_class_object_track
+#            must fail: `MrmPier.mrm_literal` accuses
+#   CO-X5 it loses its NAME key and answers any method the mixin defines
+#         -> core_reopening_mixin_typo_still_accuses must fail: the
+#            misspelling resolves to the mixin's one method
 #
 # CO-R's former emission-blocker mutation was BLIND: Widget's unknown
 # class-body call sets `open`, so lookup_singleton returns Inconclusive
@@ -433,6 +454,56 @@ mutant CO-W5 "$IDX" \
 }' \
   namespace_module_with_mixins_still_accuses \
   'the surface check stops counting extend edges: Toolkit reads as namespace-only'
+
+mutant CO-X1 "$IDX" \
+  '                if let Some(found) = self.core_mixin_definition(core, core.includes.iter().rev(), name) {
+                    return Some(found);
+                }' \
+  '' \
+  core_reopening_mixin_resolves_on_the_class_object_track \
+  'the core-reopening consult stops reading its includes: class Module; include T::Sig puts nothing on class objects'
+
+mutant CO-X2 "$IDX" \
+  '                if let Some(found) = self.core_mixin_definition(core, core.prepends.iter().rev(), name) {
+                    return Some(found);
+                }' \
+  '' \
+  core_reopening_mixin_resolves_on_the_class_object_track \
+  'the core-reopening consult stops reading its prepends'
+
+mutant CO-X3 "$IDX" \
+  '            let Some(mid) = self.resolve_const(&core.nesting, mixin) else {
+                continue;
+            };
+            for a in self.ancestors(mid).0 {' \
+  '            let Some(mid) = self.resolve_const(&core.nesting, mixin) else {
+                return Some(MethodLookup::Inconclusive);
+            };
+            for a in self.ancestors(mid).0 {
+                if self.class(a).open {
+                    return Some(MethodLookup::Inconclusive);
+                }' \
+  core_reopening_open_mixin_never_blinds_the_class_object_track \
+  'the core-reopening consult goes fail-closed: one open mixin of Object silences every class object'
+
+mutant CO-X4 "$IDX" \
+  '            for a in self.ancestors(mid).0 {
+                if let Some(m) = self.class(a).methods.get(name) {' \
+  '            for a in self.ancestors(mid).0 {
+                if self.class(a).open {
+                    continue;
+                }
+                if let Some(m) = self.class(a).methods.get(name) {' \
+  core_reopening_open_mixin_never_blinds_the_class_object_track \
+  'the core-reopening consult skips an open mixin: the literal def of a declared-open T::Sig goes unread'
+
+mutant CO-X5 "$IDX" \
+  '            for a in self.ancestors(mid).0 {
+                if let Some(m) = self.class(a).methods.get(name) {' \
+  '            for a in self.ancestors(mid).0 {
+                if let Some(m) = self.class(a).methods.values().next() {' \
+  core_reopening_mixin_typo_still_accuses \
+  'the core-reopening consult loses its name key: a misspelling resolves to the mixin method'
 
 echo
 if (( fail )); then

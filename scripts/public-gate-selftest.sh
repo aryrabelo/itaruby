@@ -11,8 +11,11 @@
 # Silence side: the shipped gate still proves its clone-path and ceiling
 # controls. The workflow controls also exercise the one shared
 # scripts/public-corpora-fetch.sh implementation with a local fixture remote:
-#   missing, already-at-pin, wrong-HEAD, no-baseline, failed-fetch, and the
-#   PUBLIC_GATE_CLONE=1 gate path.
+#   missing, already-at-pin, wrong-HEAD, no-baseline, failed-fetch, a
+#   `check=<path>` declaration (clone lands at <id>, an escaping path is
+#   refused), and the PUBLIC_GATE_CLONE=1 gate path. The gate's own
+#   `check=<path>` cases prove it measures exactly the declared subdir and
+#   fails closed on a missing or escaping one.
 #
 # Accusation side: every guard has a labelled mutant and its named case must
 # accuse it. Every mutation is diff-guarded (a replacement that changed
@@ -78,6 +81,10 @@ printf 'class L\n  def a\n    1\n  end\nend\n' >"$HEADCLONE/f.rb"
 git_clean -C "$HEADCLONE" add -A && git_clean -C "$HEADCLONE" commit -qm one
 SPARENT=$(git_clean -C "$HEADCLONE" rev-parse HEAD)
 printf '# touched\n' >>"$HEADCLONE/f.rb"
+# A subdirectory for the `check=<path>` cases (brew's shape: the Ruby lives
+# below the clone root).
+mkdir -p "$HEADCLONE/sub"
+printf 'class S\nend\n' >"$HEADCLONE/sub/g.rb"
 git_clean -C "$HEADCLONE" add -A && git_clean -C "$HEADCLONE" commit -qm two
 SGOOD=$(git_clean -C "$HEADCLONE" rev-parse HEAD)
 
@@ -97,6 +104,11 @@ mk_lab() { # DIR GATE_SRC
   chmod +x "$1/scripts/public-gate.sh"
   printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"lab/f.rb","severity":"error"}\n' \
     >"$1/scripts/baseline/lab.jsonl"
+  # The check-path id: normalization strips the CLONE root, so a correctly
+  # aimed `ita check` reports `labsub/sub/f.rb`, and a check of the root
+  # (the defect) reports `labsub/f.rb`.
+  printf '{"code":"E0101","column":5,"line":3,"message":"lab","path":"labsub/sub/f.rb","severity":"error"}\n' \
+    >"$1/scripts/baseline/labsub.jsonl"
   {
     echo '#!/bin/sh'
     echo '# fake ita: one diagnostic, pathed inside the clone it is handed ($2).'
@@ -131,6 +143,9 @@ line_ci_over="lab file:///dev/null $SGOOD 999:0 lab-head"
 line_ci_unmeasured=$line_match
 line_dev_over=$line_ci_match
 line_ci_invalid="lab file:///dev/null $SGOOD 999:invalid lab-head"
+line_check="labsub file:///dev/null $SGOOD 999 lab-head check=sub"
+line_check_missing="labsub file:///dev/null $SGOOD 999 lab-head check=absent"
+line_check_escape="labsub file:///dev/null $SGOOD 999 lab-head check=../lab"
 
 mk_lab "$LAB/shipped" "$GATE"
 
@@ -163,6 +178,18 @@ case_holds() { # NAME TRANSCRIPT RC -> 0 when the case behaved as its name says
     ci-invalid)
       [[ $t == *"public time ceiling (lab): invalid ci ceiling invalid"* ]] &&
       [[ $t == *"RESULT: FAIL"* ]] && (( rc == 1 )) ;;
+    check-path)
+      [[ $t == *"public check path (labsub): $HEADCLONE/sub"* ]] &&
+      [[ $t == *"match baseline exactly (labsub)"* ]] &&
+      [[ $t == *"RESULT: PASS"* ]] && (( rc == 0 )) ;;
+    check-missing)
+      [[ $t == *"declared check path absent is missing in $HEADCLONE"* ]] &&
+      [[ $t != *"public errors"*"(labsub)"* ]] &&
+      [[ $t == *"RESULT: FAIL"* ]] && (( rc == 1 )) ;;
+    check-escape)
+      [[ $t == *"malformed repo line (optional fields"*"labsub"* ]] &&
+      [[ $t != *"public revision (labsub)"* ]] &&
+      [[ $t == *"RESULT: FAIL"* ]] && (( rc == 1 )) ;;
   esac
 }
 
@@ -179,13 +206,17 @@ run_named() { # LABDIR NAME -> echoes transcript, sets RC; picks the line by nam
     ci-unmeasured) line=$line_ci_unmeasured; COL=ci ;;
     ci-invalid)   line=$line_ci_invalid; COL=ci ;;
     dev-over)     line=$line_dev_over; COL=default ;;
+    check-path)   line=$line_check ;;
+    check-missing) line=$line_check_missing ;;
+    check-escape) line=$line_check_escape ;;
   esac
   cf=$(corpora_file "$labdir" "$name" "$line")
   run_gate "$labdir" "$cf" "$labdir/art-$name"
 }
 
 say 'silence side — the shipped gate is fail-closed over a declared clone dir'
-for name in match wrong-rev missing default-skip ci-match ci-over ci-unmeasured ci-invalid dev-over; do
+for name in match wrong-rev missing default-skip ci-match ci-over ci-unmeasured ci-invalid dev-over \
+    check-path check-missing check-escape; do
   t=$(run_named "$LAB/shipped" "$name")
   RC=$(cat "$LAB/last-rc")
   if case_holds "$name" "$t" "$RC"; then
@@ -203,6 +234,9 @@ mutants=(
   'ci_reads_dev_column|ci-over|ci)  limit=$ci_ceiling ;;|ci)  limit=$dev_ceiling ;;'
   'ci_borrows_dev_ceiling|ci-unmeasured|ci)  limit=$ci_ceiling ;;|ci)  limit=${ci_ceiling:-$dev_ceiling} ;;'
   'dev_defaults_to_ci|dev-over|COLUMN=${PUBLIC_COLUMN:-dev}|COLUMN=${PUBLIC_COLUMN:-ci}'
+  'check_path_ignored|check-path|"$ITA" check "$target"|"$ITA" check "$clone"'
+  'check_missing_not_failclosed|check-missing|if [[ ! -d $target ]]; then|if false; then'
+  'check_escape_accepted|check-escape|[[ ! $check_path =~ $CHECK_PATH_RE ]]|false'
 )
 for entry in "${mutants[@]}"; do
   IFS='|' read -r mname mcase needle repl <<<"$entry"
@@ -221,13 +255,18 @@ for entry in "${mutants[@]}"; do
 
   t=$(run_named "$mgate" "$mcase")
   RC=$(cat "$LAB/last-rc")
-  if [[ $mcase == missing || $mcase == wrong-rev ]]; then
-    reproduced=0
-    [[ $t == *"SKIP public corpus (lab)"* && $t != *"RESULT: FAIL"* && $RC == 2 ]] && reproduced=1
-  else
-    reproduced=0
-    case_holds match "$t" "$RC" && reproduced=1
-  fi
+  reproduced=0
+  case $mcase in
+    missing|wrong-rev)
+      [[ $t == *"SKIP public corpus (lab)"* && $t != *"RESULT: FAIL"* && $RC == 2 ]] && reproduced=1 ;;
+    check-*)
+      # The defect is measuring a tree the declaration never named: the gate
+      # runs, and the fake ita's path (normalized from what it was handed)
+      # no longer matches the subdir baseline.
+      [[ $t == *"public errors drifted (labsub)"* && $RC == 1 ]] && reproduced=1 ;;
+    *)
+      case_holds match "$t" "$RC" && reproduced=1 ;;
+  esac
   if (( ! reproduced )); then
     bad "mutant $mname did NOT reproduce the named defect in $mcase (rc=$RC)"
     continue
@@ -523,6 +562,26 @@ PY
     bad 'fetcher fetched an unbaselined corpus'
   fi
 
+  # check=<path> is not a clone dir: the clone lands at <id>, and a path that
+  # could leave the clone is a malformed declaration (exit 64).
+  check_root=$wf/fetch-check
+  printf 'lab %s %s 999 check=sub\n' "$REMOTE" "$SGOOD" >"$wf/check.txt"
+  if fetch_case "$check_root" "$wf/check.txt" "$baseline" "$wf/check.log" &&
+      [[ $(git_clean -C "$check_root/lab" rev-parse HEAD) == "$SGOOD" ]] &&
+      [[ ! -e "$check_root/check=sub" ]]; then
+    ok 'fetcher reads check=<path> as a check path, not a clone dir'
+  else
+    bad 'fetcher misplaced a check=<path> declaration'
+  fi
+  escape_root=$wf/fetch-check-escape
+  printf 'lab %s %s 999 check=../x\n' "$REMOTE" "$SGOOD" >"$wf/check-escape.txt"
+  fetch_case "$escape_root" "$wf/check-escape.txt" "$baseline" "$wf/check-escape.log"
+  if [[ $(cat "$wf/check-escape.log.rc") == 64 && ! -e "$escape_root/lab" ]]; then
+    ok 'fetcher refuses an escaping check path'
+  else
+    bad 'fetcher accepted an escaping check path'
+  fi
+
   # failing fetch -> no final tree and no partial directory. TWO failing repos,
   # because the exit trap alone cleans the LAST partial: only the per-failure
   # cleanup keeps the first one from leaking, and only two repos can tell.
@@ -638,6 +697,44 @@ SH
     ok 'fetcher top-level mutant accused by nested-host'
   else
     bad 'fetcher top-level mutant was not accused'
+  fi
+
+  # Accuse the check-token arm: without it `check=sub` becomes the clone dir.
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-check.sh" \
+      'check=*) (( ! check_set ))' 'check=__never__*) (( ! check_set ))' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-check.sh"; then
+    bad 'INVALIDO-cmp: fetcher check-token arm'
+  elif ! bash -n "$wf/fetch-mutant-check.sh"; then
+    bad 'INVALIDO-parse: fetcher check-token arm'
+  else
+    mutant_root=$wf/fetch-mutant-check
+    ( cd "$wf" && PUBLIC_CORPORA_ROOT="$mutant_root" \
+        PUBLIC_CORPORA_FILE="$wf/check.txt" PUBLIC_BASELINE_DIR="$baseline" \
+        bash "$wf/fetch-mutant-check.sh" >"$wf/fetch-mutant-check.log" 2>&1 )
+    if [[ -d "$mutant_root/check=sub" && ! -e "$mutant_root/lab" ]]; then
+      ok 'fetcher check-token mutant accused by check=<path>'
+    else
+      bad 'fetcher check-token mutant was not accused'
+    fi
+  fi
+
+  # Accuse the check-path validation: without it `check=../x` is accepted.
+  if ! mutate "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-check-escape.sh" \
+      ')*$ ]] || opts_ok=0 ;;' ')*$ ]] || true ;;' ||
+      cmp -s "$wf/scripts/public-corpora-fetch.sh" "$wf/fetch-mutant-check-escape.sh"; then
+    bad 'INVALIDO-cmp: fetcher check-path validation'
+  elif ! bash -n "$wf/fetch-mutant-check-escape.sh"; then
+    bad 'INVALIDO-parse: fetcher check-path validation'
+  else
+    mutant_root=$wf/fetch-mutant-check-escape
+    if ( cd "$wf" && PUBLIC_CORPORA_ROOT="$mutant_root" \
+        PUBLIC_CORPORA_FILE="$wf/check-escape.txt" PUBLIC_BASELINE_DIR="$baseline" \
+        bash "$wf/fetch-mutant-check-escape.sh" >"$wf/fetch-mutant-check-escape.log" 2>&1 ) &&
+        [[ -d "$mutant_root/lab" ]]; then
+      ok 'fetcher check-path validation mutant accused by an escaping check path'
+    else
+      bad 'fetcher check-path validation mutant was not accused'
+    fi
   fi
 fi
 

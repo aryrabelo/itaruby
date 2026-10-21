@@ -527,3 +527,87 @@ pub fn find_upward_dir(root: &Path, rel: &str) -> Option<PathBuf> {
         .map(|dir| dir.join(rel))
         .find(|candidate| candidate.is_dir())
 }
+
+/// bead ita-9d4: sorbet's own `sorbet/config` can list `--ignore=<path>`
+/// entries (also written as the two-token `--ignore <path>` form,
+/// argv-style — sorbet's config file is one flag/value per line) that
+/// exclude a subtree from typechecking. Honoring it removes a source of
+/// noise-only diagnostics from paths the project itself declared out of
+/// scope (vendored code, generated fixtures, ...).
+///
+/// H4 (2026-10-20): shared by `ita check` and `ita server`. `--ignore`
+/// means "don't TYPECHECK these", never "they don't exist": both callers
+/// route matching files into `IgnoredFiles` (suppression-only evidence,
+/// see its doc comment in `lib.rs`), never into `ProjectFiles`, and never
+/// report a diagnostic inside them.
+///
+/// No `sorbet/config` (missing, unreadable, or simply empty of `--ignore`
+/// lines) returns `vec![]`: the anti-overreach control
+/// (`tests/sorbet_ignore_cli.rs`'s absent-config test) leans on this —
+/// an empty list makes `discover_rb_files`'s filtering a pure no-op, so
+/// "no config" and "old behavior" are the same code path, not merely
+/// close to it.
+pub fn sorbet_ignore_entries(root: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(root.join("sorbet").join("config")) else {
+        return Vec::new();
+    };
+    let mut tokens = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let mut entries = Vec::new();
+    while let Some(tok) = tokens.next() {
+        if let Some(path) = tok.strip_prefix("--ignore=") {
+            entries.push(normalize_ignore_entry(path));
+        } else if tok == "--ignore" {
+            if let Some(path) = tokens.next() {
+                entries.push(normalize_ignore_entry(path));
+            }
+        }
+    }
+    entries
+}
+
+/// Strips one trailing `/` so `--ignore=test/fixtures/` and
+/// `--ignore=test/fixtures` (I2: "without trailing slash still excludes
+/// the directory it names") normalize to the same entry before
+/// `path_is_ignored` compares it.
+fn normalize_ignore_entry(path: &str) -> String {
+    path.strip_suffix('/').unwrap_or(path).to_string()
+}
+
+/// H4b (2026-10-20): Sorbet's own `--ignore` matching, as OBSERVED on
+/// sorbet 0.6.13437 (`srb tc --no-config --dir . --ignore=<e>` over a
+/// planted tree, not the docs). The file's path relative to the input dir
+/// is written `/<rel>` (`/bar/foo/baz.rb`):
+/// - an entry starting with `/` must be a PREFIX of it (`/foo` ignores
+///   `foo/bar.rb`, never `bar/foo/baz.rb`);
+/// - any other entry may match ANYWHERE (`foo` ignores `foo/bar.rb` and
+///   `bar/foo/baz.rb`; `a/b` ignores `x/a/b/c.rb`; `foo.rb` ignores
+///   `bar/foo.rb`);
+/// - either way the match must start right after a `/` and end at a `/`
+///   or the end of the path: whole names only (`foo` never ignores
+///   `foo.rb` or `foo2/bar.rb`, `oo` ignores nothing, `Formula` never
+///   `FormulaX/`);
+/// - an entry is compared as text: `./foo` ignores nothing.
+///
+/// A trailing `/` is already stripped by `normalize_ignore_entry`, which
+/// Sorbet agrees with (`foo/` ignores exactly what `foo` does).
+pub fn path_is_ignored(rel: &Path, ignore_list: &[String]) -> bool {
+    let path = format!("/{}", rel.to_string_lossy());
+    ignore_list.iter().any(|entry| ignore_entry_matches(&path, entry))
+}
+
+/// One `--ignore` entry against one `/`-prefixed relative path; see
+/// `path_is_ignored` for the observed rules.
+fn ignore_entry_matches(path: &str, entry: &str) -> bool {
+    let ends_at_boundary = |end: usize| end == path.len() || path.as_bytes()[end] == b'/';
+    if entry.is_empty() || entry == "/" {
+        return false;
+    }
+    if entry.starts_with('/') {
+        return path.starts_with(entry) && ends_at_boundary(entry.len());
+    }
+    path.match_indices(entry)
+        .any(|(at, _)| path.as_bytes()[at - 1] == b'/' && ends_at_boundary(at + entry.len()))
+}

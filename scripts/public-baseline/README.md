@@ -1,8 +1,9 @@
 # Public-corpus baselines — audit ledger & provenance
 
 These files are the expected-forward state for `scripts/public-gate.sh`'s
-drift check against four public Rails apps. They are **generated
-measurements, not claims about correctness**.
+drift check against public Ruby codebases (four Rails apps since
+2026-09-02; zammad and Homebrew/brew since 2026-10-19). They are
+**generated measurements, not claims about correctness**.
 
 ## ⚠️ The error sets are DRIFT DETECTORS, NOT a claim of truth
 
@@ -530,3 +531,277 @@ silent. Those 4 lines were false positives (the `webpush` and `logster` gems
 are in Gemfile.lock), but the change that removed them was a blind spot, not a
 correction. The loop now walks a non-symbol pair's key and value and a splat's
 value, and all 4 lines are present again in the baselines above.
+
+## First baselines 2026-10-19 — zammad and Homebrew/brew
+
+Two public corpora replace the retired private corpora as sources of
+findings. Both were generated from the gate's own normalized artifacts
+(`public-<id>.txt` passed through the gate's `sed` + `^{` filter), produced
+on m5 by a checked release build at `295e213` (`cargo build --release`,
+exit 0). The triage that chose them (a pre-merge branch binary, not this
+one) named the families below; every family was re-counted from these
+baselines and re-read at its sites in the pinned clones. Counts that differ
+from the triage are this binary's.
+
+| id | pinned sha | checked dir | errors | warnings | ita wall (m5) |
+|----|-----------|-------------|-------:|---------:|--------------:|
+| zammad | `228b456174a989a2f9b5b33de2189a5808499150` | repo root | 275 | 1072 | 0.60–1.02 s |
+| brew | `d78c1943dc2b77930691102481df0d9e9bf7e257` | `Library/Homebrew` (`check=`) | 1240 | 156 | 2.45–2.83 s |
+
+### zammad — errors (275 = 271 FALSE POSITIVE + 4 TRUE POSITIVE)
+
+| family | lines | verdict | evidence read |
+|---|---:|---|---|
+| Z1 project `module Kernel` method called from an instance method (`__`) | 222 | FALSE POSITIVE | `lib/core_ext/kernel.rb:1-5` is `module Kernel; def __(string)`; sites such as `app/models/ai/agent/type/custom_ai_agent.rb:6` call `__('…')` from instance methods. The instance-track lookup does not read project `Kernel`/`Object` reopenings (the class-object track does). |
+| Z2 gem class reopened in project code reads as closed | 36 | FALSE POSITIVE | `Net::SMTP` 22: `lib/core_ext/net/smtp.rb:2-47` reopens the locked `net-smtp` 0.5.2 class and calls its private helpers (`check_auth_args`, `tlsconnect`, `do_helo`, …). `Delayed::Worker` 14: `config/initializers/delayed_jobs_log_level.rb:18-19` reopens the locked `delayed_job` 4.1.13 class; sites call its `work_off`, `plugins`, `logger`, `logger=`, `max_run_time=`, `reset`, `run`. Gem name ≠ namespace (`delayed_job` → `Delayed`, bundled `net-smtp` → `Net::SMTP`). |
+| Z3 `Class#descendants` (ActiveSupport) | 6 | FALSE POSITIVE | `app/graphql/gql/types/enum/authentication_provider_type.rb:7`, `lib/text/quote_remover/attribution_pattern.rb:27`; ActiveSupport's `core_ext/class/subclasses.rb` defines it and zammad defines no override. |
+| Z4 `Kernel.silence_warnings` | 3 | FALSE POSITIVE | `lib/certificate/apply_ssl_certificates.rb:29`, `lib/core_ext/em-websocket/{framing07,masking04}.rb`; ActiveSupport's `core_ext/kernel/reporting.rb` uses `module_function`, so it is also a singleton method of `Kernel`. |
+| Z5a abstract class-method stub overridden with arity 1 (E0102) | 2 | FALSE POSITIVE | `lib/tasks/zammad/email_parser/failed_email/base.rb:16,20` call `process_dir(x)`/`process_file(x)` from `def self.process_given_dir_or_file`; the base's `def self.process_dir; end` stubs (l.30-31) take 0 args, and both subclasses (`import.rb`, `delete.rb`) define 1-arg versions — self is always the subclass. |
+| Z5b instance delegators installed by `self.inherited` | 2 | FALSE POSITIVE | `lib/import/integration_base.rb:122-123` call `active?`/`display_name` from an instance method; l.13-20 `def self.inherited(subclass)` runs `subclass.delegate %i[identifier active? config display_name] => subclass`, so every subclass instance has them. (The triage called these "subclass hooks"; the mechanism is the `inherited` delegation.) |
+| Z6 TRUE POSITIVES | 4 | **TRUE POSITIVE** | see below |
+
+The four TRUE POSITIVES, each read at its site:
+
+1. `lib/enrichment/clearbit/user.rb:166` — `User.of_role(...)` inside
+   `class Enrichment::Clearbit::User; class << self; def all`. Lexical lookup
+   resolves `User` to `Enrichment::Clearbit::User` itself, which defines no
+   `of_role`: `NoMethodError` whenever `.all` runs (it has no in-repo caller).
+2. `app/models/channel/email_build.rb:100` — `logger.error e` in the rescue
+   of `def self.build` on `module Channel::EmailBuild`; the module has no
+   `logger` and zammad defines no global one (l.243 of the same file uses
+   `Rails.logger`), so a scrub failure becomes a `NameError` inside the
+   rescue.
+3. `app/models/store/provider/file.rb:55` — `raise "… #{location} …"` in
+   `def self.validate_file(sha)`; `location` is no local and no method there
+   (the class method is `get_location(sha)`, l.81), so a SHA mismatch raises
+   `NameError` instead of the intended message.
+4. `lib/auth/two_factor.rb:55` — `method_object = method_object(method)`;
+   no `method_object` method exists anywhere (the sibling is
+   `authentication_method_object`, l.79), so the call raises `NoMethodError`.
+
+### zammad — warnings (1072 E0104)
+
+| family | lines | verdict | evidence read |
+|---|---:|---|---|
+| GraphQL type names (`Boolean`, `ID`) reached through gem ancestry | 247 | FALSE POSITIVE | `field :x, Boolean` in `app/graphql/gql/mutations/*`; the names are `GraphQL::Schema::Member::GraphQLTypeNames` constants of the locked `graphql` 2.6.11, reached by ancestor lookup. |
+| stdlib / default-gem constants missing from the inventory (`CGI` 111, `REXML` 21, `SimpleDelegator` 15, `ERB` 9) | 156 | FALSE POSITIVE | e.g. `app/models/channel/filter/attachment_reference_remove.rb:37` `CGI`; `cgi` 0.5.2 is locked and loaded by Rails, `delegate`/`erb` by the framework. |
+| project classes defined by a compact path INSIDE a body (`class A::B::C` nested in `module A::B`) | 54 | FALSE POSITIVE | `app/models/store/provider/s3.rb:5` `class Store::Provider::S3::Error` inside `module Store::Provider::S3`; `lib/secure_mailing/pgp/tool/error.rb:23ff` `class SecureMailing::PGP::Tool::Error::NoData` inside `module SecureMailing::PGP::Tool::Error`; `lib/password_policy.rb:7`. Ruby resolves the compact path's first segment lexically to the top-level constant; the reference sites (`users_controller.rb:460` `PasswordPolicy::Error`, …) name a class that exists. Counted mechanically: E0104 whose exact path is written as an indented compact `class`/`module` definition somewhere in the tree. |
+| Loofah scrubber constants (`STOP` 12, `CONTINUE` 9) | 21 | FALSE POSITIVE | `lib/html_sanitizer/scrubber/image_size.rb:13`; `Loofah::Scrubber::STOP`/`CONTINUE`, reached through the scrubber superclass of the locked `loofah` gem. |
+| gem constants with no declaration (`WhatsappSdk`, `Capybara`, `Faker`, `VCR`, `ZendeskAPI`, `Selenium`, `RuboCop`, `ActiveRecord::SessionStore`, …) | 594 | FALSE POSITIVE (class verdict) | the external-declaration gap: sampled roots are locked gems (18 of the largest roots matched `Gemfile.lock` by name; `ActiveRecord::SessionStore::Session` at `app/channels/application_cable/connection.rb:31` is `activerecord-session_store`). Not read site by site; a site in this family that names no gem constant is unaudited until read. |
+
+### brew — errors (1240, all FALSE POSITIVE)
+
+The mechanical oracle agrees: `sorbet tc` (static binary 0.6.13437, run
+from `Library/Homebrew`, 0.41 s, re-run 2026-10-19 at the pin) reports 11
+errors, all environmental — 5× 5035 in `standalone/sorbet.rb` (local Sorbet
+older than brew's pinned 0.6.13544), 1× 7004 `Coverage.start(eval:)`, and
+3× 5002 + 1× 7003 + 1× 1004 from a `require_relative` into `.github/`
+outside the checked dir (itaruby warns on the same constant, below). None
+lands on any itaruby error line.
+
+| family | lines | verdict | evidence read |
+|---|---:|---|---|
+| B1 `sig` undefined on class/module bodies | 1196 | FALSE POSITIVE | `extend/module.rb:1-2` is `class Module; include T::Sig`, which puts `sig` on every class and module object; sites such as `api/cask_download.rb:11` call `sig {` in a module body. A mixin into a project reopening of `Module` is not read on the class-object surface. |
+| B2 `Kernel#Pathname` from a class method | 18 | FALSE POSITIVE | `api/packages_index.rb:32` `Pathname("…")` inside `def self.path_for`; `global.rb:159` requires `extend/pathname`, which loads stdlib `pathname`, whose private `Kernel#Pathname` is reachable with self = a class. |
+| B5 class reopened through a conditional constant alias (vendored concurrent-ruby) | 18 | FALSE POSITIVE | `vendor/…/concurrent/atomic/lock_local_var.rb:19-28` sets `LockLocalVar = ThreadLocalVar` or `= FiberLocalVar`, then `class LockLocalVar; end` (a doc stub) reopens the ALIASED class; `value`/`value=` (`reentrant_read_write_lock.rb:163ff`) are defined on both targets. Not in the triage (its binary did not emit it). |
+| B3 Enumerable methods on an includer when the project reopens `module Enumerable` | 7 | FALSE POSITIVE | `options/options.rb:6` `include Enumerable` with `def each` (l.35); `extend/enumerable.rb:4` reopens `module Enumerable`; `to_a` ×5 (`options.rb:75,106`, `formula_installer.rb:884`, `tab/tab.rb:500`), `map` (l.89), `any?` (l.94). The reopening fragment shadows the core module's surface. |
+| B4 project `class Object` method on an instance receiver | 1 | FALSE POSITIVE | `dev-cmd/bump-cask-pr.rb:162` `new_version.present?`; `extend/blank.rb:4,28` is `class Object … def present?`. Same root as zammad Z1. |
+
+### brew — warnings (156 E0104: 113 project, 43 vendor)
+
+| family | lines | verdict | evidence read |
+|---|---:|---|---|
+| W1 RSpec `stub_const("Name", …)` | 77 | FALSE POSITIVE | `test/cli/parser_spec.rb:7` `stub_const("Cmd", Class.new(…))` (58 `Cmd`); `SubcommandTestCmd` 7, `TestCat` 6, `TestSubcommand` 2, `TapiocaArgsTestCmd` 2, `Tac` 1 (`test/abstract_command_spec.rb:56`), `TestChecker` 1 (`test/cmd/bundle/check_subcommand_spec.rb:424`). |
+| W2 REXML | 15 | FALSE POSITIVE | `bundle_version.rb:31`, `livecheck/strategy/xml.rb`; `require "rexml/document"` (bundled gem missing from the inventory). |
+| W3 RBI constant alias / nesting inside RBI namespaces | 12 | FALSE POSITIVE | `rubocops/shared/helper_functions.rb:17` `RuboCop::ProcessedSource` (aliased to `RuboCop::AST::ProcessedSource` in `sorbet/rbi/gems/rubocop@*.rbi`), `rubocops/ternary_to_if.rb:26` `VariableForce`, `NodePattern::Macros`. |
+| W4 misc project | 8 | FALSE POSITIVE | `startup/bootsnap.rb:86` and `test/startup/bootsnap_spec.rb:58` optional `Bootsnap`; `extend/ENV/sensitive.rb:10` `Sorbet::Private::Static::ENVClass`; `test/shims/super/cc_spec.rb:13` `CcShim::Cmd` defined via a string. |
+| W4b class defined outside the checked dir | 1 | FALSE POSITIVE (scope) | `test/stale_lead_maintainer_pr_approval_spec.rb:7`; the class lives in `.github/scripts/approve_stale_lead_maintainer_prs.rb:12`, reached by `require_relative "../../../.github/…"` outside `Library/Homebrew`. Sorbet reports the same constant (5002). |
+| V1 vendored gems: platform-guarded constants (`::XZ`, `::Brotli`, `::LZ4`, `::Zstd`, `LZFSE`, JRuby/Truffle/C-ext classes) | 31 | FALSE POSITIVE | `vendor/…/bindata-3.0.1/lib/bindata/transform/lzma.rb:17` optional codec gems; `concurrent/array.rb:35-43` engine-guarded `JRubyArray`/`TruffleRubyArray`. |
+| V2 vendored concurrent-ruby: constants through ancestry / conditional superclass alias | 12 | FALSE POSITIVE | `executor/cached_thread_pool.rb:40` `DEFAULT_THREAD_IDLETIMEOUT`, defined on `RubyThreadPoolExecutor`, the superclass reached through `ThreadPoolExecutorImplementation = case …` (`thread_pool_executor.rb:10`); `executor/abstract_executor_service.rb:97` `DEBUG`, written by a multiple assignment in `concern/logging.rb:11` and included through `ExecutorService` (`executor_service.rb:158`). |
+
+**Vendored gems stay in the baseline.** `Library/Homebrew/vendor/bundle`
+is committed and walked, and it stays walked: the vendored
+`sorbet-runtime` 0.6.13544 is what defines most of `T::*`, so excluding it
+(the triage measured it with a `.ignore`) adds 65 `T::Class`/`T::Range`/…
+E0104 to project code and moves 6 `sig` rows — a different corpus, not a
+filtered one. Its 61 rows (18 E0101 + 43 E0104) stay in the set as well:
+the gate has one normalization and no row filter, and a second one would
+be a second convention; and vendored gem code is real Ruby that this
+checker reads, where B5 is a false-positive family the project rows alone
+would never have shown.
+
+**TRUE POSITIVES: zammad 4, brew 0.** Every other error line on both
+corpora is a false positive with a named mechanism, so each family above is
+a fix with a known size; a fix re-baselines downward and its GONE lines are
+ledgered against these families.
+
+## Regeneration 2026-10-19 — brew B1: mixins of a core reopening reach class objects
+
+The fix: the class-object track's core consult
+(`core_object_instance_surface`, the `Class`/`Module`/`Object`/`Kernel`/
+`BasicObject` chain) now also reads the MIXINS a project reopening of
+those names wrote, in MRO order (prepends, own defs, includes). It reads
+literal definitions only and answers `Found` or nothing. An unresolved or
+open mixin is skipped, as it was before mixins were read at all, so the
+only verdict that moves is `NotFound` -> `Found`, and only for a name that
+some such mixin literally defines. Brew's `class Module; include T::Sig`
+(`extend/module.rb:1-2`) resolves because `T::Sig#sig` is literal in the
+vendored sorbet-runtime (`vendor/bundle/ruby/4.0.0/gems/sorbet-runtime-0.6.13544/lib/types/sig.rb:98`),
+even though `T::Sig` is declared open by `declarations/gems.rbi`.
+
+A fail-closed variant was measured first and rejected. It made an open or
+unresolved mixin answer `Inconclusive`, and on rails it took the class-object
+track down wholesale: rails' own `class Object; include
+ActiveSupport::Tryable` (`activesupport/lib/active_support/core_ext/object/try.rb:33`)
+names a module the index holds open, so every class-object lookup went
+Inconclusive. It silenced the reachable NoMethodError at
+`activesupport/test/autoloading_fixtures/raises_no_method_error.rb` (the
+fixture's whole point; constantize tests expect that raise). Brew also lost
+its 18 B2 lines, for that blanket reason rather than B2's own mechanism.
+The shipped variant leaves both in place.
+
+Measured with the gate's own normalization against the pinned clones:
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 1196 |
+
+### Brew GONE: 1196 lines, all family B1, all FALSE POSITIVE
+
+| family | gone | verdict |
+|---|---:|---|
+| B1 `sig` undefined on class/module bodies | 1196 | FALSE POSITIVE repaired. Every line is E0101 ``undefined method `sig` `` in 197 files, none under `vendor/` and 4 under `test/`. Sites read: `api/cask_download.rb:11` (module body), `keg_only_reason.rb:7` (class body), `bundle/dumper.rb:12` (`module Homebrew::Bundle::Dumper`), `test_runner_formula.rb:7`, `api/packages_index.rb:269` and `build_environment.rb:17`; none of these files extends `T::Sig` itself, and all of them reach `sig` through `class Module; include T::Sig`. |
+
+**TRUE POSITIVES lost: 0.** brew's error set goes 1240 -> 44 (B2 18, B5 18,
+B3 7, B4 1, all unchanged); warnings are unchanged. `brew.jsonl` keeps its
+previous line order, so the diff is a pure deletion of 1196 lines, and its
+`sort -u` set equals the gate's fresh artifact byte-for-byte.
+
+## Regeneration 2026-10-20 — brew H4/H4b: `sorbet/config --ignore` honored the way Sorbet matches it
+
+The change: `--ignore` entries now match the way sorbet 0.6.13437 was
+observed to match them (a `/`-leading entry is an anchored prefix of
+`/<path relative to the input dir>`, any other entry matches anywhere, whole
+names only), and an ignored `.rb` is read as SUPPRESSION-ONLY evidence
+(`IgnoredFiles`) and never checked or reported. Brew's
+`Library/Homebrew/sorbet/config` lists `--ignore=/vendor/bundle`,
+`/vendor/gems`, `/vendor/ruby`, `/vendor/portable-ruby`, `/test/.gem`,
+`/spec/stub`, `Formula` and `Casks`. Before this change the matcher compared
+`Path::components()`, so `/vendor/bundle` began with a root component that
+no relative path has, and every `/`-leading entry was dead: brew's vendored
+gems were checked and reported. Now 397 `.rb` under `vendor/bundle`, 2
+under `vendor/gems` and 203 under test-fixture `Casks/`/`Formula/` dirs
+are ignored (the other entries match no file at the pin).
+
+Measured with the gate's own normalization (`PUBLIC_COLUMN=ci`) against the
+pinned clones, release build of the branch merged with main at
+`cb9b0be` (B1 included):
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 61 |
+
+(Measured against main before B1 the brew drift was 0 new / 67 gone: the
+extra 6 were `sig` E0101 on a module that `extend T::Helpers`, which B1's
+regeneration above already removed.)
+
+### Brew GONE: 61 lines, every one inside the ignored `/vendor/bundle`
+
+One mechanism covers all 61: the line's file is under
+`brew/Library/Homebrew/vendor/bundle/`, which brew's own `sorbet/config`
+ignores, and nothing inside an ignored path is reported. Checked
+mechanically: 61 of 61 gone paths start with that prefix, 0 gone lines lie
+outside it, and the fresh set holds 0 `vendor/` rows (the old baseline
+held exactly 61, the vendored rows counted in "Vendored gems stay in the
+baseline" above). No gone line comes from the two other H4 mechanisms
+(a constant defined only in an ignored file, `OpenReason::IgnoredReopening`):
+those could only move project rows, and none moved.
+
+| family (first-baseline ledger) | gone | verdict |
+|---|---:|---|
+| B5 class reopened through a conditional constant alias (`value`/`value=` for `Concurrent::LockLocalVar`, `concurrent/atomic/reentrant_read_write_lock.rb:163-337`) | 18 E0101 | FALSE POSITIVE, now out of scope. Re-read `concurrent/atomic/lock_local_var.rb:19-28`: `LockLocalVar = ThreadLocalVar` / `= FiberLocalVar`, then `class LockLocalVar; end`. |
+| V1 platform-guarded constants (`::Zstd`/`::Brotli`/`::LZ4`/`::XZ` in `bindata-3.0.1/lib/bindata/transform/*.rb:17,31`; `LZFSE` in `ruby-macho-7.0.0/lib/macho/macho_file.rb:542,546`; `JRuby*`/`TruffleRuby*`/`Java*`/`C*` in concurrent-ruby) | 31 E0104 | FALSE POSITIVE, now out of scope. Re-read `concurrent/atomic/atomic_fixnum.rb:99-105` (`case when on_cruby? && c_extensions_loaded? then CAtomicFixnum when on_jruby? then JavaAtomicFixnum`) and `bindata/transform/zstd.rb:17` (optional codec gem). |
+| V2 constants through ancestry / conditional superclass alias (`DEFAULT_THREAD_IDLETIMEOUT` ×3, `DEFAULT_MAX_QUEUE_SIZE` ×2, `DEFAULT_MAX_POOL_SIZE`, `FALLBACK_POLICY_CLASSES`, `DEBUG` ×3, `ERROR`, `WARN`) | 12 E0104 | FALSE POSITIVE, now out of scope. Re-read `concurrent/executor/cached_thread_pool.rb:40-43`; the constants are defined on `RubyThreadPoolExecutor`, reached through `ThreadPoolExecutorImplementation = case …`. |
+
+**These families are NOT repaired in the checker.** B5's alias reopening
+and V2's conditional-superclass lookup are still gaps; they leave the
+baseline because brew declares its vendored gems out of scope, exactly as
+`srb tc` treats them (its 11 errors at the pin include none in `vendor/`).
+A project that does not ignore its vendored code still sees them.
+
+**Vendored gems are still read.** The paragraph "Vendored gems stay in the
+baseline" above is superseded for reporting only: `vendor/bundle` is still
+walked and still defines `T::*` (now as suppression-only evidence), so the
+65 `T::Class`/`T::Range`/… E0104 that the triage's `.ignore` exclusion
+produced in project code do NOT appear — the run adds 0 lines.
+
+**TRUE POSITIVES lost: 0.** All 61 were FALSE POSITIVE in the first-baseline
+audit. brew's error set goes 44 -> 26 (B2 18, B3 7, B4 1, unchanged);
+warnings 156 -> 113 (the 113 project rows, unchanged). `brew.jsonl` keeps
+its previous line order, so the diff is a pure deletion of 61 lines, and its
+`sort -u` set equals the gate's fresh artifact byte-for-byte.
+
+## Regeneration 2026-10-20 — task/sig-rbi (Sorbet sig contracts) merged with main at `cb12bbe`
+
+Measured with the gate's own normalization (`PUBLIC_COLUMN=ci`) against the
+pinned clones, release build of the branch merged with main at `cb12bbe`
+(H4/H4b and H5 included):
+
+| corpus | new | gone |
+|---|---:|---:|
+| rails | 0 | 0 |
+| mastodon | 0 | 0 |
+| discourse | 0 | 0 |
+| zammad | 0 | 0 |
+| brew | 0 | 2 |
+
+Before this branch's last fix the brew drift was 0 new / 5 gone. Three of
+the five were `Pathname` E0101 on `module Utils`
+(`utils/git_repository.rb:16,28,39`, family B2). They went silent because
+one `sig { type_parameters(:Item, :Result).params(...).returns(...) }` in
+`utils.rb:83-89` opened `Utils`: this branch opened a class for every sig
+its contract grammar refused, where `main` reads any sig whose outermost call
+is `returns(X)`/`void` as type metadata (bead ita-4xy). That was a blind
+spot, not a correction, and it is fixed in source: such a sig is still no
+contract, but its class stays closed
+(`uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed`, mutant
+"uncontracted sig shape opens its class"). The 3 lines are back.
+
+### Brew GONE: 2 lines, family B3, FALSE POSITIVE
+
+| line | verdict |
+|---|---|
+| `tab/tab.rb:500` `used_options.to_a` | FALSE POSITIVE (B3). `Tab#used_options` (`tab/tab.rb:335-338`) is `sig { returns(Options) }` over `Options.create(@used_options)`, and `Options` (`options/options.rb:6`) does `include Enumerable` with `def each`, so `to_a` exists. |
+| `formula_installer.rb:884` `effective_build_options_for(formula).used_options.to_a` | FALSE POSITIVE (B3), same receiver: `BuildOptions#used_options` (`build_options.rb:110-113`) is `sig { returns(Options) }`. |
+
+Mechanism: on `main` the receiver is typed `Options` only by the declared
+`returns(Options)`, which `main` uses when body inference answers nothing.
+This branch lets a sig type a consumer only where sorbet-runtime is proven to
+enforce it (AGENTS.md, "A project's Sorbet `sig { ... }` is a contract, not a
+hint"). In the full brew tree it is not proven, so the receiver is `Unknown`.
+`standalone/sorbet.rb:109-123` (a no-op `T::Sig#sig`, plus no-op validation
+handlers for non-test runs) is one hazard. It is not the only one: blanking
+those lines in a copy of the tree still leaves both lines silent, and the
+remaining trigger has not been pinned down. Either way, the B3 lookup gap
+(a project `module Enumerable` reopening that shadows the core module)
+is no longer reached from these two sites. It is still reached
+from inside `Options` itself (`options/options.rb:75,89,94,106`, unchanged).
+A three-file reduction confirms that the declared type is the only source:
+`tab/tab.rb` + `options/options.rb` + `extend/enumerable.rb` loses
+`tab.rb:500` under this branch. It returns once a `Gemfile.lock` locks
+`sorbet-runtime` and `class Module; include T::Sig` is present, which is
+when a sig counts as enforced.
+
+**TRUE POSITIVES lost: 0.** Both lines were FALSE POSITIVE in the
+first-baseline audit (B3). brew's error set goes 26 -> 24 (B2 18, B3 5, B4
+1); warnings are unchanged. `brew.jsonl` keeps its previous line order, so
+the diff is a pure deletion of 2 lines, and its `sort -u` set equals the
+gate's fresh artifact byte-for-byte.

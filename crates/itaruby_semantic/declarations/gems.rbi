@@ -80,6 +80,25 @@
 #      rule 1's own absence bar means these are a collection regression
 #      to report upstream, not a gap for this file to paper over by
 #      hand.
+#      EXCEPTION (bead H1, 2026-10-20): 16 more sorbet-runtime `T::*`
+#      namespaces — `T::Helpers`, `T::Enum`, `T::Generic`, `T::Class`,
+#      `T::Range`, `T::Enumerator`/`::Lazy`/`::Chain`,
+#      `T::ImmutableStruct`, `T::InexactStruct`, `T::Utils`,
+#      `T::Configuration`, `T::Types::Simple` and
+#      `T::Props::{Serializable,Constructor,CustomType}` — entered not
+#      from a fresh corpus scan but from `~/.local/share/itaruby/sorbet-parity/MATRIX.md`'s
+#      HARMFUL rows, itself a public/open-world Sorbet-project
+#      measurement (`extend T::Helpers` on every abstract/interface/
+#      sealed/final class, `T::Enum`/`T::Generic` on every enum/generic,
+#      `T::Class[...]` 52x in brew). Same bar as every other entry:
+#      every name is a public member of `T` itself (never the much
+#      larger internal tree also found under reflection — T::AbstractUtils,
+#      T::Helpers::Private::*, T::Props::Decorator, most of T::Types::*
+#      — none of those were measured HARMFUL, so none entered). Existence
+#      and kind (class vs module) verified against the exact pinned
+#      runtime (sorbet-runtime 0.6.13036 under MRI 3.4.2) via
+#      `T.constants` reflection, same version MATRIX.md's own setup
+#      table pins.
 #   2. The name is a public gem's own top-level API (sorbet-runtime, rails,
 #      sidekiq, dry-initializer, i18n, money, flipper, appsignal,
 #      sentry-ruby, turbo-rails, mail, fabrication, rspec-core,
@@ -138,13 +157,40 @@ class T::Types::Base; end
 module T::Sig::WithoutRuntime; end
 module T::Set; end
 module T::Enumerable; end
-# sorbet-runtime's generic type constructors written in a `sig` (W6,
-# measured 2026-10-21 by the sorbet-parity MATRIX rows 37/40/42/43: each
-# was a false E0104 on code MRI + sorbet-runtime runs clean).
+# bead H1 (sorbet-parity MATRIX.md rows 37/40/42/43/67/68/69/71/74,
+# "Missing sorbet-runtime constants produce E0104 on correct code"):
+# 16 more sorbet-runtime namespaces, each measured HARMFUL — every
+# `abstract!`/`interface!`/`sealed!`/`final!` class or module
+# (`extend T::Helpers`), every `T::Enum`, every `T::Generic`, every
+# `T::Class[...]` (52x in brew per TRIAGE W5), and every `T::Range`/
+# `T::Enumerator[::Lazy|::Chain]`/`T::ImmutableStruct`/`T::InexactStruct`/
+# `T::Utils`/`T::Configuration`/`T::Types::Simple`/
+# `T::Props::{Serializable,Constructor,CustomType}` reference was a false
+# E0104 on correct, sorbet-runtime-defined code. Kind (class vs module)
+# and existence verified against runtime 0.6.13036 under MRI 3.4.2 via
+# `T.constants` reflection (same version pinned in MATRIX.md's setup
+# table) — ~/Sites/temp-files/h1-t-inventory-20261020/dump_t.rb. Every
+# name below is a public member of `T` itself; this file does not carry
+# the much larger internal tree reflection also found (T::AbstractUtils,
+# T::Helpers::Private::*, T::Props::Decorator, most of T::Types::*,
+# T::Utils::Private, ...) because none of those were measured HARMFUL —
+# rule 1 still applies, no speculative entries.
+module T::Helpers; end
+class T::Enum; end
+module T::Generic; end
 module T::Class; end
 module T::Range; end
 module T::Enumerator; end
 module T::Enumerator::Lazy; end
+module T::Enumerator::Chain; end
+class T::ImmutableStruct; end
+class T::InexactStruct; end
+module T::Utils; end
+module T::Configuration; end
+class T::Types::Simple; end
+module T::Props::Serializable; end
+module T::Props::Constructor; end
+module T::Props::CustomType; end
 
 module Rails; end
 class ActiveRecord::Base; end

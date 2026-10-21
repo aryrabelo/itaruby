@@ -372,6 +372,13 @@ fn intersection_ty_leaf(s: &str, resolve: &dyn Fn(&str) -> Option<Ty>) -> Option
 /// whose type arguments the runtime erases (`T::Set[X]` checks
 /// `is_a?(Set)` and nothing about `X`). A wrong member count is `Unknown`.
 fn sig_only_leaf(s: &str) -> Option<Ty> {
+    const CORE: [(&str, &str); 5] = [
+        ("T::Set", "Set"),
+        ("T::Range", "Range"),
+        ("T::Enumerable", "Enumerable"),
+        ("T::Enumerator::Lazy", "Enumerator::Lazy"),
+        ("T::Enumerator", "Enumerator"),
+    ];
     if s == "T.noreturn" {
         return Some(Ty::Contract(SigOnly::NoReturn));
     }
@@ -382,13 +389,6 @@ fn sig_only_leaf(s: &str) -> Option<Ty> {
     {
         return Some(if one(inner) { Ty::Contract(SigOnly::ClassObject) } else { Ty::Unknown });
     }
-    const CORE: [(&str, &str); 5] = [
-        ("T::Set", "Set"),
-        ("T::Range", "Range"),
-        ("T::Enumerable", "Enumerable"),
-        ("T::Enumerator::Lazy", "Enumerator::Lazy"),
-        ("T::Enumerator", "Enumerator"),
-    ];
     CORE.iter().find_map(|(spelling, class)| {
         let inner = strip_index(s, spelling)?;
         Some(if one(inner) { Ty::Contract(SigOnly::Core(class)) } else { Ty::Unknown })

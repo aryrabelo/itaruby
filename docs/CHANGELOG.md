@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Fixed
+- A bare, unqualified top-level value-constant write in a client's
+  `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,
+  no `::` anywhere in the LHS — planningalerts' real
+  `sorbet/rbi/shims/elasticsearch_client.rbi`:
+  `ElasticSearchClient = T.let(T.unsafe(nil),
+  T.nilable(Elasticsearch::Client))`) was never read by any RBI channel:
+  `rbi_declares` only matches a `class`/`module` header, and
+  `rbi_qualified_const_declares` requires a `::` to split on, so it
+  returned `false` immediately for a bare name — a reference to such a
+  constant falsely warned `E0104` even though the shim genuinely
+  declares it. Fix: `rbi.rs::scan_toplevel_const_write` (phase 1) unions
+  bare value-constant-write candidates into the existing RBI locator
+  map, and `index.rs::rbi_toplevel_const_declares` (phase 2) verifies
+  via a real Prism parse (`FileDefs::toplevel_consts`, or a nested
+  `class Object`/`module Kernel` write), wired into
+  `check.rs::Checker::rbi_fallback_declares` beside the other direct RBI
+  channels. Suppression-only (invariant #1): a hit silences `E0104` but
+  the reference still types `Ty::Unknown`, never interned into
+  `ProjectIndex`. Measured: planningalerts loses exactly its 3
+  `ElasticSearchClient` E0104s; zero added diagnostics across rails,
+  mastodon, discourse, and all 8 Sorbet corpora (serveme,
+  planningalerts, morph, brew, ruby-lsp, tapioca, packwerk, spoom).
+
+### Fixed
+- A mixin written into a project reopening of `Class`, `Module`, `Object`,
+  `Kernel` or `BasicObject` now reaches every class object (2026-10-19).
+  Homebrew/brew's `class Module; include T::Sig` (`extend/module.rb`)
+  left 1196 class-body `sig { ... }` calls as false E0101. The class-object
+  track reads those mixins in MRO order and answers `Found` only for a
+  name one of them literally defines. An open or unresolved mixin is
+  skipped, never treated as unreadable, because the fail-closed variant
+  silenced rails' whole class-object track through `include
+  ActiveSupport::Tryable` and cost a true positive. Brew's baseline drops
+  1240 -> 44 errors; no line is new on any public corpus. Five mutants
+  (CO-X1..X5) in `scripts/class-object-flip-mutants.sh`, each accused by a
+  named `singleton_track` test.
+
+### Added
+- Two public corpora, zammad/zammad (repo root) and Homebrew/brew
+  (`Library/Homebrew`), join the public gate at pinned shas (2026-10-19).
+  Baselines from the release binary at `295e213`: zammad 275 errors + 1072
+  warnings, brew 1240 errors + 156 warnings. The ledger in
+  `scripts/public-baseline/README.md` gives every family a verdict read at
+  its sites: zammad carries 4 TRUE POSITIVES and 271 false positives in six
+  named families, brew 1240 false positives in five (B1 `sig` on class
+  bodies alone is 1196), confirmed by brew's own `sorbet tc` oracle. The
+  vendored gems under `Library/Homebrew/vendor` stay walked and baselined.
+  Dev ceilings on m5: zammad 2 s, brew 5 s; CI ceilings from the hosted
+  public job.
+- `scripts/public-corpora.txt` takes an optional `check=<relative path>`
+  field: the gate points `ita check` at that directory inside the clone,
+  keeps the clone-root normalization, and fails closed on a malformed or
+  missing path. Proved two-sided in `scripts/public-gate-selftest.sh`
+  (three cases, three gate mutants, two fetcher mutants).
+
+### Removed
+- corpus-a and corpus-b are retired (2026-10-19): the only machine that
+  held them is gone for good, so no run can ever check them again. Their
+  declarations left `scripts/corpus-baseline.txt`, and the
+  `scripts/dev anchor` and `scripts/dev prove` verbs (gates over ssh on
+  that machine, and the union of both machines' proof) are deleted.
+  corpus-c on m5 is the one private corpus; full proof is one
+  `./scripts/dev gates` run there. The gate-digest and gate-triage
+  fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
 
 ### Added
 - W5/W6/W7, Sorbet contracts (2026-10-21): E0103 on `T.let`/`T.cast`/
@@ -64,6 +129,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The w12 Tapioca closed world no longer accuses a narrowed
   `is_a?(String)` local: `String` is not final, and a subclass may define
   the name. A literal receiver still accuses.
+- `sorbet/config` `--ignore` no longer hides definitions (H4, 2026-10-20).
+  Ignored files are still never checked or reported (parse errors
+  included), but they are read as suppression-only evidence: a constant
+  defined only there (a Rails initializer's `Client = if ... end`) no
+  longer reads as E0104 elsewhere, and a class they reopen is open. They
+  never resolve a name to a closed class, so a test-fixture stub sharing a
+  gem's name cannot cause a new E0101. `ita server` now honors the same
+  `--ignore` list as `ita check` (previously it ignored `sorbet/config`
+  entirely). Public corpora (no `sorbet/config`): byte-identical. Proof:
+  `tests/sorbet_ignore_indexing.rs`, `scripts/ignore-indexing-mutants.sh`
+  (6 mutants, gate c1).
+- `--ignore` entries now match the way Sorbet does (H4b, observed on sorbet
+  0.6.13437): `/`-leading entries are anchored prefixes, others match
+  anywhere, whole names only. brew's `/vendor/...` entries now take effect:
+  against main with B1 merged, -61 diagnostics and 0 added, all 61 inside
+  `vendor/bundle` (18 E0101 + 43 E0104), now never reported. Measured
+  before B1, the drift was -67: the extra 6 were `sig` E0101 on a module
+  that `extend T::Helpers` (open once the vendored sorbet-runtime's
+  reopening of `T::Helpers` was read), which B1 already removes. brew
+  baseline regenerated, ledger in `scripts/public-baseline/README.md`.
 - Disk diet for the development workflow (2026-10-04, measured on m5):
   every worktree that ran the gauntlet used to grow its own `target/`
   (~150 GiB across itaruby worktrees on 2026-09-29), and one full gauntlet
@@ -107,6 +192,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
+- A `sig` the contract grammar refuses no longer blinds its class when its
+  shape is one `main` already read as type metadata (an outermost
+  `returns(X)` or `void`): `sig { type_parameters(:U).params(...).void }`
+  is still no contract, but it defines nothing, so the class stays closed
+  as on `main` (bead ita-4xy's carve-out). On this branch any refused
+  clause (`type_parameters`, ...) opened the class, and Homebrew/brew lost
+  3 E0101 lines on `module Utils` (`utils/git_repository.rb:16,28,39`,
+  ledger family B2) because one `type_parameters` sig in `utils.rb`
+  silenced every call on `Utils` project-wide. A block of any other shape
+  still opens its class. Test:
+  `uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed`, mutant
+  "uncontracted sig shape opens its class".
 - The sorbet-runtime enforcement gates can no longer be evaded (r4,
   review 5), and they read the whole project root, not only the checked
   paths: `ita check app/` now also reads `config/initializers`, `lib/`, a
@@ -348,6 +445,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or
   post parameter drops its whole contract, the return included, so neither
   E0103 nor E0109 fires for it.
+- Bead H1: 16 sorbet-runtime `T::*` namespaces itaruby had never seen
+  gave a false E0104 "unresolved constant" on correct code —
+  `extend T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
+  `final!` class or module), every `T::Enum`, every `T::Generic`, every
+  `T::Class[...]` (52x in brew per the sorbet-parity matrix's TRIAGE
+  W5), and every `T::Range`/`T::Enumerator[::Lazy|::Chain]`/
+  `T::ImmutableStruct`/`T::InexactStruct`/`T::Utils`/`T::Configuration`/
+  `T::Types::Simple`/`T::Props::{Serializable,Constructor,CustomType}`
+  reference. Found via `~/.local/share/itaruby/sorbet-parity/MATRIX.md`'s
+  16 HARMFUL rows; existence and kind (class vs module) verified against
+  sorbet-runtime 0.6.13036 under MRI 3.4.2 via `T.constants` reflection,
+  the version MATRIX.md itself pins. Added to `declarations/gems.rbi`'s
+  curated allowlist, same open/empty-namespace contract as every other
+  entry: resolves the constant, never closes ancestry. A typo under any
+  of the 16 (`T::Class::NoSuchThing`, `T::NotACuratedName`, …) still
+  warns E0104 — this is an exact-path allowlist, never a `T::`-prefix
+  suppressor. Measured on the 8 public Sorbet corpora
+  (serveme/planningalerts/morph/brew/ruby-lsp/tapioca/packwerk/spoom):
+  7 false E0104 removed (serveme 2, morph 2, planningalerts 3), zero new
+  diagnostics anywhere; rails/mastodon/discourse public-gate output
+  stayed byte-identical.
 - Issue #6, FP-B: a project that reopens a gem's top-level module only to
   put its own code under it (`module Honeycomb; class NoiseCancellingSampler`)
   no longer makes every call on that module an E0101. Since the

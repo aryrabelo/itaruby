@@ -938,6 +938,10 @@ fn mri_ground_truth_is_executed() {
         ("def_body_eval_opens.rb", Mri::Clean),
         ("string_source_stub_opens.rb", Mri::Clean),
         ("string_source_named_class_still_accuses.rb", Mri::Clean),
+        ("core_reopening_mixin_resolves.rb", Mri::Clean),
+        ("core_reopening_mixin_arity_accuses.rb", Mri::Raises("ArgumentError", 19)),
+        ("core_reopening_mixin_typo_still_accuses.rb", Mri::Raises("NoMethodError", 19)),
+        ("core_reopening_open_mixin_never_blinds.rb", Mri::Raises("NoMethodError", 29)),
     ];
     for (name, expected) in &table {
         assert_mri(name, expected);
@@ -1021,6 +1025,55 @@ fn core_ext_object_reopening_arity_is_checked() {
     assert_eq!(
         diags("core_ext_object_reopening_arity_accuses.rb"),
         vec!["15:8:E0102"]
+    );
+}
+
+/// 2026-10-19, Homebrew/brew `extend/module.rb`: `class Module; include
+/// T::Sig; end` puts `sig` on every class and module object. The
+/// reopening's MIXINS are on the class object's dispatch exactly like its
+/// own defs, for an `include` (class and module receivers) and for a
+/// `prepend`. Reading only the fragment's own method map left 1196 brew
+/// class-body `sig` calls as false E0101.
+#[test]
+fn core_reopening_mixin_resolves_on_the_class_object_track() {
+    let d = diags("core_reopening_mixin_resolves.rb");
+    assert!(d.is_empty(), "resolution is silence, got {d:?}");
+}
+
+/// Resolving through the reopening's mixin is checkable knowledge: the
+/// mixin's `mrm_need(width)` makes the zero-argument call an E0102 MRI
+/// really raises, not an E0101 and not silence.
+#[test]
+fn core_reopening_mixin_arity_is_checked() {
+    assert_eq!(
+        diags("core_reopening_mixin_arity_accuses.rb"),
+        vec!["19:10:E0102"]
+    );
+}
+
+/// Control: the consult resolves only names the mixin literally defines;
+/// a misspelling of the one it installs keeps its E0101.
+#[test]
+fn core_reopening_mixin_typo_still_accuses() {
+    assert_eq!(
+        diags("core_reopening_mixin_typo_still_accuses.rb"),
+        vec!["19:9:E0101"]
+    );
+}
+
+/// Control for rails' `class Object; include ActiveSupport::Tryable`: an
+/// OPEN mixin of a core reopening still answers its literal definition
+/// (the brew shape: the declared-open `T::Sig` defines `sig` in the
+/// vendored sorbet-runtime), and its openness never makes every class
+/// object unreadable: the name nothing defines keeps its E0101. The
+/// fail-closed variant silenced a rails true positive this way.
+#[test]
+fn core_reopening_open_mixin_never_blinds_the_class_object_track() {
+    let (_instance, _singleton, open) = facts("core_reopening_open_mixin_never_blinds.rb", "MrmOpaque");
+    assert!(open, "the fixture's mixin must be one the index holds open");
+    assert_eq!(
+        diags("core_reopening_open_mixin_never_blinds.rb"),
+        vec!["29:9:E0101"]
     );
 }
 

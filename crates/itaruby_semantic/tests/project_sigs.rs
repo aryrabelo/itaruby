@@ -238,3 +238,49 @@ ProjSigOwnerG.new.make(1).nonexistent_method_g
     );
 }
 
+/// (h) The carve-out is about the block's SHAPE, not the contract grammar:
+/// a sig whose outermost call is `void`/`returns(X)` but which carries a
+/// clause `sorbet_sig::extract_sig` refuses (`type_parameters`) is no
+/// contract, yet it is type metadata that defines nothing, so the class
+/// stays closed and a typo on either track is still accused. Found on
+/// Homebrew/brew: one `type_parameters` sig in `utils.rb` silenced every
+/// E0101 on `module Utils` across the project. (g) is the control: an
+/// unrecognized shape still opens.
+#[test]
+fn uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed() {
+    let diags = check_src(
+        r"
+module ProjSigUtilsH
+  sig { type_parameters(:I).params(items: T::Array[T.type_parameter(:I)]).returns(T::Array[T.type_parameter(:I)]) }
+  def self.each_item(items)
+    items
+  end
+
+  sig { type_parameters(:I).params(item: T.type_parameter(:I)).void }
+  def self.take(item); end
+
+  def self.run
+    nonexistent_method_h(1)
+  end
+end
+
+class ProjSigOwnerH
+  sig { type_parameters(:I).params(item: T.type_parameter(:I)).void }
+  def take(item); end
+
+  def run
+    nonexistent_instance_method_h(1)
+  end
+end
+",
+    );
+    // No `extend T::Sig` here, so the bare `sig` calls may be accused too;
+    // what this test pins is that the typos below them are.
+    let e0101: Vec<_> = diags.iter().filter(|d| d.contains("E0101")).collect();
+    assert!(e0101.iter().any(|d| d.contains("`nonexistent_method_h`")), "singleton typo must be accused: {diags:?}");
+    assert!(
+        e0101.iter().any(|d| d.contains("`nonexistent_instance_method_h`")),
+        "instance typo must be accused: {diags:?}"
+    );
+}
+

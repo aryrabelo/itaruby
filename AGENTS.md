@@ -83,7 +83,17 @@ found, and the launch bar is winning on both.
   E0103 (at the argument, by param name, across positional, keyword and
   default layouts) only for an argument node that is itself a literal.
   Never judged: variables, `self`, constants, calls (`X.new` included),
-  ternaries in argument position, a literal behind a `#: as` cast. A
+  ternaries in argument position, a literal behind a `#: as` cast. The
+  inline `#:` RBS path (`check_sig_args`) is literal-only too (MATRIX H2,
+  2026-10-20, binding): judging inferred types accused correctly narrowed
+  code (`n && f(n)`, `f(n || "z")`, `case/when`, an `is_a?` early return).
+  `compatible`'s inferred Instance/Union-ARG arms (`instance_compatible`,
+  `may_be_core_value`, the module-instance arm) were removed as dead after
+  H2, with their six `sorbet-contracts-mutants.py` mutants: that drop in
+  the mutant count is not a lost control. No contract accusation inside a
+  branch a literal predicate proves dead (`if false`/`if nil`/`unless
+  true`/`false ? x :`, the else of `if true`/`unless false`; MATRIX H6,
+  `forget_dead_branch_contracts`). A
   receiver no flow walk follows is `Unknown`, so it dispatches to no
   contract and misses no method (review F10, E0103 and E0101 alike): a
   `for` index, every local of a nested/splatted multi-assignment, of a
@@ -225,6 +235,68 @@ found, and the launch bar is winning on both.
   ThreadSanitizer job). Read a ratchet entry's SCOPE, never just its
   presence: `- rust` and `- path/to/one.rs:hash` are not the same kind of
   debt.
+- Core-receiver E0101 in a Bundler project needs COMPLETE evidence, and a
+  Tapioca RBI alone is NOT complete for core reopenings (W11, learned
+  2026-10-20, binding, measured): `json_expressions` 0.9.0 does
+  `alias_method :ignore_extra_keys!, :forgiving!` inside `class Hash`,
+  its Tapioca RBI and `hidden.rbi` list only the `include`, and an
+  RBI-only rule emitted 19 false E0101s on one real project. `ita check`
+  wires `TapiocaEvidence` (and closed world) for a root with a `Gemfile`
+  only when every spec in `Gemfile.lock` is accounted for
+  (`open_world::lock_evidence`): a gem with an RBI for its LOCKED version
+  whose RBI reopens a chain namespace (`Integer`..`BasicObject`) is read
+  from its installed source for that exact version
+  (`installed_gem_dir`: `GEM_PATH`/`GEM_HOME`, Bundler's path, the
+  per-user and per-Ruby defaults), and with no source on disk the
+  namespaces THAT RBI reopens stay open - only those, so a gem that only
+  reopens `Hash` cannot open `Integer`; a gem with no RBI (stale,
+  `exclude:`d, never generated) needs a `CURATED_GEMS` audit or its
+  installed Ruby source (a native extension is a gap: C is unreadable);
+  a `PATH` gem must live inside the project. Sources are harvested
+  NAME-KEYED (`open_world::Harvest`): readable chain reopenings, literal
+  `define_method`/`alias_method`/`attr_*` and constant mixins on a chain
+  constant, mixins resolved in the same gem or in the stdlib's top-level
+  module surface (`@Module#name` lines); an unreadable chain body, a
+  dynamic definer or an eval on a chain constant opens that namespace,
+  and `BasicObject` open opens all. Reach differs (`Reach`): an RBI gem
+  is read for chain-TARGETED shapes only, because its load-time effects
+  through receivers no constant names are already in the RBI; a gem
+  without an RBI and every project file the run does not load
+  (`harvest_unloaded`) are read for EVERYTHING - a definer through an
+  unnamed receiver may land on any class, a type-test override anywhere
+  makes declared types inexact. Residual, stated not proven away: a gem
+  method body that reopens a core class only when called later is seen
+  by neither Tapioca nor this harvest. In the project index, a core
+  `define_method(:literal)`/`include Const` no longer sets the blanket
+  `core_mixin`; the conclusive lookup asks about the NAME instead
+  (`Checker::core_names_unpolluted`), and a top-level `include M`
+  resolves to M's names or marks `Object` opaque. Measured by mutation,
+  three older blanket marks became indistinguishable from the keyed
+  record and were DELETED, not kept as unaccused safeguards: the
+  walker's `core_mixin` for any core-receiver injection call,
+  `eval_polluted_core`, and `expand_unresolved_alias_target` in
+  `target_spellings` (the alias-table chaser resolves every alias shape
+  it did). Their mutants (O34, M21, M23, M24) now target the keyed
+  decision that carries the proof. Under evidence
+  condition (e) silences a name that any of these can answer: an
+  audited gem, the stdlib's core extensions
+  (`declarations/stdlib_core_ext.txt`, `scripts/gen-stdlib-core-ext.rb`),
+  an RBI reopening of the receiver's chain or `BasicObject` (an
+  unreadable body or `method_missing` answers every name; a body is
+  unreadable only for a reason about the body itself,
+  `ClassFragment::body_unreadable`), or the harvest. A declared type is
+  not an exact class: only a literal receiver, or a final class with no
+  type-test override in the project, the RBIs or a harvested source, may
+  accuse. E0107 stays off under evidence. Measured on eight public Sorbet
+  projects with every installed source this machine has: ZERO activate.
+  Each stays open for a named, real reason (`ita check --verbose` prints
+  it): a gap gem with no installed source or a native extension, or an
+  installed source that genuinely reopens the chain unreadably
+  (ActiveSupport's `Object#try`/`Kernel` patches, `rake/ext/string`'s
+  block, `rainbow`'s `refine String`, YARD's and RDoc's evals). Zero new
+  diagnostics; public corpora byte-identical. Proof:
+  `crates/itaruby/tests/open_world_cli.rs` and
+  `scripts/open-world-mutants.sh` (O1-O39, gate c1).
 - Tracker: GitHub Issues on this repository. A local beads/Dolt database MAY
   exist per machine for agent-local planning memory, but `.beads/` is
   gitignored and never versioned here.
@@ -588,7 +660,7 @@ green but at least one declared corpus could not be checked on this machine
 | Gate 0b — MRI interpreter (`ruby -v` ≥ 3.x; a missing ruby is fine, the MRI legs skip) | only the repo | **any machine** |
 | `cargo test --workspace` | only the repo | **any machine** |
 | Mutation probes in `testdata/` | only the repo | **any machine** |
-| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, the namespace-only module pass (issue #6) and each of its conditions — top level, a module, nests a definition, no method or mixin edge of its own — plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-V and CO-W1..CO-W5) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) and `scripts/sorbet-contracts-mutants.py` (the Sorbet `sig` contract decisions: which definition a signature governs, an RBI-only return typing its consumer only outside silent walks, declared type arguments erased for every consumer (sig return, bound param, RBI return), instance/singleton separation, the E0109 body check and its silent paths, by-name param correspondence, stacked sigs never picking an overload, every redefinition path poisoning the contract, the family dispatch walk, and the per-definition cost bounds; builds an isolated temporary source copy, never the checkout, and `--anchors` counts its needles without building; run against the `sorbet_contracts`, `sorbet_contract_parser`, `project_sigs` and `sorbet_sig` suites) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
+| Per-fix source mutants (gate c1): `scripts/const-missing-mutants.sh` (E0104 `const_missing` suppression) and `scripts/operand-types-mutants.sh` (E0108 + the refinement, eval-body and name-keyed pollution decisions, mutants M1a/M1b/M2–M7/M13–M47, run against both the `operand_types` and `core_conclusive` suites with `--no-fail-fast`) and `scripts/class-object-flip-mutants.sh` (the class-object E0101 flip and the mechanisms it stands on: the transitive `extend` ancestry and its open-ancestor arm, the `Object`/`Kernel` link of the class-object chain, the `include Singleton` softening and its name gate, block-nested class registration and its openness, the `define_singleton_method` hook install and the hook's base-escape opacity, the def-body `eval` arm, the explicit-`self` rebindable guard, the `queue_classic` namespace entry, `BigDecimal`, the sclass-include track routing, the string-source pass and its bare-stub gate, the namespace-only module pass (issue #6) and each of its conditions — top level, a module, nests a definition, no method or mixin edge of its own — plus the flip's own emission and singleton lookup's open-ancestor guard — mutants CO-A..CO-V and CO-W1..CO-W5) and `scripts/singleton-mutants.sh` (the singleton track: receiver-spelling attr filing, class_attribute predicate, thread variants, the lock-gated `any_instance` softening, the `_exec` prefilter family, the concern-edge gate on the `class_methods do` harvest, the `gem_namespace_key` camelize key, the `class << self` track routing for `define_method`/`alias_method`/`alias`, the literal def-body filing with its fail-closed gates on an instance body and on a foreign receiver, and the two sides of the `send(:define_method, ...)` unwrap; mutants MUT-A..MUT-P, run with `--no-fail-fast`) and `scripts/mixin-attribution-mutants.sh` (the attributed-mixin family: the `method_missing` gate, the literal-constant receiver, both ternary arms, the receiverless project call, the interpolated-`def` harvest being called and its names being filed, the eval call's receiver deciding where they land, and the instance-only track filter that keeps an `extend` edge from silencing instance lookups; mutants MUT-1a/1b/1c, MUT-2a/2b/2c, MUT-3a/3b/3c) and, from fase A/onda 2, five families on the same terms — `scripts/lazy-load-mutants.sh` (bead B: the `run_load_hooks` base openness), `scripts/extended-hook-mutants.sh` (bead H: what a `self.extended` hook installs on its extender), `scripts/guard-narrowing-mutants.sh` (bead C: the two predicate-proven shapes), `scripts/asserted-raise-mutants.sh` (bead E: the asserted-raise subject span) and `scripts/rebindable-guard-mutants.sh` (bead F: the guard moved above the lookup dispatch) and `scripts/sorbet-contracts-mutants.py` (the Sorbet `sig` contract decisions: which definition a signature governs, an RBI-only return typing its consumer only outside silent walks, declared type arguments erased for every consumer (sig return, bound param, RBI return), instance/singleton separation, the E0109 body check and its silent paths, by-name param correspondence, stacked sigs never picking an overload, every redefinition path poisoning the contract, the family dispatch walk, and the per-definition cost bounds; builds an isolated temporary source copy, never the checkout, and `--anchors` counts its needles without building; run against the `sorbet_contracts`, `sorbet_contract_parser`, `project_sigs` and `sorbet_sig` suites) and `scripts/open-world-mutants.sh` (W11 Tapioca open world, O1–O39: installed-source harvest of chain-touching gems, per-class fail-closed for a missing source, gap gems covered by source, native extensions, `Reach`, top-level includes and literal core definers name-keyed, and each fail-closed condition of the core-receiver E0101 under Tapioca evidence — finality, RBI/project/unloaded type-test overrides, missing/stale RBI, unaudited Tapioca-ignored version, PATH gem, unloaded files, the ancestor list, `BasicObject`, include/prepend, `method_missing`, unreadable and readable reopenings, refinement, stdlib, audited names, the one-gap-closes-all opt-in, the E0108/E0107 siblings, and the shapes Tapioca really writes - unparsed annotation sigs, restated core inclusions and their limit; run against the `open_world_cli` and `tapioca_closed_world_cli` suites) — one decision removed at a time, each accused by a NAMED test, source restored byte-identical with `cmp`, `INVALIDO` when an anchor no longer matches | only the repo | **any machine** |
 | `scripts/unwrap-gate.sh` — every `unwrap()` in production source is a prism downcast | only the repo | **any machine** |
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin, mutant-lab fresh build): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/gate-box-selftest.sh` — the gate box that runs the gauntlet: mirror exact (HEAD + uncommitted delta), lock exclusive, corpora map copied, the caller's `CARGO_TARGET_DIR` dropped; each step removed as a mutant and accused by its named case | only the repo | **any machine** |

@@ -133,6 +133,54 @@ pub fn scan_class_name(line: &str) -> Option<&str> {
 pub struct RbiIndex {
     pub constants: HashMap<String, Vec<PathBuf>>,
     pub core_reopenings: HashMap<String, Vec<PathBuf>>,
+    /// W11 (Tapioca open world): every file reopening a namespace on a
+    /// core receiver's method chain, keyed by the bare name — the
+    /// `core_reopenings` set plus `BasicObject`, and a `::`-rooted header
+    /// (`class ::Integer`) counted too. Kept apart from `core_reopenings`
+    /// so the older consumers of that map stay byte-identical.
+    pub chain_reopenings: HashMap<String, Vec<PathBuf>>,
+    /// W11: files declaring an instance `is_a?`/`kind_of?`/`instance_of?`
+    /// override or a `method_missing`/`respond_to_missing?` anywhere. Any
+    /// such class can pass sorbet-runtime's `is_a?` check for a core type
+    /// without being one (see `TapiocaEvidence`).
+    pub type_test_files: Vec<PathBuf>,
+}
+
+/// W11: the bare chain namespace a `class`/`module` header reopens,
+/// `::`-rooted or not (`class ::Integer`, `module Kernel`). Indented
+/// headers count too: the parsed fragment's path decides later whether a
+/// nested `class Integer` really is the top-level one.
+pub fn scan_chain_header(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed
+        .strip_prefix("class ")
+        .or_else(|| trimmed.strip_prefix("module "))?
+        .trim_start();
+    let rest = rest.strip_prefix("::").unwrap_or(rest);
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    if rest[end..].starts_with("::") {
+        return None;
+    }
+    let name = &rest[..end];
+    (crate::core::is_core_namespace(name) || name == "BasicObject").then_some(name)
+}
+
+/// W11: does this line define an instance method that lets an object
+/// pass `is_a?(Integer)` without being an Integer — a type-test override,
+/// or the `method_missing` pair a proxy forwards `is_a?` through?
+pub fn is_type_test_def(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix("def ") else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    ["is_a?", "kind_of?", "instance_of?", "method_missing", "respond_to_missing?"]
+        .iter()
+        .any(|name| {
+            rest.strip_prefix(name)
+                .is_some_and(|tail| tail.is_empty() || tail.starts_with(['(', ' ', ';']))
+        })
 }
 
 /// Phase 1 scan. One file's contents in memory at a time
@@ -142,6 +190,7 @@ pub fn build_rbi_index(files: &[PathBuf]) -> RbiIndex {
     let mut index = RbiIndex::default();
     for path in files {
         let Ok(f) = std::fs::File::open(path) else { continue };
+        let mut type_test = false;
         for line in std::io::BufReader::new(f).lines() {
             let Ok(line) = line else { continue };
             if let Some(name) = scan_class_name(&line) {
@@ -160,6 +209,16 @@ pub fn build_rbi_index(files: &[PathBuf]) -> RbiIndex {
                         .push(path.clone());
                 }
             }
+            if let Some(name) = scan_chain_header(&line) {
+                let files = index.chain_reopenings.entry(name.to_string()).or_default();
+                if files.last() != Some(path) {
+                    files.push(path.clone());
+                }
+            }
+            type_test |= is_type_test_def(&line);
+        }
+        if type_test {
+            index.type_test_files.push(path.clone());
         }
     }
     index

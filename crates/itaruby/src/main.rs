@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use itaruby_semantic::open_world;
 use itaruby_semantic::{
     call_stats, check_file, check_file_dark, constraint_report, definition_at, find_upward_dir,
     hover_at, wire_declaration_sources, CallStats, ConstraintCall, ConstraintOutcome,
@@ -206,116 +207,147 @@ fn run_hover(arg: &str) -> ExitCode {
     ExitCode::from(0)
 }
 
-/// bead ita-2ve + w12 closure: closed-world core checking. A root is
-/// safe when gems cannot monkeypatch core classes invisibly: either no
+/// bead ita-2ve + w12 closure + W11: closed-world core checking. A root
+/// is safe when gems cannot monkeypatch core classes invisibly: either no
 /// `Gemfile`/`Gemfile.lock`/`*.gemspec` sits anywhere upward of it
-/// (ita-2ve), or the project carries a `Gemfile.lock` with COMPLETE
-/// Tapioca coverage (w12 closure) — every gem in the lock's GEM/specs
-/// sections has a `sorbet/rbi/gems/<name>@*.rbi`, so the core patches
-/// gems make are exactly what those RBIs declare, and the conclusive
-/// lookup consults them (`check.rs`'s condition (d)). Every checked root
-/// must be safe; one unsafe root keeps the whole run open (silence).
-/// Wired only when clean, and only here: `ita server`/LSP never wire it,
-/// so they keep v0's exact behavior (see `ClosedWorld`).
-fn wire_closed_world(db: &Db, paths: &[String]) {
-    if paths.iter().all(|p| {
+/// (ita-2ve), or its Bundler project's evidence is complete
+/// (`tapioca_evidence`). Every checked root must be safe; one unsafe root
+/// keeps the whole run open (silence). When some root was proven by
+/// evidence, `TapiocaEvidence` is wired too and the conclusive lookup
+/// applies the open-world rules (`check.rs`, condition (e)). Wired only
+/// when clean, and only here: `ita server`/LSP never wire it, so they keep
+/// v0's exact behavior (see `ClosedWorld`).
+fn wire_closed_world(db: &Db, paths: &[String], loaded: &[PathBuf]) {
+    let loaded: std::collections::HashSet<PathBuf> =
+        loaded.iter().flat_map(|p| [Some(p.clone()), std::fs::canonicalize(p).ok()]).flatten().collect();
+    let mut projects: Vec<(PathBuf, open_world::LockEvidence)> = Vec::new();
+    for p in paths {
         let root = Path::new(p);
-        !gems_detected(root) || tapioca_coverage_complete(root)
-    }) {
-        itaruby_semantic::ClosedWorld::new(db, true);
-    }
-}
-
-/// Does `root`'s project have complete Tapioca coverage — a
-/// `Gemfile.lock` upward, a `sorbet/rbi/gems/` upward (same 4-level
-/// walk), and an RBI for EVERY gem the lock's GEM/specs sections name?
-/// Any miss (lock absent, gems dir absent, one gem without an RBI, an
-/// unreadable lock) fails closed: the old silence, exactly as if no
-/// Tapioca existed. Platform-suffixed versions (`wal-pro@1.0-arm64`)
-/// come along for free — `<name>@*.rbi` matches on the name prefix.
-fn tapioca_coverage_complete(root: &Path) -> bool {
-    let Some(lock) = find_upward_file(root, "Gemfile.lock") else {
-        return false;
-    };
-    let Some(gems_dir) = find_upward_dir(root, "sorbet/rbi/gems") else {
-        return false;
-    };
-    let Ok(text) = std::fs::read_to_string(&lock) else {
-        return false;
-    };
-    let gems = parse_gemfile_lock_gems(&text);
-    if gems.is_empty() {
-        // ponytail: a lock with zero GEM/specs entries is gemless; PATH/
-        // GIT gems still need their own coverage story before this can
-        // open — fail closed until then.
-        return false;
-    }
-    let covered = gem_rbi_names(&gems_dir);
-    gems.iter().all(|g| covered.contains(g))
-}
-
-/// Distinct gem names from a `Gemfile.lock`'s GEM sections' `specs:`
-/// blocks — the 4-space-indented `name (version)` lines. The 6-space
-/// lines under each are dependency constraints, not declarations; every
-/// gem in the graph gets its own 4-space line. Multiple GEM sections
-/// (private sources) all count. Hand-rolled, stdlib-only: the format is
-/// two `grep`-able shapes and a section-name guard.
-fn parse_gemfile_lock_gems(text: &str) -> Vec<String> {
-    let mut gems: Vec<String> = Vec::new();
-    let mut in_gem_specs = false;
-    for line in text.lines() {
-        if !line.starts_with(' ') && !line.is_empty() {
-            // A section header at column 0: `GEM`, `PLATFORMS`, ... —
-            // `GEM` re-enters, anything else leaves.
-            in_gem_specs = line == "GEM";
+        if !gems_detected(root) {
             continue;
         }
-        if !in_gem_specs {
-            continue;
-        }
-        // Exactly 4 spaces of indent = a declared spec; more = a
-        // dependency constraint under it.
-        let Some(rest) = line.strip_prefix("    ") else {
-            continue;
-        };
-        if rest.starts_with(' ') {
-            continue;
-        }
-        let Some(open) = rest.find(" (") else {
-            continue;
-        };
-        let name = &rest[..open];
-        if !name.is_empty()
-            && name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            && !gems.iter().any(|g| g == name)
-        {
-            gems.push(name.to_string());
-        }
-    }
-    gems
-}
-
-/// Gem names with an RBI on disk: `<name>@<version>[.platform].rbi`
-/// stems cut at the first `@` (gem names never contain one).
-fn gem_rbi_names(gems_dir: &Path) -> std::collections::HashSet<String> {
-    let mut names = std::collections::HashSet::new();
-    let Ok(entries) = std::fs::read_dir(gems_dir) else {
-        return names;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("rbi") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            if let Some(at) = stem.find('@') {
-                names.insert(stem[..at].to_string());
+        match tapioca_evidence(root, &loaded) {
+            Ok(found) => {
+                if !projects.iter().any(|(dir, _)| *dir == found.0) {
+                    projects.push(found);
+                }
+            }
+            Err(reason) => {
+                // `--verbose` names the first gap that keeps the world
+                // open, so a silent Bundler project can be diagnosed.
+                if std::env::args().any(|a| a == "--verbose" || a == "-v") {
+                    eprintln!("itaruby check: open world: {reason}");
+                }
+                return;
             }
         }
     }
-    names
+    // One RBI tree is wired per run (`wire_declaration_sources`), so two
+    // Bundler projects in one run cannot both be read: stay open.
+    if projects.len() > 1 {
+        return;
+    }
+    itaruby_semantic::ClosedWorld::new(db, true);
+    if let Some((_, evidence)) = projects.pop() {
+        if std::env::args().any(|a| a == "--verbose" || a == "-v") {
+            let mut open: Vec<&String> = evidence.harvest.open.iter().collect();
+            open.sort();
+            eprintln!(
+                "itaruby check: open world: evidence complete; chain namespaces left open: {open:?}; type-test hazard: {}",
+                evidence.harvest.type_test
+            );
+        }
+        itaruby_semantic::TapiocaEvidence::new(db, evidence.curated_names, evidence.harvest);
+    }
+}
+
+/// W11: is `root`'s Bundler project fully accounted for? Returns the
+/// project directory and the chain names its audited gems add, or the
+/// first gap. Every one of these must hold:
+/// - a `Gemfile.lock` upward, and every gem it installs covered
+///   (`open_world::lock_evidence`: a Tapioca RBI for the locked version,
+///   a source-audited Tapioca-ignored gem, or a `PATH` gem inside the
+///   project);
+/// - the `sorbet/rbi` tree this run wires is that project's own;
+/// - no Ruby file under the project that this run does not load can
+///   touch the core chain (`open_world::unloaded_core_hazard`: a
+///   `sorbet/config --ignore`d path, a directory outside the checked
+///   roots, vendored code, a gitignored file).
+fn tapioca_evidence(
+    root: &Path,
+    loaded: &std::collections::HashSet<PathBuf>,
+) -> Result<(PathBuf, open_world::LockEvidence), String> {
+    let lock = find_upward_file(root, "Gemfile.lock").ok_or("no Gemfile.lock")?;
+    let project = lock.parent().ok_or("lock has no directory")?.to_path_buf();
+    let rbi_dir = project.join("sorbet/rbi");
+    if let Some(wired) = find_upward_dir(root, "sorbet/rbi") {
+        if std::fs::canonicalize(&wired).ok() != std::fs::canonicalize(&rbi_dir).ok() {
+            return Err("the wired sorbet/rbi belongs to another project".into());
+        }
+    }
+    let text = std::fs::read_to_string(&lock).map_err(|e| e.to_string())?;
+    let gems_dir = rbi_dir.join("gems");
+    let versions = open_world::rbi_gem_versions(&gems_dir);
+    let roots = gem_roots(&project);
+    let env = open_world::GemEnv {
+        rbi_versions: &versions,
+        rbi_gems_dir: &gems_dir,
+        gem_roots: &roots,
+    };
+    let mut evidence = open_world::lock_evidence(&text, &project, &env)?;
+    let unloaded = open_world::harvest_unloaded(&project, loaded)
+        .map_err(|path| format!("{} is not loaded and cannot be read", path.display()))?;
+    evidence.harvest.merge(unloaded);
+    Ok((project, evidence))
+}
+
+/// Every directory installed gems live in, for `open_world::GemEnv`:
+/// `GEM_HOME`/`GEM_PATH`, the project's Bundler path, and the per-user
+/// and per-Ruby default locations (mise, rbenv, asdf, Homebrew, system).
+/// Order does not matter: a gem directory is named by its exact version.
+fn gem_roots(project: &Path) -> Vec<PathBuf> {
+    let mut patterns: Vec<String> = Vec::new();
+    for var in ["GEM_HOME", "GEM_PATH"] {
+        if let Ok(v) = std::env::var(var) {
+            patterns.extend(v.split(':').filter(|p| !p.is_empty()).map(|p| format!("{p}/gems")));
+        }
+    }
+    let p = project.display();
+    patterns.push(format!("{p}/vendor/bundle/ruby/*/gems"));
+    if let Some(home) = std::env::var_os("HOME") {
+        let h = Path::new(&home).display().to_string();
+        for pat in [
+            "/.gem/ruby/*/gems",
+            "/.local/share/gem/ruby/*/gems",
+            "/.local/share/mise/installs/ruby/*/lib/ruby/gems/*/gems",
+            "/.rbenv/versions/*/lib/ruby/gems/*/gems",
+            "/.asdf/installs/ruby/*/lib/ruby/gems/*/gems",
+        ] {
+            patterns.push(format!("{h}{pat}"));
+        }
+    }
+    patterns.push("/opt/homebrew/lib/ruby/gems/*/gems".into());
+    patterns.push("/usr/local/lib/ruby/gems/*/gems".into());
+    patterns.push("/Library/Ruby/Gems/*/gems".into());
+    patterns.iter().flat_map(|pat| expand_stars(pat)).filter(|d| d.is_dir()).collect()
+}
+
+/// `a/*/b` -> every existing `a/<x>/b`: a `*` segment matches any one
+/// directory entry, every other segment is literal.
+fn expand_stars(pattern: &str) -> Vec<PathBuf> {
+    let mut found = vec![PathBuf::from("/")];
+    for seg in pattern.split('/').filter(|s| !s.is_empty()) {
+        found = if seg == "*" {
+            found
+                .iter()
+                .filter_map(|d| std::fs::read_dir(d).ok())
+                .flat_map(|e| e.flatten().map(|e| e.path()))
+                .collect()
+        } else {
+            found.into_iter().map(|d| d.join(seg)).filter(|p| p.exists()).collect()
+        };
+    }
+    found
 }
 
 /// Hand-parsed `ita check` flags (no clap, same as the rest of the CLI).
@@ -618,7 +650,7 @@ fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
     }
     ProjectFiles::new(&db, sources.clone());
 
-    wire_closed_world(&db, paths);
+    wire_closed_world(&db, paths, &rb_files);
 
     (db, sources, discovered)
 }
@@ -1413,57 +1445,4 @@ fn find_upward_file(root: &Path, name: &str) -> Option<PathBuf> {
         dir = dir.parent()?.to_path_buf();
     }
     None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Real-world shapes, including one private benchmark corpus's multi-source lock (two GEM
-    /// sections), 6-space dependency constraints that must NOT count,
-    /// platform-suffixed versions, and the non-GEM sections that end the
-    /// harvest.
-    #[test]
-    fn parses_gemfile_lock_gem_specs() {
-        let lock = "\
-GEM
-  remote: https://gems.contribsys.com/
-  specs:
-    sidekiq-pro (7.3.2)
-      sidekiq (>= 7.3.0, < 8)
-
-GEM
-  remote: https://rubygems.org/
-  specs:
-    activesupport (7.1.3)
-      concurrent-ruby (~> 1.0)
-    nokogiri (1.15.0-arm64-darwin)
-    my_gem (2.0.0)
-
-PLATFORMS
-  ruby
-  arm64-darwin-22
-
-DEPENDENCIES
-  sidekiq-pro (~> 7.3)
-
-PATH
-  local-thing
-
-BUNDLED WITH
-   2.4.10
-";
-        assert_eq!(
-            parse_gemfile_lock_gems(lock),
-            ["sidekiq-pro", "activesupport", "nokogiri", "my_gem"]
-        );
-    }
-
-    #[test]
-    fn no_gem_section_or_empty_lock_yields_no_gems() {
-        assert!(parse_gemfile_lock_gems("PLATFORMS\n  ruby\n").is_empty());
-        assert!(parse_gemfile_lock_gems("").is_empty());
-        // GEM section without a specs block (remote-only) yields nothing.
-        assert!(parse_gemfile_lock_gems("GEM\n  remote: https://x/\n").is_empty());
-    }
 }

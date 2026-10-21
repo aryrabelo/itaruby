@@ -61,9 +61,9 @@ enum LiteralClass {
 }
 
 impl LiteralClass {
-    fn fits(&self, expected: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+    fn fits(&self, expected: &Ty, index: &ProjectIndex) -> bool {
         match self {
-            LiteralClass::Modeled(ty) => compatible(ty, expected, index, rbi),
+            LiteralClass::Modeled(ty) => compatible(ty, expected, index),
             LiteralClass::Other(_) => other_core_fits(expected, index),
         }
     }
@@ -2298,6 +2298,10 @@ impl Checker<'_> {
             Node::IfNode { .. } => {
                 let n = node.as_if_node().unwrap();
                 let narrow = self.narrow_of(&n.predicate(), scope);
+                // MATRIX H6: `x if false` / `false ? x : y` / `if true …
+                // else x end` — a literal predicate proves one branch
+                // never runs; see `forget_dead_branch_contracts`.
+                let truth = literal_truth(&n.predicate());
                 self.infer_expr(&n.predicate(), env, self_ty, scope);
                 let mut then_env = env.clone();
                 if let Some(nw) = &narrow {
@@ -2325,10 +2329,14 @@ impl Checker<'_> {
                 }
                 let then_stmts = n.statements();
                 let then_diverges = then_stmts.as_ref().is_some_and(stmts_diverge);
+                let mark = self.diags.len();
                 let then_ty = match &then_stmts {
                     Some(s) => self.infer_stmts(s, &mut then_env, self_ty, scope),
                     None => Ty::Nil,
                 };
+                if truth == Some(false) {
+                    self.forget_dead_branch_contracts(mark);
+                }
                 if defined_guard.is_some() {
                     self.defined_guards.pop();
                 }
@@ -2340,10 +2348,14 @@ impl Checker<'_> {
                     apply_narrow_false(&mut else_env, nw, env);
                 }
                 let has_else = n.subsequent().is_some();
+                let mark = self.diags.len();
                 let else_ty = match n.subsequent() {
                     Some(s) => self.infer_expr(&s, &mut else_env, self_ty, scope),
                     None => Ty::Nil,
                 };
+                if truth == Some(true) {
+                    self.forget_dead_branch_contracts(mark);
+                }
                 if narrow.is_some() && then_diverges && !has_else {
                     // `return if x.nil?` / `raise ... if x.nil?` (bead
                     // ita-u1t): the statement after this `if` is only ever
@@ -2358,6 +2370,8 @@ impl Checker<'_> {
             Node::UnlessNode { .. } => {
                 let n = node.as_unless_node().unwrap();
                 let narrow = self.narrow_of(&n.predicate(), scope);
+                // MATRIX H6, the `unless` mirror: `x unless true`.
+                let truth = literal_truth(&n.predicate());
                 self.infer_expr(&n.predicate(), env, self_ty, scope);
                 // `unless` runs its body when the predicate is FALSE, so
                 // the roles are swapped relative to `IfNode`.
@@ -2367,10 +2381,14 @@ impl Checker<'_> {
                 }
                 let then_stmts = n.statements();
                 let then_diverges = then_stmts.as_ref().is_some_and(stmts_diverge);
+                let mark = self.diags.len();
                 let then_ty = match &then_stmts {
                     Some(s) => self.infer_stmts(s, &mut then_env, self_ty, scope),
                     None => Ty::Nil,
                 };
+                if truth == Some(true) {
+                    self.forget_dead_branch_contracts(mark);
+                }
                 let mut else_env = env.clone();
                 if let Some(nw) = &narrow {
                     apply_narrow_true(&mut else_env, nw);
@@ -2391,6 +2409,7 @@ impl Checker<'_> {
                 if let Some(m) = &respond_to_guard {
                     self.respond_to_guards.push(m.clone());
                 }
+                let mark = self.diags.len();
                 let else_ty = match n.else_clause() {
                     Some(e) => match e.statements() {
                         Some(s) => self.infer_stmts(&s, &mut else_env, self_ty, scope),
@@ -2398,6 +2417,9 @@ impl Checker<'_> {
                     },
                     None => Ty::Nil,
                 };
+                if truth == Some(false) {
+                    self.forget_dead_branch_contracts(mark);
+                }
                 if defined_guard.is_some() {
                     self.defined_guards.pop();
                 }
@@ -4004,12 +4026,16 @@ impl Checker<'_> {
                     // closed-world-via-Tapioca, no gem RBI reopening of
                     // the receiver's core namespaces declares it either —
                     // a declared `String#squish` exists, exactly like an
-                    // inventory hit. Any miss = silence, still.
+                    // inventory hit. W11 adds (e), only when the world was
+                    // closed by Tapioca evidence: `open_world_silences`.
+                    // Any miss = silence, still.
                     if self.core_unknown_is_conclusive(cc)
                         && !core_inventory_names(cc)
                             .iter()
                             .any(|cls| core_inventory_has(cls, &name))
                         && !self.rbi_core_declares(cc, &name)
+                        && !self.open_world_silences(call, cc, &name)
+                        && self.core_names_unpolluted(cc, &name)
                     {
                         let message = format!(
                             "undefined method `{name}` for `{}`",
@@ -4382,7 +4408,10 @@ impl Checker<'_> {
     /// in by `method_return`/`ivar_ty`'s nested silent walk must never
     /// leak constraints into the method actually being checked.
     fn collect_constraint(&mut self, call: &CallNode<'_>, name: &str, msg_loc: (usize, usize)) {
-        if self.silent || !self.closed_world() {
+        // W11: under Tapioca evidence the world holds every gem class too,
+        // and the candidate sets here are project ∪ core only — a gem
+        // object answering both names would be a false contradiction.
+        if self.silent || !self.closed_world() || crate::TapiocaEvidence::try_get(self.db).is_some() {
             return;
         }
         let Some(recv) = call.receiver() else { return };
@@ -4554,6 +4583,18 @@ impl Checker<'_> {
         self.core_class_unpolluted(cc)
     }
 
+    /// The NAME-KEYED half of condition (b) for E0101 and the block-self
+    /// guard: no keyed source (a literal core definer such as
+    /// `Kernel.define_method(:abort)`, a top-level `include M` resolved
+    /// to M's methods, a definition through a receiver no constant names)
+    /// can have given `cc`'s chain `name` or `method_missing`. An opaque
+    /// keyed source answers every name. Since W11 those definers no
+    /// longer set the blanket `core_mixin`; this is what replaced it.
+    fn core_names_unpolluted(&self, cc: CoreClass, name: &str) -> bool {
+        let chain: Vec<&str> = core_pollution_names(cc).iter().copied().chain(["BasicObject"]).collect();
+        self.names_unpolluted(&chain, &[name, "method_missing", "respond_to_missing?"])
+    }
+
     /// Condition (b) of the closed-world contract, on its own because bead
     /// ita-uye needs exactly it and none of the rest: the project never
     /// reopened `cc` nor any ancestor/mixin that could carry a method —
@@ -4563,7 +4604,8 @@ impl Checker<'_> {
     /// `refine Integer do def +(o) ... end end` plus `using` makes
     /// `1 + "s"` a program MRI runs clean, and it creates no fragment)
     /// nor through an eval body nobody showed this checker
-    /// (`eval_polluted_core`/`eval_polluted_unknown`, `index.rs`'s
+    /// (`eval_polluted_unknown`, plus the name-keyed opaque target
+    /// `core_names_unpolluted` reads, `index.rs`'s
     /// `note_opaque_eval`: `Integer.class_eval("def +(o) = 'x'")` from a
     /// method body, through a constant alias, or through a receiver that
     /// cannot be named — measured clean under MRI and accused here).
@@ -4574,7 +4616,6 @@ impl Checker<'_> {
         !core_pollution_names(cc).iter().any(|n| {
             self.index.by_path.contains_key(*n)
                 || self.index.refined_core.contains(*n)
-                || self.index.eval_polluted_core.contains(*n)
         })
     }
 
@@ -4609,6 +4650,7 @@ impl Checker<'_> {
         let arg_keys = arg_pollution_keys(recv_cc);
         self.names_unpolluted(core_own_names(recv_cc), &[op])
             && self.names_unpolluted(core_pollution_names(arg_cc), &arg_keys)
+            && !self.open_world_ops_polluted(recv_cc, arg_cc, op)
     }
 
     /// Is every `key` absent from every pollution source aimed at any of
@@ -4674,7 +4716,7 @@ impl Checker<'_> {
         let Some(cc) = core_class_of(recv_ty) else {
             return false;
         };
-        core_block_keeps_lexical_self(name) && self.core_class_unpolluted(cc)
+        core_block_keeps_lexical_self(name) && self.core_class_unpolluted(cc) && self.core_names_unpolluted(cc, name)
     }
 
     /// Condition (d) of the closed-world contract (w12 closure,
@@ -4691,6 +4733,114 @@ impl Checker<'_> {
             .iter()
             .any(|ns| methods.get(*ns).is_some_and(|set| set.contains(name)))
     }
+
+    /// Condition (e), W11: the open-world rules, live only when the world
+    /// was closed by Tapioca evidence (`TapiocaEvidence` wired); without
+    /// it this answers `false` and the lookup is exactly what it was.
+    /// Silent when any of these holds:
+    /// - the name is one a source-audited gem adds to the chain
+    ///   (`TapiocaEvidence::curated_names`) or one the standard library
+    ///   adds when required (`open_world::stdlib_core_ext_has`) — default
+    ///   gems are never in the lock, so no RBI speaks for them;
+    /// - an RBI reopening of the receiver's chain, `BasicObject` included,
+    ///   declares it or mixes in a module that does, or is unreadable
+    ///   (`rbi_chain_surface`), or the project reopens `BasicObject`;
+    /// - the receiver is not EXACT. A literal is. Otherwise the value only
+    ///   passed some `is_a?` — a sig's runtime check, a narrowing — so a
+    ///   non-final class (`String`, `Array`, `Hash`, `Object`) may be a
+    ///   subclass no RBI shows (the stdlib's `OpenSSL::Buffer < String`),
+    ///   and even a final one (`Integer`, `Float`, `Symbol`, `nil`,
+    ///   booleans) may be an object faking `is_a?`: any gem class
+    ///   overriding a type test or defining `method_missing`
+    ///   (`rbi_type_test_hazard`), or a project one (`methods_by_name`,
+    ///   name-keyed pollution of those names, `polluted_unknown`).
+    fn open_world_silences(&self, call: &CallNode<'_>, cc: CoreClass, name: &str) -> bool {
+        let Some(evidence) = crate::TapiocaEvidence::try_get(self.db) else {
+            return false;
+        };
+        if evidence.curated_names(self.db).contains(name)
+            || core_inventory_names(cc).iter().any(|class| crate::open_world::stdlib_core_ext_has(class, name))
+            || self.open_world_chain_answers(core_pollution_names(cc), &[name])
+            || Self::harvest_answers(evidence.harvest(self.db), core_pollution_names(cc), &[name])
+        {
+            return true;
+        }
+        let literal = call
+            .receiver()
+            .and_then(|receiver| literal_class(&receiver))
+            .is_some_and(|class| matches!(class, LiteralClass::Modeled(_)));
+        if literal {
+            return false;
+        }
+        let final_class =
+            matches!(cc, CoreClass::Integer | CoreClass::Float | CoreClass::Sym | CoreClass::Nil | CoreClass::Bool);
+        !final_class
+            || crate::index::rbi_type_test_hazard(self.db)
+            || self.project_type_test_hazard()
+            || evidence.harvest(self.db).type_test
+    }
+
+    /// Can any RBI reopening of `chain` (plus `BasicObject`), or a project
+    /// reopening of `BasicObject`, answer one of `keys`? An unreadable
+    /// reopening answers every key.
+    fn open_world_chain_answers(&self, chain: &[&str], keys: &[&str]) -> bool {
+        if self.index.by_path.contains_key("BasicObject") {
+            return true;
+        }
+        let (names, open) = crate::index::rbi_chain_surface(self.db);
+        chain.iter().copied().chain(["BasicObject"]).any(|ns| {
+            open.contains(ns) || names.get(ns).is_some_and(|set| keys.iter().any(|k| set.contains(*k)))
+        })
+    }
+
+    /// W11: could a PROJECT class pass `is_a?` for a core type without
+    /// being one — a readable type-test override or `method_missing`
+    /// anywhere, the same names through a receiver no constant names, or
+    /// a source that could define anything anywhere?
+    fn project_type_test_hazard(&self) -> bool {
+        self.index.polluted_unknown
+            || crate::index::TYPE_TEST_NAMES
+                .iter()
+                .chain(&["method_missing", "respond_to_missing?"])
+                .any(|k| self.index.methods_by_name.contains_key(*k) || self.index.polluted_any_class.contains(*k))
+    }
+
+    /// W11: E0108's half of condition (e). Under Tapioca evidence, a
+    /// conversion hook or operator a gem RBI, an audited gem or the
+    /// stdlib gives either operand's chain makes the pairing legal.
+    fn open_world_ops_polluted(&self, recv_cc: CoreClass, arg_cc: CoreClass, op: &str) -> bool {
+        let Some(evidence) = crate::TapiocaEvidence::try_get(self.db) else {
+            return false;
+        };
+        let arg_keys = arg_pollution_keys(recv_cc);
+        let curated = evidence.curated_names(self.db);
+        let stdlib = |cc: CoreClass, keys: &[&str]| {
+            core_inventory_names(cc)
+                .iter()
+                .any(|class| keys.iter().any(|k| crate::open_world::stdlib_core_ext_has(class, k)))
+        };
+        std::iter::once(op).chain(arg_keys.iter().copied()).any(|k| curated.contains(k))
+            || stdlib(recv_cc, &[op])
+            || stdlib(arg_cc, &arg_keys)
+            || self.open_world_chain_answers(core_pollution_names(recv_cc), &[op])
+            || self.open_world_chain_answers(core_pollution_names(arg_cc), &arg_keys)
+            || Self::harvest_answers(evidence.harvest(self.db), core_pollution_names(recv_cc), &[op])
+            || Self::harvest_answers(evidence.harvest(self.db), core_pollution_names(arg_cc), &arg_keys)
+    }
+
+/// W11: can what the installed gem sources and the unloaded project files
+/// add (`open_world::Harvest`) answer one of `keys` on `chain` (plus
+/// `BasicObject`)? An open namespace answers every key, and a harvested
+/// `method_missing` answers every name.
+fn harvest_answers(h: &crate::open_world::Harvest, chain: &[&str], keys: &[&str]) -> bool {
+    let hit = |set: &std::collections::HashSet<String>| {
+        keys.iter().chain(&["method_missing", "respond_to_missing?"]).any(|k| set.contains(*k))
+    };
+    hit(&h.any_names)
+        || chain.iter().copied().chain(["BasicObject"]).any(|ns| {
+            h.open.contains(ns) || h.names.get(ns).is_some_and(&hit)
+        })
+}
 
     /// E0108's flow-insensitive half for the scope about to be walked:
     /// the real scan on a live walk, an empty map on a `silent` one. A
@@ -4847,7 +4997,12 @@ impl Checker<'_> {
         self.emit(loc.0, loc.1, E0102_WRONG_ARITY, Severity::Error, message);
     }
 
-    /// E0103: positional args vs RBS sig, strict mismatches only.
+    /// E0103: positional args vs an inline `#:` RBS sig. LITERAL-ONLY, the
+    /// same rule as `check_sorbet_args` (MATRIX H2): an argument that is
+    /// not WRITTEN as a literal is never judged, because an inferred type
+    /// held to a signature is exactly where this checker's narrowing gaps
+    /// (`n && f(n)`, `f(n || "z")`, an `is_a?` early return) accuse code
+    /// that runs. A literal accuses only through `contract_breaks`.
     fn check_sig_args(
         &mut self,
         m: &MethodSig,
@@ -4872,16 +5027,19 @@ impl Checker<'_> {
             })
             .map(|t| self.rbs_to_ty(t, owner, scope, &sig.type_params))
             .collect();
-        for (i, (arg_ty, span, _)) in args.positional.iter().enumerate() {
+        for (i, (_, span, _)) in args.positional.iter().enumerate() {
             let Some(param_ty) = param_tys.get(i) else {
                 break;
             };
-            if !compatible(arg_ty, param_ty, self.index, self.rbi_map) {
+            let Some(literal) = args.literals.iter().find(|(at, _)| at == span).map(|(_, class)| class) else {
+                continue;
+            };
+            if self.contract_breaks(std::slice::from_ref(literal), param_ty) {
                 let message = format!(
                     "argument {} of `{name}` expects {}, got {}",
                     i + 1,
                     ty_name(param_ty, self.index),
-                    ty_name(arg_ty, self.index),
+                    literal.name(self.index),
                 );
                 self.emit(
                     span.0,
@@ -4942,13 +5100,15 @@ impl Checker<'_> {
     /// `expected`? A literal is judged by the class it is written as, so
     /// the only doubt left is which leaf runs: a union of branch leaves is
     /// accused only when NO leaf fits, because this checker cannot tell a
-    /// dead branch from a live one. A project whose runtime is not proven
-    /// to raise on a broken sig (`ProjectIndex::sorbet_runtime_unchecked`)
-    /// never reaches here: every contract comes from `effective_sorbet`,
-    /// which hands out none in that project, and an RBI is never one.
+    /// dead branch from a live one. A Sorbet sig in a project whose runtime
+    /// is not proven to raise on a broken sig
+    /// (`ProjectIndex::sorbet_runtime_unchecked`) never reaches here: every
+    /// sig contract comes from `effective_sorbet`, which hands out none in
+    /// that project, and an RBI is never one. An inline `#:` RBS sig
+    /// reaches here from `check_sig_args`, literal arguments only.
     fn contract_breaks(&self, leaves: &[LiteralClass], expected: &Ty) -> bool {
         !leaves.is_empty()
-            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))
+            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index) && self.type_test_unpatched(leaf))
     }
 
     /// sorbet-runtime decides a value's fit with `is_a?`: a project that
@@ -4966,6 +5126,20 @@ impl Checker<'_> {
             && !leaf.core_ancestry().iter().any(|class| {
                 self.index.polluted_methods.get(*class).is_some_and(|defined| keys.iter().any(|k| defined.contains(*k)))
             })
+    }
+
+    /// MATRIX H6: drop every contract accusation (E0103/E0109) emitted
+    /// since `mark`, because it was made inside an `if`/`unless`/ternary
+    /// branch whose literal predicate (`literal_truth`) proves it never
+    /// runs — `A.new.f(:sym) if false` breaks no contract. The branch is
+    /// still walked, so its writes, inference and every other diagnostic
+    /// stay as before. Suppression-only (invariant #1).
+    fn forget_dead_branch_contracts(&mut self, mark: usize) {
+        let mut at = 0;
+        self.diags.retain(|d| {
+            at += 1;
+            at <= mark || ![E0103_ARG_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH].contains(&d.code)
+        });
     }
 
     /// E0106 (bead ita-yho): literal-argument-only, cast-is-provably-
@@ -5190,10 +5364,9 @@ impl Checker<'_> {
     /// dozens of ivars (15x wall-clock regression on corpus-c,
     /// bead ita-9p9). Deliberately NOT `Ty::union` per name: two different
     /// assignment types collapse straight to `Ty::Unknown`, never
-    /// `Ty::Union` — `compatible()` treats a `Union` argument as "every
-    /// member must match its param", stricter than Unknown's "always
-    /// passes", so a real union here could still trigger a false-positive
-    /// E0103. No visible assignment anywhere: Unknown, never an error
+    /// `Ty::Union` — a union claims every member is possible, stronger
+    /// than Unknown's "nothing is known", and a consumer can read a member
+    /// as proof. No visible assignment anywhere: Unknown, never an error
     /// (invariant #1). Only instance methods are walked — a class-level
     /// `@x` inside `def self.foo` is a different storage slot in real
     /// Ruby, not the same variable. Ivar narrowing itself stays out of
@@ -5541,82 +5714,29 @@ fn self_ty_of(class: Option<ClassId>, singleton: bool) -> SelfTy {
     }
 }
 
-/// `RbiProject`'s `constant name -> declaring .rbi files` map, as the
-/// checker holds it.
-type RbiMap = HashMap<String, Vec<std::path::PathBuf>>;
-
-/// Strict-but-safe compatibility: Unknown always passes. An `Instance` arg
-/// also passes when the param class is in its ancestry (a subclass IS the
-/// param type at runtime) — or when that ancestry is incomplete, because
-/// then non-subtyping is unprovable and invariant #1 ranks silence above
-/// accusation. Surfaced by bead ita-p24: once malformed sig comments stopped
-/// dying as E0105, genuine subtype calls (e.g. `Entry::Method` into
-/// `(entry: Entry)`) fired E0103 on exact-equality.
+/// Does a value of the literal type `arg` satisfy `param`? Unknown always
+/// passes. The only caller is `LiteralClass::fits`, so `arg` is always a
+/// `LiteralClass::Modeled` type: a core scalar, `nil`, or a collection
+/// whose type arguments are Unknown — never an `Instance` and never a
+/// `Union`. The arms that judged an inferred `Instance` or `Union` ARG
+/// (`instance_compatible`, `may_be_core_value`, a module instance as
+/// proof) were removed once the `#:` RBS path became literal-only
+/// (MATRIX H2): nothing could reach them.
 ///
-/// Both nominal questions fail closed. A MODULE-typed param is never
-/// proof against anything: any class, core ones included, can gain a
-/// module at runtime by reflection this index never records as an
-/// ancestor edge (`Late.include(M)`, `Late.send(:include, M)`,
-/// `Late.class_eval { include M }`, a class method that calls `include`),
-/// and `X.extend(M)` makes a class object itself an `M`. An `Instance` arg
-/// against a core scalar or collection param is accused only when
-/// `may_be_core_value` rules the core type out — `class SafeStr < String`
-/// IS a String under sorbet-runtime.
-fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
+/// A MODULE-typed param is never proof against anything: any class, core
+/// ones included, can gain a module at runtime by reflection this index
+/// never records as an ancestor edge (`Late.include(M)`, `Late.send(
+/// :include, M)`, `Late.class_eval { include M }`, a class method that
+/// calls `include`), and `X.extend(M)` makes a class object itself an `M`.
+fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
     match (arg, param) {
         (Ty::Unknown, _) | (_, Ty::Unknown) => true,
-        // An instance of a MODULE (`self` in a module method, a value typed
-        // by a module name) is an instance of some class that includes it,
-        // which this checker cannot name: never proof against anything.
-        (Ty::Instance(a), _) if index.class(*a).is_module => true,
         (_, Ty::Instance(p)) if index.class(*p).is_module => true,
-        (Ty::Union(parts), p) => parts.iter().all(|a| compatible(a, p, index, rbi)),
-        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index, rbi)),
-        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index, rbi),
-        (Ty::Hash(ak, av), Ty::Hash(pk, pv)) => {
-            compatible(ak, pk, index, rbi) && compatible(av, pv, index, rbi)
-        }
-        (Ty::Instance(a), p) => instance_compatible(*a, p, index, rbi),
+        (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index)),
+        (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index),
+        (Ty::Hash(ak, av), Ty::Hash(pk, pv)) => compatible(ak, pk, index) && compatible(av, pv, index),
         (a, p) => a == p,
     }
-}
-
-/// `compatible` for an instance of project class `a` against a param that
-/// is neither Unknown, a union nor a module.
-fn instance_compatible(a: ClassId, param: &Ty, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
-    match param {
-        Ty::Instance(p) => {
-            if a == *p {
-                return true;
-            }
-            let (anc, complete) = index.ancestors(a);
-            anc.contains(p) || !complete
-        }
-        // Neither a sig nor an RBS param ever resolves to `Ty::Class`, so
-        // every param left here is a core scalar or collection.
-        _ => may_be_core_value(a, index, rbi),
-    }
-}
-
-/// Could an instance of project class `id` be a core value (a `String`, a
-/// `Hash`, an `Array`, ...)? Only a superclass edge makes a class one, so
-/// the answer is NO only when every link of its ancestry is known and
-/// none of them may be a core class: the ancestry is complete (`class
-/// SafeStr < String` leaves `String` unresolved), no ancestor is `open`
-/// (a core reopen such as `class Hash` is `ReopenedExternal`, a
-/// `declarations/gems.rbi` class `DeclaredExternal`, and since the first
-/// recorded reason wins, no open reason is trusted to rule either out),
-/// and no `sorbet/rbi` file declares an ancestor's path (a project
-/// reopening of a gem class written without its superclass looks like a
-/// fresh Object subclass here). Any doubt is `true`, never an accusation.
-/// The trade-off is a false negative: an instance of an open project
-/// class (a Rails model with `validates`) is no longer accused against
-/// `String` and friends.
-fn may_be_core_value(id: ClassId, index: &ProjectIndex, rbi: Option<&RbiMap>) -> bool {
-    let (ancestors, complete) = index.ancestors(id);
-    !complete
-        || ancestors.iter().any(|&c| index.class(c).open)
-        || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))
 }
 
 /// A collection whose CONTENTS are unproven keeps only its category: a
@@ -6312,6 +6432,16 @@ impl<'pr> Visit<'pr> for ReturnContractSafety {
                 break;
             }
         }
+    }
+}
+
+/// The truthiness a branch predicate WRITTEN as `true`/`false`/`nil`
+/// always has, else `None` (MATRIX H6).
+fn literal_truth(node: &Node<'_>) -> Option<bool> {
+    match node {
+        Node::TrueNode { .. } => Some(true),
+        Node::FalseNode { .. } | Node::NilNode { .. } => Some(false),
+        _ => None,
     }
 }
 

@@ -291,12 +291,10 @@ mutant M20 "$CHK" \
 # plumbing, so the same eight decisions get their own mutants.
 
 mutant M21 "$IDX" \
-  '        if let Some(expanded) = index.expand_unresolved_alias_target(&nesting, &name) {
-            index.eval_polluted_core.insert(expanded.trim_start_matches("::").to_string());
-        }' \
-  '        let _ = &nesting;' \
+  '    let chased = index.chase_alias_target_text(nesting, target);' \
+  '    let chased = None::<String>;' \
   an_aliased_or_unnamable_eval_receiver_stands_down \
-  'alias resolution: `I = Integer; I.class_eval("def +(o) = ...")` prints "aliased" under MRI'
+  'alias resolution: `I = Integer; I.class_eval("def +(o) = ...")` prints "aliased" under MRI (since W11 the keyed opaque target carries it: the blanket eval_polluted_core read and the first alias chaser, which no mutant could distinguish, were deleted)'
 
 mutant M22 "$IDX" \
   '            None if string_body => self.eval_unknown = true,' \
@@ -305,18 +303,20 @@ mutant M22 "$IDX" \
   'fail-closed on an unnamable receiver: `klass.class_eval(str)` proves nothing about any class'
 
 mutant M23 "$IDX" \
-  '        index.eval_polluted_core.insert(name.clone());' \
-  '        index.eval_polluted_unknown = true;
-        let _ = name.clone();' \
+  '        Some(t) => {
+            for spelling in target_spellings(index, nesting, t) {
+                index.polluted_opaque.insert(spelling);
+            }
+        }' \
+  '        Some(_) => index.polluted_unknown = true,' \
   a_string_eval_stands_its_receiver_down \
   'per-class, not blanket: evaling into Array must leave Integer + String accusing'
 
 mutant M24 "$CHK" \
-  '                || self.index.eval_polluted_core.contains(*n)
-' \
-  '' \
+  '            self.index.polluted_opaque.contains(*n)' \
+  '            false' \
   a_string_eval_stands_its_receiver_down \
-  'the checker reads eval_polluted_core, instead of collecting it for nothing'
+  'the checker reads the opaque eval target (the keyed half that replaced eval_polluted_core)'
 
 mutant M25 "$CHK" \
   ' || self.index.eval_polluted_unknown {' \
@@ -412,8 +412,8 @@ mutant M34 "$IDX" \
   'a block ARGUMENT is a body this file does not contain, not a body that defines nothing'
 
 mutant M35 "$IDX" \
-  '        .or_else(|| index.chase_alias_target_text(nesting, target));' \
-  ';' \
+  '    let chased = index.chase_alias_target_text(nesting, target);' \
+  '    let chased = None::<String>;' \
   a_reopening_through_an_alias_is_read_by_name \
   'the second alias chaser: a reopening through an alias resolves in-project, so the first one bails'
 

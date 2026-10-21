@@ -391,6 +391,12 @@ pub struct ClassFragment {
     pub open: bool,
     /// Why `open` is set (bead ita-anc); `None` while closed. First-reason-wins.
     pub open_reason: Option<OpenReason>,
+    /// W11: `open` for a reason that says something about THIS body. False
+    /// when the only reasons are that the class is defined elsewhere
+    /// (`ReopenedExternal`) or a `sig` this crate cannot parse (a pure
+    /// annotation: it defines nothing). First-reason-wins cannot answer
+    /// that, so the Tapioca open-world surface reads this instead.
+    pub body_unreadable: bool,
     /// `self.table_name = ...` as written in this fragment, if any.
     pub table_name: Option<TableNameDecl>,
     /// This fragment was NOT written by a `class`/`module` keyword: it
@@ -447,6 +453,7 @@ impl ClassFragment {
             consts: Vec::new(),
             open: false,
             open_reason: None,
+            body_unreadable: false,
             table_name: None,
             mixes_in_class_methods: Vec::new(),
             declared_owner_required: false,
@@ -1447,8 +1454,8 @@ impl FileScan {
     /// `p 1 + "s"` prints `"evaled"` and exits 0, while E0108 accused it.
     ///
     /// The toplevel/class-body contour of the literal-receiver shape was
-    /// already covered by `core_injection_call` (which sets the
-    /// project-wide `core_mixin`). What reaches here is every contour
+    /// already covered by the walker's core-injection mark (deleted in
+    /// W11: the keyed record below now covers that contour too). What reaches here is every contour
     /// that walk never visits — a method body, a block, a conditional —
     /// plus the two shapes a literal-receiver test can never see: a
     /// receiver spelled as a constant ALIAS, and a receiver that cannot
@@ -1471,9 +1478,9 @@ impl FileScan {
     /// - a block on any of those, or on `class_exec`/`module_exec`/
     ///   `instance_exec`. A block IS walkable, and reading its defs
     ///   instead would be more precise — but the walker-reachable contour
-    ///   already treats the block form as pollution whatever its body
-    ///   (`core_injection_call` lists `class_eval` with no look at the
-    ///   argument), and one program must not mean two things depending on
+    ///   treated the block form as pollution whatever its body (the
+    ///   walker's core-injection mark, keyed since W11, listed `class_eval`
+    ///   with no look at the argument), and one program must not mean two things depending on
     ///   whether it sits in a method body or at toplevel. The cost is a
     ///   measured false negative kept identical to the toplevel one: a
     ///   block that defines something else
@@ -1481,7 +1488,7 @@ impl FileScan {
     ///   `1 + "s"` (see `a_block_eval_body_that_defines_nothing_relevant_is_a_false_negative`).
     ///
     /// The polluted class is the RECEIVER: a constant path as written
-    /// (chased through aliases in `resolve_eval_polluted_core`), or the
+    /// (chased through aliases in `resolve_keyed_pollution`), or the
     /// innermost lexical nesting for `self.class_eval`/receiverless
     /// `class_eval` — the Rails `class_eval <<~RUBY` idiom, whose
     /// implicit receiver is the enclosing class. That fallback is what
@@ -1664,8 +1671,8 @@ impl FileScan {
     ///   the project; a base that is `self`, a local, or a call is not a
     ///   name this pass can resolve, and an unresolved name contributes
     ///   nothing (`apply_load_hook_openness`).
-    /// * the receiver is unconstrained, exactly as `core_injection_call`'s
-    ///   family is: `ActiveSupport.run_load_hooks(...)`, a bare
+    /// * the receiver is unconstrained, exactly as the injection family
+    ///   is: `ActiveSupport.run_load_hooks(...)`, a bare
     ///   `run_load_hooks(...)` inside the library's own
     ///   `extend LazyLoadHooks`, and a chained receiver all name the same
     ///   public API, and a project callback named `run_load_hooks` that
@@ -1686,8 +1693,9 @@ impl FileScan {
 
     /// `Integer.include M` / `String.define_method(:+) { }` /
     /// `Hash.send(:alias_method, :x, :y)` / top-level `include M` — every
-    /// injection shape `core_injection_call` flags project-wide, now
-    /// carrying the names it can actually inject.
+    /// injection shape on a core receiver, carrying the names it can
+    /// actually inject (since W11 the only record of these calls: the
+    /// walker's blanket mark for them was deleted).
     ///
     /// The eval family is deliberately NOT handled here:
     /// `note_opaque_eval` above already owns those shapes, including
@@ -1726,9 +1734,9 @@ impl FileScan {
     /// `DefWalker` has it.
     ///
     /// A receiver this file cannot name (`klass.include M`) is not
-    /// recorded either: `core_injection_call`'s project-wide mark
-    /// requires a constant receiver too, so poisoning here would make
-    /// the keyed question STRICTER than the blanket one it refines — and
+    /// recorded either: the old blanket core-injection mark required a
+    /// constant receiver too, so poisoning here would make the keyed
+    /// question STRICTER than the blanket one it replaced — and
     /// the shape is everywhere (50 sites in rails alone), so it would
     /// stand every core class down on every real project. The gap it
     /// leaves is the pre-existing one `dynamic_mixin_covers` softens for
@@ -2368,8 +2376,8 @@ struct DefWalker<'a> {
     fragments: Vec<ClassFragment>,
     sig_errors: Vec<(usize, usize, String)>,
     /// Set when this file monkeypatches a core class without creating a
-    /// fragment (bead ita-2ve) — see `core_injection_call` and the
-    /// top-level `include`/`method_missing` arms below.
+    /// fragment and no name-keyed record can bound it (bead ita-2ve) —
+    /// see the top-level `method_missing` arm below.
     core_mixin: bool,
     /// Qualified value-constant assignments (w12 closure) — see
     /// `FileDefs::consts`.
@@ -2422,6 +2430,7 @@ impl DefWalker<'_> {
     fn open_class(&mut self, i: usize, reason: OpenReason) {
         let f = &mut self.fragments[i];
         f.open = true;
+        f.body_unreadable = true;
         if f.open_reason.is_none()
             || (f.open_reason == Some(OpenReason::AbstractRaise)
                 && reason != OpenReason::AbstractRaise)
@@ -2659,6 +2668,7 @@ impl DefWalker<'_> {
             let mut frag = ClassFragment::new(path, is_module, nest);
             frag.open = true;
             frag.open_reason = Some(OpenReason::BlockNestedDefinition);
+            frag.body_unreadable = true;
             self.fragments.push(frag);
         }
     }
@@ -3155,6 +3165,7 @@ impl DefWalker<'_> {
                             Some(sc) => f.superclass = Some(sc),
                             None if class.superclass().is_some() => {
                                 f.open = true;
+                                f.body_unreadable = true;
                                 if f.open_reason.is_none() {
                                     f.open_reason = Some(OpenReason::DynamicSuperclass);
                                 }
@@ -3470,17 +3481,14 @@ impl DefWalker<'_> {
             }
             Node::CallNode { .. } => {
                 let call = node.as_call_node().unwrap();
-                // bead ita-2ve: a method-injection call whose receiver is
-                // a constant naming a core class/mixin (`String.prepend(M)`,
-                // `Kernel.class_eval { def ... }`, `Hash.send(:define_method,
-                // ...)`) adds methods no fragment records, so the
-                // closed-world core lookup must stand down for the run.
-                if call
-                    .receiver()
-                    .is_some_and(|r| core_injection_call(&r, call.name().as_slice()))
-                {
-                    self.core_mixin = true;
-                }
+                // A method-injection call on a constant naming a core
+                // class/mixin (`String.prepend(M)`, `Kernel.class_eval { }`,
+                // `Hash.send(:define_method, x)`) no longer sets the blanket
+                // `core_mixin` (W11, measured by mutation: no shape told the
+                // two apart): `FileScan::note_injection`/`note_eval_keyed`
+                // file every such call name-keyed on the class it names
+                // (`Opaque` when unreadable), and the conclusive lookup asks
+                // about the NAME (`Checker::core_names_unpolluted`).
                 // A block running at class-body level (`FIELDS.each do
                 // define_method ... end`, `included do ... end`) can define
                 // anything: open, whatever the receiver — except
@@ -3531,6 +3539,7 @@ impl DefWalker<'_> {
                             ClassFragment::new(owner, false, nesting.to_vec());
                         frag.declared_owner_required = true;
                         frag.open = true;
+                        frag.body_unreadable = true;
                         frag.open_reason = Some(OpenReason::EvalOrSend);
                         self.fragments.push(frag);
                         return;
@@ -3567,7 +3576,11 @@ impl DefWalker<'_> {
                             _ => PendingSig::Unusable,
                         });
                         if !recognized {
+                            // Opens exactly as before; only W11's
+                            // `body_unreadable` reads it as annotation.
+                            let before = self.fragments[i].body_unreadable;
                             self.open_class(i, OpenReason::ClassBodyBlock);
+                            self.fragments[i].body_unreadable = before;
                         }
                     } else if call.name().as_slice() == b"class_methods"
                         && call.receiver().is_none()
@@ -3692,10 +3705,10 @@ impl DefWalker<'_> {
                     // methods (bead ita-2ve condition (b)). Bare
                     // top-level `extend`/`prepend` only touch `main`'s
                     // singleton — not a core-class patch.
+                    // It is keyed, not blanket: `FileScan::note_injection`
+                    // files it as `Object`'s `Module(M)`, resolved to M's
+                    // methods or marked opaque (`resolve_keyed_pollution`).
                     if frag_idx.is_none() {
-                        if call.receiver().is_none() && call.name().as_slice() == b"include" {
-                            self.core_mixin = true;
-                        }
                         return;
                     }
                     let i = frag_idx.expect("non-None: guarded above");
@@ -5165,45 +5178,6 @@ fn top_level_def_names(source: &str) -> Vec<String> {
         .collect()
 }
 
-/// Is `recv.method_name` a method-injection call on a core class/mixin
-/// (bead ita-2ve)? `String.prepend(M)`, `Kernel.class_eval { def ... }`,
-/// `Hash.send(:define_method, :x)` — each can add instance methods to a
-/// core class without creating any fragment, which `by_path` alone can
-/// never see. Only constant receivers naming a core namespace count:
-/// `Foo.prepend(M)` patches a project class (visible as a fragment), and
-/// a dynamic receiver can't be named at all — both stay exactly as v0.
-fn core_injection_call(recv: &Node<'_>, name: &[u8]) -> bool {
-    const INJECTIONS: &[&str] = &[
-        "include",
-        "extend",
-        "prepend",
-        "class_eval",
-        "module_eval",
-        "instance_eval",
-        "class_exec",
-        "module_exec",
-        "instance_exec",
-        "send",
-        "public_send",
-        "__send__",
-        "define_method",
-        "define_singleton_method",
-        "alias_method",
-        "attr_accessor",
-        "attr_reader",
-        "attr_writer",
-    ];
-    let Ok(name) = std::str::from_utf8(name) else {
-        return false;
-    };
-    INJECTIONS.contains(&name)
-        && const_path_str(recv).is_some_and(|p| {
-            p.rsplit("::")
-                .next()
-                .is_some_and(crate::core::is_core_namespace)
-        })
-}
-
 /// Literal method name from a `define_method` first argument: a symbol or
 /// plain string literal names the method being defined at compile time
 /// (bead ita-53y); a variable, interpolation, or call is dynamic and
@@ -5316,7 +5290,7 @@ pub struct ProjectIndex {
     /// Bead B of onda 2, staging: `run_load_hooks(:sym, Base)` bases as
     /// `(path as written, nesting at the call site)`, resolved to real
     /// `ClassId`s by `apply_load_hook_openness` once every fragment has
-    /// merged (the same two-phase shape `refine_raw`/`eval_raw` use).
+    /// merged (the same two-phase shape `refine_raw` uses).
     load_hook_raw: Vec<(String, Vec<String>)>,
     /// Any checked file monkeypatched a core class without a fragment
     /// (bead ita-2ve): the closed-world conclusive core lookup stands
@@ -5335,14 +5309,6 @@ pub struct ProjectIndex {
     /// Any checked file refined a target that could not be named — see
     /// `FileDefs::refined_unknown`.
     pub refined_unknown: bool,
-    /// Every class name any checked file hands an unreadable eval body
-    /// (`Integer.class_eval("def +(o) = 'x'")`), merged across the
-    /// project and alias-resolved — see `FileDefs::eval_targets` and
-    /// `resolve_eval_polluted_core`.
-    pub eval_polluted_core: FxHashSet<String>,
-    /// Staging for `eval_polluted_core`, the same two-phase shape
-    /// `refine_raw` uses.
-    eval_raw: Vec<(String, Vec<String>)>,
     /// Any checked file evaled a body into a target it could not name —
     /// see `FileDefs::eval_unknown`.
     pub eval_polluted_unknown: bool,
@@ -5632,7 +5598,6 @@ pub fn project_index(db: &dyn salsa::Database) -> ProjectIndex {
     // `OpenReason::MethodMissing`).
     apply_attributed_mixin_edges(&mut index);
     resolve_refined_core(&mut index);
-    resolve_eval_polluted_core(&mut index);
     // Before `resolve_keyed_pollution` consumes the raw name-keyed sources.
     poison_injected_contracts(&mut index);
     // Name-keyed pollution resolves LAST of the three: it is the only
@@ -5873,7 +5838,6 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.core_mixin |= defs.core_mixin;
     index.refine_raw.extend(defs.refine_targets.iter().cloned());
     index.refined_unknown |= defs.refined_unknown;
-    index.eval_raw.extend(defs.eval_targets.iter().cloned());
     index.eval_polluted_unknown |= defs.eval_unknown;
     index.keyed_raw.extend(defs.keyed_pollution.iter().cloned());
     index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
@@ -6928,22 +6892,6 @@ fn resolve_refined_core(index: &mut ProjectIndex) {
     }
 }
 
-/// Turn every raw eval-pollution target (`ProjectIndex::eval_raw`) into
-/// the class NAMES `Checker::core_class_unpolluted` compares against,
-/// once every file is merged so constant aliases can be chased — the same
-/// two-phase shape and the same two recorded spellings as
-/// `resolve_refined_core` above, and for the same measured reason:
-/// `I = Integer; I.class_eval("def +(o) = 'aliased'")` prints
-/// `"aliased"` under MRI, and the raw spelling `I` matches no core name.
-fn resolve_eval_polluted_core(index: &mut ProjectIndex) {
-    for (name, nesting) in std::mem::take(&mut index.eval_raw) {
-        index.eval_polluted_core.insert(name.clone());
-        if let Some(expanded) = index.expand_unresolved_alias_target(&nesting, &name) {
-            index.eval_polluted_core.insert(expanded.trim_start_matches("::").to_string());
-        }
-    }
-}
-
 /// Turn every raw name-keyed source (`ProjectIndex::keyed_raw`) into the
 /// four maps `Checker::core_ops_unpolluted` reads, once every file is
 /// merged: only then can a `Module(...)` reference be resolved to a real
@@ -7131,15 +7079,14 @@ fn target_spellings(index: &ProjectIndex, nesting: &[String], target: &str) -> V
     if crate::core::is_core_namespace(target) {
         out.push(target.to_string());
     }
-    // Two chasers, because a REOPENING through an alias resolves in
-    // project after all and `expand_unresolved_alias_target` bails on
-    // exactly that: `I = Integer; class I; def +(o) = 1; end` creates a
-    // fragment named `I`, so the alias has to be read from the alias
-    // table itself. Measured: that program prints nothing and exits 0
-    // under MRI, and it accused until this line existed.
-    let chased = index
-        .expand_unresolved_alias_target(nesting, target)
-        .or_else(|| index.chase_alias_target_text(nesting, target));
+    // The alias table itself, not `expand_unresolved_alias_target`: a
+    // REOPENING through an alias resolves in project after all and that
+    // chaser bails on exactly it (`I = Integer; class I; def +(o) = 1;
+    // end` creates a fragment named `I`; MRI prints nothing and exits 0,
+    // and it accused until this chaser existed). Every alias shape the
+    // other chaser resolved, this one resolves too - measured by mutation
+    // (W11), so the first chaser was removed here.
+    let chased = index.chase_alias_target_text(nesting, target);
     if let Some(expanded) = chased {
         let expanded = expanded.trim_start_matches("::").to_string();
         if crate::core::is_core_namespace(&expanded) && !out.contains(&expanded) {
@@ -8118,6 +8065,113 @@ pub fn rbi_core_methods(
         }
     }
     out
+}
+
+/// W11 (Tapioca open world): what every `.rbi` reopening of a core chain
+/// namespace (`RbiOpenWorld::chain_reopenings`, `BasicObject` included)
+/// gives that namespace's instances — `(names, open)`. `names` holds the
+/// declared instance methods PLUS every method of every module the
+/// reopening `include`s or `prepend`s, walked transitively through the
+/// RBI constant map (Tapioca renders `require "json"` on `Object` as
+/// `include ::JSON::Ext::Generator::GeneratorMethods::Object`, so the
+/// methods themselves live in the module). A namespace lands in `open`,
+/// answering every name, when a reopening or a mixed-in module is open,
+/// defines `method_missing`/`respond_to_missing?`, or names a module the
+/// RBIs do not declare (or a core one: its surface is not this map's to
+/// read). Memoized by salsa on the singleton inputs.
+#[salsa::tracked]
+pub fn rbi_chain_surface(
+    db: &dyn salsa::Database,
+) -> (HashMap<String, std::collections::HashSet<String>>, std::collections::HashSet<String>) {
+    let mut names: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+    let mut open: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Some(ow) = crate::RbiOpenWorld::try_get(db) else {
+        return (names, open);
+    };
+    let empty = HashMap::new();
+    let rbi_map = crate::RbiProject::try_get(db).map_or(&empty, |p| p.map(db));
+    for (ns, files) in ow.chain_reopenings(db) {
+        let mut acc = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut readable = true;
+        for file in files {
+            for frag in rbi_file_fragments(file) {
+                if frag.path.trim_start_matches("::") == ns {
+                    readable &= absorb_rbi_fragment(&frag, rbi_map, &mut acc, &mut visited);
+                }
+            }
+        }
+        if !readable {
+            open.insert(ns.clone());
+        }
+        names.entry(ns.clone()).or_default().extend(acc);
+    }
+    (names, open)
+}
+
+/// One fragment's instance surface into `acc`; `false` when it cannot be
+/// read whole (see `rbi_chain_surface`).
+fn absorb_rbi_fragment(
+    frag: &ClassFragment,
+    rbi_map: &HashMap<String, Vec<PathBuf>>,
+    acc: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    // `open` alone is not the question: a core-class reopening is forced
+    // open only because the class lives elsewhere (`ReopenedExternal`),
+    // and Tapioca annotation `sig`s this crate cannot parse define
+    // nothing. Every other reason makes the body unreadable.
+    if frag.body_unreadable {
+        return false;
+    }
+    // A `method_missing`/`respond_to_missing?` def already made the body
+    // unreadable: the walker opens its fragment (`OpenReason::MethodMissing`).
+    acc.extend(frag.methods.iter().map(|m| m.name.clone()));
+    let owner = frag.path.trim_start_matches("::");
+    frag.includes
+        .iter()
+        .filter(|module| !crate::open_world::is_core_include(owner, module.trim_start_matches("::")))
+        .chain(&frag.prepends)
+        .all(|module| absorb_rbi_module(module, rbi_map, acc, visited))
+}
+
+fn absorb_rbi_module(
+    module: &str,
+    rbi_map: &HashMap<String, Vec<PathBuf>>,
+    acc: &mut std::collections::HashSet<String>,
+    visited: &mut std::collections::HashSet<String>,
+) -> bool {
+    let key = module.trim_start_matches("::");
+    if crate::open_world::is_chain_name(key) || visited.len() >= RBI_METHOD_CLOSURE_CAP {
+        return false;
+    }
+    if !visited.insert(key.to_string()) {
+        return true;
+    }
+    let Some(files) = rbi_map.get(key) else {
+        return false;
+    };
+    let mut found = false;
+    for file in files {
+        for frag in rbi_file_fragments(file) {
+            if frag.path.trim_start_matches("::") == key {
+                found = true;
+                if !absorb_rbi_fragment(&frag, rbi_map, acc, visited) {
+                    return false;
+                }
+            }
+        }
+    }
+    found
+}
+
+/// W11: does any `.rbi` declare a class that can pass sorbet-runtime's
+/// `is_a?` check for a core type without being one — an `is_a?`/
+/// `kind_of?`/`instance_of?` override, or a `method_missing` proxy (a
+/// `BasicObject` proxy forwards `is_a?`, and an RBI cannot show an
+/// `undef_method :is_a?`)? Line-scanned in phase 1 (`rbi::is_type_test_def`).
+pub fn rbi_type_test_hazard(db: &dyn salsa::Database) -> bool {
+    crate::RbiOpenWorld::try_get(db).is_some_and(|ow| !ow.type_test_files(db).is_empty())
 }
 
 fn method_sig(md: &MethodDef, file: SourceFile, nesting: &[String]) -> MethodSig {

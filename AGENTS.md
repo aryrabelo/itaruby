@@ -1102,14 +1102,19 @@ the judge always calls TypeSafe's default endpoint, `https://api.typesafe.ai`
 — the fleet-wide `TYPESAFE_BASE_URL` shim is dropped for this call. The
 request leaves the machine, so nothing private may enter the report — `closing-evidence` strips
 corpus revisions and error-set hashes and the corpus ids are the generic ones.
-It proves corpus-c, the only private corpus left since corpus-a and corpus-b
-were retired on 2026-10-19, so it closes only on `m5`, the machine that holds it.
+It reads the digest from the gate box (`$ITA_GATE_BOX`) and requires the box's
+HEAD to be the closing commit and the digest newer than the run. corpus-c is
+proved where it is mounted (mapped AND on disk); where it is not — measured
+2026-10-21: m5's mapped path no longer exists — the two corpus-c assertions
+carry `basis: not_mounted_here` and pass only if gate d really skipped and
+every baselined public corpus (rails, mastodon, discourse, zammad, brew)
+measured zero new and zero gone errors (decided by the owner 2026-10-21).
 
 To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
-At the closing commit every gate `./scripts/dev gates` runs on this machine passed: the corpus gate proved corpus-c with zero new errors, the public corpora showed no drift, every per-fix source mutant was accused by a named test, the drift detectors were proven to fire, and the checker source was untouched after the mutants ran.
+At the closing commit every gate `./scripts/dev gates` ran in the gate box on that exact commit passed: where corpus-c is mounted the corpus gate proved it with zero new errors, and where it is not the report records its absence; every public corpus with a baseline was measured with zero new and zero gone errors; every per-fix source mutant was accused by a named test; the drift detectors were proven to fire; and the checker source was untouched after the mutants ran.
 
 ## Child DOX Index
 

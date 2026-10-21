@@ -7,12 +7,17 @@ Why this exists (AGENTS.md, closing gate): "the gates passed" was a sentence in
 a hand-off, and a sentence is what the software factory refuses to trust. This
 turns it into the `closing` gate's evidence:
 
-  1. `./scripts/dev gates` runs here, on the committed tree. Nothing is reused
-     from an earlier run: a digest that cannot name the commit it measured is
-     not evidence about this one.
-  2. `target/gauntlet/digest.json` becomes `.software-factory/evidence/
+  1. `./scripts/dev gates` runs on the committed tree, in the gate box (it
+     never builds here). Nothing is reused from an earlier run: the box's
+     HEAD must be the commit being closed and its digest must be newer than
+     this run's start, or it is not evidence about this commit.
+  2. The box's `target/gauntlet/digest.json` becomes `.software-factory/evidence/
      closing-run.json`, with every private-corpus revision removed (the report
      is committed AND sent to the judge; the secrecy wall covers both).
+     corpus-c is required only where it is mounted (mapped AND on disk);
+     elsewhere the report says so, and the public corpora carry the proof:
+     every baselined public repo must be measured with zero new and zero
+     gone errors. gitlab-foss has no baseline and is the only allowed skip.
   3. `sf seal closing` binds the report to the implementation digest, so the
      next change to the checker expires it (L3.GATE_HAS_FRESH_EVIDENCE).
   4. The marked closing claim and the report, verbatim, become Jev's question
@@ -28,9 +33,14 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+import time
+
 
 ROOT = Path(__file__).resolve().parent.parent
-ART = ROOT / "target/gauntlet"
+BOX = Path(os.environ.get("ITA_GATE_BOX") or Path.home() / ".cache/itaruby/gate-box").expanduser()
+ART = BOX / "target/gauntlet"
+CORPORA_MAP = ROOT / "scripts/corpora-local.txt"
+BASELINED = sorted(p.stem for p in (ROOT / "scripts/public-baseline").glob("*.jsonl"))
 REPORT = ROOT / ".software-factory/evidence/closing-run.json"
 REQUEST = ROOT / ".software-factory/evidence/jev/closing.json"
 TWIN = ROOT / ".software-factory/evidence/jev/closing.twin.json"
@@ -104,25 +114,59 @@ def gate(digest, name):
     return next((g for g in digest.get("gates", []) if g.get("name") == name), {})
 
 
-def assertions(exit_code, digest, src_clean):
+def corpus_c_mounted():
+    """Mapped in this machine's corpora map AND present on disk."""
+    try:
+        lines = CORPORA_MAP.read_text().splitlines()
+    except OSError:
+        return False
+    paths = [line.split(None, 1)[1].strip() for line in lines
+             if line.split(None, 1)[:1] == ["corpus-c"] and len(line.split(None, 1)) == 2]
+    return bool(paths) and Path(paths[0]).is_dir()
+
+
+def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted):
     corpus_c = next(
         (c for c in gate(digest, "d").get("numbers", {}).get("corpora", []) if c.get("id") == "corpus-c"),
         None,
     )
     c1 = gate(digest, "c1").get("numbers", {})
+    repos = {r.get("id"): r for r in gate(digest, "f").get("numbers", {}).get("repos", [])}
+    public_ok = gate(digest, "f").get("status") in ("PASS", "SKIP") and bool(BASELINED) and all(
+        rid in repos and repos[rid].get("new") == 0 and repos[rid].get("gone") == 0 for rid in BASELINED
+    )
+    # A SKIP is allowed only where its reason is one of the two declared
+    # absences; every other gate must PASS.
+    allowed_skip = {"f"} | ({"d"} if not mounted else set())
+    others_green = all(
+        g.get("status") == "PASS" or (g.get("status") == "SKIP" and g.get("name") in allowed_skip)
+        for g in digest.get("gates", [])
+    )
+    corpus_c_proved = (corpus_c is not None and corpus_c.get("new") == 0
+                       and "corpus-c" in digest.get("corpus", {}).get("proved", []))
+    # The seven names are the policy's `required_assertions` and never change.
+    # Where corpus-c is not mounted, its two assertions say so in `basis` and
+    # pass only if the gate really skipped it AND the public corpora proved
+    # clean; the report never claims a corpus-c measurement that did not run.
+    absent_ok = gate(digest, "d").get("status") == "SKIP" and public_ok
+    corpus_basis = "measured" if mounted else "not_mounted_here; public corpora carry the proof"
     checks = {
-        "dev_gates.exit_zero": exit_code == 0 and digest.get("result") == "PASS",
-        "corpus.proved_corpus_c": "corpus-c" in digest.get("corpus", {}).get("proved", []),
-        "corpus_c.no_new_errors": corpus_c is not None and corpus_c.get("new") == 0,
-        "public_corpora.no_drift": gate(digest, "f").get("status") == "PASS",
-        "mutants.every_decision_accused": gate(digest, "c1").get("status") == "PASS"
-        and c1.get("not_accused") == 0 and c1.get("total", 0) > 0,
+        "dev_gates.exit_zero": (exit_code in (0, 2) and others_green and bool(digest.get("gates"))
+                                and box_head == head and fresh, "gate box at the closing commit, fresh digest"),
+        "corpus.proved_corpus_c": (corpus_c_proved if mounted else absent_ok, corpus_basis),
+        "corpus_c.no_new_errors": (corpus_c_proved if mounted else absent_ok, corpus_basis),
+        "public_corpora.no_drift": (public_ok, "zero new and zero gone: " + ", ".join(BASELINED)),
+        "mutants.every_decision_accused": (gate(digest, "c1").get("status") == "PASS"
+                                           and c1.get("not_accused") == 0 and c1.get("total", 0) > 0, None),
         # The negative path: the drift detectors themselves are proven to fire
         # on planted drift, so "no drift" above is a measurement, not silence.
-        "instruments.drift_detectors_fire": gate(digest, "c2b").get("status") == "PASS",
-        "source.untouched_after_mutants": src_clean,
+        "instruments.drift_detectors_fire": (gate(digest, "c2b").get("status") == "PASS", None),
+        "source.untouched_after_mutants": (src_clean, "gate box crates/ equal to HEAD"),
     }
-    return [{"type": k, "status": "passed" if v else "failed"} for k, v in checks.items()]
+    results = []
+    for kind, (ok, basis) in checks.items():
+        results.append({"type": kind, "status": "passed" if ok else "failed", **({"basis": basis} if basis else {})})
+    return results
 
 
 def request(claim, evidence, criteria):
@@ -145,15 +189,23 @@ def main():
     claim = claim_sentence()
     head = git("rev-parse", "HEAD").strip()
 
+    started = time.time()
     gates = subprocess.run(["./scripts/dev", "gates"], cwd=ROOT, check=False)
     try:
-        digest = json.loads((ART / "digest.json").read_text())
+        digest_path = ART / "digest.json"
+        digest = json.loads(digest_path.read_text())
+        fresh = digest_path.stat().st_mtime >= started
     except (OSError, ValueError) as error:
-        print(f"closing-evidence: no gate digest to read: {error}")
+        print(f"closing-evidence: no gate digest to read at {ART}: {error}")
         return 2
-    src_clean = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", "crates"], cwd=ROOT).returncode == 0
+    box_git = ["git", "-C", str(BOX)]
+    box_head = subprocess.run([*box_git, "rev-parse", "HEAD"], text=True, capture_output=True,
+                              check=False).stdout.strip()
+    # The mutants rewrite the box, never this tree, so the box is what must be clean.
+    src_clean = subprocess.run([*box_git, "diff", "--quiet", "HEAD", "--", "crates"]).returncode == 0
 
-    results = assertions(gates.returncode, redact(digest), src_clean)
+    mounted = corpus_c_mounted()
+    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted)
     passed = all(a["status"] == "passed" for a in results)
     sf = subprocess.run(["sf", "--version"], text=True, capture_output=True, check=False).stdout.strip()
     report = {

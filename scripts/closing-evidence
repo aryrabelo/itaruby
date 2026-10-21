@@ -125,16 +125,31 @@ def corpus_c_mounted():
     return bool(paths) and Path(paths[0]).is_dir()
 
 
-def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted):
+def public_corpora_clean():
+    """Every baselined repo's own verdict line in the artifact, not the
+    digest's transcript-derived summary: gate-digest only ever sees the
+    one-line `ok`/`skip` `gauntlet-gates.sh` logs for gate f, never the
+    per-repo detail `public-gate.sh` writes straight to `public.txt` — so a
+    structured read of the digest can never see individual repos (measured
+    2026-10-21: `numbers.repos` is always `[]`). Read the artifact itself.
+    A repo is clean only if its own exact-match line is present; a drifted
+    or skipped-for-cause line, or no line at all, fails it.
+    """
+    try:
+        lines = (ART / "public.txt").read_text().splitlines()
+    except OSError:
+        return False
+    clean = {m.group(1) for line in lines
+             if (m := re.search(r"^PASS public errors match baseline exactly \((\w[\w-]*)\):", line))}
+    return bool(BASELINED) and all(rid in clean for rid in BASELINED)
+
+
+def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted, public_ok):
     corpus_c = next(
         (c for c in gate(digest, "d").get("numbers", {}).get("corpora", []) if c.get("id") == "corpus-c"),
         None,
     )
     c1 = gate(digest, "c1").get("numbers", {})
-    repos = {r.get("id"): r for r in gate(digest, "f").get("numbers", {}).get("repos", [])}
-    public_ok = gate(digest, "f").get("status") in ("PASS", "SKIP") and bool(BASELINED) and all(
-        rid in repos and repos[rid].get("new") == 0 and repos[rid].get("gone") == 0 for rid in BASELINED
-    )
     # A SKIP is allowed only where its reason is one of the two declared
     # absences; every other gate must PASS.
     allowed_skip = {"f"} | ({"d"} if not mounted else set())
@@ -205,7 +220,8 @@ def main():
     src_clean = subprocess.run([*box_git, "diff", "--quiet", "HEAD", "--", "crates"]).returncode == 0
 
     mounted = corpus_c_mounted()
-    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted)
+    public_ok = public_corpora_clean()
+    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted, public_ok)
     passed = all(a["status"] == "passed" for a in results)
     sf = subprocess.run(["sf", "--version"], text=True, capture_output=True, check=False).stdout.strip()
     report = {

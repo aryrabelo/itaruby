@@ -1,0 +1,18 @@
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 75-84,89-90
+scripts/closing-evidence
+  h_b156936c57c455 128-147,223-224
+.gitignore
+  h_b156936c57c455 36-37
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "807ab8206071fb6d0e7c9d6ad39ed03d4d55df41",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

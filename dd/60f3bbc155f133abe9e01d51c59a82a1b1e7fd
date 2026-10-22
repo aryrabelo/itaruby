@@ -1,0 +1,21 @@
+crates/itaruby/tests/open_world_cli.rs
+  s_7578d5e55c9a5d::t_17b2dccb6d8d22 241-243,259-271,466-468,477,481
+scripts/open-world-mutants.sh
+  s_7578d5e55c9a5d::t_4a1dae7f1df9b2 175-176
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dd60f3bbc155f133abe9e01d51c59a82a1b1e7fd",
+  "prompts": {},
+  "sessions": {
+    "s_7578d5e55c9a5d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a370f249-5712-4b52-880c-da242b37fcaf",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

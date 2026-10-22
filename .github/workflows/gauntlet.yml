@@ -8,9 +8,9 @@ name: gauntlet
 # ~5 h in series.
 #
 # What is NOT here, on purpose:
-#   gate d  - the private corpus (corpus-c) never leaves the machine that
-#             hosts it; the local `./scripts/dev gates` on m5 stays its only
-#             proof.
+#   gate d  - no private corpus is declared (corpus-c was retired
+#             2026-10-21); the gate prints an explicit SKIP and lives in
+#             the local `./scripts/dev gates` only.
 #   gate c  - the testdata mutation probe is inline in gauntlet-gates.sh and
 #             runs there (two seconds; not worth a second convention).
 # So a green run here is the gauntlet's `PASS (incomplete)` by construction,

@@ -558,19 +558,9 @@ class ContractUnsupported
   def posts(first = 1, last)
     "runtime inference only"
   end
-  sig { params(values: Integer).returns(Integer) }
-  def rest(*values)
-    "runtime inference only"
-  end
-  sig { params(value: Integer, block: T.untyped).returns(Integer) }
-  def callback(value, &block)
-    "runtime inference only"
-  end
 end
 ContractUnsupported.new.overloaded(nil)
 ContractUnsupported.new.posts("last")
-ContractUnsupported.new.rest("values")
-ContractUnsupported.new.callback("value") {}
 "#, None);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
 }
@@ -4766,3 +4756,309 @@ ContractLiveBranch.new.f(:live_guard) if ENV.key?("NOPE_Q")
     assert_eq!(contract_codes(&diags), ["E0103"; 5], "{diags:?}");
 }
 
+
+/// W5: sorbet-runtime's `T.let`/`T.cast`/`T.assert_type!`/`T.bind` raise
+/// `TypeError` on a value that breaks the asserted type, and
+/// `T.must`/`T.must_because` on `nil` (measured: the sorbet-parity probes
+/// `t_let_*`, `t_cast`, `t_assert_type`, `t_must*`). Literal-only, as every
+/// contract: a call, a variable, a fitting literal, `T.unsafe`, a
+/// `checked:` keyword, a dead branch, a `T` the project shadows and a
+/// patched `==` on `nil`'s ancestry stay silent.
+#[test]
+fn assertions_accuse_a_literal_that_breaks_the_asserted_type() {
+    let source = r#"
+x = T.let(:let_local, String)
+ContractAssertConst = T.let("let_const", Integer)
+class ContractAssertCvar
+  @@c = T.let("let_cvar", Integer)
+end
+T.cast(:cast, String)
+T.assert_type!(:assert_type, String)
+T.bind(:bind, String)
+T.must(nil)
+T.must_because(nil) { "why" }
+T.let(1, T.all(Comparable, String))
+T.let("fits", String)
+T.let(nil, T.nilable(String))
+T.cast(send(:Integer, "1"), String)
+T.unsafe(:unsafe)
+T.must(:present)
+T.must(x)
+T.let(:checked_off, String, checked: false)
+T.let(:dead, String) if false
+module ContractAssertShadow
+  module T
+    def self.let(value, _type) = value
+  end
+  T.let(:shadowed, String)
+end
+"#;
+    let diags = check("assertions", source, None);
+    assert_eq!(
+        contract_names(source, &diags),
+        [":let_local", "\"let_const\"", "\"let_cvar\"", ":cast", ":assert_type", ":bind", "nil", "nil", "1"],
+        "{diags:?}"
+    );
+    assert!(diags.iter().any(|d| d.message == "`T.let` expects String, got Symbol"), "{diags:?}");
+    assert!(diags.iter().any(|d| d.message == "`T.must` raises on a literal `nil`"), "{diags:?}");
+
+    let inert = format!("T::Configuration.default_checked_level = :never\n{source}");
+    assert!(contract_codes(&check("assertions-inert", &inert, None)).is_empty());
+    let nil_eq = format!("class NilClass\n  def ==(other) = true\nend\n{source}");
+    let names = contract_names(&nil_eq, &check("assertions-nil-eq", &nil_eq, None)).len();
+    assert_eq!(names, 7, "a patched `==` lets `T.must(nil)` return");
+    let type_test = format!("class Symbol\n  def is_a?(k) = true\nend\n{source}");
+    let diags = check("assertions-type-test", &type_test, None);
+    assert!(!contract_names(&type_test, &diags).contains(&":cast"), "{diags:?}");
+}
+
+/// W5: an assertion returns its argument, so the argument's own inferred
+/// type always wins (`T.cast(1, String)` is still an `Integer` receiver,
+/// MATRIX H5); only an `Unknown` argument takes the asserted type, type
+/// arguments erased, and only where the runtime enforces it. `T.unsafe`
+/// and `T.bind` type nothing, `T.must` strips `nil`.
+#[test]
+fn assertions_type_only_an_unknown_value() {
+    let source = r#"
+declared = T.let(send(:Integer, "1"), Integer)
+declared
+inferred = T.cast(1, String)
+inferred
+erased = T.let(Marshal.load(Marshal.dump(["a"])), T::Array[String])
+erased
+unsafe = T.unsafe(1)
+unsafe
+must = T.must(ENV.key?("NOPE_Q") ? nil : "a")
+must
+"#;
+    let at = |name: &str, src: &str, local: &str| ty_at(name, src, &format!("\n{local}\n"), local);
+    assert_eq!(at("assert-ty-1", source, "declared").as_deref(), Some("Integer"));
+    assert_eq!(at("assert-ty-2", source, "inferred").as_deref(), Some("Integer"));
+    assert_eq!(at("assert-ty-3", source, "erased").as_deref(), Some("Array[untyped]"));
+    assert_eq!(at("assert-ty-4", source, "unsafe"), None);
+    assert_eq!(at("assert-ty-5", source, "must").as_deref(), Some("String"));
+    let inert = format!("T::Configuration.default_checked_level = :never\n{source}");
+    assert_eq!(at("assert-ty-6", &inert, "declared"), None);
+    assert_eq!(at("assert-ty-7", &inert, "inferred").as_deref(), Some("Integer"));
+    // sorbet-runtime checks only the Array category, so `first` is unproven.
+    let diags = check(
+        "assert-ty-e0101",
+        "x = T.let(send(:Integer, \"1\"), Integer)\nx.upcase\nx.succ\nT.let(Marshal.load(Marshal.dump([\"a\"])), T::Array[Integer]).first.upcase\n",
+        None,
+    );
+    assert_eq!(codes(&diags), ["E0101"], "{diags:?}");
+}
+
+/// W6: the sig types sorbet-runtime enforces beyond scalars and
+/// collections. `T::Set`/`T::Range`/`T::Enumerable`/`T::Enumerator`/
+/// `T::Enumerator::Lazy` check only `is_a?` of their category,
+/// `T.class_of`/`T::Class`/`T::Module` a class object, `T.noreturn`
+/// nothing, a tuple an `Array`, a shape a `Hash`, `T.all` every member, a
+/// `T.type_alias` its aliased type. Each accuses a literal that cannot
+/// pass, and none names an unresolved constant.
+#[test]
+fn sig_only_types_accuse_only_literals_that_cannot_pass() {
+    let source = r#"
+class ContractSigOnly
+  extend T::Sig
+  Id = T.type_alias { Integer }
+  sig { params(x: T::Set[Integer]).void }
+  def set(x); end
+  sig { params(x: T::Range[Integer]).void }
+  def range(x); end
+  sig { params(x: T::Enumerable[Integer]).void }
+  def enum(x); end
+  sig { params(x: T::Enumerator[Integer]).void }
+  def enumerator(x); end
+  sig { params(x: T::Enumerator::Lazy[Integer]).void }
+  def lazy(x); end
+  sig { params(x: T.class_of(Integer)).void }
+  def class_of(x); end
+  sig { params(x: T::Class[Integer]).void }
+  def klass(x); end
+  sig { params(x: T::Module[Comparable]).void }
+  def mod(x); end
+  sig { params(x: T.all(Comparable, Integer)).void }
+  def all(x); end
+  sig { params(x: [Integer, String]).void }
+  def tuple(x); end
+  sig { params(x: {a: Integer}).void }
+  def shape(x); end
+  sig { params(x: Id).void }
+  def alias(x); end
+  sig { returns(T.noreturn) }
+  def die = :noreturn
+  sig { returns(T.noreturn) }
+  def dies = raise("x")
+end
+o = ContractSigOnly.new
+o.set([:set])
+o.range([:range])
+o.range(1..2)
+o.enum(:enum)
+o.enum([1])
+o.enum(1..2)
+o.enumerator([:enumerator])
+o.lazy([:lazy])
+o.class_of(:class_of)
+o.class_of(Integer)
+o.klass(:klass)
+o.mod(:mod)
+o.all(:all)
+o.all(1)
+o.tuple(:tuple)
+o.tuple(["a", 1])
+o.shape(:shape)
+o.shape({a: "s"})
+o.alias(:alias)
+o.alias(1)
+"#;
+    let diags = check("sig-only", source, None);
+    assert!(!codes(&diags).contains(&"E0104"), "{diags:?}");
+    assert_eq!(
+        contract_names(source, &diags),
+        ["die", "[:set]", "[:range]", ":enum", "[:enumerator]", "[:lazy]", ":class_of", ":klass", ":mod", ":all", ":tuple", ":shape", ":alias"],
+        "{diags:?}"
+    );
+    // A project reopening on a literal's ancestry may mix `Enumerable` in.
+    let reopened = format!("class Symbol\n  include Enumerable\nend\n{source}");
+    let diags = check("sig-only-enumerable", &reopened, None);
+    assert!(!contract_names(&reopened, &diags).contains(&":enum"), "{diags:?}");
+    // An alias written twice proves no single type: Ruby keeps the last.
+    let twice = source.replace("  sig { params(x: Id).void }", "  Id = T.type_alias { Symbol }\n  sig { params(x: Id).void }");
+    let diags = check("sig-only-alias-twice", &twice, None);
+    assert!(!contract_names(&twice, &diags).contains(&":alias"), "{diags:?}");
+}
+
+/// W6: a type no value models never reaches a consumer: the declared
+/// return of `T::Set[X]`, `T.class_of(X)`, `T.noreturn` types nothing.
+#[test]
+fn sig_only_types_never_type_a_consumer() {
+    let source = r"
+class ContractSigOnlyReturn
+  extend T::Sig
+  sig { returns(T::Set[Integer]) }
+  def set = send(:Set)
+end
+made = ContractSigOnlyReturn.new.set
+made
+";
+    assert_eq!(ty_at("sig-only-ret", source, "\nmade\n", "made"), None);
+}
+
+/// W7: sorbet-runtime keeps checking a method with `*rest`, `**kwrest` or
+/// `&block` params: each rest element against the rest's type, each
+/// keyword the method does not name against the kwrest's, and the return
+/// (measured: probes `sig_rest`, `sig_rest_return`, `sig_kwrest`,
+/// `sig_block_return_contract`). A `.on_failure(...)` builder keeps the
+/// default raising handler (`sig_on_failure`).
+#[test]
+fn rest_kwrest_and_block_layouts_keep_their_contract() {
+    let source = r#"
+class ContractLayouts
+  extend T::Sig
+  sig { params(first: Integer, values: Integer).returns(Integer) }
+  def rest(first, *values) = :rest_return
+  sig { params(name: String, options: Integer).void }
+  def kwrest(name:, **options); end
+  sig { params(value: Integer, block: T.untyped).returns(Integer) }
+  def callback(value, &block) = :block_return
+  sig { params(x: Integer).void.on_failure(:log) }
+  def failing(x); end
+end
+o = ContractLayouts.new
+o.rest(:first, 2, :second_rest)
+o.rest(1, 2, 3)
+o.kwrest(name: "n", extra: :kwrest)
+o.kwrest(name: :named, extra: 1)
+o.kwrest(name: "n", extra: 2)
+o.callback(:with_block) {}
+o.failing(:on_failure)
+o.failing(1)
+"#;
+    let diags = check("layouts", source, None);
+    assert_eq!(
+        contract_names(source, &diags),
+        ["rest", "callback", ":first", ":second_rest", ":kwrest", ":named", ":on_failure"],
+        "{diags:?}"
+    );
+}
+
+/// W7: `X.new(...)` runs `initialize`, whose Sorbet contract the runtime
+/// enforces, when nothing but `Class#new` can answer `new` — `extend
+/// T::Sig` included. Any hidden `new` keeps it off.
+#[test]
+fn new_checks_the_initialize_contract() {
+    const TARGET: &str = r"
+PRELUDE
+class ContractInit
+  extend T::Sig
+  BODY
+  sig { params(n: Integer).void }
+  def initialize(n); end
+end
+OUTSIDE
+ContractInit.new(:literal)
+ContractInit.new(1)
+";
+    let render = |prelude: &str, body: &str, outside: &str| {
+        TARGET.replace("PRELUDE", prelude).replace("BODY", body).replace("OUTSIDE", outside)
+    };
+    let factory = "module ContractInitFactory\n  def new(*args)\n    super\n  end\nend\n";
+    let source = render("", "", "");
+    assert_eq!(contract_names(&source, &check("init-new", &source, None)), [":literal"]);
+    for (i, (prelude, body, outside)) in [
+        ("", "def self.new(*args)\n    super\n  end", ""),
+        (factory, "extend ContractInitFactory", ""),
+        ("", "extend ContractInitUnknown::Factory", ""),
+        (factory, "", "ContractInit.extend(ContractInitFactory)\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = render(prelude, body, outside);
+        let diags = check(&format!("init-new-hidden-{i}"), &source, None);
+        assert!(contract_codes(&diags).is_empty(), "{source}: {diags:?}");
+    }
+}
+
+/// W7: a sig right above a one-name `attr_reader`/`attr_writer` wraps the
+/// method it defines (probes `sig_attr_reader`, `sig_attr_writer`): the
+/// writer's argument is checked, the reader's declared return types its
+/// consumers. Several names, `attr_accessor`, or a sig whose params do not
+/// fit the method are no contract, and the sig never reaches a later def.
+#[test]
+fn attr_sigs_are_contracts() {
+    let source = r"
+class ContractAttr
+  extend T::Sig
+  sig { params(w: Integer).void }
+  attr_writer :w
+  sig { returns(Integer) }
+  attr_reader :r
+  sig { params(v: Integer).returns(Integer) }
+  attr_reader :bad
+  sig { returns(Integer) }
+  attr_reader :a, :b
+  sig { returns(Integer) }
+  attr_accessor :acc
+  sig { params(n: Integer).void }
+  attr_reader :q
+  def later(n); end
+end
+o = ContractAttr.new
+o.w = :writer
+o.w = 1
+o.r.upcase
+o.bad.upcase
+o.a.upcase
+o.acc.upcase
+o.later(:later)
+";
+    let diags = check("attr-sigs", source, None);
+    assert_eq!(contract_names(source, &diags), [":writer"], "{diags:?}");
+    let e0101: Vec<&str> = diags.iter().filter(|d| d.code == "E0101").map(|d| &source[d.start..d.end]).collect();
+    assert_eq!(e0101, ["upcase"], "{diags:?}");
+    let first = diags.iter().find(|d| d.code == "E0101").unwrap();
+    assert!(first.start > source.find("o.r.upcase").unwrap() && first.start < source.find("o.bad").unwrap());
+}

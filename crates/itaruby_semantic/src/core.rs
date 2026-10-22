@@ -288,7 +288,7 @@ pub fn core_class_of(ty: &Ty) -> Option<CoreClass> {
         Ty::Hash(_, _) => Some(CoreClass::Hash),
         Ty::Nil => Some(CoreClass::Nil),
         Ty::Bool => Some(CoreClass::Bool),
-        Ty::Instance(_) | Ty::Class(_) | Ty::Union(_) | Ty::Unknown => None,
+        Ty::Instance(_) | Ty::Class(_) | Ty::Union(_) | Ty::Unknown | Ty::Contract(_) => None,
     }
 }
 

@@ -172,8 +172,8 @@ mutant O7 "$OW" \
 mutant O8 "$MAIN" \
   '    evidence.harvest.merge(unloaded);' \
   '' \
-  ignored_path_reopening_core_stays_silent \
-  'a `sorbet/config --ignore`d file still runs and may reopen Integer'
+  unloaded_script_reopening_core_stays_silent \
+  'an unloaded script (outside every `--ignore`) still runs and may reopen Integer'
 
 mutant O9 "$CHK" \
   '            || evidence.harvest(self.db).type_test' \

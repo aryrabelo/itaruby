@@ -83,6 +83,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
 
 ### Added
+- W5/W6/W7, Sorbet contracts (2026-10-21): E0103 on `T.let`/`T.cast`/
+  `T.assert_type!` with a literal breaking the type and on `T.must(nil)`/
+  `T.must_because(nil)`; these assertions type an otherwise-Unknown
+  value (so `T.cast(1, String).upcase` keeps its closed-world E0101).
+  `sig` now reads `T.all`, `T.class_of`, `T::Class`/`T::Module`/`T::Set`/
+  `T::Range`/`T::Enumerable`/`T::Enumerator(::Lazy)`, tuples, shapes,
+  `T.noreturn` and `T.type_alias`; sigs on `attr_reader`/`attr_writer`,
+  `*rest`/`**kwrest`/`&blk` methods, `.on_failure`, and `X.new` against
+  `initialize` are contracts. Removes 4 false E0104 on `T::Range`
+  (serveme, planningalerts, morph); zero new diagnostics on the 8 Sorbet
+  projects. `void` consumers stay silent (existing runtime control).
+  Still silent (literal-only, category-level): tuple/shape element types,
+  a constant argument against `T.class_of`, a non-literal `T.all`
+  argument, and consumers of sig-only, tuple or `T::Set` returns
+  (probes t_all_param, t_class_of_param/return, t_class_generic_return,
+  t_set_return, t_tuple_param/return, t_shape_param).
 - W11, Tapioca open world (2026-10-20): `ita check` reports E0101 on a
   core receiver (`sig { returns(Integer) }` then `.upcase`; a literal
   receiver) in a project WITH a `Gemfile` when its evidence is complete:

@@ -323,11 +323,19 @@ fi
 # in a versioned file, hence the generic ids and the gitignored, per-machine
 # scripts/corpora-local.txt that maps them to real paths). Each declared
 # corpus is checked only where its id has a mapped, existing path on this
-# machine; unmapped or absent corpora are skipped individually, by id — the
-# one private corpus (corpus-c) lives on m5, see AGENTS.md's Gates section.
+# machine; unmapped or absent corpora are skipped individually, by id. No
+# corpus is declared today (corpus-c was retired 2026-10-21, see AGENTS.md's
+# Machines section): the gate then prints one explicit SKIP line, so the
+# section is never silent, without raising `skipped` — nothing declared is
+# nothing left unproved, and a permanent exit 2 would be the forever-SKIP
+# the retirement rule forbids.
 say 'gate d — corpus diff'
 corpus_proved=()
 corpus_skipped=()
+if ! grep -q '^corpus ' "$BASELINE"; then
+  printf 'SKIP %s — %s\n' 'corpus diff' 'no corpora declared in scripts/corpus-baseline.txt'
+  log 'SKIP corpus diff — no corpora declared in scripts/corpus-baseline.txt'
+fi
 while read -r _ id ceiling_kv; do
   ceiling=${ceiling_kv#warn_ceiling=}
   path=""

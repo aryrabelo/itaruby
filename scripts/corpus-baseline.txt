@@ -40,69 +40,24 @@
 # exactly the day that got burned on 2026-09-18 (see AGENTS.md's Rules of
 # proof). Every ratchet updates it in the same commit as the number.
 #
-# Corpus ids are generic (corpus-c) on purpose: their real paths are
+# Corpus ids are generic (corpus-<letter>) on purpose: their real paths are
 # client-identifying and live only in the gitignored, machine-local
 # scripts/corpora-local.txt — never in this file, never in git history. A
 # corpus is checked only on a machine whose scripts/corpora-local.txt maps
 # its id to an existing directory; an absent corpus (missing mapping file,
-# or no line for that id) is skipped by id. corpus-c lives only on m5.
+# or no line for that id) is skipped by id. No corpus is declared today.
 #
 # Retired 2026-10-19: corpus-a and corpus-b lived only on a machine that is
 # gone for good, so no machine can ever check them again; their declarations
 # were removed rather than left to SKIP forever. zammad/zammad and
 # Homebrew/brew replace them as public corpora (scripts/public-corpora.txt).
 #
+# Retired 2026-10-21: corpus-c no longer exists, so no machine can ever
+# check it again; its declaration (ceiling 170, four error hashes) was
+# removed rather than left to SKIP forever. Its measurement history stays
+# in git and docs/CHANGELOG.md. With no corpus declared, gate d prints an
+# explicit `SKIP corpus diff: no corpora declared` line instead of silence.
+#
 # Format: one `corpus <id> warn_ceiling=<n>` line declares a corpus,
 # followed by zero or more `err <id> <hash>` lines (its expected error-hash
 # set). A corpus with zero expected errors has no `err` lines at all.
-#
-# The hashes on record were regenerated 2026-08-25 under the `<id>/`
-# normalization (corpus-c: 3 errors then — the same set as the previous
-# path-based hashes, re-derived from a clean `ita check` run on m5).
-
-# measured 2026-08-22 @ 2363 .rb files
-# 2298 -> 1525 (bead ita-exc, -773 / -33.6%): constants written inside a
-# class-body call block were never indexed at all, so every reference to
-# one was E0104. E0104 is 100% of this corpus's warnings.
-# 1525 -> 373 (bead ita-k9j.3, -1152 / -75.5%): `RbiIndex.constants` kept
-# ONE declaring file per name, chosen by `read_dir` order, and THREE files
-# in this corpus's `sorbet/rbi/gems` declare `ActiveRecord::Base` (123, 8
-# and 5 direct edges). The stubs were winning the race here, so every
-# constant whose real declaring file lost it was E0104. This ratchet is the
-# proof that the bug was ACTIVE on the machine holding this corpus, not
-# latent: the union fix changes no rule about what deserves a warning.
-# 373 -> 303 (beads ita-083/ita-54k/ita-gjb, 2026-08-25, -70): T::Struct/
-# TracePoint curated declarations, constant-alias following (X = Y), and
-# fail-closed `.new` on classes with no visible initialize — three FP
-# mechanisms silenced, error hashes byte-identical, so the ceiling tightens
-# in the same commit (ratchet slack paid down, no debt carried).
-# 303 -> 179 (wave 7/8 gains not yet ratcheted, measured 2026-08-26 on the
-# machine holding corpus-c): slack is debt — a 124-warning cushion greens
-# a 124-warning regression, which is exactly how this ratchet almost let
-# bead ita-dpg.1's +2567 E0104 spike hide behind a stale number.
-# corpus_rev e10255bf93 — the revision the last green m5 run judged
-# (2026-09-17: error hashes matched exactly, 179 warnings against a 179
-# ceiling). Recorded 2026-09-18 from that run, not from a fresh measurement;
-# the corpus working tree carried 3 uncommitted files at that run, so a future
-# unexplained delta of that size is the first thing to check.
-# 179 -> 170 (2026-09-22, checker fa6dd22): fresh local gate, all four
-# error hashes unchanged. Same tracked revision; the live tree still has
-# three untracked files without .rb/.rbi extensions, not a pristine snapshot.
-# Their names do not match dependency manifests or ignore configuration.
-# Record the measured tree honestly and remove the observed slack.
-corpus corpus-c warn_ceiling=170
-err corpus-c b183a1b03e93cb09
-err corpus-c cd39871949cd29b2
-# 3rd err added 2026-08-21 (bead ita-4xy): surfaced by the sig{} carve-out
-# closing previously-open classes. Proven true positive by reading the
-# site: a bare method call in a rescue path on a class that defines no such
-# reader anywhere (the nearby happy path correctly uses the @ivar form) — a
-# dormant NameError that fires exactly when that error path runs.
-err corpus-c de6fab5dc1f10706
-# 4th err added 2026-09-03: surfaced by open-reason precedence (an abstract
-# raise is now the weakest open reason) plus the abstract-raise lookup
-# softening. Proven true positive by reading the site: a call to a name the
-# receiver's family never defines anywhere, whose base only carries a
-# `raise NotImplementedError` stub — so it is a real dormant NoMethodError,
-# firing every time that path runs.
-err corpus-c 33aded51a652e5b7

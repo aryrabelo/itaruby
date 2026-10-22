@@ -63,6 +63,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (three cases, three gate mutants, two fetcher mutants).
 
 ### Removed
+- corpus-c is retired (2026-10-21): it no longer exists, so no run can
+  ever check it again. Its declaration (warning ceiling 170, four error
+  hashes) and its measurement history left `scripts/corpus-baseline.txt`;
+  no private corpus is declared any more. Gate d now prints one explicit
+  `SKIP corpus diff — no corpora declared in scripts/corpus-baseline.txt`
+  line instead of an empty section, without raising the run's `skipped`
+  flag, so a full run still ends `RESULT: PASS`. Full proof is one
+  `./scripts/dev gates` run on m5 over the public corpora. The
+  gate-digest, gate-triage and gate-box fixtures keep `corpus-c` as a
+  synthetic id.
 - corpus-a and corpus-b are retired (2026-10-19): the only machine that
   held them is gone for good, so no run can ever check them again. Their
   declarations left `scripts/corpus-baseline.txt`, and the

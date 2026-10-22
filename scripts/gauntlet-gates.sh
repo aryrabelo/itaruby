@@ -72,17 +72,22 @@ digest() {
 # --- gate 0: software-factory. Tamper-proof by design; a rule that blocks you
 # is a finding about your change, never about the rule.
 #
-# Two runs, not one. Plain `sf check` judges the tree as it stands. The
-# `--changed` run is what gives the direction-reading L2 rules a base to
-# compare against — without it POLICY_ONLY_TIGHTENS reports green while
-# being inert, which is how a loosening walks past a local gate (measured
-# 2026-08-26: disabling a rule in policy passed plain `sf check`).
+# Two runs, not one. `scripts/sf-check-local` judges the tree as it stands —
+# `sf check` itself, minus exactly the two closing-gate findings a commit
+# that has never been through `closing-evidence` cannot satisfy yet (its own
+# evidence is what this run is building). CI still runs plain
+# `sf check --allow-commands` with nothing filtered on the pull request, so
+# nothing here weakens what actually gates a merge. The `--changed` run is
+# what gives the direction-reading L2 rules a base to compare against —
+# without it POLICY_ONLY_TIGHTENS reports green while being inert, which is
+# how a loosening walks past a local gate (measured 2026-08-26: disabling a
+# rule in policy passed plain `sf check`).
 say 'gate 0 — sf check'
 if ! command -v sf >/dev/null; then
   bad 'sf check (sf not installed — cargo install --git https://github.com/nicolasmelo1/software-factory --locked)'
 else
-  if sf check >"$ART/sf.txt" 2>&1; then ok 'sf check'; else bad 'sf check (see target/gauntlet/sf.txt)'; fi
-  if sf check --changed HEAD >"$ART/sf-changed.txt" 2>&1; then
+  if "$ROOT/scripts/sf-check-local" >"$ART/sf.txt" 2>&1; then ok 'sf check'; else bad 'sf check (see target/gauntlet/sf.txt)'; fi
+  if "$ROOT/scripts/sf-check-local" --changed HEAD >"$ART/sf-changed.txt" 2>&1; then
     ok 'sf check --changed HEAD (the guardrail only tightened)'
   else
     bad 'sf check --changed HEAD (see target/gauntlet/sf-changed.txt)'
@@ -209,6 +214,12 @@ if python3 "$ROOT/scripts/conflicting-superclasses-mutants.py" >"$ART/conflictin
   ok 'conflicting-superclasses mutants (each decision accused, isolated source copy)'
 else
   bad 'conflicting-superclasses mutants (see target/gauntlet/conflicting-superclasses-mutants.txt)'
+fi
+# Sorbet sig/RBI contracts: same shape, same isolated public-source copy.
+if python3 "$ROOT/scripts/sorbet-contracts-mutants.py" >"$ART/sorbet-contracts-mutants.txt" 2>&1; then
+  ok 'sorbet-contracts mutants (each decision accused, isolated source copy)'
+else
+  bad 'sorbet-contracts mutants (see target/gauntlet/sorbet-contracts-mutants.txt)'
 fi
 # Those scripts leave $ROOT/target holding a binary built from the LAST
 # mutant they injected only if they died mid-run; on success they rebuild

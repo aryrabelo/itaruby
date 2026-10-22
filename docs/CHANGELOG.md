@@ -146,6 +146,259 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   undeclared gem. Attribution in `scripts/corpus-baseline.txt`.
 
 ### Fixed
+- A `sig` the contract grammar refuses no longer blinds its class when its
+  shape is one `main` already read as type metadata (an outermost
+  `returns(X)` or `void`): `sig { type_parameters(:U).params(...).void }`
+  is still no contract, but it defines nothing, so the class stays closed
+  as on `main` (bead ita-4xy's carve-out). On this branch any refused
+  clause (`type_parameters`, ...) opened the class, and Homebrew/brew lost
+  3 E0101 lines on `module Utils` (`utils/git_repository.rb:16,28,39`,
+  ledger family B2) because one `type_parameters` sig in `utils.rb`
+  silenced every call on `Utils` project-wide. A block of any other shape
+  still opens its class. Test:
+  `uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed`, mutant
+  "uncontracted sig shape opens its class".
+- The sorbet-runtime enforcement gates can no longer be evaded (r4,
+  review 5), and they read the whole project root, not only the checked
+  paths: `ita check app/` now also reads `config/initializers`, `lib/`, a
+  `Gemfile`, `Rakefile`, `*.rake`, `*.gemspec`, `config.ru` and `bin/*`
+  under the nearest directory holding a `Gemfile`, `Gemfile.lock` or
+  `.git`. Every sig in the project is inert (no E0103/E0109, no declared
+  type for a consumer) when any of those files references
+  `T::Configuration` or `T::Private` in any spelling (`send`/`public_send`,
+  an alias constant, a `tap` block parameter, `instance_eval`,
+  `T::Private::RuntimeLevels`, a bare `Configuration` inside `module T`,
+  `T.const_get`, a string or symbol naming it) other than the literal
+  statement `T::Configuration.default_checked_level = :always`; defines a
+  method named `sig` on any receiver (a module extended after `T::Sig`, a
+  reopened `T::Sig`, `define_method`/`alias`/`attr_reader`); or defines a
+  `method_added`/`singleton_method_added` without `super` anywhere (a
+  module extended on a subclass, a module prepended to `class << self`,
+  the top level, any `define_method` spelling). A file outside the
+  checked paths that defines `is_a?`/`kind_of?`/`instance_of?` makes every
+  sig inert too. These were per-class checks before; any other
+  `T::Configuration` setting (`enable_final_checks_on_hooks`, for one) now
+  also makes every sig inert. The two E0109 lines this branch had added to
+  corpus-c's baseline are retracted: that project installs a validation
+  handler outside the checked app directory that reports instead of raising
+  in production, so neither violation was proven to raise. The corpus is
+  `new=0 gone=0` without them.
+- A Sorbet `sig` no longer overrides what its method is inferred to return
+  (r4, a regression against `main` 05a282e): sorbet-runtime proves a
+  returned value only `is_a?`, which a decorator overriding `is_a?`, or an
+  object given singleton methods, also passes. `sig { returns(User) }` over
+  a body returning `UserDecorator.new(user)` no longer makes
+  `.display_name` a false E0101: the declared return types a call only when
+  body inference answers nothing, as on `main`. A sig's params are no
+  longer bound into the method body (`u: User` typed `u` inside it), also
+  as on `main`; the literal E0103/E0109 contracts are unchanged. `X.new`
+  types nothing when a project singleton `new` may answer it — `def
+  self.new`, `class << self; def new`, `def X.new` or `X.extend(M)` from
+  outside or through a mixin hook's install, a superclass's singleton `new`, an extended or
+  singleton-prepended module defining `new` or whose methods are not fully
+  known, a project-side open ancestor, or an ambiguous superclass — so no
+  contract is judged against a method that never runs. sorbet-runtime's
+  own `T::Sig` and a descendant's `self.new` still leave `X.new` an `X`.
+- A hidden definition no longer takes every contract in the project off
+  where its reach can be bounded (r4). What a mixin hook installs through
+  its receiver parameter (`def self.included(base)`, `def
+  self.extended(base)`, and now `def included(base)` in the module's own
+  `class << self`) lands only on the module's direct includers and
+  extenders: each loses the contract of every name the install defines,
+  or every contract when that set is unknown, and stops counting as a
+  plain inheritor — so `def self.extended(base); base.prepend(M)` now
+  takes `M`'s names off every class that `extend`s the module, which it
+  did not before. A hook install that defines a type test is still judged
+  project-wide. `k.prepend("/")`, `k.prepend(1)` and any other argument no
+  module can be is `String#prepend`/`Array#prepend` (`Module#prepend`
+  raises `TypeError` first), so it defines nothing. `<x>.routes.url_helpers`
+  mixed into an unnamed receiver takes off only the names a Rails route
+  helper can have (containing `url`, `path`, `route` or `polymorphic`,
+  starting with `_`, or `initialize`); with an argument, or
+  `mounted_helpers`, it stays unreadable. Every contract still comes off for a hidden definition whose
+  names cannot be read on a target that cannot be bounded: a method or
+  block parameter (`ObjectSpace.each_object`), a `const_get` by a computed
+  name, a bare string `eval`, and a hook parameter the hook body can
+  rebind (any write to it, `binding`, `local_variable_set`), which no
+  longer names the includer.
+- E0109 judges the whole body (review F9): it accuses only when EVERY
+  return point — each reachable explicit `return` (a bare `return` is
+  `nil`) and each leaf of the reachable implicit tail — is a literal and
+  none fits the declared return. One non-literal point (`return nil unless
+  x; x`) or one fitting literal (`return nil if RUBY_VERSION < "3.0";
+  "modern"`) keeps the body silent; before, each explicit `return` and the
+  tail were judged apart. A statement after one that always leaves the
+  method is no return point: `return`, a receiverless `raise`/`fail`, and
+  now an `unless … else …` or a `case … else` whose every branch leaves
+  (a `case` without `else` falls through). A body whose every return point
+  is a mismatching literal still accuses, naming them all.
+- A receiver no flow walk follows is `Unknown` (review F10), so it
+  dispatches to no Sorbet contract (E0103) and misses no method (E0101): a
+  `for` index (`item = A.new; for item in [B.new]` no longer keeps `A`),
+  every target of a nested or splatted multi-assignment (`(l, y), z = …`,
+  `a, *l = …`), a pattern capture (`v => l`, `v in [l]`) or a named
+  regexp capture (`/(?<l>.)/ =~ s`), and every local of a scope — blocks included, since a loop
+  or closure reaches earlier reads again — holding a string `eval` (`eval`,
+  or `instance_eval`/`class_eval`/`module_eval` without a block), a
+  `binding` call (`binding.local_variable_set`, `binding.eval`,
+  `binding.pry`), a `local_variable_set`, or a singleton method defined on
+  a local (`def l.m`, `class << l`). The same shapes lose their E0101 on
+  the rebound local.
+- A method defined through a receiver no constant names takes its name's
+  contracts off everywhere (review F5): `k.class_eval { def m }`,
+  `k.class_exec`/`k.module_eval`/`k.module_exec`/`k.instance_eval` blocks,
+  `k.define_method(:m)`, `k.send(:define_method, :m)`,
+  `k.define_singleton_method(:m)`, `k.alias_method(:m, ...)`, `k.attr_*`,
+  `def k.m`, `class << k; def m`, a refinement of an unnamed class, and
+  `k.include(M)`/`k.extend(M)`/`k.prepend(M)` for every method `M` answers,
+  where `k` is a local, a parameter, a block parameter (`[A, B].each`,
+  `ObjectSpace.each_object`) or a call (`Object.const_get(...)`). The
+  contract comes off every class and module defining that name, on both
+  tracks, so it neither accuses nor types a consumer. A dynamic name, a
+  string body, a block argument to a `Module`-level eval, a module whose
+  methods are not fully known, a bare `eval(<string>)`, or a type test
+  (`is_a?`, `kind_of?`, `instance_of?`) defined this way takes every
+  contract in the project off. An `instance_eval`/`instance_exec` block
+  counts only its `def`s and literal definers (other calls in it are DSL
+  calls, and a block passed as `&blk` is not read: a known gap); a `send`
+  of a non-literal name is a call, not a definition; and
+  a mixin hook's own receiver (`def self.included(base); base.define_method`)
+  is the module's includers, judged by the include-time rule below.
+  Receivers written as a constant keep their per-class precision.
+- `Alias = Foo; class Alias; def m` reopens `Foo`: each name the reopen
+  defines takes the contract of that name off `Foo`, off every ancestor of
+  `Foo`, and off the reopen, on the track it was written on.
+- A project that defines `is_a?`, `kind_of?` or `instance_of?` on a core
+  class or its core ancestry (its reopen, a module it includes, a definer
+  aimed at it, `Object`, `Kernel`, `Comparable`, `Numeric`, `Enumerable`)
+  decides what that class's literals satisfy, since sorbet-runtime tests a
+  value with `is_a?`: such a literal never accuses (review F11). Only a
+  readable definition counts; a body nobody can read (an unresolved gem
+  module mixed into `Object`, `include T::Sig` at top level among them) is
+  not taken as one.
+- An RBI is never checked at runtime, so a `.rbi` declaration is never a
+  contract: no E0103 or E0109 comes from an RBI anywhere, and an RBI never
+  types the consumers of a method the project source defines (source
+  inference governs, as before Sorbet contracts). A method that exists only
+  in an external RBI (a gem ancestor, a Tapioca DSL file) keeps exactly the
+  return typing its consumers had before Sorbet contracts, minus the
+  declared type arguments below; its params are never judged. Measured
+  against `main` at 05a282e on the same fixture: the same E0101s, except
+  the one an erased element type no longer proves.
+- A declared collection's type arguments never type a consumer:
+  sorbet-runtime checks a generic's category, not its elements. A
+  `returns(T::Array[String])` result is `Array[untyped]` to its caller, a
+  `params(xs: T::Hash[Symbol, Integer])` param binds as `Hash[untyped,
+  untyped]` in the body, and an RBI-only return is erased the same way.
+  `T.nilable`/`T.any` keep each member's category (`T.nilable(T::Array[X])`
+  is `Array[untyped] | nil`).
+- A Sorbet `sig` accuses (E0103/E0109) and types its callers only where
+  sorbet-runtime provably enforces it; anywhere else it is inert: no
+  accusation, and no declared return or param type for any consumer. Inert project-wide when a file sets
+  `T::Configuration.default_checked_level` to anything but a literal
+  `:always` (`:tests` and expressions included; the literal `:never` gate
+  now also stops typing), assigns any `T::Configuration.*_handler` (a
+  handler may log instead of raising), or when the project's visible
+  `Gemfile.lock` names `sorbet-runtime-stub` or does not name
+  `sorbet-runtime` (with no lock found, sigs are judged from source as
+  before). Inert per sig with `.checked(:never)` or `.checked(:tests)`.
+  Inert per class when its `sig` is not provably `T::Sig`'s (no `extend
+  T::Sig` or `class << self; include T::Sig` on the class or a superclass,
+  no `include T::Sig` into `Object`/`Module`/`Class` or at top level, or a
+  homemade `def self.sig` on that chain), or when the class or an
+  ancestor defines a `method_added`/`singleton_method_added` whose body
+  never calls `super`. RBI-only declarations (no source definition) are
+  never accused, and keep their pre-contract return typing.
+- `__LINE__` is an Integer, no longer a String, for every consumer; a
+  rational (`3r`) or imaginary (`2i`) literal is Unknown to inference
+  instead of a Float (no modeled type is a `Rational` or a `Complex`).
+- A Sorbet contract no longer outlives a redefinition of its method. The
+  `sig` is dropped, and the body kept for inference, when
+  the method is redefined by an out-of-line `class << X` body, by a
+  `self.extended(base)` hook install, by a named-receiver
+  `class_eval`/`instance_eval`/`define_method`/`alias_method`/`send` (a
+  body that cannot be read drops every contract on that class), or when
+  an `include`/`prepend` may run code on the includer (an `included` or
+  `prepended` hook, or a project module the index cannot read to the end,
+  such as a concern with an `included do` block). A gem's own module stays
+  out of reach, as for every other check. A prepend takes off the
+  contract of every method its module answers, on the track it lands on:
+  `prepend M` for instance methods, and `class << self; prepend M; end`,
+  `X.singleton_class.prepend(M)` (a method body included) or `class << X;
+  prepend M; end` for class methods. A prepended module whose method set is not fully known
+  (unresolved, open, or running a mixin hook) takes off every contract on
+  that track. `def X.m` written anywhere (top level, another class, a
+  method body) takes off the contract of `X`'s class method `m`, and only
+  that one: the instance method of the same name keeps its contract, and
+  `def Integer.+` leaves the operand check alone. An `X.include(M)` or
+  `X.extend(M)` written outside `X` takes off every contract on `X` when
+  `M`'s chain has an `included`, `extended`, `prepended` or
+  `append_features` hook, because the hook can redefine or prepend
+  anything there. Any source written outside a subclass (a hooked mixin, a
+  `define_method`, a `class_eval`) and any prepend of a module that is not
+  fully known also keep a parent's contract off calls on a receiver of the
+  parent's type. The trade-off is a false negative: a signed method loses
+  its contract, including the E0109 check of its own body, whenever a
+  prepend could shadow it, even if the prepended method calls `super`.
+  The contract also stays off
+  every call a receiver of
+  that type could send elsewhere. That covers a subclass override, a
+  mixin that answers first in a subclass, and, for a module's method, an
+  override anywhere under an includer or extender. Each case was a
+  reproduced false E0103 and has a synthetic test with a control that
+  still accuses.
+- Contract cost is per definition, not per call. With a `sorbet/rbi`
+  directory present, every call to an unsigned method used to walk the
+  receiver's whole subclass tree twice. Now the contract is resolved once
+  per definition per file, the family walk runs only for a definition that
+  has a contract, and the return memo is read before any contract lookup.
+  Release binary on a synthetic 1500-subclass project with `sorbet/rbi`
+  present: CPU user 0.83s -> 0.06s (4 calls per subclass), 13.72s -> 5.43s (40 calls per subclass; ~4.9s of it is present without sorbet/rbi too), 8.29s -> 0.32s (same, base methods signed); median of 3 runs, 2026-09-22. A counter-based test
+  (`contract_work_is_per_definition_not_per_call`) bounds the work.
+- The core model no longer types a consumer with a collection it did not
+  prove. `+`, `concat`, `<<` and `push` answer an Array of the union of
+  the receiver's and the arguments' elements, and `merge` a Hash of the
+  union of both sides' pairs, when every side is a known collection;
+  otherwise the elements are Unknown (`([1] + ["a"]).last`,
+  `{a: 1}.merge(b: "x").values.last`). An iterator called without a block
+  (`each`, `each_with_index`, `map`, `select`, `sort_by`, `find_index`,
+  `Hash#each`/`#each_pair`/`#map`, `Integer#times`, `String#gsub` with only
+  a pattern) is an `Enumerator`, so its result is Unknown, never the
+  receiver. A method that builds its result from a block (`Hash#to_h`,
+  `Hash#merge`) and `String#split`/`#chars` with a block are Unknown. A
+  collection taken out of a collection (`first`, `last`, `pop`, `min`, a
+  full `flatten` of nested arrays) never keeps its own type arguments,
+  because it is shared by reference and `outer.first << x` changes it
+  without a write. A local collection keeps its element types only when
+  EVERY read of it in its scope is the receiver of a call that neither
+  changes nor returns it (`first`, `size`, `map`, `select`, `+`, ...) or an
+  `each` statement whose value is dropped; `arr << x`, `arr.map!`,
+  `h[:k] = v`, `arr.clear.push(x)`, passing `arr` to any method, `b = arr`,
+  returning it, or a string `eval`/`binding` in the scope erases its
+  element types on every read there, before and after. An ivar collection
+  never keeps its element types, since any method of the object (or any
+  caller of a reader) can change it in place. The category is still
+  typed (hover, E0101, RBS-comment E0103); a Sorbet contract judges
+  literals only. The trade-off is a
+  false negative: an element read of a collection that is also iterated
+  for its value, passed along or held in an ivar is no longer typed, and
+  `x.flatten.first` on nested arrays no longer resolves.
+- Ivar proofs cost one ancestry walk per class, not one per descendant per
+  read. The hidden-writer answer is memoized per class and ivar name once
+  no class walk is in progress, and every ancestry it reads is linearized
+  once per check; a descendant's inherited part of its ancestry is read
+  only through its superclass, so the answer is unchanged. Release binary
+  on a synthetic single-file chain where every class writes and reads its
+  own ivar: CPU user N=400 1.80s -> 0.20s, N=800 14.13s -> 0.72s, N=3000
+  826s wall -> 12.97s (the pre-regression binary measures 0.20s, 0.75s
+  and 12.86s; what remains is re-parsing the file once per class walk).
+  A counter-based test (`deep_hierarchy_ivar_reads_linearize_each_class_once`)
+  bounds the linearizations to two per class.
+- Known false negatives, documented rather than guessed. `.new` on a class
+  with `extend T::Sig` does not check the arguments against `initialize`'s
+  `sig`. A method with a rest (`*`), keyword-rest (`**`), block (`&`) or
+  post parameter drops its whole contract, the return included, so neither
+  E0103 nor E0109 fires for it.
 - Bead H1: 16 sorbet-runtime `T::*` namespaces itaruby had never seen
   gave a false E0104 "unresolved constant" on correct code —
   `extend T::Helpers` (every `abstract!`/`interface!`/`sealed!`/
@@ -210,6 +463,85 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   receiver's diagnostic silence with the same typo on a closed receiver.
 
 ### Added
+- Sorbet `sig` contracts (2026-09-22; literal-only since 2026-09-23). A
+  project method's own recognized `sig { ... }` is now checked, not only
+  read. The declared return types the consumer, exactly as far as
+  sorbet-runtime enforces it: a collection by its category only. A contract ACCUSES only a value written as
+  a LITERAL, the same rule E0108 follows: a string or symbol (plain or
+  interpolated), an Integer, Float, rational or imaginary number, `nil`,
+  `true`/`false`, an Array or Hash literal (whatever it holds), a range, a
+  regexp, `__FILE__`, `__LINE__`, or a parenthesized literal. A body whose
+  literal return contradicts the declaration is **E0109** (new code,
+  Error), reported at the method name, with no call site needed: each
+  explicit `return <literal>` on its own (a bare `return` is a written
+  `nil`), and the implicit tail when EVERY leaf it can take through
+  `if`/`unless`/ternary, `case`/`when`, a plain `begin` and parentheses is
+  a literal (a missing branch is a written `nil`). Those leaves are
+  accused only when NO leaf fits, because the checker cannot tell a dead
+  branch from a live one: `flag ? 1 : 2.5` under `returns(String)` is
+  accused, `flag ? "x" : 1` is not. A call argument written as a literal
+  that contradicts a declared param is **E0103**, reported at the argument
+  and naming the param. Params match the `def` by name, not by order,
+  across positional, keyword and default layouts; a splat leaves positions
+  unproven, and a bare keyword hash is never guessed onto a positional
+  param. Everything else is never judged, however precisely it infers: a
+  variable of any kind, `self`, a constant, any call (`X.new`, a call typed
+  by another sig, `.to_s`), a ternary or `if` in argument position, a
+  backtick command, a literal behind a `#: as` cast. Three review rounds
+  found 24 false-positive shapes, almost all an inferred type held to a
+  sig (dispatch to an override or an outside redefinition, an overridden
+  `self.new`, a declared supertype read as exact, a setter's value,
+  declared type arguments trusted as element proof, refinements); none of
+  them is a literal. `void`, `abstract`, Unknown bodies, a block, loop,
+  `rescue` or `ensure` in the body, code after a `return`, and an
+  `if false` branch never accuse. A project that sets
+  `T::Configuration.default_checked_level = :never` (a literal assignment
+  anywhere in its files) runs no sig check, so no Sorbet contract accuses
+  anything there. A contract written in a module named by a
+  multi-argument `include A, B` (or `prepend`/`extend`), or in one of its
+  ancestors, is dropped: the index linearizes that call in reverse of
+  Ruby's order (a known ancestry bug, fixed separately), so which module
+  answers is unproven. Declared params bind the body's locals (a
+  collection by its category only). The
+  contract follows the definition onto subclass receivers and onto the
+  `def self.` track. Nominal types resolve in the definition's lexical
+  scope. `::X` stays absolute. A dynamically shadowed prefix or a
+  `type_member` resolves to Unknown and never falls back to a same-named
+  global class. `T.nilable`, `T.any`, `T::Array` and `T::Hash` map when
+  every member is known. An unsupported but well-formed element such as a
+  shape or a `T.proc` keeps the collection's category with an Unknown
+  member. A malformed expression is Unknown. A contract holds a literal to
+  its collection CATEGORY only: sorbet-runtime erases type arguments, so
+  `{a: 1}` under `returns(T::Hash[String, T.untyped])` runs and is not
+  accused, while a Hash literal returned under `returns(String)` is. A
+  `Range`, `Regexp`, `Rational` or `Complex` literal fits only a contract
+  the checker cannot read (a core name it does not model, a module) and
+  is accused against everything else. A MODULE-typed contract never
+  accuses anything, since any class can gain a module by reflection the
+  index never records as an ancestor. A class-typed contract still
+  accuses a literal. Known false negatives, by design: every
+  contradiction carried by an inferred value (`def f(n) = n` under
+  `params(n: Integer).returns(String)`, `count` typed by another sig,
+  `x = "s"; x`, `n.to_s` under `returns(Integer)`, a wrong project class
+  from `.new`) is silent.
+  The shared compatibility check keeps its nominal rules for the
+  RBS-comment E0103, which still judges inferred values: a project class
+  is held to a core scalar or collection type only when its ancestry is
+  complete, no ancestor is open and no `sorbet/rbi` file declares an
+  ancestor (`class SafeStr < String` IS a String), and a module-typed
+  param or a module's `self` never accuses.
+  A client RBI is never a contract (it is never checked at runtime): it
+  neither accuses nor types a source method's consumers.
+  Every shape the checker cannot prove resolves to `Ty::Unknown` and
+  diagnoses nothing. That covers generics (`type_parameters`), `bind`,
+  duplicate or dynamic clauses, overloads (stacked sigs), post-optional,
+  rest and block parameter layouts, duplicate source definitions, open
+  classes (Ruby checks such as E0108 still apply there). Inline `#:` RBS
+  keeps precedence over the `sig`.
+  Recognized-sig fixtures declare `extend T::Sig`. This is not Sorbet
+  parity: it checks what the named suites prove and nothing more. Focused
+  proof: `sorbet_contracts`, `sorbet_contract_parser` and `project_sigs`,
+  plus mutants in `scripts/sorbet-contracts-mutants.py`.
 - Reconcile conflicting superclass headers after project indexing instead of
   selecting the first filesystem entry. Inherited methods and constants
   become inconclusive, including navigation and global-name collisions;
@@ -976,6 +1308,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stays open.
 
 ### Changed
+- A project method's `sig { returns(X) }` now wins over its inferred body.
+  Before, it was a fallback (bead ita-4xy): it was consulted only when body
+  inference reached Unknown, so an inferred type such as `Ty::Str` beat the
+  declaration and the consumer went silent. Now the declaration types the
+  consumer, and a body that disagrees is accused as E0109 instead of quietly
+  winning. `project_sigs`' precedence test (b) asserts both halves by name.
 - Public-corpus baselines regenerated for the attributed-mixin family: rails
   1100 → 940 lines (166 → 6 errors, **0 new**), mastodon and discourse
   byte-identical — their files do not appear in the diff at all, which is the

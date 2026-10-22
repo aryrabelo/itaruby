@@ -426,6 +426,7 @@ name = "itaruby_semantic"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "ignore",
  "itaruby_syntax",
  "ruby-prism",
  "rustc-hash",

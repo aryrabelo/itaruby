@@ -1,0 +1,982 @@
+#!/usr/bin/env python3
+"""Two-sided Sorbet sig/RBI contract probes. Builds only a temporary source copy, never the checkout.
+
+Run: python3 scripts/sorbet-contracts-mutants.py            (full family)
+     python3 scripts/sorbet-contracts-mutants.py --anchors  (count every needle, build nothing)
+     python3 scripts/sorbet-contracts-mutants.py --only TEXT (only mutants whose label contains TEXT;
+                                                             a development aid, never a gate verdict)
+
+Each mutant removes ONE contract decision and must be accused by a NAMED test.
+Needles are literal and counted with `src.count(needle)` against the source
+BEFORE anything builds, so a dead anchor is an INVALID-anchor in milliseconds
+instead of a blind mutant half an hour in. The baseline and each mutant run the
+contract suites; invalid/no-op mutations, compiler failures, and failures of
+the wrong test are distinct verdicts.
+"""
+from pathlib import Path
+import filecmp
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+SRC = Path("crates/itaruby_semantic/src")
+CHECK = SRC / "check.rs"
+INDEX = SRC / "index.rs"
+SIG = SRC / "sorbet_sig.rs"
+DISCOVERY = SRC / "discovery.rs"
+RUNTIME = SRC / "runtime_gate.rs"
+TESTS = ("sorbet_contracts", "sorbet_contract_parser", "project_sigs", "sorbet_sig", "conflicting_superclasses")
+
+# (label, file, needle, replacement, named test(s) that must FAIL)
+MUTATIONS = [
+    # -- eligibility: which definition a written signature is proven to govern
+    ("open owner governs its sig", CHECK,
+     "        if class.open {\n            return None;\n        }\n        let same = ",
+     "        let same = ",
+     "open_source_keeps_existing_ruby_checks_without_contract_accusations"),
+    ("descendant override ignored", CHECK,
+     "        let diverges = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);\n",
+     "        let diverges = false;\n",
+     "descendant_override_keeps_the_parent_contract_off_the_call"),
+    ("duplicate source picks the last sig", INDEX,
+     "        method.sorbet_sig = None;\n    }\n    methods.insert(definition.name.clone(), method);",
+     "    }\n    methods.insert(definition.name.clone(), method);",
+     "duplicate_source_definitions_do_not_pick_a_signature"),
+    ("uncontracted sig shape opens its class", INDEX,
+     "                        let recognized = sig.is_some() || sig_block_is_recognized(&call);\n",
+     "                        let recognized = sig.is_some();\n",
+     "uncontracted_sig_of_a_recognized_shape_keeps_the_class_closed"),
+    # -- RBI: never checked at runtime, so never a contract (F6)
+    # removed: stale RBI layout accepted — F6: no RBI is ever a source method's contract, so there is no layout match left to skip
+    # removed: RBI positional names ignored — F6: `RbiMethod::matches_source` is gone with the RBI contract path
+    # removed: conflicting RBI declarations pick one — F6: an RBI declaration carries only its return text again, first visit wins as on main
+    # removed: inherited RBI owner lends its contract — F6: `source_rbi_method` and its owner filter are gone with the RBI contract path
+    # removed: RBI track forced to instance — F6: the source-track RBI lookup is gone; the RBI walk's own tracks are main's
+    ("RBI return keeps its type arguments", CHECK,
+     "                return Some(erase_type_arguments(&ty));",
+     "                return Some(ty);",
+     "external_rbi_types_only_its_consumer"),
+    ("RBI typing in a silent walk", CHECK,
+     "    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {\n        if self.silent {\n            return None;\n        }\n",
+     "    fn rbi_escalate(&mut self, c: ClassId, name: &str, singleton: bool) -> Option<Ty> {\n",
+     "external_rbi_types_only_its_consumer"),
+    # -- F4: a declared type argument never types a consumer
+    ("sig return keeps its type arguments", CHECK,
+     "                erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting))",
+     "                crate::sorbet_sig::resolve_sig_ty(&expr, self.index, &nesting)",
+     "declared_type_arguments_never_type_consumers"),
+    # removed: sig param keeps its type arguments — r4: a sig's params never bind into the body, so there is no bound type left to erase
+    # -- instance / singleton separation
+    ("source track forced to instance", CHECK,
+     "        let singleton = class.singleton_methods.get(name).is_some_and(same);",
+     "        let singleton = false;",
+     "rbi_singleton_declaration_is_silent_and_the_source_track_accuses"),
+    # -- E0109: the body answers to its own signature
+    ("body never checked against sig", CHECK,
+     "            self.check_sorbet_return(def, contract, nesting);",
+     "            let _ = (contract, nesting);",
+     ("incompatible_source_return_accuses_without_a_call",
+      "explicit_returns_and_implicit_branches_are_checked")),
+    ("explicit returns not inspected", CHECK,
+     "        let mut points = safety.returns;\n",
+     "        let mut points = Vec::new();\n        drop(safety.returns);\n",
+     "explicit_returns_and_implicit_branches_are_checked"),
+    # -- F9 reachability: every return point, judged together
+    ("reachability non-literal point judged on its literals", CHECK,
+     "        let Some(actual) = points.into_iter().collect::<Option<Vec<LiteralClass>>>() else { return };",
+     "        let Some(actual) = Some(points.into_iter().flatten().collect::<Vec<LiteralClass>>()) else { return };",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability points judged one by one", CHECK,
+     "        if self.contract_breaks(&actual, &expected) {\n            let mut names",
+     "        if actual.iter().any(|point| self.contract_breaks(std::slice::from_ref(point), &expected)) {\n            let mut names",
+     ("every_return_point_must_be_a_mismatching_literal", "explicit_returns_and_implicit_branches_are_checked")),
+    ("reachability terminal tail leaf read as a point", CHECK,
+     "fn tail_points(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) {\n    if return_terminal(node) {\n        return;\n    }\n",
+     "fn tail_points(node: &Node<'_>, points: &mut Vec<Option<LiteralClass>>) {\n",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability unreachable suffix walked", CHECK,
+     "            self.visit(&statement);\n            if return_terminal(&statement) {\n                break;\n            }\n",
+     "            self.visit(&statement);\n",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability statement list terminal only by its last", CHECK,
+     "        return statements.body().iter().any(|n| return_terminal(&n));",
+     "        return statements.body().iter().last().is_some_and(|n| return_terminal(&n));",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability unless-else never terminal", CHECK,
+     "        return unless.statements().is_some_and(|n| return_terminal(&n.as_node()))\n",
+     "        return false && unless.statements().is_some_and(|n| return_terminal(&n.as_node()))\n",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability case never terminal", CHECK,
+     "    whens && case.else_clause().is_some_and(|n| return_terminal(&n.as_node()))\n}",
+     "    false && whens && case.else_clause().is_some_and(|n| return_terminal(&n.as_node()))\n}",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("reachability case without else terminal", CHECK,
+     "    whens && case.else_clause().is_some_and(|n| return_terminal(&n.as_node()))\n}",
+     "    whens && case.else_clause().is_none_or(|n| return_terminal(&n.as_node()))\n}",
+     "every_return_point_must_be_a_mismatching_literal"),
+    ("uncertain return paths accused", CHECK,
+     "        if safety.uncertain {\n            return;\n        }\n",
+     "",
+     "void_unknown_and_uncertain_return_paths_stay_silent"),
+    # `void` and `returns` share one clause bit, so a void sig never carries
+    # `ret`: deleting the `contract.void` guard alone is an equivalent mutant
+    # (measured BLIND). The observable failure of this decision is reading
+    # `void` as a promise of `nil`, so the mutant drops the guard AND does that.
+    ("void sig treated as a return type", CHECK,
+     "        if self.silent || contract.void {\n            return;\n        }\n"
+     "        let (Some(expr), Some(body)) = (contract.ret.as_deref(), def.body()) else { return };",
+     "        if self.silent {\n            return;\n        }\n"
+     "        let (Some(expr), Some(body)) = (contract.ret.as_deref()"
+     ".or(contract.void.then_some(\"NilClass\")), def.body()) else { return };",
+     "void_unknown_and_uncertain_return_paths_stay_silent"),
+    # -- E0103: parameters correspond by NAME, never by position
+    ("params zipped by sig order", CHECK,
+     "        let positional = positional_names.iter().zip(args.positional)",
+     "        let positional = sig.params.iter().map(|(n, _)| n).zip(args.positional)",
+     "named_positional_params_accuse_at_argument"),
+    ("keyword args never checked", CHECK,
+     "        let bound = positional.chain(keyword_args.iter().map(",
+     "        let bound = positional.chain(keyword_args.iter().take(0).map(",
+     "keywords_and_defaults_keep_named_correspondence"),
+    ("splat keeps positional correspondence", CHECK,
+     "                        exact_arity = false;\n                        sorbet_args_known = false;\n                        self.infer_expr(&a, env, self_ty, scope);",
+     "                        exact_arity = false;\n                        self.infer_expr(&a, env, self_ty, scope);",
+     "keywords_and_defaults_keep_named_correspondence"),
+    ("unmatched sig names guessed", INDEX,
+     "            if !matches {\n                md.sorbet_sig = None;\n            }",
+     "            if !matches {\n                let _ = ();\n            }",
+     "sig_naming_an_absent_parameter_is_not_a_contract"),
+    # -- PendingSig::Unusable: unreadable or stacked sigs are never a contract
+    ("stacked sigs pick the last overload", INDEX,
+     "                            Some(parsed) if !stacked && !parsed.unchecked => PendingSig::Parsed(parsed),",
+     "                            Some(parsed) if !parsed.unchecked => PendingSig::Parsed(parsed),",
+     "overloads_and_unsupported_layouts_do_not_invent_correspondence"),
+    # removed: unusable sig counts as unannotated — F6: `sorbet_annotated` only ever blocked the RBI contract fallback, which is gone
+    # -- nil is proven only where it is written (invariant #1)
+    # removed: union member nil excuses the union — literal-only: every nil a contract sees is a written leaf, judged like any other; the nil filter is gone
+    # removed: nil read from a variable counts as proven — literal-only: no variable is ever read, so the `literal_nil` gate is gone
+    # removed: literal nil never accused — literal-only: a literal nil has no special case left to remove; `literal_nil_and_mismatched_union_members_still_accuse` still holds it
+    # -- literal-only: a contract judges a value only where it is WRITTEN as a literal
+    ("literal-only non-literal argument judged", CHECK,
+     "            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone()) else {",
+     "            let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone())"
+     ".or(Some(LiteralClass::Modeled(Ty::Sym))) else {",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only cast comment ignored", CHECK,
+     "        if self.cast_comment_at(loc.start_offset()).is_some() {\n            return;\n        }\n        if let Some(class) = literal_class(node) {",
+     "        if let Some(class) = literal_class(node) {",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only non-literal explicit return judged", CHECK,
+     "                    [value] => literal_class(value),\n",
+     "                    [value] => literal_class(value).or(Some(LiteralClass::Modeled(Ty::Sym))),\n",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only non-literal tail leaf dropped", CHECK,
+     "    if !tail_branches(node, points) {\n        points.push(literal_class(node));\n    }\n",
+     "    if !tail_branches(node, points) {\n        if let Some(literal) = literal_class(node) {\n            points.push(Some(literal));\n        }\n    }\n",
+     "contracts_accuse_only_literal_values"),
+    ("literal-only missing branch is not a nil leaf", CHECK,
+     "        None => points.push(Some(LiteralClass::Modeled(Ty::Nil))),",
+     "        None => points.push(None),",
+     "union_with_no_compatible_member_still_accuses"),
+    ("literal-only unmodeled core literal fits every contract", CHECK,
+     "        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),\n        _ => false,",
+     "        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),\n        _ => true,",
+     ("contracts_accuse_only_literal_values", "unmodeled_core_literals_fit_only_what_the_checker_cannot_read")),
+    ("literal-only __LINE__ typed as a String", CHECK,
+     "        Node::IntegerNode { .. } | Node::SourceLineNode { .. } => Ty::Int,",
+     "        Node::IntegerNode { .. } => Ty::Int,\n        Node::SourceLineNode { .. } => Ty::Str,",
+     ("contracts_accuse_only_literal_values", "source_line_and_exotic_numerics_type_their_consumers")),
+    ("literal-only rational literal typed as a Float", CHECK,
+     "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,",
+     "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Float,",
+     "source_line_and_exotic_numerics_type_their_consumers"),
+    # removed: "literal-only default_checked_level never still accuses" — the
+    # unchecked guard it cut from `contract_breaks` was an equivalent copy of
+    # the one in `effective_sorbet` (measured BLIND after 7144dc0 made an RBI
+    # never a contract), so the copy is gone; the `effective_sorbet` mutant
+    # below still holds the decision.
+    ("literal-only multi-argument mixin keeps its contract", INDEX,
+     "    poison_ambiguous_mixin_contracts(&mut index);\n",
+     "",
+     "multi_argument_mixin_takes_the_contract_off"),
+    ("literal-only multi-argument mixin ancestors trusted", INDEX,
+     "        for id in index.ancestors(module).0 {",
+     "        for id in [module] {",
+     "multi_argument_mixin_takes_the_contract_off"),
+    # -- literal branches are what the body MIGHT return: one leaf is no proof
+    ("union member mismatch accuses the union", CHECK,
+     "            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))",
+     "            && leaves.iter().any(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))",
+     "union_with_one_compatible_member_stays_silent"),
+    # -- sig names: a core name stays core, an inherited name never falls to the top level
+    ("reopened core name becomes a project instance", SIG,
+     "    if crate::core::is_known_core_constant(path) {\n        return Ty::Unknown;\n    }\n",
+     "",
+     "reopened_core_names_keep_their_core_meaning"),
+    ("module mixed into core keeps its instance", SIG,
+     "    if mixed_into_core(id, index) {\n        return Ty::Unknown;\n    }\n",
+     "",
+     "project_module_mixed_into_core_never_accuses_core_values"),
+    ("ancestor namespace shadow ignored", INDEX,
+     "                    return ConstFallback::Shadowed;\n",
+     "                    let _ = ();\n",
+     "inherited_namespace_constants_never_bind_to_top_level"),
+    ("opaque ancestry proves the top-level fallback", SIG,
+     "            ConstFallback::Opaque if matches!(ty, Ty::Instance(_)) => Ty::Unknown,\n",
+     "",
+     "inherited_namespace_constants_never_bind_to_top_level"),
+    # -- core returns follow their arguments; unproven is Unknown, never a guess
+    ("integer operand type ignored", CHECK,
+     "            [Ty::Int] => Ty::Int,\n            [Ty::Float] => Ty::Float,\n            _ => Ty::Unknown,\n",
+     "            _ => Ty::Int,\n",
+     "integer_arithmetic_takes_the_operand_type"),
+    ("float operand type ignored", CHECK,
+     "            [Ty::Int | Ty::Float] => Ty::Float,\n            _ => Ty::Unknown,\n",
+     "            _ => Ty::Float,\n",
+     "integer_arithmetic_takes_the_operand_type"),
+    ("float digits ignored", CHECK,
+     "        ([Ty::Int], Some(n)) if n > 0 => Ty::Float,\n",
+     "",
+     "float_rounding_with_digits_is_not_an_integer"),
+    ("array count returns one element", CHECK,
+     "            ([Ty::Int], Ty::Array(_)) => Some(recv.clone()),\n",
+     "            ([Ty::Int], Ty::Array(_)) => None,\n",
+     "array_count_argument_returns_an_array"),
+    ("hidden argument shape keeps the table return", CHECK,
+     "        return if core_ret_depends_on_args(cc, name) { Ty::Unknown } else { core_ret_to_ty(ret, recv) };",
+     "        return core_ret_to_ty(ret, recv);",
+     "array_count_argument_returns_an_array"),
+    ("flatten keeps the nesting", CHECK,
+     "        \"flatten\" => Some(flatten_ret(recv, args.is_empty())),",
+     "        \"flatten\" => None,",
+     "flatten_drops_the_nesting"),
+    # -- core model: a result holds what the call really answers
+    ("cm6 blockless iterator keeps the table", CHECK,
+     "    !matches!(\n        (cc, name),\n        (\n            CoreClass::Array,",
+     "    true || !matches!(\n        (cc, name),\n        (\n            CoreClass::Array,",
+     "blockless_iterators_answer_an_enumerator"),
+    ("cm6 blockless gsub keeps the table", CHECK,
+     "    (name == \"gsub\" && args.len() == 1 && !block).then_some(Ty::Unknown)",
+     "    let _ = (name, args, block);\n    None",
+     "blockless_iterators_answer_an_enumerator"),
+    ("cm6 block-built result keeps the table", CHECK,
+     "        return !matches!(\n            (cc, name),\n            (CoreClass::Hash, \"to_h\" | \"merge\")",
+     "        return true || !matches!(\n            (cc, name),\n            (CoreClass::Hash, \"to_h\" | \"merge\")",
+     "block_built_core_results_are_unproven"),
+    ("cm6 plus and concat keep the receiver", CHECK,
+     "        \"+\" | \"concat\" => {\n            let parts",
+     "        \"+ \" | \"concat \" => {\n            let parts",
+     "combinators_hold_both_sides_elements"),
+    ("cm6 shovel and push keep the receiver", CHECK,
+     "        \"<<\" | \"push\" => Some(Ty::Array(",
+     "        \"<< \" | \"push \" => Some(Ty::Array(",
+     "combinators_hold_both_sides_elements"),
+    ("cm6 merge keeps the receiver", CHECK,
+     "        CoreClass::Hash => hash_call_ret(name, args, recv),",
+     "        CoreClass::Hash => None,",
+     "combinators_hold_both_sides_elements"),
+    ("cm6 hidden merge arguments keep the receiver", CHECK,
+     "        CoreClass::Hash => name == \"merge\",",
+     "        CoreClass::Hash => false,",
+     "combinators_hold_both_sides_elements"),
+    ("cm6 nested collection keeps its type arguments", CHECK,
+     "            Ty::Array(e) => erase_type_arguments(e),",
+     "            Ty::Array(e) => (**e).clone(),",
+     "a_collection_inside_a_collection_is_shared"),
+    ("cm6 flatten reads through shared inner arrays", CHECK,
+     "    if scalar(inner) { Ty::Array(Box::new(Ty::Unknown)) } else { Ty::Unknown }",
+     "    if scalar(inner) { Ty::Array(Box::new(inner.clone())) } else { Ty::Unknown }",
+     ("a_collection_inside_a_collection_is_shared", "flatten_drops_the_nesting")),
+    ("cm6 changed local keeps its elements", CHECK,
+     "                if self.trusted_collections.contains(&name) { ty } else { erase_type_arguments(&ty) }",
+     "                let _ = &self.trusted_collections;\n                ty",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 every receiver read trusted", CHECK,
+     "        if !self.safe_receiver_read(node, collection_read_keeps_elements(node.name().as_slice())) {",
+     "        if !self.safe_receiver_read(node, true) {",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 a statement's value counted as discarded", CHECK,
+     "            if i < value {\n                if let Some(call) = statement.as_call_node() {",
+     "            if i <= value {\n                if let Some(call) = statement.as_call_node() {",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 discarded iteration escapes", CHECK,
+     "                    if self.safe_receiver_read(&call, discarded_iteration(call.name().as_slice())) {",
+     "                    if self.safe_receiver_read(&call, false) {",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 eval trusted with locals", CHECK,
+     "    if scan.bail {\n        return FxHashSet::default();\n    }\n    let CollectionReadScan",
+     "    let CollectionReadScan",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 class << self reads the outer scope's proof", CHECK,
+     "                        let trusted = trusted_collection_locals(None, Some(&body));\n"
+     "                        let saved_trusted = std::mem::replace(&mut self.trusted_collections, trusted);\n"
+     "                        self.walk_scope(scope, class, true, &body, env);\n",
+     "                        let saved_trusted = self.trusted_collections.clone();\n"
+     "                        self.walk_scope(scope, class, true, &body, env);\n",
+     "in_place_changes_unprove_a_local_collection"),
+    ("cm6 ivar collection keeps its elements", CHECK,
+     "                        erase_type_arguments(&self.ivar_ty(c, &name))",
+     "                        self.ivar_ty(c, &name)",
+     "ivar_collections_hold_unproven_elements"),
+    ("clamp bounds ignored", CHECK,
+     "        \"clamp\" => match args {\n            [Ty::Int, Ty::Int] => Ty::Int,\n            _ => Ty::Unknown,\n        },\n",
+     "        \"clamp\" => Ty::Int,\n",
+     "integer_clamp_with_float_bounds_is_unproven"),
+    # -- an ivar is proven only when every writer path is visible
+    ("attribute writer ignored", CHECK,
+     "        let (hidden, settled) = if self.ivar_writer_may_exist(class, &writer, &subtree) {",
+     "        let (hidden, settled) = if false && self.ivar_writer_may_exist(class, &writer, &subtree) {",
+     "ivar_with_an_attribute_writer_is_unproven"),
+    ("project-wide hidden writes ignored", CHECK,
+     "        if self.index.hidden_ivar_writes_any || self.index.hidden_ivar_writes.contains(name) {\n"
+     "            return true;\n        }\n",
+     "",
+     "ivar_written_by_reflection_is_unproven"),
+    ("reflection names not hidden", INDEX,
+     "            Some(name) => self.hide_ivar(&name),",
+     "            Some(_) => {}",
+     "ivar_written_by_reflection_is_unproven"),
+    ("self-rebinding block writes attributed lexically", INDEX,
+     "        self.ivar_scopes.push(if lexical && in_def { IvarScope::InstanceDef } else { IvarScope::Opaque });",
+     "        self.ivar_scopes.push(IvarScope::InstanceDef);",
+     "ivar_written_by_reflection_is_unproven"),
+    ("family writes ignored", CHECK,
+     ".chain(subtree.iter().map(|&(kid, _)| kid)).filter(|&c| c != class);",
+     ".chain(subtree.iter().map(|&(kid, _)| kid)).filter(|&c| c != class).take(0);",
+     "ivar_written_elsewhere_in_the_family_is_unproven"),
+    ("cm6 descendant chain writer ignored", CHECK,
+     "            if !chain.1 || chain.0[..own].iter().any(|&a| supplies(a)) {",
+     "            if !chain.1 {",
+     "ivar_writer_supplied_below_the_reader_is_unproven"),
+    ("cm6 descendant method_missing ignored", CHECK,
+     "            if methods.contains_key(\"method_missing\") || methods.contains_key(\"respond_to_missing?\") {",
+     "            if methods.contains_key(\"respond_to_missing?\") {",
+     "ivar_writer_supplied_below_the_reader_is_unproven"),
+    ("cm6 ancestry linearized per read", CHECK,
+     "        Rc::clone(self.ancestors_memo.entry(id).or_insert_with(|| Rc::new(index.ancestors(id))))",
+     "        let _ = &self.ancestors_memo;\n        Rc::new(index.ancestors(id))",
+     "deep_hierarchy_ivar_reads_linearize_each_class_once"),
+    ("or-write is not a write", CHECK,
+     "                let n = node.as_instance_variable_or_write_node().unwrap();\n"
+     "                self.infer_expr(&n.value(), env, self_ty, scope);\n"
+     "                self.capture_ivar_write(self_ty, n.name().as_slice(), Ty::Unknown);\n",
+     "                let n = node.as_instance_variable_or_write_node().unwrap();\n"
+     "                self.infer_expr(&n.value(), env, self_ty, scope);\n",
+     "ivar_compound_writes_in_the_same_class_are_unproven"),
+    ("multiple-assignment target is not a write", INDEX,
+     "        self.hide_ivar(node.name().as_slice());\n        ruby_prism::visit_instance_variable_target_node",
+     "        ruby_prism::visit_instance_variable_target_node",
+     "ivar_compound_writes_in_the_same_class_are_unproven"),
+    # -- every redefinition path takes a written contract off the method
+    ("singleton patch keeps the stale contract", INDEX,
+     "                std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),",
+     "                std::collections::hash_map::Entry::Occupied(_) => {}",
+     "singleton_patch_redefinition_takes_the_contract_off"),
+    ("extended hook keeps the stale contract", INDEX,
+     "            slot.insert(hook_install_sig(span, file));\n        }\n"
+     "        std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),",
+     "            slot.insert(hook_install_sig(span, file));\n        }\n"
+     "        std::collections::hash_map::Entry::Occupied(_) => {}",
+     "extended_hook_redefinition_takes_the_contract_off"),
+    ("outside redefinitions keep the stale contract", INDEX,
+     "    poison_injected_contracts(&mut index);\n",
+     "",
+     "class_eval_redefinition_takes_the_contract_off"),
+    ("include-time code keeps the stale contract", INDEX,
+     "    poison_include_time_redefinitions(&mut index);\n",
+     "",
+     "included_hook_redefinition_takes_the_contract_off"),
+    ("include hook methods ignored", INDEX,
+     "    INCLUDE_HOOKS.iter().any(|hook| module.singleton_methods.contains_key(*hook))\n",
+     "    INCLUDE_HOOKS.iter().take(0).any(|hook| module.singleton_methods.contains_key(*hook))\n",
+     "included_hook_redefinition_takes_the_contract_off"),
+    ("open project module trusted at include time", INDEX,
+     "        || (module.open\n",
+     "        || (false && module.open\n",
+     "included_hook_redefinition_takes_the_contract_off"),
+    ("descendant include-time code trusted", INDEX,
+     "        if class.open || self.include_time_code.contains(&id) {",
+     "        if class.open {",
+     "include_time_code_in_a_descendant_keeps_the_parent_contract_off_the_call"),
+    ("module family never walked", INDEX,
+     "            let mixed = self.mixers.get(&cur).into_iter()",
+     "            let mixed = None::<&Vec<Mixer>>.into_iter()",
+     "module_contract_yields_to_an_includer_family_override"),
+    ("mixing member trusted by its own map", INDEX,
+     "        let mixes = !class.includes.is_empty()",
+     "        let mixes = false && !class.includes.is_empty()",
+     "descendant_mixin_override_keeps_the_parent_contract_off_the_call"),
+    # -- cost: contract work is per definition, never per call
+    ("contract memo bypassed", CHECK,
+     "        if let Some(hit) = self.contract_memo.borrow().get(&key) {\n            return hit.clone();\n        }\n",
+     "",
+     "contract_work_is_per_definition_not_per_call"),
+    ("family walked before the contract", CHECK,
+     "        let sig = method.sorbet_sig.as_ref()?;\n",
+     "        if let Some((owner, name, singleton)) = method.nesting.last()\n"
+     "            .and_then(|path| self.dispatching_name(method, name, path))\n"
+     "        {\n"
+     "            let _ = self.index.contract_dispatch_diverges(owner, name, singleton, method.file, method.def_span);\n"
+     "        }\n"
+     "        let sig = method.sorbet_sig.as_ref()?;\n",
+     "contract_work_is_per_definition_not_per_call"),
+    ("return memo read after sig_fill", CHECK,
+     "        let key = (class, name.to_string(), singleton);\n        if let Some(t) = self.return_memo.get(&key) {\n",
+     "        let _ = self.sig_fill(m, name);\n        let key = (class, name.to_string(), singleton);\n        if let Some(t) = self.return_memo.get(&key) {\n",
+     "contract_work_is_per_definition_not_per_call"),
+    # -- r4: a sig proves only `is_a?`, so it types a consumer only as a fallback
+    ("r4 declared return overrides inference", CHECK,
+     "        if ty == Ty::Unknown {\n            ty = self.sig_fill(m, name);\n        }\n",
+     "        let declared = self.sig_fill(m, name);\n        if declared != Ty::Unknown {\n            ty = declared;\n        }\n",
+     ("inferred_return_wins_over_the_declared_one", "declared_return_checks_body_but_never_overrides_inference")),
+    ("r4 sig params bind the body", CHECK,
+     "        // A sorbet sig's params never bind into the body: sorbet-runtime\n",
+     "        if let Some((contract, nesting)) = &sorbet {\n"
+     "            for (name, expr) in &contract.params {\n"
+     "                let ty = erase_type_arguments(&crate::sorbet_sig::resolve_sig_ty(expr, self.index, nesting));\n"
+     "                if ty != Ty::Unknown && env.contains_key(name) {\n"
+     "                    env.insert(name.clone(), ty);\n"
+     "                }\n"
+     "            }\n"
+     "        }\n",
+     "signature_params_never_bind_the_source_body"),
+    # -- r4: `X.new` proves an `X` only when `Class#new` answers it
+    ("r4 project self.new constructs its receiver", CHECK,
+     "                            // nothing downstream is judged against `c`.\n                            return Ty::Unknown;\n",
+     "                            // nothing downstream is judged against `c`.\n                            return Ty::Instance(c);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 hidden singleton new ignored", CHECK,
+     "        if self.index.singleton_new_hidden(c) {\n            Ty::Unknown\n",
+     "        if false {\n            Ty::Unknown\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 open ancestor hides no new", INDEX,
+     "                if class.open_reason == Some(OpenReason::DeclaredExternal) {\n                    continue;\n                }\n                return true;\n",
+     "                continue;\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 declared ancestor hides a new", INDEX,
+     "                if class.open_reason == Some(OpenReason::DeclaredExternal) {\n                    continue;\n                }\n                return true;\n",
+     "                return true;\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 superclass singleton new ignored", INDEX,
+     "            if class.singleton_methods.contains_key(\"new\") || self.outside_new.contains(&a) {\n",
+     "            if self.outside_new.contains(&a) {\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new on an ancestor ignored", INDEX,
+     "            if class.singleton_methods.contains_key(\"new\") || self.outside_new.contains(&a) {\n",
+     "            if class.singleton_methods.contains_key(\"new\") {\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new never recorded", INDEX,
+     "            index.outside_new.insert(id);\n",
+     "",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 unresolved extend hides no new", INDEX,
+     "        let Some(mid) = self.resolve_const(&class.nesting, ext) else {\n            return true;\n        };\n        let (chain, complete) = self.ancestors(mid);\n",
+     "        let Some(mid) = self.resolve_const(&class.nesting, ext) else {\n            return false;\n        };\n        let (chain, complete) = self.ancestors(mid);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 incomplete extend chain hides no new", INDEX,
+     "        let (chain, complete) = self.ancestors(mid);\n        if !complete {\n            return true;\n        }\n",
+     "        let (chain, _complete) = self.ancestors(mid);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 extended module new ignored", INDEX,
+     "            let answers_new = module.methods.contains_key(\"new\") || self.outside_new.contains(&m);\n",
+     "            let answers_new = self.outside_new.contains(&m);\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 outside new on an extended module ignored", INDEX,
+     "            let answers_new = module.methods.contains_key(\"new\") || self.outside_new.contains(&m);\n",
+     "            let answers_new = module.methods.contains_key(\"new\");\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 open extended module hides no new", INDEX,
+     "            answers_new || (module.open && Some(m) != t_sig)\n",
+     "            answers_new\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 T::Sig hides a new", INDEX,
+     "            answers_new || (module.open && Some(m) != t_sig)\n",
+     "            answers_new || module.open\n",
+     "a_project_singleton_new_proves_no_instance"),
+    ("r4 ambiguous superclass hides no new", INDEX,
+     "        self.ambiguous_ancestry.contains(&id)\n    }\n\n    /// Can `ext`",
+     "        false\n    }\n\n    /// Can `ext`",
+     "identical_base_text_in_different_scopes_conflicts_but_local_methods_remain_known"),
+    # -- self in a module is an instance of an includer nobody named
+    ("module instance proves incompatibility", CHECK,
+     "        (Ty::Instance(a), _) if index.class(*a).is_module => true,\n",
+     "",
+     "module_self_is_never_proof_against_an_includer"),
+    # -- nominal: a module param never accuses; a class is not a core value only on a closed ancestry
+    ("nominal module param held to the ancestry", CHECK,
+     "        (_, Ty::Instance(p)) if index.class(*p).is_module => true,\n",
+     "",
+     "module_typed_contracts_never_accuse"),
+    ("nominal class param excused like a module", CHECK,
+     "        (_, Ty::Instance(p)) if index.class(*p).is_module => true,\n",
+     "        (_, Ty::Instance(_)) => true,\n",
+     "class_typed_contracts_still_accuse_unrelated_values"),
+    ("nominal core param held to exact equality", CHECK,
+     "        _ => may_be_core_value(a, index, rbi),\n",
+     "        _ => false,\n",
+     "core_subclass_instances_satisfy_core_contracts"),
+    ("nominal incomplete ancestry rules out a core value", CHECK,
+     "    !complete\n        || ancestors.iter().any(|&c| index.class(c).open)\n",
+     "    ancestors.is_empty()\n        || ancestors.iter().any(|&c| index.class(c).open)\n",
+     "core_subclass_instances_satisfy_core_contracts"),
+    ("nominal open ancestor rules out a core value", CHECK,
+     "        || ancestors.iter().any(|&c| index.class(c).open)\n",
+     "",
+     "core_subclass_instances_satisfy_core_contracts"),
+    ("nominal rbi-declared ancestor rules out a core value", CHECK,
+     "        || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))\n",
+     "",
+     "core_subclass_instances_satisfy_core_contracts"),
+    ("nominal closed ancestry never rules out a core value", CHECK,
+     "    let (ancestors, complete) = index.ancestors(id);\n    !complete\n",
+     "    let (ancestors, complete) = index.ancestors(id);\n    true || !complete\n",
+     "closed_project_ancestry_still_accuses_core_contracts"),
+    # -- collection type arguments are erased at runtime; only the category binds
+    # removed: type arguments held as a contract — literal-only: an Array/Hash literal's class is built without type arguments, so the contract path erases nothing
+    # -- the keyword loop still WALKS what it cannot bind by name
+    ("non-symbol keyword pair left unwalked", CHECK,
+     "                                    self.infer_expr(&assoc.key(), env, self_ty, scope);\n                                    self.infer_expr(&assoc.value(), env, self_ty, scope);\n",
+     "                                    self.infer_expr(&element, env, self_ty, scope);\n",
+     "unbindable_keyword_elements_are_still_checked"),
+    ("keyword splat left unwalked", CHECK,
+     "                                    Some(value) => { self.infer_expr(&value, env, self_ty, scope); }",
+     "                                    Some(_) => { self.infer_expr(&element, env, self_ty, scope); }",
+     "unbindable_keyword_elements_are_still_checked"),
+    # -- redefine: a prepend shadows, `def X.m` redefines, a hook reaches from outside
+    ("redefine singleton prepend not recorded", INDEX,
+     "        if name == b\"prepend\" && !frag.singleton_prepends.contains(&path) {",
+     "        if false && name == b\"prepend\" && !frag.singleton_prepends.contains(&path) {",
+     "singleton_prepend_takes_the_shadowed_contract_off"),
+    ("redefine in-body singleton prepend dropped at merge", INDEX,
+     "        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());\n        class.consts",
+     "        class.consts",
+     "singleton_prepend_takes_the_shadowed_contract_off"),
+    ("redefine patch singleton prepend dropped at merge", INDEX,
+     "        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());\n        for path in frag.extends {",
+     "        for path in frag.extends {",
+     "singleton_prepend_takes_the_shadowed_contract_off"),
+    ("redefine prepend shadowing never applied", INDEX,
+     "    poison_prepend_shadowed_contracts(&mut index);\n",
+     "",
+     ("singleton_prepend_takes_the_shadowed_contract_off", "instance_prepend_takes_the_shadowed_contract_off")),
+    ("redefine prepended names keep their contracts", INDEX,
+     "                track.get_mut(name).map(poison_contract);\n",
+     "                let _ = (&track, name);\n",
+     "singleton_prepend_takes_the_shadowed_contract_off"),
+    ("redefine unknown prepend keeps the track", INDEX,
+     "            track.values_mut().for_each(poison_contract);\n            index.include_time_code.insert(id);",
+     "            index.include_time_code.insert(id);",
+     ("singleton_prepend_takes_the_shadowed_contract_off", "instance_prepend_takes_the_shadowed_contract_off")),
+    ("redefine unknown prepend trusted by the family", INDEX,
+     "            track.values_mut().for_each(poison_contract);\n            index.include_time_code.insert(id);",
+     "            track.values_mut().for_each(poison_contract);",
+     "outside_redefinition_of_a_subclass_keeps_the_parent_contract_off_the_call"),
+    ("redefine hooked mixin names trusted", INDEX,
+     "    if hooked {\n        return None;\n    }\n",
+     "",
+     ("singleton_prepend_takes_the_shadowed_contract_off", "external_mixin_hook_takes_the_contract_off")),
+    ("redefine extended hook not a hook", INDEX,
+     "EXTEND_HOOKS.iter().any(|hook|",
+     "EXTEND_HOOKS.iter().take(0).any(|hook|",
+     "external_mixin_hook_takes_the_contract_off"),
+    ("redefine def on a constant ignored", INDEX,
+     "            self.push_keyed(Some(target.trim_start_matches(\"::\")), vec![PollutionSource::Singleton(Box::new(source))]);",
+     "            let _ = (target, source);",
+     "def_on_a_constant_redefines_its_singleton_contract"),
+    ("redefine def on a constant hits the instance track", INDEX,
+     "                    if !singleton_only {\n",
+     "                    if true || !singleton_only {\n",
+     "def_on_a_constant_redefines_its_singleton_contract"),
+    ("redefine def on a constant pollutes core operators", INDEX,
+     "            PollutionSource::Singleton(_) => continue,",
+     "            PollutionSource::Singleton(inner) => match inner.as_ref() {\n"
+     "                PollutionSource::Names(n) => n.clone(),\n                _ => Vec::new(),\n            },",
+     "def_on_a_constant_redefines_its_singleton_contract"),
+    ("redefine singleton_class definer ignored", INDEX,
+     "        if let Some(owner) = singleton_class_owner(node) {\n            let sources",
+     "        if let Some(owner) = None::<String> {\n            let sources",
+     "singleton_prepend_takes_the_shadowed_contract_off"),
+    ("redefine outside source trusted by the family", INDEX,
+     "    for (id, names, singleton_only) in hits {\n        index.include_time_code.insert(id);\n",
+     "    for (id, names, singleton_only) in hits {\n",
+     "outside_redefinition_of_a_subclass_keeps_the_parent_contract_off_the_call"),
+    # -- runtime gates: a sig accuses and types only where sorbet-runtime provably enforces it
+    ("runtime-gate checked never sig kept", INDEX,
+     "                            Some(parsed) if !stacked && !parsed.unchecked => PendingSig::Parsed(parsed),",
+     "                            Some(parsed) if !stacked => PendingSig::Parsed(parsed),",
+     "checked_never_or_tests_sig_is_inert"),
+    # removed: runtime-gate only a literal never level softens — r4-gates: any `T::Configuration` reference but the literal `:always` statement is a hazard (`runtime_gate.rs`), so `runtime_config_softens` is gone
+    # removed: runtime-gate soft handler ignored — r4-gates: a handler assignment is a `T::Configuration` reference like any other
+    ("runtime-gate unenforced project still types consumers", CHECK,
+     "        if self.index.sorbet_runtime_unchecked {\n            return None;\n        }\n",
+     "",
+     "default_checked_level_other_than_always_makes_sigs_inert"),
+    ("runtime-gate lock without sorbet-runtime trusted", INDEX,
+     "!lock.enforced(db)) {\n        index.sorbet_runtime_unchecked = true;\n    }\n",
+     "!lock.enforced(db)) {\n        let _ = ();\n    }\n",
+     "lockfile_without_real_sorbet_runtime_makes_sigs_inert"),
+    ("runtime-gate sorbet-runtime-stub counts as the runtime", DISCOVERY,
+     "    names(\"sorbet-runtime\") && !names(\"sorbet-runtime-stub\")",
+     "    names(\"sorbet-runtime\") || names(\"sorbet-runtime-stub\")",
+     "lockfile_without_real_sorbet_runtime_makes_sigs_inert"),
+    ("runtime-gate sig without T::Sig trusted", INDEX,
+     "        .filter(|&id| !sorbet_sig_reaches(index, id, t_sig))",
+     "        .filter(|&id| false && !sorbet_sig_reaches(index, id, t_sig))",
+     "sig_not_provided_by_t_sig_is_inert"),
+    # removed: runtime-gate homemade sig method trusted — r4-gates: any project `sig` definition makes every sig inert, so the per-class chain check is gone
+    ("runtime-gate project-wide T::Sig ignored", INDEX,
+     "    if index.sorbet_sig_everywhere {\n        return true;\n    }\n",
+     "",
+     "sig_not_provided_by_t_sig_is_inert"),
+    # removed: runtime-gate swallowing method_added hook ignored — r4-gates: a swallowing hook anywhere makes every sig inert, so `sig_hook_swallowers` is gone
+    # removed: runtime-gate hook calling super still swallows — r4-gates: moved to `runtime_gate.rs` as "r4-gates hook calling super still swallows"
+    # -- r4-gates: every runtime hazard is read project-wide, from the whole project root
+    ("r4-gates T::Configuration path ignored", RUNTIME,
+     "        self.hazard |= runtime && node.parent().as_ref().is_some_and(names_t);",
+     "        let _ = runtime;",
+     "any_runtime_configuration_reference_makes_sigs_inert"),
+    ("r4-gates literal always statement not exempt", RUNTIME,
+     "        if always_checked_statement(node) {\n            return;\n        }\n",
+     "",
+     ("any_runtime_configuration_reference_makes_sigs_inert", "default_checked_level_other_than_always_makes_sigs_inert")),
+    ("r4-gates bare Configuration inside module T ignored", RUNTIME,
+     "        self.hazard |= self.t_depth > 0 && runtime_namespace(node.name().as_slice());",
+     "        let _ = node;",
+     "any_runtime_configuration_reference_makes_sigs_inert"),
+    ("r4-gates T.const_get ignored", RUNTIME,
+     "        self.hazard |= name.as_slice() == b\"const_get\" && node.receiver().as_ref().is_some_and(names_t);\n",
+     "",
+     "any_runtime_configuration_reference_makes_sigs_inert"),
+    ("r4-gates string naming the namespace ignored", RUNTIME,
+     "    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {\n        self.hazard |= names_runtime_namespace(node.unescaped());",
+     "    fn visit_string_node(&mut self, node: &ruby_prism::StringNode<'pr>) {\n        let _ = node;",
+     "any_runtime_configuration_reference_makes_sigs_inert"),
+    ("r4-gates symbol naming the namespace ignored", RUNTIME,
+     "    fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {\n        self.hazard |= names_runtime_namespace(node.unescaped());",
+     "    fn visit_symbol_node(&mut self, node: &ruby_prism::SymbolNode<'pr>) {\n        let _ = node;",
+     "any_runtime_configuration_reference_makes_sigs_inert"),
+    ("r4-gates project sig definition trusted", RUNTIME,
+     "        self.hazard |= name == b\"sig\"\n",
+     "        self.hazard |= name == b\"sig-\"\n",
+     ("any_project_sig_definition_makes_sigs_inert", "sig_not_provided_by_t_sig_is_inert")),
+    ("r4-gates definer call ignored", RUNTIME,
+     "        if DEFINERS.contains(&name.as_slice()) {",
+     "        if false && DEFINERS.contains(&name.as_slice()) {",
+     ("any_project_sig_definition_makes_sigs_inert", "any_swallowing_method_added_hook_makes_sigs_inert")),
+    ("r4-gates alias ignored", RUNTIME,
+     "        if let Some(literal) = literal_name(&node.new_name()) {",
+     "        if let Some(literal) = literal_name(&node.new_name()).filter(|_| false) {",
+     "any_project_sig_definition_makes_sigs_inert"),
+    ("r4-gates definer spelling of a hook trusted", RUNTIME,
+     "            || SIG_HOOKS.contains(&name)\n",
+     "",
+     "any_swallowing_method_added_hook_makes_sigs_inert"),
+    ("r4-gates hook without super trusted", RUNTIME,
+     "            self.hazard |= !calls.0;",
+     "            self.hazard |= false && !calls.0;",
+     ("any_swallowing_method_added_hook_makes_sigs_inert", "method_added_hook_without_super_makes_sigs_inert")),
+    ("r4-gates hook calling super still swallows", RUNTIME,
+     "            self.hazard |= !calls.0;",
+     "            self.hazard |= calls.0 || !calls.0;",
+     ("any_swallowing_method_added_hook_makes_sigs_inert", "method_added_hook_without_super_makes_sigs_inert")),
+    ("r4-gates outside type test trusted", RUNTIME,
+     "            || (self.type_tests && TYPE_TEST_NAMES.iter().any(|test| test.as_bytes() == name));",
+     "            || (false && self.type_tests && TYPE_TEST_NAMES.iter().any(|test| test.as_bytes() == name));",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates prefilter skips a sig definition", RUNTIME,
+     "    [\"Configuration\", \"Private\", \"sig\", \"method_added\"]",
+     "    [\"Configuration\", \"Private\", \"method_added\"]",
+     "any_project_sig_definition_makes_sigs_inert"),
+    ("r4-gates prefilter skips a type test", RUNTIME,
+     "        || (type_tests && TYPE_TEST_NAMES.iter().any(|name| text.contains(name)))",
+     "        || (false && type_tests && TYPE_TEST_NAMES.iter().any(|name| text.contains(name)))",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates checked file hazard ignored", INDEX,
+     "        sorbet_runtime_unchecked: crate::runtime_gate::mentions_hazard(text, false)\n",
+     "        sorbet_runtime_unchecked: false && crate::runtime_gate::mentions_hazard(text, false)\n",
+     ("any_runtime_configuration_reference_makes_sigs_inert", "any_project_sig_definition_makes_sigs_inert")),
+    ("r4-gates outside hazard not wired", INDEX,
+     "    if crate::discovery::SorbetRuntimeHazard::try_get(db).is_some() {",
+     "    if false && crate::discovery::SorbetRuntimeHazard::try_get(db).is_some() {",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates project root not walked up", DISCOVERY,
+     "            .find(|dir| PROJECT_MARKERS.iter()",
+     "            .find(|dir| false && PROJECT_MARKERS.iter()",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates only .rb files read", DISCOVERY,
+     "    matches!(ext, Some(\"rb\" | \"rake\" | \"gemspec\" | \"ru\"))\n        || matches!(name,",
+     "    matches!(ext, Some(\"rb\"))\n        || false && matches!(name,",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates non-.rb files under a checked path skipped", DISCOVERY,
+     "!(rb_file(path) && checked.iter()",
+     "!((rb_file(path) || path.extension().is_some_and(|e| e == \"rake\")) && checked.iter()",
+     "project_root_hazards_reach_a_partial_check"),
+    ("r4-gates enclosing ignore files read", DISCOVERY,
+     "        .parents(false)\n",
+     "",
+     "project_root_hazards_reach_a_partial_check"),
+    # -- a collection literal is named by the category the contract compared
+    ("literal-only collection named by type arguments", CHECK,
+     "            LiteralClass::Modeled(Ty::Hash(_, _)) => \"Hash\".to_owned(),\n",
+     "",
+     "collection_literal_is_named_by_its_category"),
+    # -- hidden-redef: a definition through a receiver no constant names poisons by name (F5, F11)
+    ("hidden-redef unnamed receiver call ignored", INDEX,
+     "        self.note_hidden_call(node);\n",
+     "",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef class << obj ignored", INDEX,
+     "        if self.hidden_receiver(&node.expression()) {",
+     "        if false && self.hidden_receiver(&node.expression()) {",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef def obj.m ignored", INDEX,
+     "        if node.receiver().is_some_and(|recv| self.hidden_receiver(&recv)) {\n            let name",
+     "        if false {\n            let name",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef mixin hook receiver read as unnamed", INDEX,
+     "        !hook_param\n",
+     "        let _ = hook_param;\n        true\n",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef instance_eval DSL call read as a definer", INDEX,
+     "            Some(block) => instance_block_definitions(block.body().as_ref(), 0),",
+     "            Some(_) => block_pollution(node.block().as_ref()),",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef dynamic send read as a definition", INDEX,
+     "    if dynamic_send {\n        return Vec::new();\n    }\n",
+     "",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef bare eval trusted", INDEX,
+     "            if has_arg {\n                self.note_hidden(vec![PollutionSource::Opaque]);\n            }\n",
+     "",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef unnamed refine ignored", INDEX,
+     "        if target.is_none() {\n            self.note_hidden(sources.clone());\n        }\n",
+     "",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef unreadable source bounded by name", INDEX,
+     "            None => every = true,\n",
+     "            None => {}\n",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef type test bounded by name", INDEX,
+     "    every |= TYPE_TEST_NAMES.iter().any(|n| names.contains(*n));\n",
+     "",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef singleton track kept", INDEX,
+     "        for track in [&mut class.methods, &mut class.singleton_methods] {\n            for (name, method) in track.iter_mut() {",
+     "        for track in [&mut class.methods] {\n            for (name, method) in track.iter_mut() {",
+     "redefinition_through_an_unnamed_receiver_poisons_by_name"),
+    ("hidden-redef alias reopen not a reopen", INDEX,
+     "    poison_alias_reopen_redefinitions(&mut index);\n",
+     "",
+     "reopen_through_a_constant_alias_is_a_redefinition"),
+    ("hidden-redef alias reopen spares the ancestors", INDEX,
+     "        let mut family = index.ancestors(real).0;\n",
+     "        let mut family = vec![real];\n",
+     "reopen_through_a_constant_alias_is_a_redefinition"),
+    # -- r4: a hidden definition is bounded wherever its target can be
+    ("hidden-r4 literal argument read as a module", INDEX,
+     "    if never_a_module(arg) {\n        return None;\n    }\n",
+     "    if false && never_a_module(arg) {\n        return None;\n    }\n",
+     "literal_argument_to_an_unnamed_mixin_is_no_mixin"),
+    ("hidden-r4 route helpers read as unknown", INDEX,
+     "    if route_helpers_module(arg) {\n",
+     "    if false && route_helpers_module(arg) {\n",
+     "route_helpers_on_an_unnamed_receiver_take_route_names_off"),
+    ("hidden-r4 route helper names spared", INDEX,
+     "    names.contains(name) || (names.contains(ROUTE_HELPERS) && route_helper_name(name))\n",
+     "    names.contains(name) || (false && names.contains(ROUTE_HELPERS) && route_helper_name(name))\n",
+     "route_helpers_on_an_unnamed_receiver_take_route_names_off"),
+    ("hidden-r4 project url_helpers ignored", INDEX,
+     "        PollutionSource::Names(n) if n.iter().any(|name| name == ROUTE_HELPERS) && project_defines(index, \"url_helpers\") => None,\n",
+     "        PollutionSource::Names(n) if false && n.iter().any(|name| name == ROUTE_HELPERS) && project_defines(index, \"url_helpers\") => None,\n",
+     "route_helpers_on_an_unnamed_receiver_take_route_names_off"),
+    ("hidden-r4 hook install through a call dropped", INDEX,
+     "        } else if self.hook_param_read(&recv) {\n",
+     "        } else if false && self.hook_param_read(&recv) {\n",
+     "hook_installs_land_on_the_modules_mixers"),
+    ("hidden-r4 hook install lands on no mixer", INDEX,
+     "                hits.push((ClassId(raw), names.clone()));\n",
+     "                let _ = (raw, &names);\n",
+     "hook_installs_land_on_the_modules_mixers"),
+    ("hidden-r4 hook in class << self read as unnamed", INDEX,
+     "        None => in_own_singleton,\n",
+     "        None => false && in_own_singleton,\n",
+     "hook_installs_land_on_the_modules_mixers"),
+    ("hidden-r4 polymorphic_mapping spared", INDEX,
+     '    ["url", "path", "route", "polymorphic"].iter().any(|part| name.contains(part))\n',
+     '    ["url", "path", "route"].iter().any(|part| name.contains(part))\n',
+     "route_helpers_on_an_unnamed_receiver_take_route_names_off"),
+    ("hidden-r4 rebound hook param still bounded", INDEX,
+     "    let rebound = node.body().is_some_and(|body| local_rebound(&body, &param));\n",
+     "    let rebound = false && node.body().is_some_and(|body| local_rebound(&body, &param));\n",
+     "a_rebound_hook_param_is_an_unnamed_receiver"),
+    ("hidden-r4 binding escape not a rebind", INDEX,
+     '            self.hit |= matches!(node.name().as_slice(), b"binding" | b"local_variable_set");\n',
+     '            self.hit |= false && matches!(node.name().as_slice(), b"binding" | b"local_variable_set");\n',
+     "a_rebound_hook_param_is_an_unnamed_receiver"),
+    ("hidden-r4 hook type test bounded by mixers", INDEX,
+     "        let Some(module) = module.filter(|_| !type_test) else {\n",
+     "        let Some(module) = module.filter(|_| !(false && type_test)) else {\n",
+     "hook_installs_land_on_the_modules_mixers"),
+    # -- F10 rebinding: a local no flow walk follows types no receiver
+    ("rebinding opaque scope never read", CHECK,
+     "                if self.opaque_locals {\n                    return Ty::Unknown;\n                }\n",
+     "",
+     "rebound_receivers_are_unknown"),
+    ("rebinding for index keeps its old type", CHECK,
+     "                for name in target_locals([n.index()]) {",
+     "                for name in target_locals([n.index()]).into_iter().take(0) {",
+     "rebound_receivers_are_unknown"),
+    ("rebinding splat target keeps its old type", CHECK,
+     "                for name in target_locals(n.lefts().iter().chain(n.rest()).chain(n.rights().iter())) {",
+     "                for name in target_locals(n.lefts().iter().chain(n.rights().iter())) {",
+     "rebound_receivers_are_unknown"),
+    ("rebinding pattern capture keeps its old type", CHECK,
+     "                for name in target_locals(match_targets(node)) {",
+     "                for name in target_locals(match_targets(node)).into_iter().take(0) {",
+     "rebound_receivers_are_unknown"),
+    ("rebinding string eval trusted", CHECK,
+     "        if string_eval || matches!(node.name().as_slice(), b\"binding\" | b\"local_variable_set\") {",
+     "        if (false && string_eval) || matches!(node.name().as_slice(), b\"binding\" | b\"local_variable_set\") {",
+     "rebound_receivers_are_unknown"),
+    ("rebinding block eval read as a string eval", CHECK,
+     "            && node.block().is_none();\n",
+     ";\n",
+     "rebound_receivers_are_unknown"),
+    ("rebinding binding escape trusted", CHECK,
+     "        if string_eval || matches!(node.name().as_slice(), b\"binding\" | b\"local_variable_set\") {",
+     "        if string_eval {",
+     "rebound_receivers_are_unknown"),
+    ("rebinding def on a local trusted", CHECK,
+     "        if node.receiver().is_some_and(|r| r.as_local_variable_read_node().is_some()) {\n            self.opaque = true;",
+     "        if false && node.receiver().is_some_and(|r| r.as_local_variable_read_node().is_some()) {\n            self.opaque = true;",
+     "rebound_receivers_are_unknown"),
+    ("rebinding class << local trusted", CHECK,
+     "        if node.expression().as_local_variable_read_node().is_some() {\n            self.opaque = true;",
+     "        if false && node.expression().as_local_variable_read_node().is_some() {\n            self.opaque = true;",
+     "rebound_receivers_are_unknown"),
+    ("hidden-redef core type test ignored", CHECK,
+     " && self.type_test_unpatched(leaf))",
+     ")",
+     "redefined_type_test_on_a_core_class_silences_its_literals"),
+]
+
+
+def verdict(build_code, run_code, output, expected):
+    if build_code != 0:
+        return "INVALID-build"
+    if run_code == 0:
+        return "BLIND" if expected else "PASS"
+    if expected:
+        names = (expected,) if isinstance(expected, str) else expected
+        if all(re.search(rf"^test {re.escape(name)} \.\.\. FAILED$", output, re.M) for name in names):
+            return "CAUGHT"
+    return "WRONG-check"
+
+
+def run(copy, *args):
+    env = os.environ.copy()
+    env["CARGO_TARGET_DIR"] = str(copy / "target")
+    tests = [argument for test in TESTS for argument in ("--test", test)]
+    result = subprocess.run(
+        ["cargo", "test", "--locked", "--no-fail-fast", "-p", "itaruby_semantic", *tests, *args],
+        cwd=copy, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        check=False,
+    )
+    print(result.stdout, end="", flush=True)
+    return result
+
+
+def exercise(copy, path, original, content, expected):
+    target = copy / path
+    target.write_text(content)
+    try:
+        if expected and filecmp.cmp(original, target, shallow=False):
+            return "INVALID-cmp", None
+        built = run(copy, "--no-run")
+        if built.returncode != 0:
+            return "INVALID-build", (built.returncode, None, built.stdout)
+        tested = run(copy, "--", "--test-threads=1")
+        evidence = (built.returncode, tested.returncode, tested.stdout)
+        return verdict(*evidence, expected), evidence
+    finally:
+        # Every mutant starts from the shipped source, byte-identical.
+        shutil.copyfile(original, target)
+        if not filecmp.cmp(original, target, shallow=False):
+            raise SystemExit(f"RESTORE-FAILED {path}")
+
+
+def require(actual, expected, label):
+    print(f"{label}: {actual}", flush=True)
+    if actual != expected:
+        raise SystemExit(f"{label}: expected {expected}, got {actual}")
+
+
+def count_anchors(sources):
+    broken = []
+    for label, path, needle, _after, _expected in MUTATIONS:
+        n = sources[path].count(needle)
+        if n != 1:
+            broken.append(f"INVALID-anchor {label}: needle matches {n} times in {path}")
+    for line in broken:
+        print(line)
+    print(f"{len(MUTATIONS)} anchors checked in {len({m[1] for m in MUTATIONS})} files")
+    return not broken
+
+
+def main():
+    sources = {path: (ROOT / path).read_text() for path in {m[1] for m in MUTATIONS}}
+    if not count_anchors(sources):
+        raise SystemExit(1)
+    if "--anchors" in sys.argv[1:]:
+        print("PASS every anchor matches exactly once")
+        return
+    with tempfile.TemporaryDirectory(prefix="ita-sorbet-mutants-") as temporary:
+        copy = Path(temporary)
+        for name in ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"]:
+            shutil.copy2(ROOT / name, copy / name)
+        shutil.copytree(ROOT / "crates", copy / "crates", ignore=shutil.ignore_patterns("target"))
+        # Cargo builds this semantic-crate bin for integration tests too.
+        # Copy its public source explicitly, never the scripts directory
+        # (which may contain machine-local corpus configuration).
+        (copy / "scripts").mkdir()
+        generator = Path("scripts/gen-activerecord-inventory.rs")
+        shutil.copy2(ROOT / generator, copy / generator)
+        originals = {}
+        for path, text in sources.items():
+            original = copy / f"original-{path.name}"
+            original.write_text(text)
+            originals[path] = original
+
+        first = next(iter(sources))
+        result, _ = exercise(copy, first, originals[first], sources[first], None)
+        require(result, "PASS", "positive control")
+        result, _ = exercise(copy, CHECK, originals[CHECK], sources[CHECK], MUTATIONS[0][4])
+        require(result, "INVALID-cmp", "no-op guard")
+        result, _ = exercise(copy, CHECK, originals[CHECK], sources[CHECK] + "\nnot valid Rust;\n", MUTATIONS[0][4])
+        require(result, "INVALID-build", "compiler guard")
+
+        only = sys.argv[sys.argv.index("--only") + 1] if "--only" in sys.argv[1:] else None
+        selected = [m for m in MUTATIONS if only is None or only in m[0]]
+        if not selected:
+            raise SystemExit(f"--only {only!r} matches no mutant label")
+        for label, path, needle, after, expected in selected:
+            mutant = sources[path].replace(needle, after, 1)
+            result, evidence = exercise(copy, path, originals[path], mutant, expected)
+            require(result, "CAUGHT", label)
+            require(verdict(*evidence, "this_test_does_not_exist"), "WRONG-check", f"named-check guard: {label}")
+
+        result, _ = exercise(copy, first, originals[first], sources[first], None)
+        require(result, "PASS", "restored positive control")
+    if only is not None:
+        print(f"PARTIAL: {len(selected)} of {len(MUTATIONS)} mutants (--only {only!r}); not a family verdict")
+        return
+    print(f"PASS: {len(MUTATIONS)} sorbet contract mutants and all four evidence guards")
+
+
+if __name__ == "__main__":
+    main()

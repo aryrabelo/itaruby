@@ -109,9 +109,10 @@ Model.new
 /// `OpenReason::MethodMissing` (`index.rs` ~line 300). Unlike the DSL/meta
 /// fixtures, the opening statement is a `def` — `Checker::scope_stmt`'s
 /// `DefNode` arm walks its body (`nil`, not a call), so it contributes NO
-/// call site of its own. `Model.new` (`new`-with-`Inconclusive`) and the
-/// chained `.foo` (`Ty::Instance(c)` arm) are the only two Inconclusive
-/// sites, both `anc_missing`.
+/// call site of its own. `Model.new` (`new`-with-`Inconclusive`) is the
+/// only Inconclusive site, `anc_missing`: an open ancestry may hide a
+/// singleton `new`, so it types Unknown and the chained `.foo` is an
+/// unknown receiver, never an ancestry block.
 #[test]
 fn anc_missing_method_missing() {
     let s = stats_of(
@@ -125,8 +126,9 @@ end
 Model.new.foo
 ",
     );
-    assert_eq!(s.inconclusive, 2, "Model.new + .foo, both blocked by method_missing's open flag: {s:?}");
-    assert_eq!(s.anc_missing, 2, "Model opened by defining method_missing: {s:?}");
+    assert_eq!(s.inconclusive, 1, "Model.new, blocked by method_missing's open flag: {s:?}");
+    assert_eq!(s.anc_missing, 1, "Model opened by defining method_missing: {s:?}");
+    assert_eq!(s.unknown_receiver, 1, ".foo on the Unknown an open `Model.new` answers: {s:?}");
     assert_sums(&s);
 }
 
@@ -188,13 +190,13 @@ ExternalModel.new.foo
     );
     assert_eq!(s.anc_dsl, 2, "has_many :things + DslModel.new: {s:?}");
     assert_eq!(s.anc_meta, 2, "send(...) + MetaModel.new: {s:?}");
-    assert_eq!(s.anc_missing, 2, "MissingModel.new + .foo: {s:?}");
+    assert_eq!(s.anc_missing, 1, "MissingModel.new; .foo runs on Unknown: {s:?}");
     assert_eq!(
         s.anc_declared, 1,
         "ExternalModel.new resolves via its own initialize (bead ita-k9j entrega 2); only .foo is blocked by ActiveRecord::Base: {s:?}"
     );
     assert_eq!(s.anc_other, 0, "unreachable: no declared fragment is ever Project(DeclaredExternal): {s:?}");
     assert_eq!(s.anc_na, 1, "1.mystery_method, not an ancestry block: {s:?}");
-    assert_eq!(s.inconclusive, 8, "2+2+2+1+1 across the 5 mixed shapes: {s:?}");
+    assert_eq!(s.inconclusive, 7, "2+2+1+1+1 across the 5 mixed shapes: {s:?}");
     assert_sums(&s);
 }

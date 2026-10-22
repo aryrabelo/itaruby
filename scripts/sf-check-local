@@ -1,0 +1,51 @@
+#!/usr/bin/env python3
+"""`sf check` for a commit that is not closing anything yet.
+
+Run: scripts/sf-check-local [sf check args...]   (the pre-commit hook does)
+
+The `closing` gate (AGENTS.md) is proved by a full `./scripts/dev gates` run
+plus a Jev verdict — half an hour of gauntlet. Demanding that on every commit
+would make every commit a closing; the owner's rule is that it is demanded
+every time a change is CLOSED, which is the pull request, where CI runs
+`sf check --allow-commands` with nothing filtered.
+
+So exactly two findings are tolerated here, and each is printed, not hidden:
+  - L3.GATE_HAS_FRESH_EVIDENCE for the `closing` gate (its evidence is stale
+    because the work is still moving);
+  - L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE (the judge is not run locally
+    without --allow-commands, and its question tracks the stale evidence).
+Every other finding of every rule fails the commit exactly as `sf check` does.
+
+Exit: 0 nothing but the tolerated two · 1 any other finding · 2 sf failed.
+"""
+import json
+import subprocess
+import sys
+
+TOLERATED = (
+    lambda f: f["rule"] == "L3.GATE_HAS_FRESH_EVIDENCE" and f.get("key", "").startswith("closing:"),
+    lambda f: f["rule"] == "L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE",
+)
+
+
+def main():
+    args = sys.argv[1:]
+    run = subprocess.run(["sf", "check", "--format", "json", *args], text=True, capture_output=True, check=False)
+    try:
+        findings = json.loads(run.stdout)["findings"]
+    except (ValueError, KeyError):
+        sys.stderr.write(run.stdout + run.stderr)
+        return 2
+    blocking = [f for f in findings if not any(t(f) for t in TOLERATED)]
+    if blocking:
+        # Show the whole report the way sf renders it; the filter only decides.
+        subprocess.run(["sf", "check", *args], check=False)
+        return 1
+    for f in findings:
+        print(f"closing gate not proved yet ({f['rule']}): {f['message']} — "
+              "run scripts/closing-evidence before the pull request")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

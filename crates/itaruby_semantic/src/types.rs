@@ -163,3 +163,6 @@ pub const E0107_CONSTRAINT_CONTRADICTION: &str = "E0107";
 /// by any declaration — a user-defined `coerce`/`+` makes the pairing
 /// legal at runtime.
 pub const E0108_OPERAND_TYPE_MISMATCH: &str = "E0108";
+/// A proven source-method return contradicts its explicit Sorbet contract.
+/// Unknown, void, and declaration-only bodies never emit this diagnostic.
+pub const E0109_RETURN_TYPE_MISMATCH: &str = "E0109";

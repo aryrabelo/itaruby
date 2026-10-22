@@ -292,6 +292,11 @@ end
 /// `DslWireChainQuantity`'s own project body — must resolve too, proving
 /// the returned `Ty::Instance` actually carries the right `ClassId`
 /// through to the next hop instead of dying on `Ty::Unknown`.
+///
+/// The sig spells the class absolutely, as Tapioca emits it: a BARE name
+/// inside a class whose ancestry is opaque (the unresolved gem superclass
+/// could carry a same-named constant) is `Unknown` by design — see
+/// `inherited_namespace_constants_never_bind_to_top_level`.
 #[test]
 fn dsl_sig_returning_a_project_class_lets_the_chain_continue() {
     let dir = wire_tmpdir("chain-continues");
@@ -301,7 +306,7 @@ fn dsl_sig_returning_a_project_class_lets_the_chain_continue() {
         &dir,
         &[(
             "dsl/dsl_wire_chain_host.rbi",
-            "class DslWireChainHost\n  sig { returns(DslWireChainQuantity) }\n  def chain_col; end\nend\n",
+            "class DslWireChainHost\n  sig { returns(::DslWireChainQuantity) }\n  def chain_col; end\nend\n",
         )],
     );
     let file = wire_project(

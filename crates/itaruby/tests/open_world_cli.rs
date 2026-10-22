@@ -238,7 +238,9 @@ fn path_gem_outside_the_project_stays_silent() {
     );
 }
 
-/// A file `sorbet/config` keeps out of the run still runs.
+/// A file `sorbet/config` keeps out of the run still runs. Since the
+/// `--ignore` indexing (`OpenReason::IgnoredReopening`) also stands this
+/// Integer down, the unloaded harvest alone is pinned by the next fixture.
 #[test]
 fn ignored_path_reopening_core_stays_silent() {
     assert_silent(
@@ -250,6 +252,19 @@ fn ignored_path_reopening_core_stays_silent() {
                 "legacy/patch.rb",
                 "class Integer\n  def upcase = to_s\nend\n",
             ),
+        ],
+    );
+}
+
+/// The shape only the unloaded harvest reaches: an extensionless script
+/// no run loads (`bin/`), outside every `--ignore`, reopening Integer.
+#[test]
+fn unloaded_script_reopening_core_stays_silent() {
+    assert_silent(
+        "silent-unloaded-script",
+        &[
+            ("main.rb", SIG_INTEGER),
+            ("bin/patch", "class Integer\n  def upcase = to_s\nend\n"),
         ],
     );
 }
@@ -448,7 +463,9 @@ fn gem_class_answering_both_names_keeps_e0107_off() {
 /// Tapioca restates MRI's own inclusions (`include ::Comparable` in every
 /// `class String` reopening) and writes `sig`s with generics this crate
 /// does not parse. Neither defines a name: the reopening stays readable
-/// and a literal typo still accuses.
+/// and a literal typo still accuses. The second `sig` ends in `.checked`,
+/// so neither the contract grammar nor the `returns`/`void` builder rule
+/// recognizes it: it is the shape that reaches the class-body opening.
 #[test]
 fn tapioca_core_reopening_shape_stays_readable() {
     let dir = project(
@@ -457,11 +474,11 @@ fn tapioca_core_reopening_shape_stays_readable() {
             ("main.rb", "# typed: true\n\"s\".upcase_all\n"),
             (
                 "sorbet/rbi/gems/mygem@1.0.0.rbi",
-                "# typed: true\n\nclass String\n  include ::Comparable\n\n  sig { type_parameters(:U).params(fill_with: T.type_parameter(:U)).returns(T::Array[T.any(Elem, T.type_parameter(:U))]) }\n  def in_groups_of(fill_with); end\nend\n",
+                "# typed: true\n\nclass String\n  include ::Comparable\n\n  sig { type_parameters(:U).params(fill_with: T.type_parameter(:U)).returns(T::Array[T.any(Elem, T.type_parameter(:U))]) }\n  def in_groups_of(fill_with); end\n\n  sig { type_parameters(:U).params(x: T.type_parameter(:U)).returns(T.type_parameter(:U)).checked(:never) }\n  def presence_in(x); end\nend\n",
             ),
             (
                 "@gems/mygem-1.0.0/lib/mygem.rb",
-                "class String\n  def in_groups_of(fill_with); end\nend\n",
+                "class String\n  def in_groups_of(fill_with); end\n  def presence_in(x); end\nend\n",
             ),
         ],
     );

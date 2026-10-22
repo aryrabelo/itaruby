@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Added
+- `scripts/sorbet-capability-probes.rb`: the README's Sorbet support matrix
+  as 25 probes, each run under `srb tc` 0.6.13437 and `ita check` with the
+  error codes both must report; exit 1 names the stale row, exit 2 skips
+  without the pinned `srb`. Guarded by
+  `scripts/sorbet-capability-probes-selftest.sh` (clean run plus five
+  mutants, each accused by its named case).
+
 ### Fixed
 - A bare, unqualified top-level value-constant write in a client's
   `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,

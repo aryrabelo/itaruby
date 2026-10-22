@@ -533,6 +533,16 @@ repository already versions in the clear — never from a private corpus artifac
 
 The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall covers any private corpus declared again exactly as before, and the retired ids' hashes stay in git history only.
 
+The README's Sorbet support matrix is an instrument, not prose (learned
+2026-10-22, binding, measured): its first draft was written from memory and
+four Sorbet cells were wrong (refinements, inline RBS, the LSP feature list,
+the `typed: false` noise example) plus one itaruby cell. Every row not marked
+*(docs)* is a probe in `scripts/sorbet-capability-probes.rb`, run against
+`srb tc` at the pinned version and a fresh release `ita`; a matrix edit, a
+contracts landing or an `srb` bump re-runs it and updates the README in the
+same change. Not a gate (it needs `srb`); its two-sided proof is
+`scripts/sorbet-capability-probes-selftest.sh`.
+
 The inference bench (`scripts/inference-bench-README.md`) answers a different
 question from every corpus gate: on twelve self-contained, gem-free fixtures,
 does itaruby find real bugs with ZERO annotations and stay silent on dynamic

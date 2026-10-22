@@ -58,6 +58,70 @@ of some return types. Full contract checking of parameters and returns,
 and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
 alongside itaruby to preserve your existing Sorbet checks.
 
+## Sorbet vs itaruby — what changes for your team
+
+Scope of every claim below: the alpha as of this README, the public-corpus
+rounds described in "Benchmarked against Sorbet", and the annotation-free
+bench (12 fixtures, `# typed: true`, srb 0.6.13437, no timing claim). Both
+columns of the support matrix are probes in
+`scripts/sorbet-capability-probes.rb` (one minimal program per row, `srb tc`
+0.6.13437 against a fresh release `ita`, first measured 2026-10-22), except
+rows marked *(docs)*, which come from each tool's documentation.
+
+### A team that replaces Sorbet with itaruby
+
+| | What you gain | What you lose |
+|---|---|---|
+| Coverage | Bodies of `typed: false` / unsigned methods are checked too — Sorbet never looks inside them | Nothing you annotated is *enforced* anymore: `params(...)` contracts, `T.let`/`T.cast`/`T.must`, nilability and generics go unchecked |
+| Annotations | No sigils, no `sig` maintenance, no `srb init` | Your existing `sig`s become mostly documentation: only `.returns(...)` is read, to improve inference |
+| False positives | Invariant #1: silence wherever it cannot prove — no `T.unsafe` / `T.untyped` escape hatches needed | No guarantee in the other direction: a silent run is not a proof of type safety |
+| Strictness | — | No `typed: strict`/`strong` levels; you cannot demand that a file be fully typed |
+| Metaprogramming | DSLs, `method_missing`, `define_method`, concerns read as *open* instead of demanding an RBI shim | Sorbet's precision on those shapes once a human/Tapioca wrote the RBI |
+| Existing setup | Tapioca RBIs (`sorbet/rbi/`) and `sorbet/config --ignore` are read for free | Hand-written RBIs are used only to resolve names and return types, not as contracts |
+| Editor | Real-time diagnostics, hover, go-to-definition, as a ruby-lsp add-on | Sorbet LSP extras: completion, rename, references, implementation, type definition, symbols, code actions |
+| Speed | Faster on 2 of 4 public repos (discourse, gitlab-foss) | Slower on the other 2 (rails, mastodon) vs `srb tc --typed true` |
+| Runtime | — | Nothing changes: `sorbet-runtime` is independent and keeps working if you keep the gem |
+
+Recommendation for now: run both. Keep `srb tc` for what you annotated and
+add `ita check` for the code Sorbet never opens.
+
+### A team that never typed anything
+
+| With Sorbet | With itaruby |
+|---|---|
+| `srb init`, a sigil per file, Tapioca for gems/DSLs, before the first useful error | `ita check app/` on the code as it is — zero annotations |
+| Default `typed: false` checks constants and syntax only; real checks start file by file, as sigils are raised and sigs written | Method bodies are inferred from day one: undefined methods (instance and class object), wrong arity, unresolved constants, impossible operators, bad schema writes |
+| Noise until RBIs exist: under `typed: false` an un-shimmed gem constant (`Nokogiri::HTML`) is already an error | Silent where it cannot prove; every reported site is meant to raise under MRI |
+| Eventually: full contracts and strict files, if the team invests | Ceiling today: no contracts, no nilability, no generics — opt in to inline RBS (`#:`) where you want argument checks |
+
+### Support matrix
+
+| Capability | Sorbet | itaruby |
+|---|---|---|
+| Undefined method on project instance / class object | ✅ (typed: true+) | ✅ E0101, zero annotations |
+| Positional arity | ✅ | ✅ E0102 |
+| Keyword-argument checking | ✅ | ❌ |
+| Unresolved constant | ✅ | ✅ E0104 |
+| Operator `TypeError` on literals | ✅ | ✅ E0108 |
+| Schema-aware column writes (`db/schema.rb`, `structure.sql`) | ❌ needs Tapioca DSL RBIs *(docs)* | ✅ E0106 |
+| Checking unannotated method bodies (`typed: false`) | ❌ | ✅ |
+| `sig { params(...) }` contracts | ✅ | ❌ (roadmap) |
+| `sig { returns(...) }` | ✅ enforced | 🟡 read for inference, not enforced |
+| Inline RBS (`#:`) | 🟡 experimental: `--enable-experimental-rbs-comments --parser=prism` | 🟡 E0103 argument types on methods of a project class; a top-level `def` is not checked |
+| `T.nilable` / nil safety | ✅ | ❌ |
+| Generics (`T::Array[...]`, `T::Generic`) | ✅ | ❌ (returns read only for core collections) |
+| `T.let` / `T.cast` / `T.must` / `T.unsafe` | ✅ | ❌ |
+| `T::Struct`, `T::Enum`, abstract/interface/sealed | ✅ (`T::Struct` probed; the rest *(docs)*) | ❌ (treated as open, never accused) |
+| Strictness levels (`false`/`true`/`strict`/`strong`) | ✅ | ❌ |
+| Tapioca RBIs | ✅ required for gems/DSLs | ✅ optional, lazily read |
+| `sorbet/config --ignore` | ✅ | ✅ |
+| Flow narrowing | ✅ locals and ivars | 🟡 locals and params only (never ivars, by design) |
+| Block parameter types (`[1].each { \|x\| x.upcase }`) | ✅ | ❌ silent |
+| Refinements (`using R; "a".refined_method`) | ❌ false positive: reports the refined method as missing | ✅ silent (degrades to `Unknown`) |
+| LSP: diagnostics, hover, go-to-definition | ✅ | ✅ |
+| LSP: completion, rename, references, implementation, symbols, code actions | ✅ | ❌ |
+| Runtime type checks | ✅ `sorbet-runtime` *(docs)* | ❌ static only |
+
 ## Quick start
 
 ```sh

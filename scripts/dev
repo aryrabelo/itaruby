@@ -20,7 +20,8 @@
 # absolute, or relative to $CORPORA_ROOT (default $HOME/Sites). The `anchor`
 # and `prove` verbs (gates over ssh on the machine that held corpus-a and
 # corpus-b, and the union of both machines' proof) were removed 2026-10-19
-# with that machine: the one remaining private corpus lives on m5.
+# with that machine; corpus-c was retired 2026-10-21, so no private corpus is
+# declared today and the mapping file has nothing to map.
 #
 # ponytail: bash with subcommands, not `cargo xtask`/cargo-make/a Makefile.
 # xtask is the right idiom when contributors are cross-platform and shouldn't

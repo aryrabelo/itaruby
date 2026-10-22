@@ -1,0 +1,24 @@
+.github/workflows/gauntlet.yml
+  h_b156936c57c455 11-13
+AGENTS.md
+  h_b156936c57c455 203-205,635,650,795-797,799,801-803,812-820,875-877
+docs/CHANGELOG.md
+  h_b156936c57c455 66-75
+scripts/corpus-baseline.txt
+  h_b156936c57c455 43,48,55-60
+scripts/dev
+  h_b156936c57c455 23-24
+scripts/gauntlet-gates.sh
+  h_b156936c57c455 337-342,346-349
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "57bfec24cf3a26a489607d86e4836c048eabf277",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

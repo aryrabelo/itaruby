@@ -1,0 +1,22 @@
+AGENTS.md
+  h_b156936c57c455 535-544
+README.md
+  h_b156936c57c455 61-124
+docs/CHANGELOG.md
+  h_b156936c57c455 9-16
+scripts/sorbet-capability-probes-selftest.sh
+  h_b156936c57c455 1-97
+scripts/sorbet-capability-probes.rb
+  h_b156936c57c455 1-296
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "03be177f27fc1147593e127934a62df4cbf93276",
+  "prompts": {},
+  "humans": {
+    "h_b156936c57c455": {
+      "author": "Ary Rabelo <aryrabelo@gmail.com>"
+    }
+  }
+}

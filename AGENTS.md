@@ -86,8 +86,9 @@ winning on both.
   levels) fails closed to "couldn't tell, treat as present" rather than
   "confirmed absent, diagnose" — an unresolvable result is never license to
   accuse.
-- The private benchmark corpus (corpus-c; corpus-a and corpus-b were retired
-  2026-10-19, see "Machines" below) is sacred:
+- A private benchmark corpus is sacred (none is declared today: corpus-a and
+  corpus-b were retired 2026-10-19 and corpus-c 2026-10-21, see "Machines"
+  below; the rule binds any corpus declared again):
   their expected error sets are recorded in `scripts/corpus-baseline.txt` as
   SHA-256 hashes only — never a path, class, method, table, or column name in
   clear text. Any new diagnostic on a corpus must be proven a true positive by
@@ -515,7 +516,7 @@ green but at least one declared corpus could not be checked on this machine
 | `scripts/instrument-mutants.sh` — the evidence producers themselves (gate fail-fast, replay run isolation, replay build pin, mutant-lab fresh build): each defect re-injected as a mutant, shipped scripts proved clean | only the repo | **any machine** |
 | `scripts/gate-box-selftest.sh` — the gate box that runs the gauntlet: mirror exact (HEAD + uncommitted delta), lock exclusive, corpora map copied, the caller's `CARGO_TARGET_DIR` dropped; each step removed as a mutant and accused by its named case | only the repo | **any machine** |
 | `scripts/perf-gate.sh` — criterion medians vs `scripts/perf-baseline.txt` | only the repo | **any machine** (tight ceiling on a dev machine, loose one under `CI`) |
-| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | corpus-c: **only `m5`** |
+| Corpus diff vs `scripts/corpus-baseline.txt` | per declared corpus, checked individually where its path is mapped in `scripts/corpora-local.txt` | none declared since 2026-10-21: **any machine** prints `SKIP corpus diff — no corpora declared` (no `skipped` raised, so it never forces exit 2) |
 | Navigation oracle vs `scripts/navfixture/oracle.jsonl` | only the repo | **any machine** |
 | `scripts/public-gate.sh` vs `scripts/public-corpora.txt` + `scripts/public-baseline/<id>.jsonl` | a depth-1 clone of each declared public repo at its pinned sha under `$HOME/.local/share/itaruby/public-corpora`, fetched by `scripts/public-corpora-fetch.sh` (never auto-fetched by the gate; `PUBLIC_GATE_CLONE=1` opts in); error sets are **drift detectors, unaudited** until `scripts/public-baseline/README.md`'s ledger has a verdict per family | **any machine with the clones** |
 | `scripts/inference-gate.sh` — the inference bench (`scripts/inference-bench.jsonl`), guarded by `scripts/inference-bench-selftest.sh` | only the repo; `ruby` for the ground truth, `srb` at the pinned version for the comparison leg (missing/mismatched → that leg skips) | **any machine** |
@@ -530,7 +531,7 @@ future model call in this repository inherits the same three rules and the same
 two-sided proof, and its state is built from the digest or from files this
 repository already versions in the clear — never from a private corpus artifact.
 
-The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall still covers the private corpus unchanged.
+The public corpora are the ONLY corpora whose diagnostics are versioned in the clear, because they are public — the secrecy wall covers any private corpus declared again exactly as before, and the retired ids' hashes stay in git history only.
 
 The inference bench (`scripts/inference-bench-README.md`) answers a different
 question from every corpus gate: on twelve self-contained, gem-free fixtures,
@@ -675,13 +676,15 @@ target from 2.91 to 1.74 GiB and the bytes written per mutant rebuild from
 for locals under lldb, `CARGO_PROFILE_DEV_DEBUG=true`. The release
 profile's `debug = true` is untouched.
 
-Full proof today is one machine: `./scripts/dev gates` on `m5` proves
-corpus-c, the only private corpus still declared, and every public corpus.
+Full proof today is one machine: `./scripts/dev gates` on `m5` proves every
+public corpus against the `dev` performance column; no private corpus is
+declared, so gate d's explicit SKIP is the full answer there.
 
-## Machines: the private corpus lives on m5
+## Machines: m5 holds the public clones and the dev ceilings
 
-`m5`/`m5-de-ary` (100.88.227.102, the strong machine) holds corpus-c and the
-public clones; `ssh m5-ary` reaches it. The machine that held corpus-a and
+`m5`/`m5-de-ary` (100.88.227.102, the strong machine) holds the public
+clones and measures the `dev` ceiling columns; `ssh m5-ary` reaches it. No
+private corpus lives anywhere any more. The machine that held corpus-a and
 corpus-b is gone for good, and both corpora were retired on 2026-10-19: no
 machine can ever check them again, so their declarations were removed
 instead of left to SKIP forever, and zammad/zammad and Homebrew/brew replace
@@ -690,6 +693,15 @@ that lives on exactly one machine dies with it, so a declaration nobody
 can measure is deleted, never kept as a permanent SKIP; the replacement is
 a public corpus whose clone any machine can fetch). Their history stays in
 `docs/CHANGELOG.md` and git; their names and paths never entered it.
+corpus-c no longer exists and was retired on 2026-10-21 under the same rule
+(learned 2026-10-21, binding: with the last private corpus gone, its
+declaration — ceiling 170, four error hashes — was deleted rather than left
+to SKIP forever, and gate d answers an empty declaration with one explicit
+`SKIP corpus diff — no corpora declared` line instead of an empty section;
+an empty declaration is nothing left unproved, so it raises no `skipped`
+and never turns a full run into exit 2). The machinery — gate d, the
+baseline format, `scripts/corpora-local.txt` — stays corpus-agnostic for
+the day a private corpus is declared again.
 
 The performance ceiling is per-machine in the same way the corpora are, and
 is honest about it: `scripts/perf-baseline.txt`'s `dev` column is an `m5`
@@ -744,9 +756,9 @@ cargo build --release
 cargo install --git https://github.com/nicolasmelo1/software-factory --locked
 ```
 
-If the machine hosts a corpus, also create `scripts/corpora-local.txt`
-(gitignored) mapping corpus id to absolute path, one per line:
-`corpus-c /path/to/the/corpus`.
+If the machine hosts a declared private corpus (none is declared today),
+also create `scripts/corpora-local.txt` (gitignored) mapping corpus id to
+absolute path, one per line: `corpus-<letter> /path/to/the/corpus`.
 
 The public corpora (~1 GB, depth 1 at the pinned shas, into
 `~/.local/share/itaruby/public-corpora`) come from one command:

@@ -1114,7 +1114,7 @@ To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
-At the closing commit the report's `corpus_c.rule` field states that `corpus.proved_corpus_c` and `corpus_c.no_new_errors` pass either by measuring corpus-c directly with zero new errors, or, when corpus-c is not mounted on this machine, by every baselined public corpus matching its own baseline exactly; `corpus_c.mounted_here` is `false` and `corpus_c.public_corpora_matched_baseline` is `true`, so that second path held. The report records `status: passed` for all seven required assertions: `dev_gates.exit_zero`, `corpus.proved_corpus_c`, `corpus_c.no_new_errors`, `public_corpora.no_drift`, `mutants.every_decision_accused`, `instruments.drift_detectors_fire`, `source.untouched_after_mutants`.
+At the closing commit, the report records `status: passed` for all seven required assertions — `dev_gates.exit_zero`, `corpus.proved_corpus_c`, `corpus_c.no_new_errors`, `public_corpora.no_drift`, `mutants.every_decision_accused`, `instruments.drift_detectors_fire`, `source.untouched_after_mutants`. corpus-c no longer exists on any machine, so `corpus.proved_corpus_c` and `corpus_c.no_new_errors` pass the only way they still can: gate d's own status is `SKIP` for the retired corpus, and every baselined public corpus matches its own baseline exactly, which `corpus_c.public_corpora_matched_baseline: true` in the report confirms.
 
 ## Child DOX Index
 

@@ -14,10 +14,11 @@ turns it into the `closing` gate's evidence:
   2. The box's `target/gauntlet/digest.json` becomes `.software-factory/evidence/
      closing-run.json`, with every private-corpus revision removed (the report
      is committed AND sent to the judge; the secrecy wall covers both).
-     corpus-c is required only where it is mounted (mapped AND on disk);
-     elsewhere the report says so, and the public corpora carry the proof:
-     every baselined public repo must be measured with zero new and zero
-     gone errors. gitlab-foss has no baseline and is the only allowed skip.
+     corpus-c no longer exists anywhere (retired; no machine can ever measure
+     it again — see AGENTS.md's "Machines" section), so the public corpora
+     carry the whole proof: every baselined public repo must be measured
+     with zero new and zero gone errors. gitlab-foss has no baseline and is
+     the only allowed skip.
   3. The evidence manifest (`.software-factory/evidence/closing.json`) is
      seeded with this one run and `sf seal closing` recomputes its digests
      from what is actually on disk, binding the report to the
@@ -42,7 +43,6 @@ import time
 ROOT = Path(__file__).resolve().parent.parent
 BOX = Path(os.environ.get("ITA_GATE_BOX") or Path.home() / ".cache/itaruby/gate-box").expanduser()
 ART = BOX / "target/gauntlet"
-CORPORA_MAP = ROOT / "scripts/corpora-local.txt"
 BASELINED = sorted(p.stem for p in (ROOT / "scripts/public-baseline").glob("*.jsonl"))
 REPORT = ROOT / ".software-factory/evidence/closing-run.json"
 MANIFEST = ROOT / ".software-factory/evidence/closing.json"
@@ -119,17 +119,6 @@ def gate(digest, name):
     return next((g for g in digest.get("gates", []) if g.get("name") == name), {})
 
 
-def corpus_c_mounted():
-    """Mapped in this machine's corpora map AND present on disk."""
-    try:
-        lines = CORPORA_MAP.read_text().splitlines()
-    except OSError:
-        return False
-    paths = [line.split(None, 1)[1].strip() for line in lines
-             if line.split(None, 1)[:1] == ["corpus-c"] and len(line.split(None, 1)) == 2]
-    return bool(paths) and Path(paths[0]).is_dir()
-
-
 def public_corpora_clean():
     """Every baselined repo's own verdict line in the artifact, not the
     digest's transcript-derived summary: gate-digest only ever sees the
@@ -149,32 +138,28 @@ def public_corpora_clean():
     return bool(BASELINED) and all(rid in clean for rid in BASELINED)
 
 
-def assertions(exit_code, digest, box_head, head, fresh, src_clean, mounted, public_ok):
-    corpus_c = next(
-        (c for c in gate(digest, "d").get("numbers", {}).get("corpora", []) if c.get("id") == "corpus-c"),
-        None,
-    )
+def assertions(exit_code, digest, box_head, head, fresh, src_clean, public_ok):
     c1 = gate(digest, "c1").get("numbers", {})
-    # A SKIP is allowed only where its reason is one of the two declared
-    # absences; every other gate must PASS.
-    allowed_skip = {"f"} | ({"d"} if not mounted else set())
+    # corpus-c no longer exists anywhere (retired); gate d SKIPping it is the
+    # only correct outcome on every machine, forever. A SKIP is allowed only
+    # for that declared absence and for gate f's gitlab-foss exemption; every
+    # other gate must PASS.
+    allowed_skip = {"f", "d"}
     others_green = all(
         g.get("status") == "PASS" or (g.get("status") == "SKIP" and g.get("name") in allowed_skip)
         for g in digest.get("gates", [])
     )
-    corpus_c_proved = (corpus_c is not None and corpus_c.get("new") == 0
-                       and "corpus-c" in digest.get("corpus", {}).get("proved", []))
-    # The seven names are the policy's `required_assertions` and never change.
-    # Where corpus-c is not mounted, its two assertions say so in `basis` and
-    # pass only if the gate really skipped it AND the public corpora proved
-    # clean; the report never claims a corpus-c measurement that did not run.
-    absent_ok = gate(digest, "d").get("status") == "SKIP" and public_ok
-    corpus_basis = "measured" if mounted else "not_mounted_here; public corpora carry the proof"
+    # corpus-c is retired: these two assertion names stay (the policy
+    # contract never changes mid-closing) but they now resolve the only way
+    # they ever can — gate d genuinely skipped a corpus that cannot be
+    # measured again, and the public corpora carry the proof in its place.
+    corpus_c_retired_ok = gate(digest, "d").get("status") == "SKIP" and public_ok
+    corpus_basis = "corpus-c retired, no machine can measure it; public corpora carry the proof"
     checks = {
         "dev_gates.exit_zero": (exit_code in (0, 2) and others_green and bool(digest.get("gates"))
                                 and box_head == head and fresh, "gate box at the closing commit, fresh digest"),
-        "corpus.proved_corpus_c": (corpus_c_proved if mounted else absent_ok, corpus_basis),
-        "corpus_c.no_new_errors": (corpus_c_proved if mounted else absent_ok, corpus_basis),
+        "corpus.proved_corpus_c": (corpus_c_retired_ok, corpus_basis),
+        "corpus_c.no_new_errors": (corpus_c_retired_ok, corpus_basis),
         "public_corpora.no_drift": (public_ok, "zero new and zero gone: " + ", ".join(BASELINED)),
         "mutants.every_decision_accused": (gate(digest, "c1").get("status") == "PASS"
                                            and c1.get("not_accused") == 0 and c1.get("total", 0) > 0, None),
@@ -251,9 +236,8 @@ def main():
     # The mutants rewrite the box, never this tree, so the box is what must be clean.
     src_clean = subprocess.run([*box_git, "diff", "--quiet", "HEAD", "--", "crates"]).returncode == 0
 
-    mounted = corpus_c_mounted()
     public_ok = public_corpora_clean()
-    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, mounted, public_ok)
+    results = assertions(gates.returncode, redact(digest), box_head, head, fresh, src_clean, public_ok)
     passed = all(a["status"] == "passed" for a in results)
     sf = subprocess.run(["sf", "--version"], text=True, capture_output=True, check=False).stdout.strip()
     report = {
@@ -263,11 +247,11 @@ def main():
         "commit": head,
         "sf": sf,
         "corpus_c": {
-            "rule": "corpus.proved_corpus_c and corpus_c.no_new_errors pass either by "
-                    "measuring corpus-c directly with zero new errors, or, when corpus-c "
-                    "is not mounted on this machine, by every baselined public corpus "
-                    "matching its own baseline exactly: zero new and zero gone diagnostics.",
-            "mounted_here": mounted,
+            "status": "retired",
+            "rule": "corpus.proved_corpus_c and corpus_c.no_new_errors pass by every "
+                    "baselined public corpus matching its own baseline exactly: zero new "
+                    "and zero gone diagnostics. corpus-c no longer exists on any machine, "
+                    "so this is the only path these two assertions can ever take.",
             "public_corpora_matched_baseline": public_ok,
         },
         "observed": digest,

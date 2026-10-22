@@ -82,7 +82,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `./scripts/dev gates` run there. The gate-digest and gate-triage
   fixtures now use the synthetic ids `corpus-c`/`corpus-x`.
 
+### Added
+- W11, Tapioca open world (2026-10-20): `ita check` reports E0101 on a
+  core receiver (`sig { returns(Integer) }` then `.upcase`; a literal
+  receiver) in a project WITH a `Gemfile` when its evidence is complete:
+  every locked gem has an RBI for its locked version, a source-audited
+  Tapioca-ignored version, an installed source, or is a `PATH` gem inside
+  the project. Tapioca RBIs drop `alias_method` inside a core reopening,
+  so a gem whose RBI reopens a core-chain class is read from its
+  installed source (name-keyed); with no source, only the classes that
+  RBI reopens stay open. Unloaded project files are harvested the same
+  way instead of blocking. `--verbose` names the gap that keeps a project
+  open. A literal core `define_method`/constant mixin and a top-level
+  `include M` stand down only the names they add; a core-receiver
+  injection call or eval no longer stands every core class down - only
+  the class it names (the blanket `core_mixin` mark for these calls,
+  `eval_polluted_core` and a redundant alias chaser were removed after
+  mutation showed nothing distinguished them from the name-keyed record). The stdlib inventory
+  now also lists each stdlib top-level module's public surface. Fixtures
+  in `crates/itaruby/tests/open_world_cli.rs`, mutants O1-O39 in
+  `scripts/open-world-mutants.sh` (gate c1).
+
 ### Changed
+- MATRIX H2 (2026-10-20): an inline `#:` RBS sig now judges only arguments
+  WRITTEN as literals (E0103), like a Sorbet `sig`. It used to judge
+  inferred types and accused correctly narrowed code that runs (`n &&
+  f(n)`, `!!n && f(n)`, `f(n || "z")`, `case v when String`, an `is_a?`
+  early return). Known false negative: a local, constant or call holding
+  a mismatching value. The `compatible` arms that judged an inferred
+  `Instance`/`Union` argument (`instance_compatible`, `may_be_core_value`,
+  the module-instance arm) were dead after H2 and are removed, with their
+  six `scripts/sorbet-contracts-mutants.py` mutants (left as `# removed`
+  notes): the lower mutant count is a removed mechanism, not a lost
+  control. New mutant "H2 rbs comment judges an inferred argument".
+- MATRIX H6 (2026-10-20): no contract accusation (E0103/E0109) inside a
+  branch a literal predicate proves dead (`x if false`, `if nil`, `unless
+  true`, `false ? x : y`, the else of `if true`/`unless false`); the live
+  branch is still checked. New mutant "H6 dead branch keeps its contract
+  accusations".
+- The w12 Tapioca closed world no longer accuses a narrowed
+  `is_a?(String)` local: `String` is not final, and a subclass may define
+  the name. A literal receiver still accuses.
 - `sorbet/config` `--ignore` no longer hides definitions (H4, 2026-10-20).
   Ignored files are still never checked or reported (parse errors
   included), but they are read as suppression-only evidence: a constant

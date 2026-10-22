@@ -3,19 +3,15 @@
 //! `compatible()` did exact `Ty::Instance` equality with no ancestry
 //! awareness — e.g. `add(entry: Entry)` called with an `Entry::Method`
 //! (measured on ruby-lsp/tapioca: +10 new false E0103, all genuine
-//! subtypes, verified by hand). The fix is ancestry-aware and fail-closed:
-//! a param class in the arg's ancestry is compatible; an INCOMPLETE
-//! ancestry can never prove non-subtyping, so it stays silent
-//! (invariant #1).
+//! subtypes, verified by hand).
 //!
-//! MUTANTS THIS FILE MUST CATCH:
-//!   1. The `Ty::Instance(a), Ty::Instance(p)` arm reduced back to
-//!      `a == p` — `subclass_instance_arg_is_compatible` and
-//!      `module_param_is_compatible` flip to an E0103 diagnostic.
-//!   2. The arm broadened to unconditional `true` —
-//!      `unrelated_class_still_accuses` flips to silence.
-//!   3. The fail-closed guard inverted (`complete` instead of
-//!      `!complete`) — `open_ancestry_stays_silent` flips to E0103.
+//! Since MATRIX H2 the `#:` RBS path judges only arguments WRITTEN as
+//! literals, like a Sorbet `sig`: an instance (`X.new`) is never judged,
+//! whatever its ancestry, so every instance call below is silent and the
+//! ancestry arms of `compatible()` were removed as unreachable. What an
+//! RBS sig still accuses is a literal against a class param; a literal
+//! against a MODULE param stays silent (reflection can mix a module into
+//! any core class).
 
 use itaruby_semantic::{check_file, Db, ProjectFiles, SourceFile};
 
@@ -29,7 +25,8 @@ fn diags_of(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// A subclass instance IS the param class at runtime: no E0103.
+/// A subclass instance IS the param class at runtime, and is not a
+/// literal either: no E0103.
 #[test]
 fn subclass_instance_arg_is_compatible() {
     let src = "class CompatEntry\nend\n\nclass CompatEntryMethod < CompatEntry\nend\n\nclass CompatService\n  #: (CompatEntry) -> void\n  def add(entry)\n  end\nend\n\nCompatService.new.add(CompatEntryMethod.new)\n";
@@ -40,20 +37,21 @@ fn subclass_instance_arg_is_compatible() {
     );
 }
 
-/// An unrelated class with a fully-resolved ancestry still fires E0103 —
-/// the subclass arm must not become blanket silence.
+/// An unrelated class instance is not a literal: never judged, even with
+/// a fully-resolved ancestry (MATRIX H2). A literal against the same
+/// class param is the one E0103, at the literal.
 #[test]
-fn unrelated_class_still_accuses() {
-    let src = "class CompatEntryB\nend\n\nclass CompatUnrelated\nend\n\nclass CompatServiceB\n  #: (CompatEntryB) -> void\n  def add(entry)\n  end\nend\n\nCompatServiceB.new.add(CompatUnrelated.new)\n";
-    let diags = diags_of(src);
-    assert!(
-        diags.iter().any(|d| d.starts_with("E0103")),
-        "unrelated arg must keep firing E0103, got: {diags:?}"
+fn unrelated_instance_is_silent_and_a_literal_accuses() {
+    let src = "class CompatEntryB\nend\n\nclass CompatUnrelated\nend\n\nclass CompatServiceB\n  #: (CompatEntryB) -> void\n  def add(entry)\n  end\nend\n\nCompatServiceB.new.add(CompatUnrelated.new)\nCompatServiceB.new.add(\"entry\")\n";
+    assert_eq!(
+        diags_of(src),
+        ["E0103 argument 1 of `add` expects CompatEntryB, got String"],
+        "only the literal is judged"
     );
 }
 
-/// Arg class whose superclass never resolves: non-subtyping is
-/// unprovable, so the call stays silent even with an unrelated param.
+/// Arg class whose superclass never resolves: an instance, never judged
+/// (MATRIX H2), so the call stays silent even with an unrelated param.
 #[test]
 fn open_ancestry_stays_silent() {
     let src = "class CompatMysteryChild < CompatGhostParent\nend\n\nclass CompatEntryC\nend\n\nclass CompatServiceC\n  #: (CompatEntryC) -> void\n  def add(entry)\n  end\nend\n\nCompatServiceC.new.add(CompatMysteryChild.new)\n";
@@ -64,14 +62,14 @@ fn open_ancestry_stays_silent() {
     );
 }
 
-/// A module as the param type: `include` puts it in the arg class's
-/// ancestry, so the call is compatible.
+/// A module as the param type: never proof against anything, so neither
+/// an includer's instance nor a literal accuses.
 #[test]
 fn module_param_is_compatible() {
-    let src = "module CompatWalkable\nend\n\nclass CompatWalker\n  include CompatWalkable\nend\n\nclass CompatServiceD\n  #: (CompatWalkable) -> void\n  def guide(who)\n  end\nend\n\nCompatServiceD.new.guide(CompatWalker.new)\n";
+    let src = "module CompatWalkable\nend\n\nclass CompatWalker\n  include CompatWalkable\nend\n\nclass CompatServiceD\n  #: (CompatWalkable) -> void\n  def guide(who)\n  end\nend\n\nCompatServiceD.new.guide(CompatWalker.new)\nCompatServiceD.new.guide(\"walker\")\n";
     assert!(
         !diags_of(src).iter().any(|d| d.starts_with("E0103")),
-        "included-module param must not fire E0103: {:?}",
+        "module param must not fire E0103: {:?}",
         diags_of(src)
     );
 }

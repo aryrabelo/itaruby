@@ -194,6 +194,16 @@ MUTATIONS = [
      "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Unknown,",
      "            Node::RationalNode { .. } | Node::ImaginaryNode { .. } => Ty::Float,",
      "source_line_and_exotic_numerics_type_their_consumers"),
+    # -- MATRIX H2: an inline `#:` RBS sig judges only arguments WRITTEN as literals, like a `sig`
+    ("H2 rbs comment judges an inferred argument", CHECK,
+     "        for (i, (_, span, _)) in args.positional.iter().enumerate() {\n            let Some(param_ty) = param_tys.get(i) else {\n                break;\n            };\n            let Some(literal) = args.literals.iter().find(|(at, _)| at == span).map(|(_, class)| class) else {\n                continue;\n            };\n            if self.contract_breaks(std::slice::from_ref(literal), param_ty) {\n",
+     "        for (i, (arg_ty, span, _)) in args.positional.iter().enumerate() {\n            let Some(param_ty) = param_tys.get(i) else {\n                break;\n            };\n            let literal = &args.literals.iter().find(|(at, _)| at == span).map_or(LiteralClass::Modeled(arg_ty.clone()), |(_, class)| class.clone());\n            if !compatible(arg_ty, param_ty, self.index) {\n",
+     "rbs_comment_contract_never_judges_an_inferred_argument"),
+    # -- MATRIX H6: a branch a literal predicate proves dead makes no contract accusation
+    ("H6 dead branch keeps its contract accusations", CHECK,
+     "        let mut at = 0;\n        self.diags.retain(|d| {\n            at += 1;\n            at <= mark || ![E0103_ARG_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH].contains(&d.code)\n        });\n",
+     "        let _ = mark;\n",
+     "contracts_stay_silent_in_a_statically_dead_branch"),
     # removed: "literal-only default_checked_level never still accuses" — the
     # unchecked guard it cut from `contract_breaks` was an equivalent copy of
     # the one in `effective_sorbet` (measured BLIND after 7144dc0 made an RBI
@@ -209,8 +219,8 @@ MUTATIONS = [
      "multi_argument_mixin_takes_the_contract_off"),
     # -- literal branches are what the body MIGHT return: one leaf is no proof
     ("union member mismatch accuses the union", CHECK,
-     "            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))",
-     "            && leaves.iter().any(|leaf| !leaf.fits(expected, self.index, self.rbi_map) && self.type_test_unpatched(leaf))",
+     "            && leaves.iter().all(|leaf| !leaf.fits(expected, self.index) && self.type_test_unpatched(leaf))",
+     "            && leaves.iter().any(|leaf| !leaf.fits(expected, self.index) && self.type_test_unpatched(leaf))",
      "union_with_one_compatible_member_stays_silent"),
     # -- sig names: a core name stays core, an inherited name never falls to the top level
     ("reopened core name becomes a project instance", SIG,
@@ -502,11 +512,11 @@ MUTATIONS = [
      "        false\n    }\n\n    /// Can `ext`",
      "identical_base_text_in_different_scopes_conflicts_but_local_methods_remain_known"),
     # -- self in a module is an instance of an includer nobody named
-    ("module instance proves incompatibility", CHECK,
-     "        (Ty::Instance(a), _) if index.class(*a).is_module => true,\n",
-     "",
-     "module_self_is_never_proof_against_an_includer"),
-    # -- nominal: a module param never accuses; a class is not a core value only on a closed ancestry
+    # removed: module instance proves incompatibility — MATRIX H2 cutover: once the `#:` RBS path judged only
+    # literals, `compatible`'s only caller is `LiteralClass::fits`, whose arg is never an `Instance`; the
+    # module-instance arm was unreachable (dead after H2) and is gone. `module_self_is_never_proof_against_an_includer`
+    # still pins that no `self` is judged.
+    # -- nominal: a module param never accuses; a class param still accuses a literal of another class
     ("nominal module param held to the ancestry", CHECK,
      "        (_, Ty::Instance(p)) if index.class(*p).is_module => true,\n",
      "",
@@ -515,26 +525,13 @@ MUTATIONS = [
      "        (_, Ty::Instance(p)) if index.class(*p).is_module => true,\n",
      "        (_, Ty::Instance(_)) => true,\n",
      "class_typed_contracts_still_accuse_unrelated_values"),
-    ("nominal core param held to exact equality", CHECK,
-     "        _ => may_be_core_value(a, index, rbi),\n",
-     "        _ => false,\n",
-     "core_subclass_instances_satisfy_core_contracts"),
-    ("nominal incomplete ancestry rules out a core value", CHECK,
-     "    !complete\n        || ancestors.iter().any(|&c| index.class(c).open)\n",
-     "    ancestors.is_empty()\n        || ancestors.iter().any(|&c| index.class(c).open)\n",
-     "core_subclass_instances_satisfy_core_contracts"),
-    ("nominal open ancestor rules out a core value", CHECK,
-     "        || ancestors.iter().any(|&c| index.class(c).open)\n",
-     "",
-     "core_subclass_instances_satisfy_core_contracts"),
-    ("nominal rbi-declared ancestor rules out a core value", CHECK,
-     "        || ancestors.iter().any(|&c| rbi.is_some_and(|map| map.contains_key(&index.class(c).path)))\n",
-     "",
-     "core_subclass_instances_satisfy_core_contracts"),
-    ("nominal closed ancestry never rules out a core value", CHECK,
-     "    let (ancestors, complete) = index.ancestors(id);\n    !complete\n",
-     "    let (ancestors, complete) = index.ancestors(id);\n    true || !complete\n",
-     "closed_project_ancestry_still_accuses_core_contracts"),
+    # removed (MATRIX H2 cutover, dead after H2 — not a lost control): the arms that held an inferred `Instance`
+    # ARG to a core param are gone with the `#:` path's inferred evidence, because `compatible`'s only caller
+    # (`LiteralClass::fits`) never passes an `Instance`: `instance_compatible` and `may_be_core_value` were
+    # unreachable. Mutants removed with them: "nominal core param held to exact equality", "nominal incomplete
+    # ancestry rules out a core value", "nominal open ancestor rules out a core value", "nominal rbi-declared
+    # ancestor rules out a core value", "nominal closed ancestry never rules out a core value".
+    # `closed_project_ancestry_instances_are_silent_and_literals_accuse` pins the new behavior.
     # -- collection type arguments are erased at runtime; only the category binds
     # removed: type arguments held as a contract — literal-only: an Array/Hash literal's class is built without type arguments, so the contract path erases nothing
     # -- the keyword loop still WALKS what it cannot bind by name

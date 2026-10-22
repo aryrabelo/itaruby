@@ -84,9 +84,10 @@ fn spaced_malformed_sig_still_warns() {
 
 /// Fixture 4 (control) — a glued-paren sig (`#:(Type) -> void`, no space,
 /// but `(` can never start an `RDoc` directive) must still attach and
-/// drive real checks: wrong arg count fires E0102, wrong arg type fires
-/// E0103. Proves the fix does not over-skip every glued `#:` comment,
-/// only glued WORD ones.
+/// drive real checks: wrong arg count fires E0102, a wrong literal arg
+/// fires E0103 (since MATRIX H2 the instance beside it is never judged).
+/// Proves the fix does not over-skip every glued `#:` comment, only glued
+/// WORD ones.
 #[test]
 fn glued_paren_sig_still_attaches_and_checks() {
     let diags = check_fixture("valid_sig_still_works.rb");
@@ -95,8 +96,10 @@ fn glued_paren_sig_still_attaches_and_checks() {
         diags.iter().any(|d| d.starts_with("E0102")),
         "expected an E0102 (wrong arity) proving the glued sig's def still resolves and checks normally, got: {diags:?}"
     );
-    assert!(
-        diags.iter().any(|d| d.starts_with("E0103")),
-        "expected an E0103 (arg type mismatch) proving the glued-paren sig actually attached, got: {diags:?}"
+    let e0103: Vec<_> = diags.iter().filter(|d| d.starts_with("E0103")).collect();
+    assert_eq!(
+        e0103,
+        ["E0103 argument 1 of `accept` expects RdocDirValidSigParam, got Symbol"],
+        "the glued-paren sig must attach and judge the literal, never the instance"
     );
 }

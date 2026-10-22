@@ -17,9 +17,11 @@ class CaseNarUnionWidget
     case event
     when CaseNarUnionA, CaseNarUnionB
       # `when A, B` narrows `event` to `A | B` (Module#=== union), not to
-      # `A` alone or back to Unknown — passing it to a method that only
-      # accepts `A` must catch the `B` half as a real E0103.
+      # `A` alone or back to Unknown — hover reads that union. The `#:`
+      # sig judges only literal arguments (MATRIX H2), so passing the
+      # narrowed local stays silent while the literal below accuses.
       sink.take_a(event)
+      sink.take_a(:not_a)
     end
   end
 end

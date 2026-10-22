@@ -5,6 +5,7 @@ pub mod core;
 pub mod declarations;
 pub mod discovery;
 pub mod index;
+pub mod open_world;
 pub mod rbi;
 pub mod rbs_comment;
 pub mod runtime_gate;
@@ -105,6 +106,42 @@ pub struct RbiProject {
 pub struct RbiCoreReopenings {
     #[returns(ref)]
     pub map: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+}
+
+/// Singleton input (W11, Tapioca open world): the `.rbi` files that
+/// reopen a namespace on a core receiver's method chain (`BasicObject`
+/// and `::`-rooted headers included, see `rbi::RbiIndex`), plus the files
+/// declaring a type-test override or a `method_missing`. Wired whenever a
+/// `sorbet/rbi` tree has either; read only when `TapiocaEvidence` is
+/// wired, so every other run is byte-identical with or without it.
+#[salsa::input(singleton)]
+pub struct RbiOpenWorld {
+    #[returns(ref)]
+    pub chain_reopenings: std::collections::HashMap<String, Vec<std::path::PathBuf>>,
+    #[returns(ref)]
+    pub type_test_files: Vec<std::path::PathBuf>,
+}
+
+/// Singleton input (W11): closed world was proven from Tapioca evidence,
+/// not from the absence of gems. Wired by `ita check` only, next to
+/// `ClosedWorld`, when at least one checked root is a Bundler project
+/// whose evidence is complete (`open_world::lock_evidence` and
+/// `open_world::unloaded_core_hazard`). Its presence turns on the
+/// open-world rules of the conclusive core lookup (`check.rs`,
+/// `open_world_silences`): the receiver must be exact, the stdlib's core
+/// extensions and every RBI mixin into the chain are read, and
+/// `curated_names` — the chain methods the source-audited gems Tapioca
+/// never writes an RBI for (`open_world::CURATED_GEMS`) add — stay
+/// silent. Absent, the lookup is exactly what it was.
+#[salsa::input(singleton)]
+pub struct TapiocaEvidence {
+    #[returns(ref)]
+    pub curated_names: std::collections::HashSet<String>,
+    /// What the installed source of every chain-touching gem, and every
+    /// project file this run does not load, adds to the core chain,
+    /// name-keyed (`open_world::Harvest`).
+    #[returns(ref)]
+    pub harvest: open_world::Harvest,
 }
 
 /// Singleton input: closed-world mode (bead ita-2ve). Wired to `true`

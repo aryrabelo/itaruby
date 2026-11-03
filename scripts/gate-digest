@@ -226,11 +226,30 @@ def nums_corpus(art, id, section_lines)
 end
 
 # Public corpora carry public repo code: path:line of NEW/GONE lines is fine.
-def nums_public(art, section_lines)
+def nums_public(art, public_lines)
+  verdicts = public_lines.filter_map do |line|
+    match = line.match(/\A(PASS|FAIL|SKIP) public [^(]*\((\w[\w-]*)\)(?::| —|\z)/)
+    [match[2], match[1], line] if match
+  end
   repos = []
-  ids = section_lines.flat_map { |l| l.scan(/public (?:errors|time ceiling)[^(]*\((\w[\w-]*)\)/) }.flatten.uniq
-  ids.each do |id|
-    r = { 'id' => id }
+  verdicts.map(&:first).uniq.each do |id|
+    rows = verdicts.select { |row| row[0] == id }
+    statuses = rows.map { |row| row[1] }
+    status = %w[FAIL SKIP PASS].find { |value| statuses.include?(value) }
+    r = { 'id' => id, 'status' => status }
+    if status == 'SKIP'
+      detail = rows.find { |row| row[1] == 'SKIP' }[2].split(' — ', 2).last
+      r['reason'] = detail.start_with?('no baseline ') ? 'no baseline' : clip(detail, MAX_REASON)
+    end
+    matched = rows.find { |row| row[2].start_with?("PASS public errors match baseline exactly (#{id})") }
+    if matched
+      r['new'] = 0
+      r['gone'] = 0
+      counts = matched[2].match(/: (\d+) error\(s\) \+ (\d+) warning\(s\) = (\d+) line\(s\)/)
+      if counts
+        r['errors'], r['warnings'], r['lines'] = counts.captures.map(&:to_i)
+      end
+    end
     %w[new gone].each do |kind|
       f = File.join(art, "public-#{id}-#{kind}.txt")
       next unless File.file?(f)
@@ -241,7 +260,7 @@ def nums_public(art, section_lines)
         r["#{kind}_at"] = lines.first(MAX_LINE_REFS).map { |_, i| "public-#{id}-#{kind}.txt:#{i + 1}" }
       end
     end
-    section_lines.each do |l|
+    public_lines.each do |l|
       m = l.match(/public time ceiling \(#{Regexp.escape(id)}\): ([\d.]+)s ([<>]=?) ([\d.]+)s/)
       next unless m
 
@@ -309,10 +328,16 @@ sections.each do |sec|
     when 'c2b' then nums_mutants(required('c2b', art, proved))
     when 'c3'  then nums_perf(art)
     when 'd'   then { 'corpora' => proved.map { |id| nums_corpus(art, id, lines) }, 'skipped' => skipped_ids }
-    when 'f'   then { 'repos' => nums_public(art, lines) }
+    when 'f'   then { 'repos' => nums_public(art, read_lines(File.join(art, 'public.txt'))) }
     else nil
     end
   g['numbers'] = numbers if numbers && !numbers.empty?
+  if name == 'f' && status == 'SKIP'
+    skipped = numbers['repos'].select { |repo| repo['status'] == 'SKIP' }
+    unless skipped.empty?
+      g['reason'] = clip(skipped.map { |repo| "#{repo['id']}: #{repo['reason']}" }.join('; '), MAX_REASON)
+    end
+  end
 
   # Absence is never agreement: a PASS with no evidence file is a FAIL.
   if status == 'PASS' || status == 'UNKNOWN'

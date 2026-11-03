@@ -271,9 +271,8 @@ else
 fi
 # Same family, one level up: scripts/gate-digest is what a reader (human or
 # model) now believes INSTEAD of the 115 MB of artifacts, so it is itself an
-# evidence producer and gets the same two-sided proof — four fixture
-# gauntlet directories it must report exactly, and five cmp-guarded mutants
-# each of which must be accused by its own named case.
+# evidence producer and gets the same two-sided proof — six fixture
+# gauntlet directories and six cmp-guarded mutants, each accused by its case.
 if GATE_DIGEST_LAB="$ART/gate-digest-selftest" \
    "$ROOT/scripts/gate-digest-selftest.sh" >"$ART/gate-digest-selftest.txt" 2>&1; then
   ok 'gate digest (each fixture reported exactly, every mutant accused by its case)'

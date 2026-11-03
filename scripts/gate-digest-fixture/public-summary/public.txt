@@ -1,0 +1,22 @@
+public gate: column=dev
+PASS public revision (rails): tree /HOST_PATH/rails at sha aaa1111
+PASS public errors match baseline exactly (rails): 2 error(s) + 871 warning(s) = 873 line(s), tree /HOST_PATH/rails at sha aaa1111
+PASS public time ceiling (rails): 2.050s <= 3s
+PASS public revision (mastodon): tree /HOST_PATH/mastodon at sha bbb2222
+PASS public errors match baseline exactly (mastodon): 0 error(s) + 973 warning(s) = 973 line(s), tree /HOST_PATH/mastodon at sha bbb2222
+PASS public time ceiling (mastodon): 0.724s <= 2s
+PASS public revision (discourse): tree /HOST_PATH/discourse at sha ccc3333
+PASS public errors match baseline exactly (discourse): 10 error(s) + 1929 warning(s) = 1939 line(s), tree /HOST_PATH/discourse at sha ccc3333
+PASS public time ceiling (discourse): 5.766s <= 10s
+SKIP public corpus (gitlab-foss) — no baseline /HOST_PATH/scripts/public-baseline/gitlab-foss.jsonl; leave it absent to keep this repo skipped until a machine generates one
+PASS public revision (zammad): tree /HOST_PATH/zammad at sha ddd4444
+PASS public errors match baseline exactly (zammad): 275 error(s) + 1072 warning(s) = 1347 line(s), tree /HOST_PATH/zammad at sha ddd4444
+PASS public time ceiling (zammad): 1.363s <= 2s
+PASS public revision (brew): tree /HOST_PATH/brew at sha eee5555
+public check path (brew): /HOST_PATH/brew/Library/Homebrew
+PASS public errors match baseline exactly (brew): 24 error(s) + 113 warning(s) = 137 line(s), tree /HOST_PATH/brew at sha eee5555
+PASS public time ceiling (brew): 1.369s <= 5s
+
+=== summary
+public corpus gate skipped (not judged on this machine): public corpus (gitlab-foss)
+RESULT: PASS (incomplete — skipped: public corpus (gitlab-foss))

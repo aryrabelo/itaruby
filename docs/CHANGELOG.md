@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- Restore the open-world mutant controls on the W11 branch: O8 uses an
+  unloaded extensionless script so ignored-file indexing cannot mask the
+  removed harvest; O23 exercises a generic annotation ending in `.checked`
+  so the recognized `returns`/`void` shortcut cannot bypass its control.
+  The checker behavior and both source mutations are unchanged.
 - Keep the closing claim separate from its historical judge notes. The
   paragraph-based extractor otherwise asks the evidence to substantiate
   prior failed experiments as well as the current gate run.

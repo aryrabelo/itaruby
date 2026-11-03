@@ -1,0 +1,12 @@
+{
+  "129600283bf813dda6f3895b7f2bb4664b11cf9276dd7f21948d438ccff5eed4": {
+    "type": "choice",
+    "choice": "contradicts",
+    "confidence": 0.34,
+    "probabilities": {
+      "supports": 0.15,
+      "contradicts": 0.56,
+      "says_nothing": 0.29
+    }
+  }
+}

@@ -2,7 +2,7 @@
   "scenario": "closing",
   "status": "passed",
   "goal": "Close this change the way the repository's owner closes one: run every gate this machine can run against the committed tree, and show that nothing the checker says about real code got worse.",
-  "commit": "f8bcd3ce5734a416c3e53da127a89bd1eb0bacb2",
+  "commit": "74e6092d75a6e444233552a0e74dcce501efd752",
   "sf": "sf 0.4.1 (catalog e9248b61811d, 42 rules)",
   "corpus_c": {
     "status": "retired",
@@ -79,9 +79,9 @@
         "label": "evidence instruments (two-sided)",
         "status": "PASS",
         "numbers": {
-          "accused": 5,
+          "accused": 6,
           "not_accused": 0,
-          "total": 5
+          "total": 6
         }
       },
       {
@@ -93,7 +93,7 @@
           "over": 0,
           "worst": {
             "id": "check/project_index",
-            "ms": 6.65,
+            "ms": 6.62,
             "ceiling_ms": 7.04
           }
         }
@@ -117,9 +117,70 @@
         "name": "f",
         "label": "public corpus",
         "status": "SKIP",
-        "reason": "public corpus — at least one declared repo could not be judged on this machine (see target/gauntlet/public.txt)",
+        "reason": "gitlab-foss: no baseline",
         "numbers": {
-          "repos": []
+          "repos": [
+            {
+              "id": "rails",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 2,
+              "warnings": 871,
+              "lines": 873,
+              "seconds": 1.738,
+              "ceiling_s": 3.0
+            },
+            {
+              "id": "mastodon",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 0,
+              "warnings": 973,
+              "lines": 973,
+              "seconds": 0.654,
+              "ceiling_s": 2.0
+            },
+            {
+              "id": "discourse",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 10,
+              "warnings": 1929,
+              "lines": 1939,
+              "seconds": 4.96,
+              "ceiling_s": 10.0
+            },
+            {
+              "id": "gitlab-foss",
+              "status": "SKIP",
+              "reason": "no baseline"
+            },
+            {
+              "id": "zammad",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 275,
+              "warnings": 1072,
+              "lines": 1347,
+              "seconds": 1.232,
+              "ceiling_s": 2.0
+            },
+            {
+              "id": "brew",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 24,
+              "warnings": 113,
+              "lines": 137,
+              "seconds": 1.245,
+              "ceiling_s": 5.0
+            }
+          ]
         }
       },
       {

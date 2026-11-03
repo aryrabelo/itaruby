@@ -8,5 +8,15 @@
       "contradicts": 0.56,
       "says_nothing": 0.29
     }
+  },
+  "e7eeaab410758c170d79e1ac6edb0e02e4d44b7d84969a309653c128768a8129": {
+    "type": "choice",
+    "choice": "supports",
+    "confidence": 0.04,
+    "probabilities": {
+      "supports": 0.36,
+      "contradicts": 0.34,
+      "says_nothing": 0.3
+    }
   }
 }

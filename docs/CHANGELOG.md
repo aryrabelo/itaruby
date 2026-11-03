@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- Keep the closing claim separate from its historical judge notes. The
+  paragraph-based extractor otherwise asks the evidence to substantiate
+  prior failed experiments as well as the current gate run.
 - A bare, unqualified top-level value-constant write in a client's
   `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,
   no `::` anywhere in the LHS — planningalerts' real

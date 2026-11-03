@@ -1128,6 +1128,7 @@ commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
 At the closing commit, the report records `status: passed` for all seven required assertions — `dev_gates.exit_zero`, `corpus.proved_corpus_c`, `corpus_c.no_new_errors`, `public_corpora.no_drift`, `mutants.every_decision_accused`, `instruments.drift_detectors_fire`, `source.untouched_after_mutants`. corpus-c no longer exists on any machine, so `corpus.proved_corpus_c` and `corpus_c.no_new_errors` pass the only way they still can: gate d's own status is `SKIP` for the retired corpus, and every baselined public corpus matches its own baseline exactly, which `corpus_c.public_corpora_matched_baseline: true` in the report confirms.
+
 A claim phrasing that reads correct to a human is not evidence it reads
 correct to Jev (learned 2026-10-22, binding, measured): ten independently
 tested `CLOSING_GATES_GREEN` wordings — spanning the retired `mounted_here`

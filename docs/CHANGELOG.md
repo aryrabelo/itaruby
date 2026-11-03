@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- The gate digest now reads each public repository's verdict and counts
+  from `public.txt`. The gauntlet transcript contains only an aggregate
+  verdict, which previously hid all five passing baselined repositories
+  behind the expected gitlab-foss no-baseline skip. The digest preserves
+  that skip explicitly without changing any gate's verdict or threshold.
+  The `public-summary` fixture and `public_summary_only` mutant prove the
+  actual producer/consumer shape; private-corpus redaction is unchanged.
 - Keep the closing claim separate from its historical judge notes. The
   paragraph-based extractor otherwise asks the evidence to substantiate
   prior failed experiments as well as the current gate run.

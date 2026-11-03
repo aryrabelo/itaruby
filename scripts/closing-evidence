@@ -120,12 +120,11 @@ def gate(digest, name):
 
 
 def public_corpora_clean():
-    """Every baselined repo's own verdict line in the artifact, not the
-    digest's transcript-derived summary: gate-digest only ever sees the
-    one-line `ok`/`skip` `gauntlet-gates.sh` logs for gate f, never the
-    per-repo detail `public-gate.sh` writes straight to `public.txt` — so a
-    structured read of the digest can never see individual repos (measured
-    2026-10-21: `numbers.repos` is always `[]`). Read the artifact itself.
+    """Verify each baselined repository against the original artifact, not the
+    digest's summary: the public gate writes each repository's verdict to
+    `public.txt`, while the gauntlet transcript carries only the aggregate
+    status. The digest now includes those public observations for readers;
+    this assertion still verifies the original artifact independently.
     A repo is clean only if its own exact-match line is present; a drifted
     or skipped-for-cause line, or no line at all, fails it.
     """

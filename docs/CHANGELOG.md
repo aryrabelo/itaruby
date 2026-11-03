@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- Restore the open-world mutant controls on the W11 branch: O8 uses an
+  unloaded extensionless script so ignored-file indexing cannot mask the
+  removed harvest; O23 exercises a generic annotation ending in `.checked`
+  so the recognized `returns`/`void` shortcut cannot bypass its control.
+  The checker behavior and both source mutations are unchanged.
+- The gate digest now reads each public repository's verdict and counts
+  from `public.txt`. The gauntlet transcript contains only an aggregate
+  verdict, which previously hid all five passing baselined repositories
+  behind the expected gitlab-foss no-baseline skip. The digest preserves
+  that skip explicitly without changing any gate's verdict or threshold.
+  The `public-summary` fixture and `public_summary_only` mutant prove the
+  actual producer/consumer shape; private-corpus redaction is unchanged.
+- Keep the closing claim separate from its historical judge notes. The
+  paragraph-based extractor otherwise asks the evidence to substantiate
+  prior failed experiments as well as the current gate run.
 - A bare, unqualified top-level value-constant write in a client's
   `sorbet/rbi/**` (`XClient = T.let(T.unsafe(nil), T.nilable(Integer))`,
   no `::` anywhere in the LHS — planningalerts' real

@@ -1,0 +1,4 @@
+=== gate f — public corpus
+SKIP public corpus — at least one declared repo could not be judged on this machine (see target/gauntlet/public.txt)
+=== summary
+RESULT: PASS (incomplete — skipped: )

@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "gate": "closing",
+  "implementation_sha256": "0070d01168f813b02207d02d3fed6195d4f074150d91bddcfc2720c40e051eea",
+  "runs": [
+    {
+      "scenario": "closing",
+      "status": "passed",
+      "actor": "scripts/closing-evidence, gauntlet run in the gate box at 74e6092d75",
+      "report": ".software-factory/evidence/closing-run.json",
+      "report_sha256": "1e9acc88ac2f098bbb135f814a79c529e7812aa376a8e7ed4cac20b68e28f460",
+      "required_assertions": [
+        "dev_gates.exit_zero",
+        "corpus.proved_corpus_c",
+        "corpus_c.no_new_errors",
+        "public_corpora.no_drift",
+        "mutants.every_decision_accused",
+        "instruments.drift_detectors_fire",
+        "source.untouched_after_mutants"
+      ]
+    }
+  ]
+}

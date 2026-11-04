@@ -38,5 +38,25 @@
       "contradicts": 0.09,
       "says_nothing": 0.77
     }
+  },
+  "1c881363a285815c243dc8fa60d6a242619aaf57e49c4d4f72eabaefaa9301e0": {
+    "type": "choice",
+    "choice": "supports",
+    "confidence": 0.89,
+    "probabilities": {
+      "supports": 0.93,
+      "contradicts": 0.05,
+      "says_nothing": 0.02
+    }
+  },
+  "337326a7b47efd9887f9a9e2c5cd10a7372f330a2df61453755372bb0ca885b5": {
+    "type": "choice",
+    "choice": "says_nothing",
+    "confidence": 0.66,
+    "probabilities": {
+      "supports": 0.13,
+      "contradicts": 0.1,
+      "says_nothing": 0.77
+    }
   }
 }

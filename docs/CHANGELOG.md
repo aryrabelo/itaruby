@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed harvest; O23 exercises a generic annotation ending in `.checked`
   so the recognized `returns`/`void` shortcut cannot bypass its control.
   The checker behavior and both source mutations are unchanged.
+- State the closing claim as individual observations present in the sealed
+  report, including the explicit corpus skips. Remove the unmeasured claim
+  about a corpus's absence on every machine; evidence and judge thresholds
+  are unchanged.
 - The gate digest now reads each public repository's verdict and counts
   from `public.txt`. The gauntlet transcript contains only an aggregate
   verdict, which previously hid all five passing baselined repositories

@@ -1237,7 +1237,19 @@ To close: commit, run `ops exec typesafe-api-key -- scripts/closing-evidence`,
 commit the files it names.
 
 <!-- claim: CLOSING_GATES_GREEN proven-by: closing -->
-At the closing commit, the report records `status: passed` for all seven required assertions — `dev_gates.exit_zero`, `corpus.proved_corpus_c`, `corpus_c.no_new_errors`, `public_corpora.no_drift`, `mutants.every_decision_accused`, `instruments.drift_detectors_fire`, `source.untouched_after_mutants`. corpus-c no longer exists on any machine, so `corpus.proved_corpus_c` and `corpus_c.no_new_errors` pass the only way they still can: gate d's own status is `SKIP` for the retired corpus, and every baselined public corpus matches its own baseline exactly, which `corpus_c.public_corpora_matched_baseline: true` in the report confirms.
+In the sealed closing report, gate `a` records `PASS` with zero failed tests.
+Gate `c1` records `PASS` with zero unaccused mutants.
+Gate `c2b` records `PASS` with zero unaccused instrument mutants.
+The public repository entries for rails, mastodon, discourse, zammad and brew each record `PASS`, `new: 0` and `gone: 0`.
+The gitlab-foss entry records `SKIP` with reason `no baseline`.
+Gate `d` records `SKIP` because no corpora are declared in `scripts/corpus-baseline.txt`.
+The assertion `dev_gates.exit_zero` records `passed`.
+The assertion `corpus.proved_corpus_c` records `passed`.
+The assertion `corpus_c.no_new_errors` records `passed`.
+The assertion `public_corpora.no_drift` records `passed`.
+The assertion `mutants.every_decision_accused` records `passed`.
+The assertion `instruments.drift_detectors_fire` records `passed`.
+The assertion `source.untouched_after_mutants` records `passed`.
 
 A claim phrasing that reads correct to a human is not evidence it reads
 correct to Jev (learned 2026-10-22, binding, measured): ten independently

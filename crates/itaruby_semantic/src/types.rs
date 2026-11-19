@@ -26,6 +26,25 @@ pub enum Ty {
     Array(Box<Ty>),
     Hash(Box<Ty>, Box<Ty>),
     Union(Vec<Ty>),
+    /// A Sorbet sig type sorbet-runtime enforces but no value type here
+    /// models (W6). It only ever judges a WRITTEN literal (E0103/E0109);
+    /// every consumer sees `Unknown` (`erase_type_arguments`,
+    /// `sorbet_sig::resolve_ret_ty`), so it never types a receiver.
+    Contract(SigOnly),
+}
+
+/// What a `Ty::Contract` demands of a value, by sorbet-runtime's own check.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SigOnly {
+    /// `is_a?(<core class or module>)`: `T::Set[X]` (`Set`), `T::Range[X]`,
+    /// `T::Enumerable[X]`, `T::Enumerator[X]`, `T::Enumerator::Lazy[X]` —
+    /// sorbet-runtime itself never checks their type arguments.
+    Core(&'static str),
+    /// `T.class_of(X)`, `T::Class[X]`, `T::Module[X]`: a class or module
+    /// object, which no literal is.
+    ClassObject,
+    /// `T.noreturn`: no value at all.
+    NoReturn,
 }
 
 impl Ty {

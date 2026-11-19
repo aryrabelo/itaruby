@@ -140,8 +140,8 @@ winning on both.
   `Array[untyped]`; `T.nilable`/`T.any` keep member categories). Precedence
   is inline `#:` RBS, then inline `sig`. Every unprovable shape resolves to
   `Ty::Unknown` and diagnoses nothing: generics, `bind`, `T.proc`,
-  overloads, duplicate or dynamic clauses, post-optional, rest and block
-  layouts, duplicate definitions and open classes. An unsupported but well-formed collection element keeps the
+  overloads, duplicate or dynamic clauses, post-optional layouts,
+  duplicate definitions and open classes. An unsupported but well-formed collection element keeps the
   collection's category, and a malformed expression is Unknown. Recognized-sig
   fixtures need `extend T::Sig`. A `.rbi` naming a project class softens that
   class's E0101 through `gem_reopens`. That behavior predates contracts; never
@@ -177,9 +177,26 @@ winning on both.
   can dispatch the name elsewhere (`contract_dispatch_diverges`). Contract
   work is memoized per definition and never walks a family for a method
   with no contract; `contract_work_is_per_definition_not_per_call` bounds
-  it. Known false negatives: `.new` does not check `initialize`'s `sig`,
-  and a method with rest, keyword-rest, block or post params drops its
-  whole contract, the return included. Claim only what the suites prove, never
+  it. W5: `T.let`/`T.cast`/`T.assert_type!` accuse (E0103) a written
+  literal breaking the type and type an `Unknown` value as the erased
+  type; `T.must`/`T.must_because` accuse a written `nil` and strip nil;
+  `T.unsafe`/`T.bind` answer `Unknown`. W6: sig-only types
+  (`Ty::Contract`: `T.class_of`, `T::Class`/`T::Module`, `T.noreturn`) and
+  category leaves (`T::Set`/`Range`/`Enumerable`/`Enumerator(::Lazy)`,
+  tuple as Array, shape as Hash, `T.all` as its first readable member)
+  judge written literals only and type no consumer; a single-write
+  `T.type_alias { X }` resolves to `X`. W7: sigs on one-name
+  `attr_reader`/`attr_writer`, `initialize` (checked at `X.new` unless
+  `singleton_new_hidden`), `*rest`/`**kwrest`/`&blk` methods (contract
+  kept, return included) and `.on_failure` (metadata) are contracts.
+  Known false negatives (measured by sorbet-parity probes): post-optional
+  params drop the contract; `void` consumers stay silent (VOID sentinel
+  unmodeled); tuple/shape ELEMENTS are not checked (`f(["a", 1])` against
+  `[Integer, String]`, `f({a: "s"})` against `{a: Integer}`); a constant
+  argument is no literal (`f(String)` against `T.class_of(Integer)`);
+  `T.all` and every other contract judge only literals (`"a".to_sym`
+  stays silent); and a return of a sig-only, tuple, or `T::Set` type
+  types no consumer (`g.zork`, `g.first.upcase`). Claim only what the suites prove, never
   Sorbet parity. Focused proof: `sorbet_contracts`, `sorbet_contract_parser`,
   `project_sigs`, and `scripts/sorbet-contracts-mutants.py` (gate c1 and CI).
 - `sorbet/config` `--ignore` means "don't typecheck", never "doesn't exist"
@@ -260,6 +277,27 @@ winning on both.
   ThreadSanitizer job). Read a ratchet entry's SCOPE, never just its
   presence: `- rust` and `- path/to/one.rs:hash` are not the same kind of
   debt.
+- sorbet-runtime assertions and the wider `sig` grammar are contracts on
+  the same terms (W5/W6/W7, learned 2026-10-21, binding, measured by the
+  sorbet-parity probes). W5: `T.let`/`T.cast`/`T.assert_type!` on a
+  WRITTEN literal that breaks the type, and `T.must`/`T.must_because` on a
+  literal `nil` (`NilClass#==` unpatched), emit E0103 - only on a lexical
+  `T` with no project `T.<name>`, runtime enforced. The value they answer
+  is the erased declared type ONLY when inference says `Ty::Unknown`
+  (never overrides `T.cast(1, String)`'s Integer); `T.unsafe`/`T.bind`
+  answer `Unknown`; `T.must` strips nil. W6: `T.all` (first readable
+  member), `T.class_of`/`T::Class`/`T::Module`, `T::Set`/`Range`/
+  `Enumerable`/`Enumerator`/`Enumerator::Lazy` (category), tuples (Array)
+  and shapes (Hash), `T.noreturn`, and single-write `T.type_alias { X }`
+  constants. Sig-only types (`Ty::Contract`) judge literals and are
+  `Unknown` to every consumer. W7: `.on_failure` is metadata; sigs above
+  a one-name `attr_reader`/`attr_writer` are contracts; `*rest`/
+  `**kwrest`/`&blk` keep their contract (each rest element and extra
+  keyword checked); `X.new(...)` checks `initialize`'s sig unless
+  `singleton_new_hidden`. Divergence: `void` consumers stay silent
+  (`void_unknown_and_uncertain_return_paths_stay_silent` wins; the VOID
+  sentinel is not modeled). Proof: `sorbet_contracts.rs` +
+  `scripts/sorbet-contracts-mutants.py` (W5/W6/W7 families).
 - Core-receiver E0101 in a Bundler project needs COMPLETE evidence, and a
   Tapioca RBI alone is NOT complete for core reopenings (W11, learned
   2026-10-20, binding, measured): `json_expressions` 0.9.0 does

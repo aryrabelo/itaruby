@@ -21,7 +21,7 @@ use crate::index::{
 use crate::rbs_comment::{parse_cast_comment, CastTarget, RbsParam, RbsSig, RbsTy};
 use crate::schema::cast_risk;
 use crate::types::{
-    ClassId, ConstraintCall, ConstraintProof, Diagnostic, Severity, Suggestion, Ty,
+    ClassId, ConstraintCall, ConstraintProof, Diagnostic, Severity, SigOnly, Suggestion, Ty,
     E0001_SYNTAX_ERROR, E0101_UNKNOWN_METHOD, E0102_WRONG_ARITY, E0103_ARG_TYPE_MISMATCH,
     E0104_UNRESOLVED_CONSTANT, E0105_INVALID_RBS_COMMENT, E0106_IMPOSSIBLE_CAST,
     E0107_CONSTRAINT_CONTRADICTION, E0108_OPERAND_TYPE_MISMATCH, E0109_RETURN_TYPE_MISMATCH,
@@ -30,6 +30,7 @@ use crate::types::{
 type Env = FxHashMap<String, Ty>;
 type KeywordArg = (String, Ty, (usize, usize));
 type PositionalArg = (Ty, (usize, usize), Option<String>);
+type WrittenLiteral = ((usize, usize), LiteralClass);
 
 struct CallTypeArgs<'a> {
     positional: &'a [PositionalArg],
@@ -64,7 +65,7 @@ impl LiteralClass {
     fn fits(&self, expected: &Ty, index: &ProjectIndex) -> bool {
         match self {
             LiteralClass::Modeled(ty) => compatible(ty, expected, index),
-            LiteralClass::Other(_) => other_core_fits(expected, index),
+            LiteralClass::Other(_) => other_core_fits(self.core_ancestry(), expected, index),
         }
     }
 
@@ -100,12 +101,29 @@ impl LiteralClass {
 /// none of the scalars or collections, and no project CLASS is one of its
 /// ancestors; a module may be mixed into it by reflection, as
 /// `compatible` assumes for every module-typed contract.
-fn other_core_fits(expected: &Ty, index: &ProjectIndex) -> bool {
+fn other_core_fits(ancestry: &[&str], expected: &Ty, index: &ProjectIndex) -> bool {
     match expected {
         Ty::Unknown => true,
         Ty::Instance(p) => index.class(*p).is_module,
-        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(p, index)),
+        Ty::Union(parts) => parts.iter().any(|p| other_core_fits(ancestry, p, index)),
+        Ty::Contract(only) => sig_only_fits(ancestry, only, index),
         _ => false,
+    }
+}
+
+/// Does a literal whose class answers through `ancestry` pass the
+/// sorbet-runtime check a `Ty::Contract` stands for (W6)? No literal is a
+/// class object or satisfies `T.noreturn`. A core CLASS (`Set`, `Range`,
+/// `Enumerator`) is a literal's ancestor or never is; a core MODULE
+/// (`Enumerable`) may also be mixed in by a project reopening of any class
+/// on the literal's ancestry, so such a reopening makes it fit.
+fn sig_only_fits(ancestry: &[&str], only: &SigOnly, index: &ProjectIndex) -> bool {
+    match only {
+        SigOnly::NoReturn | SigOnly::ClassObject => false,
+        SigOnly::Core(class) => {
+            ancestry.contains(class)
+                || (*class == "Enumerable" && ancestry.iter().any(|a| index.by_path.contains_key(*a)))
+        }
     }
 }
 
@@ -3653,6 +3671,11 @@ impl Checker<'_> {
             return Ty::Unknown;
         }
 
+        if let Some(ty) = self.sorbet_assertion(call, &name, (&pos_args, &literals), scope) {
+            self.tally(Bucket::Resolved);
+            return ty;
+        }
+
         match recv_ty {
             Ty::Instance(c) => match self.index.lookup_method_rbi(c, &name, self.rbi_map) {
                 MethodLookup::Found(m, owner) => {
@@ -3864,6 +3887,15 @@ impl Checker<'_> {
                             self.tally_inconclusive(blocker);
                             self.tally_ar_base(blocker, c);
                             self.note_unknown_origin(call, UnkOrigin::ProjectRet, None);
+                            // W7: the singleton walk stops at any open
+                            // extend (sorbet-runtime's own `T::Sig` among
+                            // them), but `singleton_new_hidden` proves no
+                            // project `new` can answer: `Class#new` runs
+                            // `initialize`, whose Sorbet contract the
+                            // runtime enforces. Arity stays as before.
+                            if !self.index.singleton_new_hidden(c) {
+                                self.check_initialize_contract(c, &typed_args);
+                            }
                             return self.constructed(c);
                         }
                         MethodLookup::NotFound => {}
@@ -4090,7 +4122,9 @@ impl Checker<'_> {
                 self.collect_constraint(call, &name, msg_loc);
                 Ty::Unknown
             }
-            Ty::Union(_) => {
+            // A contract-only type never types a receiver (it reaches no
+            // consumer); were one to leak here, it would be no proof.
+            Ty::Union(_) | Ty::Contract(_) => {
                 self.tally_unknown_receiver(call);
                 Ty::Unknown
             }
@@ -5037,7 +5071,7 @@ fn harvest_answers(h: &crate::open_world::Harvest, chain: &[&str], keys: &[&str]
     ) {
         let Some(sig) = &m.sig else {
             if let (Some((sig, nesting)), Some(names)) = (self.effective_sorbet(m, name), &m.positional_names) {
-                self.check_sorbet_args(&sig, &nesting, names, &m.keywords, name, args);
+                self.check_sorbet_args(&sig, &nesting, names, m, name, args);
             }
             return;
         };
@@ -5076,30 +5110,57 @@ fn harvest_answers(h: &crate::open_world::Harvest, chain: &[&str], keys: &[&str]
         }
     }
 
+    /// W7: `X.new(...)` against `initialize`'s inline Sorbet contract only
+    /// (an RBS `#:` comment is no runtime contract), for a class whose
+    /// `new` is proven to be `Class#new`.
+    fn check_initialize_contract(&mut self, c: ClassId, args: &CallTypeArgs<'_>) {
+        let MethodLookup::Found(m, _) = self.index.lookup_method_rbi(c, "initialize", self.rbi_map) else { return };
+        let m = m.clone();
+        if m.sig.is_some() {
+            return;
+        }
+        if let (Some((sig, nesting)), Some(names)) = (self.effective_sorbet(&m, "new"), &m.positional_names) {
+            self.check_sorbet_args(&sig, &nesting, names, &m, "new", args);
+        }
+    }
+
+    /// Bind each literal argument to the parameter NAME it lands on: the
+    /// leading positional names in order, then a `*rest` (each extra
+    /// positional is checked against the rest's declared element type),
+    /// written keywords by name, and every other keyword to a `**kwrest`
+    /// (W7: sorbet-runtime checks each of them, so the contract stays).
     fn check_sorbet_args(
         &mut self,
         sig: &crate::sorbet_sig::SorbetSig,
         nesting: &[String],
         positional_names: &[String],
-        keywords: &[(String, bool)],
+        m: &MethodSig,
         method: &str,
         args: &CallTypeArgs<'_>,
     ) {
         let Some(keyword_args) = args.keywords else { return };
+        let (rest, kwrest) = &m.splat_names;
         // A keyword hash can be a positional Hash in Ruby. Without a matching
         // keyword layout, do not guess which parameter received it.
-        if keyword_args.iter().any(|(name, _, _)| !keywords.iter().any(|(kw, _)| kw == name)) {
+        if kwrest.is_none() && keyword_args.iter().any(|(name, _, _)| !m.keywords.iter().any(|(kw, _)| kw == name)) {
             return;
         }
-        let positional = positional_names.iter().zip(args.positional).map(|(name, (_, span, _))| (name, *span));
-        let bound = positional.chain(keyword_args.iter().map(|(name, _, span)| (name, *span)));
-        for (name, span) in bound {
+        let keyword_param = |name: &String| {
+            if m.keywords.iter().any(|(kw, _)| kw == name) { Some(name.clone()) } else { kwrest.clone() }
+        };
+        let extra = args.positional.get(positional_names.len()..).unwrap_or_default();
+        let rests = extra.iter().filter_map(|(_, span, _)| rest.clone().map(|r| (Some(r), *span)));
+        let positional = positional_names.iter().zip(args.positional)
+            .map(|(name, (_, span, _))| (Some(name.clone()), *span));
+        let bound = positional.chain(keyword_args.iter().map(|(name, _, span)| (keyword_param(name), *span)));
+        for (name, span) in bound.chain(rests) {
+            let Some(name) = name else { continue };
             // Literal-only: an argument that is not WRITTEN as a literal is
             // never judged, whatever its inferred type says.
             let Some(literal) = args.literals.iter().find(|(at, _)| *at == span).map(|(_, class)| class.clone()) else {
                 continue;
             };
-            self.check_sorbet_argument(sig, nesting, method, name, (&literal, span));
+            self.check_sorbet_argument(sig, nesting, method, &name, (&literal, span));
         }
     }
 
@@ -5149,6 +5210,103 @@ fn harvest_answers(h: &crate::open_world::Harvest, chain: &[&str], keys: &[&str]
         !keys.iter().any(|k| self.index.polluted_any_class.contains(*k))
             && !leaf.core_ancestry().iter().any(|class| {
                 self.index.polluted_methods.get(*class).is_some_and(|defined| keys.iter().any(|k| defined.contains(*k)))
+            })
+    }
+
+    /// W5: sorbet-runtime's assertions — `T.let`/`T.cast`/`T.assert_type!`/
+    /// `T.bind(value, Type)`, `T.must(value)`/`T.must_because(value) { }`
+    /// and `T.unsafe(value)` — on the real `T` (the receiver resolves to
+    /// the declared namespace, which the project gives no method of that
+    /// name). `None` for any other call, or for a shape these readings do
+    /// not cover (a splat, a keyword such as `checked:`, a wrong count),
+    /// which then dispatches as before.
+    ///
+    /// The value is the asserted argument's own inferred type (the
+    /// assertion returns it unchanged; `T.must` strips `nil`), so an
+    /// inference is never overridden and `T.cast(1, String).upcase` keeps
+    /// its `Integer` receiver. Only an `Unknown` value takes the asserted
+    /// type, type arguments erased as `sig_fill` does, and only where
+    /// sorbet-runtime enforces it (`!sorbet_runtime_unchecked`); `T.bind`
+    /// and `T.unsafe` type nothing. The runtime raises on a WRITTEN literal
+    /// that breaks the asserted type, and `T.must` on a written `nil`:
+    /// E0103 at the argument, literal-only like every contract.
+    fn sorbet_assertion(
+        &mut self,
+        call: &CallNode<'_>,
+        name: &str,
+        (positional, literals): (&[PositionalArg], &[WrittenLiteral]),
+        scope: &[String],
+    ) -> Option<Ty> {
+        let nodes = self.assertion_arguments(call, name, positional.len(), scope)?;
+        if name == "unsafe" {
+            return Some(Ty::Unknown);
+        }
+        let (value, span, _) = &positional[0];
+        let literal = literals.iter().find(|(at, _)| at == span).map(|(_, class)| class);
+        let enforced = !self.index.sorbet_runtime_unchecked;
+        if name == "must" || name == "must_because" {
+            return Some(self.must_assertion(name, value, *span, literal.filter(|_| enforced)));
+        }
+        let expr = std::str::from_utf8(nodes[1].location().as_slice()).ok()?;
+        let expected = crate::sorbet_sig::resolve_sig_ty(expr, self.index, scope);
+        if let Some(literal) = literal.filter(|_| enforced) {
+            self.accuse_asserted_literal(name, literal, *span, &expected);
+        }
+        Some(match value {
+            _ if name == "bind" => Ty::Unknown,
+            Ty::Unknown if enforced => erase_type_arguments(&expected),
+            inferred => inferred.clone(),
+        })
+    }
+
+    /// The argument nodes of a `T.<assertion>` call on sorbet-runtime's own
+    /// lexical `T` (no project `T.<name>`), when their count is exact.
+    fn assertion_arguments<'pr>(
+        &self,
+        call: &CallNode<'pr>,
+        name: &str,
+        positional: usize,
+        scope: &[String],
+    ) -> Option<Vec<Node<'pr>>> {
+        let arity = match name {
+            "let" | "cast" | "assert_type!" | "bind" => 2,
+            "must" | "must_because" | "unsafe" => 1,
+            _ => return None,
+        };
+        let spelled = crate::index::const_path_str(&call.receiver()?)?;
+        let t = *self.index.by_path.get("T")?;
+        let lexical = spelled == "::T" || (spelled == "T" && self.index.resolve_const(scope, "T") == Some(t));
+        if !lexical || self.index.class(t).singleton_methods.contains_key(name) {
+            return None;
+        }
+        let nodes: Vec<Node<'pr>> = call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        (nodes.len() == arity && positional == arity).then_some(nodes)
+    }
+
+    /// E0103 when a WRITTEN literal breaks the type a `T.<assertion>` asserts.
+    fn accuse_asserted_literal(&mut self, name: &str, literal: &LiteralClass, span: (usize, usize), expected: &Ty) {
+        if self.contract_breaks(std::slice::from_ref(literal), expected) {
+            self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
+                format!("`T.{name}` expects {}, got {}", ty_name(expected, self.index), literal.name(self.index)));
+        }
+    }
+
+    /// `T.must`/`T.must_because` raise on a WRITTEN `nil` (runtime enforced,
+    /// `literal` already filtered on it) and answer the value without nil.
+    fn must_assertion(&mut self, name: &str, value: &Ty, span: (usize, usize), literal: Option<&LiteralClass>) -> Ty {
+        if literal == Some(&LiteralClass::Modeled(Ty::Nil)) && self.nil_equality_unpatched() {
+            self.emit(span.0, span.1, E0103_ARG_TYPE_MISMATCH, Severity::Error,
+                format!("`T.{name}` raises on a literal `nil`"));
+        }
+        strip_nil(value.clone())
+    }
+
+    /// `T.must(nil)` raises only after `nil == false` answers false: a
+    /// project `==` anywhere on `nil`'s ancestry may answer otherwise.
+    fn nil_equality_unpatched(&self) -> bool {
+        !self.index.polluted_any_class.contains("==")
+            && !["NilClass", "Object", "Kernel", "BasicObject"].iter().any(|class| {
+                self.index.polluted_methods.get(*class).is_some_and(|defined| defined.contains("=="))
             })
     }
 
@@ -5759,6 +5917,9 @@ fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
         (a, Ty::Union(parts)) => parts.iter().any(|p| compatible(a, p, index)),
         (Ty::Array(a), Ty::Array(p)) => compatible(a, p, index),
         (Ty::Hash(ak, av), Ty::Hash(pk, pv)) => compatible(ak, pk, index) && compatible(av, pv, index),
+        (a, Ty::Contract(only)) => {
+            sig_only_fits(core_class_of(a).map_or(&["Object", "Kernel"], core_pollution_names), only, index)
+        }
         (a, p) => a == p,
     }
 }
@@ -5766,12 +5927,14 @@ fn compatible(arg: &Ty, param: &Ty, index: &ProjectIndex) -> bool {
 /// A collection whose CONTENTS are unproven keeps only its category: a
 /// local changed in place, an ivar any method may change, a collection
 /// nested in another one (all shared by reference). Its type arguments
-/// become Unknown; that it IS an Array or a Hash still holds.
+/// become Unknown; that it IS an Array or a Hash still holds. A
+/// contract-only type (W6) types no consumer, and absorbs its union.
 fn erase_type_arguments(t: &Ty) -> Ty {
     match t {
         Ty::Array(_) => Ty::Array(Box::new(Ty::Unknown)),
         Ty::Hash(_, _) => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
-        Ty::Union(parts) => Ty::Union(parts.iter().map(erase_type_arguments).collect()),
+        Ty::Union(parts) => parts.iter().map(erase_type_arguments).reduce(Ty::union).unwrap_or(Ty::Unknown),
+        Ty::Contract(_) => Ty::Unknown,
         other => other.clone(),
     }
 }
@@ -5796,6 +5959,9 @@ pub fn ty_name(t: &Ty, index: &ProjectIndex) -> String {
             .map(|p| ty_name(p, index))
             .collect::<Vec<_>>()
             .join(" | "),
+        Ty::Contract(SigOnly::Core(class)) => (*class).to_string(),
+        Ty::Contract(SigOnly::ClassObject) => "Module".to_string(),
+        Ty::Contract(SigOnly::NoReturn) => "T.noreturn".to_string(),
     }
 }
 

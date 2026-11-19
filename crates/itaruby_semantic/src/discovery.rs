@@ -107,8 +107,9 @@ fn wire_structure_sql(db: &Db, sql_path: &Path) {
 
 /// Phase 1 scan (bead ita-vto, extended to a union by ita-k9j.3) of a
 /// client's Tapioca-generated `sorbet/rbi/`: `constant name -> EVERY
-/// declaring file` plus every core namespace reopening (w12 closure),
-/// each wired as its own salsa singleton, absent-if-empty.
+/// declaring file` plus every core namespace reopening (w12 closure) and
+/// the W11 open-world chain/type-test files, each wired as its own salsa
+/// singleton, absent-if-empty.
 fn wire_rbi(db: &Db, rbi_dir: &Path) {
     let files = crate::rbi::discover_rbi_files(rbi_dir);
     let index = crate::rbi::build_rbi_index(&files);
@@ -117,6 +118,9 @@ fn wire_rbi(db: &Db, rbi_dir: &Path) {
     }
     if !index.constants.is_empty() {
         RbiProject::new(db, index.constants);
+    }
+    if !index.chain_reopenings.is_empty() || !index.type_test_files.is_empty() {
+        crate::RbiOpenWorld::new(db, index.chain_reopenings, index.type_test_files);
     }
 }
 
@@ -245,7 +249,7 @@ fn rb_file(path: &Path) -> bool {
 
 /// A file Ruby loads: `.rb`, `.rake`, `.gemspec`, `.ru`, a `Gemfile`, a
 /// `Rakefile`, or anything directly in a `bin/` directory.
-fn ruby_source(path: &Path) -> bool {
+pub(crate) fn ruby_source(path: &Path) -> bool {
     let ext = path.extension().and_then(|ext| ext.to_str());
     let name = path.file_name().and_then(|name| name.to_str());
     matches!(ext, Some("rb" | "rake" | "gemspec" | "ru"))

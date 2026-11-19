@@ -32,7 +32,7 @@ fn contract_codes(diags: &[Diagnostic]) -> Vec<&str> {
 /// A Sorbet contract judges only literals, so the inference below it — the
 /// core model, the ivar proofs, a redefinition taking a signature off its
 /// consumers — is no longer observable through E0103/E0109. It still types
-/// every consumer (hover, E0101, RBS-comment E0103), and hover reads that
+/// every consumer (hover, E0101), and hover reads that
 /// typing directly: point `at` into the call's message name (`last`, `* `),
 /// never at its receiver or the dot right after it — a span's end is
 /// inclusive, so the receiver's smaller span would win there.
@@ -1171,9 +1171,9 @@ reopen.enumerable_echo([1])
 /// the consumer. A sig types a consumer only where inference knows nothing,
 /// so `pass` returns its (never bound) param: the declared module is all
 /// that reaches `pass(-1)`. As an instance of the module, `.abs` would
-/// resolve to the mixin's String-returning `abs` and accuse the RBS-comment
-/// call — but `Integer#abs` shadows the mixin on MRI (sorbet-runtime
-/// included) and returns `1`.
+/// resolve to the mixin's String-returning `abs` — but `Integer#abs`
+/// shadows the mixin on MRI (sorbet-runtime included) and returns `1`, so
+/// hover must read `pass` as Unknown.
 #[test]
 fn project_module_mixed_into_core_never_accuses_core_values() {
     let source = r#"
@@ -1610,9 +1610,9 @@ end
 
 // -- self in a module is an instance of an unknown includer --
 
-/// `self` is never a literal, so no Sorbet contract judges it; the rule
-/// that a module's `self` proves nothing lives on in `compatible`, which
-/// the RBS-comment E0103 still applies to inferred instances.
+/// `self` is never a literal, so no Sorbet contract judges it, and since
+/// MATRIX H2 neither does an RBS comment: a module's `self`, and a class's
+/// own `self`, pass silently. The written literal beside them is judged.
 #[test]
 fn module_self_is_never_proof_against_an_includer() {
     let diags = check("module-self", r"
@@ -1643,12 +1643,13 @@ class ContractRegistry
   end
   def again
     store(self)
+    store(:person)
   end
 end
 ", None);
-    // A class's own `self` is still proven, against the RBS comment.
+    // Only the literal is judged; neither `self` is.
     assert_eq!(codes(&diags), ["E0103"], "{diags:?}");
-    assert!(diags[0].message.contains("got ContractRegistry"), "{diags:?}");
+    assert_eq!(diags[0].message, "argument 1 of `store` expects ContractPerson, got Symbol", "{diags:?}");
 }
 
 // -- every redefinition path takes a written contract off the method --
@@ -1725,6 +1726,17 @@ class ContractHookTarget
 end
 ContractHookTarget.new.echo("text")
 "#;
+    const SINGLETON: &str = r#"
+class ContractHookSingleton
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def self.echo(value)
+    value
+  end
+  EXTENSION
+end
+ContractHookSingleton.echo("text")
+"#;
     let hook = r"
 module ContractHookInstaller
   def self.extended(base)
@@ -1744,17 +1756,6 @@ end
     // takes the singleton contract off. Measured on ruby 3.4.2 with
     // sorbet-runtime 0.6.13036: with the `extend` the call returns
     // "text"; without it, sorbet-runtime raises `TypeError`.
-    let singleton = r#"
-class ContractHookSingleton
-  extend T::Sig
-  sig { params(value: Integer).returns(Integer) }
-  def self.echo(value)
-    value
-  end
-  EXTENSION
-end
-ContractHookSingleton.echo("text")
-"#;
     let definer = r"
 module ContractHookDefiner
   def self.extended(base)
@@ -1764,9 +1765,9 @@ module ContractHookDefiner
   end
 end
 ";
-    let diags = check_files("extended-hook-def", &[&singleton.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
+    let diags = check_files("extended-hook-def", &[&SINGLETON.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
     assert!(contract_codes(&diags).is_empty(), "{diags:?}");
-    let target = singleton.replace("EXTENSION", "");
+    let target = SINGLETON.replace("EXTENSION", "");
     let control = check_files("extended-hook-def-control", &[&target, definer]);
     assert_eq!(contract_names(&target, &control), ["\"text\""], "control must accuse without the extend: {control:?}");
 }
@@ -1886,6 +1887,17 @@ class ContractIncludedTarget
 end
 ContractIncludedTarget.new.echo("text")
 "#;
+    const RETURNING: &str = r#"
+class ContractIncludedReturn
+  extend T::Sig
+  sig { returns(Integer) }
+  def label
+    "text"
+  end
+  INCLUSION
+end
+ContractIncludedReturn.new.label
+"#;
     let hook = r"
 module ContractIncludedHook
   def self.included(base)
@@ -1931,24 +1943,13 @@ end
     // include-time rule keeps E0109 off it. Measured on ruby 3.4.2 with
     // sorbet-runtime 0.6.13036 and activesupport 8.1.3: with the
     // `include` `label` returns 1; without it, `TypeError`.
-    let returning_template = r#"
-class ContractIncludedReturn
-  extend T::Sig
-  sig { returns(Integer) }
-  def label
-    "text"
-  end
-  INCLUSION
-end
-ContractIncludedReturn.new.label
-"#;
     let relabel = "module ContractIncludedRelabel\n  extend ActiveSupport::Concern\n  included do\n    def label\n      1\n    end\n  end\nend\n";
     let relabel_macro_first = relabel.replace("  included do", "  contract_setting :flag\n  included do");
     for (i, module) in [relabel, relabel_macro_first.as_str()].iter().enumerate() {
-        let diags = check_files(&format!("included-relabel-{i}"), &[&returning_template.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
+        let diags = check_files(&format!("included-relabel-{i}"), &[&RETURNING.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
         assert!(contract_codes(&diags).is_empty(), "{module}: {diags:?}");
     }
-    let returning = returning_template.replace("INCLUSION", "");
+    let returning = RETURNING.replace("INCLUSION", "");
     let control = check_files("included-relabel-control", &[&returning, relabel]);
     assert_eq!(contract_codes(&control), ["E0109"], "control must accuse without the include: {control:?}");
     assert_eq!(contract_names(&returning, &control), ["label"], "{control:?}");
@@ -2328,23 +2329,17 @@ end
 }
 
 
-// -- nominal compatibility: a class proves NOT to be a core value only from a complete ancestry --
+// -- nominal compatibility: a project instance is never judged, by a sig or an RBS comment --
 
 /// A project subclass of a core class IS that core value under
 /// sorbet-runtime (`SafeStr.new("x").is_a?(String)`), and so is a subclass
 /// of a project reopen of it or of a class some `.rbi` declares (a gem
-/// class the project reopens without restating its superclass). An
-/// `Instance` is held to a core scalar or collection type only when its
-/// ancestry is complete and names nothing that is, or may be, that core
-/// type — see the control test that follows.
+/// class the project reopens without restating its superclass).
 ///
-/// An instance is never a literal, so the Sorbet sigs below judge none of
-/// it; the rule lives on in `compatible`, which the RBS-comment E0103
-/// (`#: (String, ...) -> void`) still applies to inferred instances.
-/// `ContractReopenParams.new` infers nothing (its reopened `Hash` ancestor
-/// is open), so the reopen's rule is held by `self` inside the subclass:
-/// an inferred instance whose complete ancestry names only the OPEN
-/// reopen of `Hash`.
+/// An instance is never a literal, so neither the Sorbet sigs nor, since
+/// MATRIX H2, the RBS comment (`#: (String, ...) -> void`) judge any of
+/// it. The ancestry rule that once held inferred instances to core types
+/// (`may_be_core_value`) was removed with H2 as unreachable.
 #[test]
 fn core_subclass_instances_satisfy_core_contracts() {
     let source = r#"
@@ -2411,13 +2406,13 @@ end
     assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
 }
 
-/// The controls that keep the ancestry rule a contract: a plain project
-/// class, and a project subclass chain, whose complete ancestry names no
-/// core type are still accused against `String`, `Hash` and `Array` by the
-/// RBS-comment E0103, which judges inferred instances. The Sorbet sigs
-/// below are handed instances, never literals: not judged.
+/// A plain project class and a project subclass chain, whose complete
+/// ancestry names no core type, are still instances: the RBS comment
+/// never judges them against `String`, `Hash` and `Array` (MATRIX H2),
+/// and neither does a Sorbet sig. A literal of the wrong core class
+/// passed to the same RBS params is the E0103, at the literal.
 #[test]
-fn closed_project_ancestry_still_accuses_core_contracts() {
+fn closed_project_ancestry_instances_are_silent_and_literals_accuse() {
     let source = r"
 class ContractPlainValue
 end
@@ -2447,13 +2442,12 @@ end
 ContractClosedAncestry.new.take(ContractPlainChild.new)
 ContractClosedAncestry.new.take_data(ContractPlainChild.new)
 ContractClosedAncestry.new.take_rows(ContractPlainValue.new)
+ContractClosedAncestry.new.take(:text)
+ContractClosedAncestry.new.take_data([])
+ContractClosedAncestry.new.take_rows({})
 ";
     let diags = check("closed-ancestry", source, None);
-    assert_eq!(
-        contract_names(source, &diags),
-        ["ContractPlainChild.new", "ContractPlainChild.new", "ContractPlainValue.new"],
-        "{diags:?}"
-    );
+    assert_eq!(contract_names(source, &diags), [":text", "[]", "{}"], "{diags:?}");
     assert_eq!(contract_codes(&diags), ["E0103"; 3], "{diags:?}");
 }
 
@@ -4644,5 +4638,131 @@ fn a_rebound_hook_param_is_an_unnamed_receiver() {
     for (i, outside) in [hook("base.name"), hook("other = base.name")].iter().enumerate() {
         assert_hidden_untouched(&format!("hook-rebound-control-{i}"), outside);
     }
+}
+
+// -- MATRIX H2: an inline `#:` RBS sig judges only arguments WRITTEN as literals --
+
+/// The `#:` RBS path accuses like a `sig`: at the literal argument, by
+/// position, naming the literal's class. A fitting literal is silent.
+#[test]
+fn rbs_comment_contract_accuses_a_literal_argument() {
+    let source = r#"
+class ContractRbsTake
+  #: (String) -> void
+  def self.take(s); end
+end
+ContractRbsTake.take("fits")
+ContractRbsTake.take(1)
+"#;
+    let diags = check("rbs-literal", source, None);
+    assert_eq!(contract_codes(&diags), ["E0103"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["1"], "{diags:?}");
+    assert_eq!(diags[0].message, "argument 1 of `take` expects String, got Integer", "{diags:?}");
+}
+
+/// An argument that is not written as a literal is never judged by a `#:`
+/// sig, whatever its inferred type: the five MATRIX H2 narrowing shapes
+/// (`&&`, `!!x &&`, `x || "z"`, `case/when`, an `is_a?` early return) ran
+/// clean on MRI yet were accused, and a local holding a mismatching
+/// literal, a constant and a call are the intended false negatives.
+#[test]
+fn rbs_comment_contract_never_judges_an_inferred_argument() {
+    let source = r#"
+class ContractRbsInferred
+  #: (String) -> void
+  def self.take(s); end
+end
+n = ENV.key?("NOPE_Q") ? "a" : nil
+n && ContractRbsInferred.take(n)
+!!n && ContractRbsInferred.take(n)
+ContractRbsInferred.take(n || "z")
+v = ENV.key?("NOPE_Q") ? "a" : 1
+case v
+when String then ContractRbsInferred.take(v)
+end
+def contract_rbs_early_return
+  w = ENV.key?("NOPE_Q") ? "a" : 1
+  return unless w.is_a?(String)
+  ContractRbsInferred.take(w)
+end
+count = 1
+ContractRbsInferred.take(count)
+ContractRbsInferred.take(ContractRbsInferred)
+ContractRbsInferred.take(count.succ)
+"#;
+    let diags = check("rbs-inferred", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+// -- MATRIX H6: a branch a literal predicate proves dead accuses no contract --
+
+/// `x if false`, `x if nil`, `x unless true`, the then-branch of `false ? x
+/// : y` and of `if false`, and the else-branch of `if true` never run, so
+/// no contract (Sorbet `sig` or `#:` RBS) is accused inside them.
+#[test]
+fn contracts_stay_silent_in_a_statically_dead_branch() {
+    let source = r"
+class ContractDeadBranch
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def f(x) = x
+  #: (Integer) -> void
+  def g(x); end
+end
+ContractDeadBranch.new.f(:dead_if) if false
+ContractDeadBranch.new.g(:dead_rbs) if nil
+ContractDeadBranch.new.f(:dead_unless) unless true
+false ? ContractDeadBranch.new.f(:dead_ternary) : nil
+if false
+  ContractDeadBranch.new.f(:dead_then)
+end
+if true
+  nil
+else
+  ContractDeadBranch.new.g(:dead_else)
+end
+";
+    let diags = check("dead-branch", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The live side of the same literal predicates is walked as before: the
+/// else-branch of `if false`/`false ? :`, the then-branch of `if true`, and
+/// a guard no literal decides all accuse their literal, and only those.
+#[test]
+fn the_live_branch_of_a_literal_predicate_still_accuses() {
+    let source = r#"
+class ContractLiveBranch
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def f(x) = x
+  #: (Integer) -> void
+  def g(x); end
+end
+false ? ContractLiveBranch.new.f(:dead_ternary) : ContractLiveBranch.new.f(:live_ternary)
+if false
+  ContractLiveBranch.new.f(:dead_then)
+else
+  ContractLiveBranch.new.g(:live_else)
+end
+if true
+  ContractLiveBranch.new.f(:live_then)
+else
+  ContractLiveBranch.new.f(:dead_else)
+end
+unless false
+  ContractLiveBranch.new.f(:live_unless)
+else
+  ContractLiveBranch.new.f(:dead_unless_else)
+end
+ContractLiveBranch.new.f(:live_guard) if ENV.key?("NOPE_Q")
+"#;
+    let diags = check("live-branch", source, None);
+    assert_eq!(
+        contract_names(source, &diags),
+        [":live_ternary", ":live_else", ":live_then", ":live_unless", ":live_guard"],
+        "{diags:?}"
+    );
+    assert_eq!(contract_codes(&diags), ["E0103"; 5], "{diags:?}");
 }
 

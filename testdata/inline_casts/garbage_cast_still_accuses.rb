@@ -1,7 +1,8 @@
 # Bead ita-qst: an unresolvable cast target (`Blah` names no project
-# class) must never invent a type — the argument keeps its real inferred
-# type and the genuine mismatch still fires, byte-identical to having no
-# cast comment at all.
+# class) must never invent a type — the value keeps its real inferred
+# type (`kept` hovers as `InlineCastWrongC`), byte-identical to having no
+# cast comment at all. Since MATRIX H2 the `#:` sig judges only literal
+# arguments: the cast local is silent, the written `:not_foo` accuses.
 class InlineCastFooC
 end
 
@@ -16,7 +17,9 @@ end
 
 def inline_cast_garbage_c
   wrong = InlineCastWrongC.new
+  kept = wrong #: as Blah
   InlineCastSinkC.new.use_foo(
-    wrong, #: as Blah
+    kept, #: as Blah
   )
+  InlineCastSinkC.new.use_foo(:not_foo)
 end

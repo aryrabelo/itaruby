@@ -13,8 +13,18 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+/// The fixture's installed-gem directory (`GEM_PATH`): since W11 a gem
+/// whose RBI reopens a core class is read from its installed source, and
+/// with none the class it reopens stays open. A sibling of the project,
+/// so the unloaded-file scan never walks it.
+fn gem_store(project: &Path) -> PathBuf {
+    project.with_extension("gems")
+}
+
 fn run_check(arg: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ita"))
+        .env("GEM_PATH", gem_store(arg))
+        .env_remove("GEM_HOME")
         .arg("check")
         .arg(arg)
         .output()
@@ -33,32 +43,49 @@ fn tmpdir(name: &str) -> PathBuf {
 }
 
 fn write(dir: &Path, name: &str, text: &str) {
+    std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join(name), text).unwrap();
 }
 
 /// The p5 narrowing probe plus a real ActiveSupport-style `String#squish`
-/// call: with one gem fully covered, the typo still fires E0101 while the
-/// RBI-declared method stays silent — declared means exists.
+/// call: with one gem fully covered, a typo on a LITERAL fires E0101
+/// while the RBI-declared method stays silent — declared means exists.
+/// The narrowed `x.pushh` stays silent since W11: `x` only passed
+/// `is_a?(String)`, and a `String` subclass (the stdlib's own
+/// `OpenSSL::Buffer`) may define it.
 #[test]
 fn full_coverage_closes_the_world_and_rbi_declared_methods_stay_silent() {
     let dir = tmpdir("tapioca-closed-full");
-    write(&dir, "Gemfile", "source \"https://rubygems.org\"\ngem \"mygem\"\n");
-    write(&dir, "Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n");
+    write(
+        &dir,
+        "Gemfile",
+        "source \"https://rubygems.org\"\ngem \"mygem\"\n",
+    );
+    write(
+        &dir,
+        "Gemfile.lock",
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n",
+    );
     write(
         &dir.join("sorbet/rbi/gems"),
         "mygem@1.0.0.rbi",
         "# typed: true\n\nclass String\n  def squish; end\nend\n",
     );
     write(
-        &dir,
-        "probe.rb",
-        "# typed: true\nclass Appender\n  def append(x)\n    if x.is_a?(String)\n      x.pushh(1)\n    end\n    x\n  end\nend\n\nAppender.new.append(\"a\")\n\"s\".squish\n",
+        &gem_store(&dir).join("gems/mygem-1.0.0/lib"),
+        "mygem.rb",
+        "class String\n  def squish; end\nend\n",
     );
+    write(&dir, "probe.rb", PROBE);
     let out = run_check(&dir);
     let text = stdout(&out);
     assert!(
-        text.contains("E0101") && text.contains("pushh"),
-        "covered Tapioca project: typo must fire E0101, got: {text}"
+        text.contains("probe.rb:12:5: error[E0101]: undefined method `pushhh` for `String`"),
+        "covered Tapioca project: a literal's typo must fire E0101, got: {text}"
+    );
+    assert!(
+        !text.contains("`pushh`"),
+        "a narrowed String is not exact: silence, got: {text}"
     );
     assert!(
         !text.contains("squish"),
@@ -68,25 +95,38 @@ fn full_coverage_closes_the_world_and_rbi_declared_methods_stay_silent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Narrowed typo (silent since W11), a literal typo (the positive
+/// control the coverage tests below need to mean anything) and an
+/// RBI-declared call.
+const PROBE: &str = "# typed: true\nclass Appender\n  def append(x)\n    if x.is_a?(String)\n      x.pushh(1)\n    end\n    x\n  end\nend\n\nAppender.new.append(\"a\")\n\"s\".pushhh(1)\n\"s\".squish\n";
+
 /// Same project, RBI file deleted: coverage incomplete, mode off, total
 /// silence — exactly the pre-w12 behavior for any Gemfile project.
 #[test]
 fn missing_gem_rbi_fails_closed_to_silence() {
     let dir = tmpdir("tapioca-closed-missing");
-    write(&dir, "Gemfile", "source \"https://rubygems.org\"\ngem \"mygem\"\n");
-    write(&dir, "Gemfile.lock", "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n");
     write(
         &dir,
-        "probe.rb",
-        "# typed: true\nclass Appender\n  def append(x)\n    if x.is_a?(String)\n      x.pushh(1)\n    end\n    x\n  end\nend\n\nAppender.new.append(\"a\")\n",
+        "Gemfile",
+        "source \"https://rubygems.org\"\ngem \"mygem\"\n",
     );
+    write(
+        &dir,
+        "Gemfile.lock",
+        "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n",
+    );
+    write(&dir, "probe.rb", PROBE);
     let out = run_check(&dir);
     let text = stdout(&out);
     assert!(
         !text.contains("E0101"),
         "one gem without its RBI opens the world: silence, got: {text}"
     );
-    assert_eq!(out.status.code(), Some(0), "no errors expected, got: {text}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no errors expected, got: {text}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -95,7 +135,11 @@ fn missing_gem_rbi_fails_closed_to_silence() {
 #[test]
 fn two_gems_one_rbi_is_incomplete_coverage() {
     let dir = tmpdir("tapioca-closed-partial");
-    write(&dir, "Gemfile", "source \"https://rubygems.org\"\ngem \"mygem\"\ngem \"other\"\n");
+    write(
+        &dir,
+        "Gemfile",
+        "source \"https://rubygems.org\"\ngem \"mygem\"\ngem \"other\"\n",
+    );
     write(
         &dir,
         "Gemfile.lock",
@@ -106,18 +150,18 @@ fn two_gems_one_rbi_is_incomplete_coverage() {
         "mygem@1.0.0.rbi",
         "# typed: true\n\nclass String\n  def squish; end\nend\n",
     );
-    write(
-        &dir,
-        "probe.rb",
-        "# typed: true\nclass Appender\n  def append(x)\n    if x.is_a?(String)\n      x.pushh(1)\n    end\n    x\n  end\nend\n\nAppender.new.append(\"a\")\n",
-    );
+    write(&dir, "probe.rb", PROBE);
     let out = run_check(&dir);
     let text = stdout(&out);
     assert!(
         !text.contains("E0101"),
         "2 gems in lock, 1 RBI: coverage incomplete, silence, got: {text}"
     );
-    assert_eq!(out.status.code(), Some(0), "no errors expected, got: {text}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "no errors expected, got: {text}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -141,7 +185,8 @@ fn value_constant_typo_gets_did_you_mean_and_defined_at() {
         "qualified typo suggests the indexed value constant:\n{text}"
     );
     assert!(
-        text.lines().any(|l| l.contains("defined at") && l.contains("foo.rb:2")),
+        text.lines()
+            .any(|l| l.contains("defined at") && l.contains("foo.rb:2")),
         "defined-at must point at foo.rb line 2 (the `Bar = 1`), got:\n{text}"
     );
     assert_eq!(out.status.code(), Some(0), "warning only => exit 0");

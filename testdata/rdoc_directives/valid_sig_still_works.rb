@@ -2,8 +2,9 @@
 # space after `#:`) is NOT an RDoc directive — `(` can never start an RDoc
 # directive, and IS a valid RBS sig start. The fix must only skip glued
 # WORD forms (`#:nodoc:`, `#:doc:`), never a glued `(`. The sig must still
-# attach and drive real checks: wrong arg count -> E0102, wrong arg type
-# -> E0103.
+# attach and drive real checks: wrong arg count -> E0102, wrong literal
+# arg type -> E0103 (since MATRIX H2 the `#:` sig judges only literal
+# arguments, so the instance passed beside it is silent).
 class RdocDirValidSigParam
 end
 
@@ -24,3 +25,4 @@ end
 
 RdocDirValidSigArity.new.accept(RdocDirValidSigParam.new, RdocDirValidSigParam.new)
 RdocDirValidSigType.new.accept(RdocDirValidSigOther.new)
+RdocDirValidSigType.new.accept(:other)

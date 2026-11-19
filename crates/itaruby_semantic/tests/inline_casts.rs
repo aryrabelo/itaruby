@@ -6,13 +6,19 @@
 //! `index_single(uri, source, #: as !nil)` — leaves `source` typed
 //! `String | nil` against `index_single`'s own `(String) -> void` sig,
 //! firing a false E0103. `check.rs::Checker::apply_cast_comment` binds a
-//! trailing `#: as <target>` comment to the ONE call argument sharing its
-//! physical line and retypes it for that call's arg-type check only.
+//! trailing `#: as <target>` comment to the ONE call argument (or local
+//! assignment) sharing its physical line and retypes it there only.
+//!
+//! Since MATRIX H2 the `#:` sig judges only arguments WRITTEN as literals,
+//! and a literal behind a cast is never judged, so a cast's retyping is
+//! read through hover on a cast local assignment, and each accusing
+//! fixture pairs a silent non-literal call with a literal one.
 //!
 //! MUTANTS THIS FILE MUST CATCH:
 //!   1. Cast-comment recognition disabled (`apply_cast_comment` made a
 //!      no-op, or `collect_cast_comments` never wired into `check_call`)
-//!      — `ruby_lsp_shape_stays_silent` flips to a real E0103.
+//!      — the cast `:first` literal in `multiline_call_second_arg_still_accuses`
+//!      is judged, a second E0103.
 //!   2. `!nil` stripping applied to `Ty::Unknown` (i.e. `strip_nil`
 //!      swapped for something that turns Unknown into a concrete type,
 //!      or `apply_cast_comment`'s `NotNil` arm bypasses `strip_nil`
@@ -39,6 +45,24 @@ fn check_fixture(name: &str) -> Vec<String> {
         .collect()
 }
 
+/// The type hover reports for the first `at` after the first `anchor` in
+/// `text` (`None` is `Ty::Unknown`).
+fn hover_in(name: &str, text: &str, anchor: &str, at: &str) -> Option<String> {
+    let base = text.find(anchor).unwrap_or_else(|| panic!("{anchor:?} not in {name}"));
+    let offset = base + text[base..].find(at).unwrap_or_else(|| panic!("{at:?} not after {anchor:?}"));
+    let db = Db::default();
+    let file = SourceFile::new(&db, format!("/p/{name}").into(), text.to_owned());
+    ProjectFiles::new(&db, vec![file]);
+    itaruby_semantic::hover_at(&db, file, offset).and_then(|h| h.ty)
+}
+
+fn hover_fixture(name: &str, anchor: &str, at: &str) -> Option<String> {
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/inline_casts");
+    let path = format!("{base}/{name}");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+    hover_in(name, &text, anchor, at)
+}
+
 /// A local variable declared `?String? source` cast `#: as !nil` on the
 /// exact ruby-lsp shape satisfies a callee's required `String` param —
 /// zero E0103 (and zero diagnostics at all).
@@ -50,16 +74,8 @@ fn ruby_lsp_shape_stays_silent() {
 
 /// `!nil` narrows a real `Nil`/`Union` — it must never *invent* a type
 /// out of `Ty::Unknown`. A param with no RBS sig (Unknown by
-/// construction) cast `#: as !nil` and passed to a sig expecting a
-/// concrete class stays silent (Unknown always satisfies `compatible`),
-/// proving the cast left it Unknown rather than becoming some guessed
-/// concrete type that would ALSO happen to satisfy the sig for the wrong
-/// reason. A companion negative: if `!nil` ever fabricated a type, the
-/// arg would resolve to something other than Unknown, and this same call
-/// would remain silent for a reason invariant #1 forbids — so this test
-/// alone cannot distinguish "narrowed correctly" from "silenced for the
-/// wrong reason"; `not_nil_on_unknown_param_never_narrows_away_a_real_mismatch`
-/// below closes that gap directly against `strip_nil`'s own contract.
+/// construction) cast `#: as !nil` stays Unknown (hover reports none),
+/// and passing it to a sig expecting a concrete class is silent.
 #[test]
 fn not_nil_leaves_unknown_unknown() {
     let src = "\
@@ -76,32 +92,25 @@ class InlineCastNilUnknownUser
 end
 
 def inline_cast_nil_unknown_case(unknown_param)
+  kept = unknown_param #: as !nil
   InlineCastNilUnknownUser.new.take(
-    unknown_param, #: as !nil
+    kept, #: as !nil
   )
 end
 ";
+    assert_eq!(hover_in("nil_unknown.rb", src, "kept, #:", "kept"), None, "an Unknown param cast `!nil` must stay Unknown");
     let db = Db::default();
     let file = SourceFile::new(&db, "/p/nil_unknown.rb".into(), src.to_string());
     ProjectFiles::new(&db, vec![file]);
     let diags = check_file(&db, file);
-    assert!(
-        diags.is_empty(),
-        "an Unknown param cast `!nil` must stay Unknown (still compatible with any param), \
-         got: {diags:?}"
-    );
+    assert!(diags.is_empty(), "got: {diags:?}");
 }
 
-/// Direct contract test against `strip_nil` itself (not the integration
-/// path): stripping `Nil` out of `Ty::Union([Str, Nil])` yields `Str`,
-/// never something wider. This is the pure-function half mutant (2)
-/// targets; the fixture above is the end-to-end half.
+/// `!nil` on a real `String | nil` strips `Nil` to `String`, never coerces
+/// to an unrelated class (hover reads it). Since MATRIX H2 the stripped
+/// local is not judged by the `#:` sig; the literal beside it is.
 #[test]
 fn not_nil_on_unknown_param_never_narrows_away_a_real_mismatch() {
-    // A local var whose real (non-Unknown) type is a Union containing Nil
-    // must keep firing E0103 when cast to a class that plainly is not
-    // the non-nil half of that union — proving `!nil` only ever strips
-    // `Nil`, never coerces to an unrelated class.
     let src = "\
 class InlineCastNilRealSink
 end
@@ -113,12 +122,13 @@ class InlineCastNilRealUser
 
   #: (?String? source) -> void
   def call_it(source = nil)
-    InlineCastNilRealUser.new.take(
-      source, #: as !nil
-    )
+    stripped = source #: as !nil
+    InlineCastNilRealUser.new.take(stripped)
+    InlineCastNilRealUser.new.take(\"literal\")
   end
 end
 ";
+    assert_eq!(hover_in("nil_real.rb", src, "take(stripped", "stripped").as_deref(), Some("String"));
     let db = Db::default();
     let file = SourceFile::new(&db, "/p/nil_real.rb".into(), src.to_string());
     ProjectFiles::new(&db, vec![file]);
@@ -126,11 +136,7 @@ end
         .iter()
         .map(|d| format!("{} {}", d.code, d.message))
         .collect();
-    assert!(
-        diags.iter().any(|d| d.starts_with("E0103")),
-        "`!nil` on a real `String | nil` must strip Nil to `String`, not coerce to \
-         `InlineCastNilRealSink` — expected E0103, got: {diags:?}"
-    );
+    assert_eq!(diags, ["E0103 argument 1 of `take` expects InlineCastNilRealSink, got String"]);
 }
 
 /// `#: as Foo` retypes a genuinely mismatched argument to the real
@@ -142,50 +148,33 @@ fn class_cast_makes_mismatched_arg_compatible() {
 }
 
 /// `#: as Blah` (no project class named `Blah`) must never invent a
-/// type — the argument keeps its real type and the existing mismatch
-/// still fires exactly as it would with no cast comment at all.
+/// type — the value keeps its real type, exactly as with no cast. The
+/// cast local is silent (not a literal, MATRIX H2); the literal accuses.
 #[test]
 fn garbage_cast_stays_byte_identical_to_no_cast() {
-    let diags = check_fixture("garbage_cast_still_accuses.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
-    assert!(
-        diags[0].contains("InlineCastFooC") && diags[0].contains("InlineCastWrongC"),
-        "expected the untouched original mismatch (Foo vs Wrong), got: {diags:?}"
-    );
+    let name = "garbage_cast_still_accuses.rb";
+    assert_eq!(hover_fixture(name, "kept, #:", "kept").as_deref(), Some("InlineCastWrongC"));
+    assert_eq!(check_fixture(name), ["E0103 argument 1 of `use_foo` expects InlineCastFooC, got Symbol"]);
 }
 
-/// A cast that resolves fine to a REAL class, but still doesn't match
-/// the callee's own declared param type, must keep accusing — the cast
-/// retypes the one argument, it does not blanket-silence the call.
+/// A cast that resolves fine to a REAL class retypes the value to it, but
+/// does not silence the callee: the literal that does not match the
+/// callee's declared param keeps accusing; the cast local is not judged.
 #[test]
 fn cast_to_real_class_still_wrong_for_callee_accuses() {
-    let diags = check_fixture("still_invalid_after_cast_accuses.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
-    assert!(
-        diags[0].contains("InlineCastOtherD") && diags[0].contains("InlineCastFooD"),
-        "expected the sig's required type vs. the cast's actual target, got: {diags:?}"
-    );
+    let name = "still_invalid_after_cast_accuses.rb";
+    assert_eq!(hover_fixture(name, "cast, #:", "cast").as_deref(), Some("InlineCastFooD"));
+    assert_eq!(check_fixture(name), ["E0103 argument 1 of `use_other` expects InlineCastOtherD, got Symbol"]);
 }
 
 /// The cast comment binds to the ONE argument on its own physical line —
-/// a sibling argument on the NEXT line of the same multi-line call must
-/// keep its real (mismatched) type: exactly 1 E0103, for the second
-/// argument only.
+/// the uncast literal on the NEXT line of the same multi-line call is
+/// still judged: exactly 1 E0103, for the second argument only. The call
+/// passing locals is silent (MATRIX H2).
 #[test]
 fn multiline_call_second_arg_still_accuses() {
     let diags = check_fixture("multiline_no_leak_accuses.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic (arg 2 only), got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
-    assert!(
-        diags[0].contains("argument 2"),
-        "the leaking cast must not have silenced argument 2, got: {diags:?}"
-    );
-    assert!(
-        diags[0].contains("InlineCastFooE") && diags[0].contains("InlineCastWrongE"),
-        "expected arg 2's real (uncast) mismatch, got: {diags:?}"
-    );
+    assert_eq!(diags, ["E0103 argument 2 of `take_two` expects InlineCastFooE, got Symbol"]);
 }
 
 /// Bead ita-j0z: `#: as untyped` erases the argument's type
@@ -200,40 +189,37 @@ fn untyped_cast_erases_arg_silent() {
 
 /// Control: a capitalized, unresolvable class name that merely LOOKS
 /// like it could mean "erase the type" (but isn't the literal `untyped`
-/// token) must still go through the existing `Named` arm — the
-/// argument's real mismatch keeps accusing exactly as it would with no
-/// cast at all.
+/// token) must still go through the existing `Named` arm — the value
+/// keeps its real type (never erased). The literal accuses; the cast
+/// local is not judged (MATRIX H2).
 #[test]
 fn untyped_lookalike_garbage_class_still_accuses() {
-    let diags = check_fixture("untyped_lookalike_garbage_class_still_accuses.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
-}
-
-/// The `#: as untyped` cast binds to the ONE argument sharing its
-/// physical line — a sibling argument on a different line of the same
-/// multi-line call must keep its real (mismatched) type. Mutant (b):
-/// applying the cast to the whole line/call instead of the one argument
-/// would silence this sibling too.
-#[test]
-fn untyped_cast_no_leak_sibling_accuses() {
-    let diags = check_fixture("untyped_cast_no_leak_sibling_accuses.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic (arg 2 only), got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
-    assert!(
-        diags[0].contains("argument 2"),
-        "the leaking cast must not have silenced argument 2, got: {diags:?}"
+    let name = "untyped_lookalike_garbage_class_still_accuses.rb";
+    assert_eq!(hover_fixture(name, "kept, #:", "kept").as_deref(), Some("InlineCastUntypedLookalikeWrong"));
+    assert_eq!(
+        check_fixture(name),
+        ["E0103 argument 1 of `take` expects InlineCastUntypedLookalikeRight, got Symbol"]
     );
 }
 
-/// Control: a genuine mismatch with NO cast comment at all must still
-/// accuse — proves the new `Untyped` variant didn't widen silence
-/// beyond lines that actually carry `#: as untyped`.
+/// The `#: as untyped` cast binds to the ONE argument sharing its
+/// physical line — the uncast literal on a different line of the same
+/// multi-line call is still judged. Mutant (b): applying the cast to the
+/// whole line/call instead of the one argument would silence it too.
+#[test]
+fn untyped_cast_no_leak_sibling_accuses() {
+    let diags = check_fixture("untyped_cast_no_leak_sibling_accuses.rb");
+    assert_eq!(diags, ["E0103 argument 2 of `take_two` expects InlineCastUntypedNoLeakFoo, got Symbol"]);
+}
+
+/// Control: a literal mismatch with NO cast comment at all must still
+/// accuse — proves the new `Untyped` variant didn't widen silence beyond
+/// lines that actually carry `#: as untyped`. The local beside it is not
+/// judged (MATRIX H2).
 #[test]
 fn no_cast_real_mismatch_still_accuses() {
     let diags = check_fixture("no_cast_real_mismatch_still_accuses_e0z.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].starts_with("E0103"), "expected E0103, got: {diags:?}");
+    assert_eq!(diags, ["E0103 argument 1 of `take` expects InlineCastUntypedControlRight, got Symbol"]);
 }
 
 /// Real ruby-lsp shape (`test/addon_test.rb:149`): `x = <call> #: as

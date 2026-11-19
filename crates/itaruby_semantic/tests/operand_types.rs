@@ -889,8 +889,8 @@ fn mri_ground_truth_for_the_isolated_sources() {
 //
 // `Integer.class_eval("def +(o) = 'x'")` replaces a core operator through
 // a body no AST can read. The literal-receiver shape at toplevel or in a
-// class body was already covered by `core_injection_call` (project-wide
-// `core_mixin`); every source below was measured a LIVE false positive
+// class body was already covered by the walker's core-injection mark
+// (project-wide `core_mixin`, keyed since W11); every source below was measured a LIVE false positive
 // against ruby 3.4.2 before `FileScan::note_opaque_eval` existed — `ita
 // check` accusing the operator line, `ruby` exiting 0 and printing the
 // evaled result. All of them are executed by

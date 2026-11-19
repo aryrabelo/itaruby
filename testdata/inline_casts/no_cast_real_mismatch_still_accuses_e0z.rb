@@ -1,7 +1,8 @@
 # Bead ita-j0z control: a genuine type mismatch with NO cast comment at
 # all must still accuse — proves the new `Untyped` variant didn't
 # accidentally widen silence beyond lines that actually carry
-# `#: as untyped`.
+# `#: as untyped`. Since MATRIX H2 the `#:` sig judges only literal
+# arguments: the local is silent, the written `:wrong` accuses.
 class InlineCastUntypedControlWrong
 end
 
@@ -17,4 +18,5 @@ end
 def inline_cast_untyped_control_still_accuses
   wrong = InlineCastUntypedControlWrong.new
   InlineCastUntypedControlSink.new.take(wrong)
+  InlineCastUntypedControlSink.new.take(:wrong)
 end

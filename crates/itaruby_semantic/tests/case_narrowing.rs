@@ -39,15 +39,36 @@ fn case_class_dispatch_narrows_and_catches_unknown_method() {
     assert!(diags[0].contains("nonexistent_method"), "got: {diags:?}");
 }
 
-/// FIRES: `when A, B` narrows the subject to the union `A | B`, not to
-/// `A` alone and not back to Unknown — passing it to a method that only
-/// accepts `A` must catch the `B` half as a real E0103.
+/// The type hover reports for the first `at` after the first `anchor` in
+/// fixture `name` (`None` is `Ty::Unknown`).
+fn hover_fixture(name: &str, anchor: &str, at: &str) -> Option<String> {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/case_narrowing");
+    let path = format!("{dir}/{name}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let base = text.find(anchor).unwrap_or_else(|| panic!("{anchor:?} not in {name}"));
+    let offset = base + text[base..].find(at).unwrap_or_else(|| panic!("{at:?} not after {anchor:?}"));
+    let db = itaruby_semantic::Db::default();
+    let file = itaruby_semantic::SourceFile::new(&db, path.into(), text);
+    itaruby_semantic::ProjectFiles::new(&db, vec![file]);
+    itaruby_semantic::ClosedWorld::new(&db, true);
+    itaruby_semantic::hover_at(&db, file, offset).and_then(|h| h.ty)
+}
+
+/// NARROWS: `when A, B` narrows the subject to the union `A | B`, not to
+/// `A` alone and not back to Unknown (hover reads it). The `#:` sig
+/// judges only literal arguments (MATRIX H2): the narrowed local passed
+/// to a method that only accepts `A` stays silent, the written `:not_a`
+/// beside it is the one E0103.
 #[test]
-fn case_multi_class_when_narrows_to_union_and_catches_arg_mismatch() {
-    let diags = check_fixture("case_multi_class_when_narrows_union.rb");
-    assert_eq!(diags.len(), 1, "expected exactly 1 diagnostic, got: {diags:?}");
-    assert!(diags[0].contains("E0103"), "expected E0103, got: {diags:?}");
-    assert!(diags[0].contains("CaseNarUnionA") && diags[0].contains("CaseNarUnionB"), "got: {diags:?}");
+fn case_multi_class_when_narrows_to_union_and_only_the_literal_accuses() {
+    let name = "case_multi_class_when_narrows_union.rb";
+    assert_eq!(hover_fixture(name, "take_a(event)", "event").as_deref(), Some("CaseNarUnionA | CaseNarUnionB"));
+    let diags = check_fixture(name);
+    assert_eq!(
+        diags,
+        ["error[E0103]: argument 1 of `take_a` expects CaseNarUnionA, got Symbol"],
+        "the narrowed local is never judged; only the literal accuses"
+    );
 }
 
 /// SILENT: falling through every `when` proves nothing about the

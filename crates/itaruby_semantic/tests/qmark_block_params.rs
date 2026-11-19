@@ -37,18 +37,24 @@ fn check_fixture(name: &str) -> Vec<String> {
 }
 
 /// The tapioca shape itself: zero E0105, AND the method's own `-> String`
-/// return type is still enforced (proven by a real E0103 downstream, not
-/// the whole sig quietly degrading to Unknown along with the block).
+/// return type still types its consumer (hover on the call reads
+/// `String` while the body returns an unwritten, Unknown ivar), not the
+/// whole sig quietly degrading to Unknown along with the block. Since
+/// MATRIX H2 the `#:` sink judges only literal arguments: the call's
+/// `String` result is silent, the written `"isolated"` is the one E0103.
 #[test]
 fn tapioca_shape_is_silent_and_return_type_still_checked() {
-    let diags = check_fixture("tapioca_shape_silent.rb");
-    let e0105: Vec<_> = diags.iter().filter(|d| d.starts_with("E0105")).collect();
-    assert!(e0105.is_empty(), "expected zero E0105, got: {e0105:?} (all diags: {diags:?})");
-    assert!(
-        diags.iter().any(|d| d.starts_with("E0103")),
-        "isolate_from_fork's own `-> String` return type must still be checked \
-         (String fed into an Integer-only sink must fire E0103), got: {diags:?}"
-    );
+    let name = "tapioca_shape_silent.rb";
+    let diags = check_fixture(name);
+    assert_eq!(diags, ["E0103 argument 1 of `take` expects Integer, got String"]);
+    let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/qmark_block_params");
+    let text = std::fs::read_to_string(format!("{base}/{name}")).unwrap();
+    let call = text.find(".new.isolate_from_fork").unwrap() + ".new.".len();
+    let db = itaruby_semantic::Db::default();
+    let file = itaruby_semantic::SourceFile::new(&db, format!("/p/{name}").into(), text);
+    itaruby_semantic::ProjectFiles::new(&db, vec![file]);
+    let ty = itaruby_semantic::hover_at(&db, file, call).and_then(|h| h.ty);
+    assert_eq!(ty.as_deref(), Some("String"), "isolate_from_fork's own `-> String` must type its consumer");
 }
 
 /// Regression: a block with real (non-`(?)`) params keeps parsing exactly

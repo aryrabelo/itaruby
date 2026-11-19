@@ -150,16 +150,46 @@ fn top_level_prepend_into_core_stays_silent() {
 }
 
 /// Condition (b), Object-level shape: top-level `include M` mixes into
-/// Object, so every core receiver can gain M's methods — conclusive
-/// lookup stands down.
+/// Object, so every core receiver gains M's methods. Since W11 that is
+/// read NAME-KEYED, like E0108's pollution maps: M's own names stand
+/// down, any other name stays conclusive (MRI: `"s".core_inline_typo`
+/// raises `NoMethodError` with the include in place).
 #[test]
 fn top_level_include_stays_silent() {
     let diags = check_inline_closed(
         "module CoreInlineObjPatch\n  def core_inline_everywhere; 1; end\nend\n\
          include CoreInlineObjPatch\n\
+         class CoreInlineIncluder\n  def m\n    \"s\".core_inline_everywhere\n  end\nend\n",
+    );
+    assert!(diags.is_empty(), "the included module's name must stand down, got: {diags:?}");
+}
+
+/// The other half: a name the top-level-included module does not define.
+#[test]
+fn top_level_include_keeps_other_names_conclusive() {
+    let diags = check_inline_closed(
+        "module CoreInlineObjPatch\n  def core_inline_everywhere; 1; end\nend\n\
+         include CoreInlineObjPatch\n\
          class CoreInlineIncluder\n  def m\n    \"s\".core_inline_typo\n  end\nend\n",
     );
-    assert!(diags.is_empty(), "top-level include must stand down, got: {diags:?}");
+    assert!(
+        diags.iter().any(|d| d.contains("E0101") && d.contains("core_inline_typo")),
+        "a name M does not define stays conclusive, got: {diags:?}"
+    );
+}
+
+/// An include whose module this project cannot read stands every name
+/// down.
+#[test]
+fn top_level_include_of_an_unknown_module_stays_silent() {
+    let diags = check_inline_closed(
+        "include SomeGemModule\n\
+         class CoreInlineIncluder\n  def m\n    \"s\".core_inline_typo\n  end\nend\n",
+    );
+    assert!(
+        !diags.iter().any(|d| d.contains("E0101")),
+        "an unreadable module answers every name, got: {diags:?}"
+    );
 }
 
 /// `x.extend(M)` on a local widens it to Unknown under closed-world: the
@@ -220,7 +250,7 @@ fn inventory_knows_real_methods_and_rejects_typos() {
 
 // -- the blanket pollution collectors, from the side that reads them ----
 //
-// `refined_core`/`refined_unknown`/`eval_polluted_core`/
+// `refined_core`/`refined_unknown`/
 // `eval_polluted_unknown` answer the BLANKET question — "was this class
 // touched at all?" — which is exactly what the conclusive core lookup
 // needs and NOT what E0108 needs (that one asks after the operator by
@@ -338,11 +368,10 @@ end
 }
 
 /// A string eval into a named core receiver stands that class down, and
-/// only that class. Both halves put the eval inside a METHOD body on
-/// purpose: a toplevel `Integer.class_eval(...)` is also a
-/// `core_injection_call`, and THAT mark is receiver-blind by design
-/// (measured here: a toplevel `Array.class_eval` silences an `Integer`
-/// typo too), so a toplevel fixture would prove the wrong field.
+/// only that class. Both halves put the eval inside a METHOD body, the
+/// contour the old walker-only core-injection mark never reached (that
+/// receiver-blind mark was deleted in W11; the keyed record covers both
+/// contours now).
 #[test]
 fn a_string_eval_stands_its_receiver_down() {
     let silent = check_inline_closed(

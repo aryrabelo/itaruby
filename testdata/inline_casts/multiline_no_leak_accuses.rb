@@ -1,7 +1,9 @@
 # Bead ita-qst: the cast comment binds to the ONE argument sharing its
 # physical line only — a second argument on the NEXT line of the same
-# multi-line call must keep its real (mismatched) type, never inherit the
-# previous line's cast.
+# multi-line call never inherits the previous line's cast. Since MATRIX
+# H2 the `#:` sig judges only literal arguments, and a literal behind a
+# cast is never judged: the uncast `:second` literal is the one E0103,
+# and the call passing locals is silent.
 class InlineCastFooE
 end
 
@@ -20,5 +22,9 @@ def inline_cast_no_leak_e
   InlineCastSinkE.new.take_two(
     a, #: as InlineCastFooE
     b
+  )
+  InlineCastSinkE.new.take_two(
+    :first, #: as InlineCastFooE
+    :second
   )
 end

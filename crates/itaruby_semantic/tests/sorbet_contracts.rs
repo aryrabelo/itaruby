@@ -4688,16 +4688,22 @@ ContractRbsInferred.take(count.succ)
 
 /// `x if false`, `x if nil`, `x unless true`, the then-branch of `false ? x
 /// : y` and of `if false`, and the else-branch of `if true` never run, so
-/// no contract (Sorbet `sig` or `#:` RBS) is accused inside them.
+/// no contract (Sorbet `sig` or `#:` RBS) is accused inside them. The
+/// `dead_return` def is written for the day a branch def carries a return
+/// contract (see `a_sig_inside_a_branch_carries_no_return_contract_yet`).
 #[test]
 fn contracts_stay_silent_in_a_statically_dead_branch() {
-    let source = r"
+    let source = r#"
 class ContractDeadBranch
   extend T::Sig
   sig { params(x: Integer).returns(Integer) }
   def f(x) = x
   #: (Integer) -> void
   def g(x); end
+  if false
+    sig { returns(Integer) }
+    def dead_return = "never defined"
+  end
 end
 ContractDeadBranch.new.f(:dead_if) if false
 ContractDeadBranch.new.g(:dead_rbs) if nil
@@ -4711,7 +4717,7 @@ if true
 else
   ContractDeadBranch.new.g(:dead_else)
 end
-";
+"#;
     let diags = check("dead-branch", source, None);
     assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
 }
@@ -4754,6 +4760,31 @@ ContractLiveBranch.new.f(:live_guard) if ENV.key?("NOPE_Q")
         "{diags:?}"
     );
     assert_eq!(contract_codes(&diags), ["E0103"; 5], "{diags:?}");
+}
+
+/// H6's forget list names E0109 too, but no E0109 can be emitted inside a
+/// branch today: a `sig` attaches only to a def written directly in a
+/// class body, so a def inside ANY `if` (live or dead) carries no return
+/// contract (measured 2026-11-19 with `ita check`, the cubic review of the
+/// H6 control). This control expires on purpose: the day a branch def
+/// gains a contract, it fails, and the dead-branch E0109 arm needs its own
+/// accused mutant before the change ships.
+#[test]
+fn a_sig_inside_a_branch_carries_no_return_contract_yet() {
+    let source = r#"
+class ContractBranchDef
+  extend T::Sig
+  sig { returns(Integer) }
+  def body_return = "class body"
+  if true
+    sig { returns(Integer) }
+    def live_branch_return = "live branch"
+  end
+end
+"#;
+    let diags = check("branch-def", source, None);
+    assert_eq!(contract_names(source, &diags), ["body_return"], "{diags:?}");
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
 }
 
 

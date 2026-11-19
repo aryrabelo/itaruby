@@ -662,7 +662,11 @@ fn build_project(paths: &[String]) -> (Db, Vec<SourceFile>, DiscoveredSources) {
         IgnoredFiles::new(&db, ignored);
     }
 
-    wire_closed_world(&db, paths, &rb_files);
+    // `loaded` is what this run READ: a path whose `read_to_string` failed
+    // above is not loaded, so `harvest_unloaded` must try it and fail
+    // closed rather than skip it as already seen.
+    let loaded: Vec<PathBuf> = sources.iter().map(|file| file.path(&db).clone()).collect();
+    wire_closed_world(&db, paths, &loaded);
 
     (db, sources, discovered)
 }

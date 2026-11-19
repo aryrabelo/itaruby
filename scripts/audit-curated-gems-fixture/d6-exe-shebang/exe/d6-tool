@@ -1,0 +1,4 @@
+#!/usr/bin/env ruby
+# An extensionless Ruby executable: its top-level `def` is an `Object`
+# method in the process that runs it.
+def d6_exe_helper = 1

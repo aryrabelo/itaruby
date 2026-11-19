@@ -12,9 +12,17 @@
 # protected and private instance method of each chain class, then require
 # every feature of the standard library in its OWN forked child (one
 # feature's side effects never leak into the next) and print each name
-# that appeared. A feature that adds `method_missing` or
-# `respond_to_missing?` to the chain is printed as `Class#*`: it answers
-# every name.
+# that appeared. A feature that (re)defines `method_missing` or
+# `respond_to_missing?` on the chain is printed as `Class#*`: it answers
+# every name. Both already exist (private) on every class before any
+# require, so they never appear as NEW names; each chain class's
+# `UnboundMethod` for the two is snapshotted instead, and a different
+# definition after the require is what prints `Class#*`. Private methods
+# stay in the surface on purpose: one is callable through implicit self.
+#
+# `ITA_STDLIB_FEATURES=a,b` replaces the stdlib feature list (named on
+# stderr): the selftest's probes (`scripts/gen-stdlib-core-ext-fixture`,
+# on `-I`) use it. Never set it when regenerating the inventory.
 #
 #   ruby --disable-gems scripts/gen-stdlib-core-ext.rb > \
 #     crates/itaruby_semantic/declarations/stdlib_core_ext.txt
@@ -22,6 +30,12 @@
 # The output is versioned and embedded via include_str!. Not a
 # hand-maintained list: every line comes from the runtime's own
 # reflection, after a real `require`.
+
+# The checked-in inventory was generated with 3.4.2: an older runtime
+# would silently drop names a newer stdlib adds.
+if (RUBY_VERSION.split(".").map(&:to_i) <=> [3, 4, 2]).negative?
+  abort("need Ruby >= 3.4.2 (generated with 3.4.2); found #{RUBY_VERSION}")
+end
 abort("must run with 'ruby --disable-gems' (Gem is defined)") if defined?(Gem)
 
 require "rbconfig"
@@ -40,6 +54,17 @@ module Harvest
   def surface(name)
     klass = Object.const_get(name)
     (klass.instance_methods + klass.private_instance_methods).map(&:to_s)
+  end
+
+  HOOKS = %i[method_missing respond_to_missing?].freeze
+
+  # The current definition of each catch-all hook on a chain class (nil
+  # when the class has none: `BasicObject#respond_to_missing?`).
+  def hooks(name)
+    klass = Object.const_get(name)
+    HOOKS.to_h do |m|
+      [m, (klass.instance_method(m) if klass.method_defined?(m) || klass.private_method_defined?(m))]
+    end
   end
 
   def features
@@ -68,6 +93,10 @@ module Harvest
       end
       added = CHAIN.flat_map do |name|
         (surface(name) - before.fetch(name)).map { |m| "#{name}##{m}" }
+      end
+      # A hook redefined on (or newly inherited by) a chain class.
+      CHAIN.each do |name|
+        hooks(name).each { |m, um| added << "#{name}##{m}" if um && um != HOOKS_BEFORE.fetch(name)[m] }
       end
       # Every top-level MODULE the feature defined, with its public and
       # protected instance surface (ancestors included): what a bare
@@ -106,8 +135,14 @@ module Harvest
 end
 
 BEFORE = CHAIN.to_h { |name| [name, Harvest.surface(name)] }.freeze
+HOOKS_BEFORE = CHAIN.to_h { |name| [name, Harvest.hooks(name)] }.freeze
 BEFORE_CONSTS = Object.constants.freeze
-FEATURES = Harvest.features
+FEATURES = if (override = ENV["ITA_STDLIB_FEATURES"])
+  warn "ITA_STDLIB_FEATURES override: #{override}"
+  override.split(",")
+else
+  Harvest.features
+end
 lines = FEATURES.flat_map { |f| Harvest.harvest(f, BEFORE) }
 lines = lines.map { |l| l.end_with?("#method_missing", "#respond_to_missing?") ? l.sub(/#.*/, "#*") : l }
 # A name `Object` (or `BasicObject`) gained reaches every chain class, so it

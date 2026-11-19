@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 ### Fixed
+- W11 open-world evidence fails closed on an incomplete read (cubic
+  review of #16/#17): a checked file the run could not read is no longer
+  counted as loaded, a project or installed-gem walk that hits an
+  unreadable entry is a gap (no RBI) or opens every core chain (RBI gem),
+  an installed gem is read whole rather than only under `lib/`, an
+  unknown-target refinement or eval in a gem with an RBI opens every
+  chain, a gem reopening a core class to override `is_a?` makes declared
+  types inexact, and only a `Gemfile.lock` with Bundler's shape (known
+  sections, `PLATFORMS` and `DEPENDENCIES`) proves its gem list. New
+  fixtures in `open_world_cli.rs`, mutants O40-O52.
+- `CURATED_GEMS` gains the four names the hardened audit found through
+  the `alias` keyword: debug 1.11.1 `bb` (`Kernel`), irb's
+  `__original__load__IRB_use_loader__`/`__original__require__IRB_use_loader__`
+  (`Object`), and sorbet's top-level `DelegateClass_without_rbi_generator`.
+  Without them a project locking those versions could get a false E0101.
+- A `sig` brace expression is a shape only when every member is
+  `key: Type`: `returns({foo})`, recovered by prism from a syntax error,
+  typed its consumer `Hash` and drew a false E0101; it is now `Unknown`
+  (new mutant "W6 a malformed brace reads as a shape").
+- Instruments: `audit-curated-gems.rb` now reports `instance_exec`, the
+  `alias` keyword, receiver-qualified `eval`, a bare top-level mixin,
+  Ruby executables under `exe/`, labels `class << self` bodies as
+  singleton, and aborts on a Prism parse error (two-sided proof:
+  `scripts/audit-curated-gems-selftest.sh`); `gen-stdlib-core-ext.rb`
+  refuses a Ruby older than the inventory's 3.4.2 and detects a
+  redefined `method_missing`/`respond_to_missing?` (regenerated
+  inventory byte-identical); `open-world-mutants.sh` checks its
+  backup/restore, rejects a run whose two test binaries did not both
+  finish, and requires the named test's own failure to carry the
+  diagnostic; the `T.unsafe` contracts mutant fails a typing assertion
+  instead of an index panic. H6's E0109 arm is unreachable today (a
+  `sig` attaches only to a class-body def), now pinned by an expiring
+  control instead of an untested claim.
 - Restore the open-world mutant controls on the W11 branch: O8 uses an
   unloaded extensionless script so ignored-file indexing cannot mask the
   removed harvest; O23 exercises a generic annotation ending in `.checked`
@@ -103,11 +136,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - W5/W6/W7, Sorbet contracts (2026-10-21): E0103 on `T.let`/`T.cast`/
-  `T.assert_type!` with a literal breaking the type and on `T.must(nil)`/
-  `T.must_because(nil)`; these assertions type an otherwise-Unknown
-  value (so `T.cast(1, String).upcase` keeps its closed-world E0101).
+  `T.assert_type!`/`T.bind` with a literal breaking the type and on
+  `T.must(nil)`/`T.must_because(nil)`; `T.let`/`T.cast`/`T.assert_type!`
+  type an otherwise-Unknown value (so `T.cast(1, String).upcase` keeps
+  its closed-world E0101), while `T.bind` and `T.unsafe` leave the value
+  `Unknown`.
   `sig` now reads `T.all`, `T.class_of`, `T::Class`/`T::Module`/`T::Set`/
-  `T::Range`/`T::Enumerable`/`T::Enumerator(::Lazy)`, tuples, shapes,
+  `T::Range`/`T::Enumerable`/`T::Enumerator`/`T::Enumerator::Lazy`, tuples, shapes,
   `T.noreturn` and `T.type_alias`; sigs on `attr_reader`/`attr_writer`,
   `*rest`/`**kwrest`/`&blk` methods, `.on_failure`, and `X.new` against
   `initialize` are contracts. Removes 4 false E0104 on `T::Range`
@@ -122,7 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   core receiver (`sig { returns(Integer) }` then `.upcase`; a literal
   receiver) in a project WITH a `Gemfile` when its evidence is complete:
   every locked gem has an RBI for its locked version, a source-audited
-  Tapioca-ignored version, an installed source, or is a `PATH` gem inside
+  Tapioca-ignored version, a pure-Ruby installed source, or is a `PATH` gem inside
   the project. Tapioca RBIs drop `alias_method` inside a core reopening,
   so a gem whose RBI reopens a core-chain class is read from its
   installed source (name-keyed); with no source, only the classes that

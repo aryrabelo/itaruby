@@ -17,10 +17,10 @@ fn stats_of(text: &str) -> CallStats {
 /// `Box.new` resolves (lookup `initialize` `NotFound` still concludes);
 /// `.size` resolves against Box; `.nmae` concludes absence → diagnosed
 /// (the E0101 itself is discarded here). `Widget` declares
-/// `method_missing` so it is open: BOTH `Widget.new` and
-/// `.nonexistent_method` are inconclusive — receiver class known,
-/// lookup cannot conclude — and the chained `.frog` runs on the Unknown
-/// that arm returned → `unknown_receiver`. `"hi".upcase` resolves against
+/// `method_missing` so it is open: `Widget.new` is inconclusive, and an
+/// open ancestry may hide a singleton `new`, so it answers Unknown —
+/// `.nonexistent_method` and the chained `.frog` both run on Unknown →
+/// `unknown_receiver`. `"hi".upcase` resolves against
 /// the core allowlist → core.
 #[test]
 fn every_bucket_forced_once() {
@@ -47,11 +47,11 @@ Widget.new.nonexistent_method.frog
     assert_eq!(s.resolved, 1, ".size only — Box.new has no visible initialize, a silent-inconclusive site since ita-gjb: {s:?}");
     assert_eq!(s.core, 1, "\"hi\".upcase: {s:?}");
     assert_eq!(s.diagnosed, 1, ".nmae on closed Box: {s:?}");
-    assert_eq!(s.inconclusive, 4, "Box.new x2 (no visible initialize, ita-gjb) + Widget.new + .nonexistent_method (method_missing opens the class): {s:?}");
-    assert_eq!(s.unknown_receiver, 1, ".frog chained off an inconclusive Unknown: {s:?}");
+    assert_eq!(s.inconclusive, 3, "Box.new x2 (no visible initialize, ita-gjb) + Widget.new (method_missing opens the class): {s:?}");
+    assert_eq!(s.unknown_receiver, 2, ".nonexistent_method and .frog, chained off an inconclusive Unknown: {s:?}");
     assert_eq!(
         s.unk_project_ret, 1,
-        ".frog's receiver (`.nonexistent_method`) is an Inconclusive project call → project ret: {s:?}"
+        ".nonexistent_method's receiver (`Widget.new`) is an Inconclusive project call → project ret: {s:?}"
     );
     assert_eq!(s.total(), 8, "every call site in the text counted exactly once: {s:?}");
     assert_eq!(s.blind(), 5, "blind = inconclusive + unknown_receiver: {s:?}");

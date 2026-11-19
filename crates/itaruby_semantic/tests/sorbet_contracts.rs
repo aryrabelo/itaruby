@@ -1,0 +1,4648 @@
+//! End-to-end shared CLI/LSP checker contracts. Mutation probes for this
+//! instrument: `python3 scripts/sorbet-contracts-mutants.py` (`--anchors`
+//! counts every needle without building).
+//! No Sorbet runtime, generated RBI refresh, or private corpus is required.
+
+use itaruby_semantic::{check_file, ClosedWorld, Db, Diagnostic, ProjectFiles, RbiProject, SourceFile};
+
+fn check(name: &str, source: &str, rbi: Option<&str>) -> Vec<Diagnostic> {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-{name}"));
+    if let Some(text) = rbi {
+        let dir = root.join("sorbet/rbi");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("contract.rbi");
+        std::fs::write(&file, text).unwrap();
+        let declarations = itaruby_semantic::rbi::build_rbi_index(&[file]);
+        RbiProject::new(&db, declarations.constants);
+    }
+    let file = SourceFile::new(&db, root.join("source.rb"), source.to_owned());
+    ProjectFiles::new(&db, vec![file]);
+    ClosedWorld::new(&db, true);
+    check_file(&db, file).clone()
+}
+
+fn contract_codes(diags: &[Diagnostic]) -> Vec<&str> {
+    diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109")).map(|d| d.code).collect()
+}
+
+/// The type hover reports in `sources[0]` at the first `at` after the first
+/// `anchor` (`None` is `Ty::Unknown`), in a project of all `sources`.
+///
+/// A Sorbet contract judges only literals, so the inference below it — the
+/// core model, the ivar proofs, a redefinition taking a signature off its
+/// consumers — is no longer observable through E0103/E0109. It still types
+/// every consumer (hover, E0101, RBS-comment E0103), and hover reads that
+/// typing directly: point `at` into the call's message name (`last`, `* `),
+/// never at its receiver or the dot right after it — a span's end is
+/// inclusive, so the receiver's smaller span would win there.
+fn ty_in(name: &str, sources: &[&str], anchor: &str, at: &str) -> Option<String> {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-hover-{name}"));
+    let files: Vec<SourceFile> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, text)| SourceFile::new(&db, root.join(format!("source{i}.rb")), (*text).to_owned()))
+        .collect();
+    ProjectFiles::new(&db, files.clone());
+    ClosedWorld::new(&db, true);
+    let source = sources[0];
+    let base = source.find(anchor).unwrap_or_else(|| panic!("anchor {anchor:?} not in fixture"));
+    let offset = base + source[base..].find(at).unwrap_or_else(|| panic!("{at:?} not after {anchor:?}"));
+    itaruby_semantic::hover_at(&db, files[0], offset).and_then(|h| h.ty)
+}
+
+fn ty_at(name: &str, source: &str, anchor: &str, at: &str) -> Option<String> {
+    ty_in(name, &[source], anchor, at)
+}
+
+#[test]
+fn named_positional_params_accuse_at_argument() {
+    let source = r#"
+class ContractNamed
+  extend T::Sig
+  sig { params(label: String, count: Integer).returns(String) }
+  def build(count, label)
+    label
+  end
+end
+ContractNamed.new.build(1, "good")
+ContractNamed.new.build("bad", "good")
+"#;
+    let diags = check("named", source, None);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E0103");
+    assert_eq!(&source[diags[0].start..diags[0].end], "\"bad\"");
+    assert!(diags[0].message.contains("count"), "{diags:?}");
+}
+
+#[test]
+fn keywords_and_defaults_keep_named_correspondence() {
+    let diags = check("keywords", r#"
+class ContractKeywords
+  extend T::Sig
+  sig { params(label: String, count: Integer).returns(String) }
+  def build(count = 1, label:)
+    label
+  end
+end
+ContractKeywords.new.build(label: "good")
+ContractKeywords.new.build(2, label: "good")
+ContractKeywords.new.build(label: 3)
+ContractKeywords.new.build(*["unknown position"], label: "good")
+ContractKeywords.new.build(label: "ignored", label: "last")
+class ContractSplatPair
+  extend T::Sig
+  sig { params(count: Integer, label: String).returns(String) }
+  def pair(count, label)
+    label
+  end
+end
+ContractSplatPair.new.pair(*[1], "good")
+"#, None);
+    // After a splat no later positional is proven to land on any name:
+    // `"good"` is really `label` here, never `count`.
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E0103");
+    assert!(diags[0].message.contains("label"), "{diags:?}");
+}
+
+/// sorbet-runtime proves a parameter only `is_a?`, which a decorator that
+/// overrides it also passes, so a sig's param types never bind into the
+/// body. The sig still accuses a literal argument at the call.
+#[test]
+fn signature_params_never_bind_the_source_body() {
+    let source = r#"
+class ContractBoundValue
+end
+class ContractBoundDecorator
+  def initialize(value)
+    @value = value
+  end
+  def is_a?(klass)
+    super || @value.is_a?(klass)
+  end
+  def absent_bound_method; end
+end
+class ContractBinding
+  extend T::Sig
+  sig { params(value: ContractBoundValue).returns(Integer) }
+  def inspect_value(value)
+    value.absent_bound_method
+    1
+  end
+end
+ContractBinding.new.inspect_value(ContractBoundDecorator.new(ContractBoundValue.new))
+ContractBinding.new.inspect_value("literal")
+"#;
+    let diags = check("binding", source, None);
+    assert_eq!(codes(&diags), ["E0103"], "{diags:?}");
+    assert_eq!(&source[diags[0].start..diags[0].end], "\"literal\"");
+}
+
+/// A declared return is proof only of `is_a?`: a decorator overriding it
+/// passes sorbet-runtime's check, so an inferred body type always wins
+/// over the declaration, and the declaration types a consumer only where
+/// body inference answers Unknown.
+#[test]
+fn inferred_return_wins_over_the_declared_one() {
+    let source = r"
+class ContractDecoratedUser
+end
+class ContractUserDecorator
+  def initialize(user)
+    @user = user
+  end
+  def is_a?(klass)
+    super || @user.is_a?(klass)
+  end
+  def display_name; end
+end
+class ContractPresenter
+  extend T::Sig
+  sig { returns(ContractDecoratedUser) }
+  def user
+    ContractUserDecorator.new(ContractDecoratedUser.new)
+  end
+  sig { returns(ContractDecoratedUser) }
+  def opaque_user
+    @opaque_user
+  end
+end
+ContractPresenter.new.user.display_name
+ContractPresenter.new.opaque_user.display_name
+";
+    let diags = check("decorated-return", source, None);
+    assert_eq!(codes(&diags), ["E0101"], "{diags:?}");
+    let opaque = source.find("ContractPresenter.new.opaque_user").unwrap();
+    assert!(diags[0].start > opaque, "only the opaque body takes the declared type: {diags:?}");
+}
+
+/// `X.new` proves an `X` only when `Class#new` answers it. A project
+/// singleton `new` — on `X`, on a superclass's singleton, in a module `X`
+/// extends — or an extended module whose methods are not fully known may
+/// return anything, so the instance contract below is never judged against
+/// a method that may not run. sorbet-runtime's own `T::Sig` answers only
+/// `sig`, a descendant's `self.new` never runs for `X.new`, and a gem base
+/// class's own `new` builds the receiver as `Class#new` does.
+#[test]
+fn a_project_singleton_new_proves_no_instance() {
+    const TARGET: &str = r#"
+PRELUDE
+class ContractNewTarget PARENT
+  extend T::Sig
+  BODY
+  sig { params(n: Integer).void }
+  def take(n); end
+end
+OUTSIDE
+ContractNewTarget.new.take("literal")
+"#;
+    let render = |prelude: &str, parent: &str, body: &str, outside: &str| {
+        TARGET.replace("PRELUDE", prelude).replace("PARENT", parent).replace("BODY", body).replace("OUTSIDE", outside)
+    };
+    let factory = "module ContractNewFactory\n  def new(*args)\n    super\n  end\nend\n";
+    let base = "class ContractNewBase\n  def self.new(*args)\n    super\n  end\nend\n";
+    let open_base = "class ContractNewOpenBase\n  unmodeled_dsl :factory\nend\n";
+    let partial = "module ContractNewPartial\n  include ContractNewMissing::Mixin\nend\n";
+    let dsl = "module ContractNewDsl\n  unmodeled_dsl :factory\nend\n";
+    let hooked = "module ContractNewHooked\n  def self.extended(base)\n    base.define_singleton_method(:new) { |*args| super(*args) }\n  end\nend\n";
+    let shapes = [
+        ("", "", "def self.new(*args)\n    super\n  end", ""),
+        ("", "", "class << self\n    def new(*args)\n      super\n    end\n  end", ""),
+        ("", "", "", "def ContractNewTarget.new(*args)\n  super\nend\n"),
+        (base, "< ContractNewBase", "", ""),
+        (open_base, "< ContractNewOpenBase", "", ""),
+        (factory, "", "extend ContractNewFactory", ""),
+        ("", "", "extend ContractNewUnknown::Factory", ""),
+        ("", "", "class << self\n    prepend ContractNewFactory\n  end", factory),
+        ("", "", "", "ContractNewTarget.extend(ContractNewFactory)\n"),
+        ("module ContractNewLate\nend\n", "", "extend ContractNewLate", "ContractNewLate.define_method(:new) { |*args| super(*args) }\n"),
+        (partial, "", "extend ContractNewPartial", ""),
+        (dsl, "", "extend ContractNewDsl", ""),
+        (hooked, "", "extend ContractNewHooked", ""),
+    ];
+    for (i, (prelude, parent, body, outside)) in shapes.iter().enumerate() {
+        let source = render(prelude, parent, body, outside);
+        let diags = check(&format!("singleton-new-{i}"), &source, None);
+        assert!(contract_codes(&diags).is_empty(), "{source}: {diags:?}");
+    }
+    // A superclass spelled to two different classes may be either one.
+    let ambiguous = "class ContractNewSpelled\nend\nmodule ContractNewOuter\n  class ContractNewSpelled\n  end\n  class Target < ContractNewSpelled\n    extend T::Sig\n    sig { params(n: Integer).void }\n    def take(n); end\n  end\nend\nclass ContractNewOuter::Target < ContractNewSpelled; end\nContractNewOuter::Target.new.take(\"literal\")\nmade = ContractNewOuter::Target.new\nmade\n";
+    let diags = check("singleton-new-ambiguous", ambiguous, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // The lookups on an ambiguous class are already inconclusive, so the
+    // decision shows only in what `.new` proves: no instance of either base.
+    assert_ne!(
+        ty_at("singleton-new-ambiguous", ambiguous, "made = ", "made").as_deref(),
+        Some("ContractNewOuter::Target"),
+        "{ambiguous}"
+    );
+
+    let quiet = "module ContractNewQuiet\n  def quiet; end\nend\n";
+    let kid = "class ContractNewKid < ContractNewTarget\n  def self.new(*args)\n    super\n  end\nend\n";
+    let controls = [
+        render("", "", "", ""),
+        render(quiet, "", "extend ContractNewQuiet", ""),
+        render("", "", "", kid),
+        render("", "< ActiveRecord::Base", "", ""),
+        render(quiet, "", "", "ContractNewTarget.extend(ContractNewQuiet)\ndef ContractNewTarget.quiet; end\n"),
+    ];
+    for (i, source) in controls.iter().enumerate() {
+        let diags = check(&format!("singleton-new-control-{i}"), source, None);
+        assert_eq!(contract_codes(&diags), ["E0103"], "{source}: {diags:?}");
+    }
+}
+
+#[test]
+fn incompatible_source_return_accuses_without_a_call() {
+    let source = r#"
+class ContractBadReturn
+  extend T::Sig
+  sig { returns(Integer) }
+  def amount
+    "wrong"
+  end
+end
+"#;
+    let diags = check("return", source, None);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E0109");
+    assert_eq!(&source[diags[0].start..diags[0].end], "amount");
+}
+
+/// Every return point — each explicit `return`, each implicit branch — is
+/// judged together, and the body accuses only when no point fits (see
+/// `every_return_point_must_be_a_mismatching_literal`), so each control
+/// mismatches on EVERY path. `mixed` returns an explicit mismatch from one
+/// branch and a mismatching implicit leaf from the other.
+#[test]
+fn explicit_returns_and_implicit_branches_are_checked() {
+    let diags = check("branches", r#"
+class ContractBranches
+  extend T::Sig
+  sig { params(flag: T.untyped).returns(Integer) }
+  def explicit(flag)
+    if flag
+      return "wrong"
+    else
+      return :wrong
+    end
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def implicit(flag)
+    if flag
+      "wrong"
+    else
+      :wrong
+    end
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def mixed(flag)
+    if flag
+      return "wrong"
+    else
+      :wrong
+    end
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def one_point_fits(flag)
+    if flag
+      return "wrong"
+    else
+      1
+    end
+  end
+end
+"#, None);
+    assert_eq!(contract_codes(&diags), ["E0109", "E0109", "E0109"], "{diags:?}");
+}
+
+#[test]
+fn void_unknown_and_uncertain_return_paths_stay_silent() {
+    let diags = check("return-controls", r#"
+class ContractReturnControls
+  extend T::Sig
+  sig { void }
+  def save
+    "a value is allowed"
+  end
+  sig { params(value: T.untyped).returns(Integer) }
+  def opaque(value)
+    value
+  end
+  sig { abstract.returns(Integer) }
+  def abstract_value; end
+  sig { returns(Integer) }
+  def ensure_overrides
+    begin
+      "discarded"
+    ensure
+      return 1
+    end
+  end
+  sig { returns(Integer) }
+  def dead_suffix
+    return 1
+    "not returned"
+  end
+  sig { returns(Integer) }
+  def unreachable_branch
+    if false
+      "not returned"
+    else
+      1
+    end
+  end
+  # A `return` inside a block leaves the method with that value, and the
+  # walk does not enter closures: the only return point it can see is the
+  # String tail, so only the `uncertain` guard keeps this silent. MRI
+  # returns 1 here.
+  sig { returns(Integer) }
+  def returns_from_a_block
+    [1].each { return 1 }
+    "fallback"
+  end
+end
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// F6: an RBI is never checked at runtime, so a client `.rbi` declaring a
+/// method the project source defines is never its contract: neither the
+/// argument nor the body is judged, and the Ruby check the source earned
+/// (the arity of `plain`) stays. The control writes the same signature
+/// inline, where sorbet-runtime enforces it, and still accuses both.
+#[test]
+fn rbi_declaration_never_contracts_a_source_method() {
+    const SOURCE: &str = r#"
+class ContractSourceRbi
+  extend T::Sig
+SIG  def amount(count)
+    "wrong"
+  end
+  def plain; 1; end
+end
+ContractSourceRbi.new.amount("bad")
+ContractSourceRbi.new.plain(1)
+"#;
+    let diags = check("source-rbi", &SOURCE.replace("SIG", ""), Some(r"
+class ContractSourceRbi
+  sig { params(count: Integer).returns(Integer) }
+  def amount(count); end
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    assert_eq!(codes(&diags), ["E0102"], "{diags:?}");
+
+    let inline = SOURCE.replace("SIG", "  sig { params(count: Integer).returns(Integer) }\n");
+    let control = check("source-rbi-control", &inline, None);
+    assert_eq!(contract_codes(&control), ["E0109", "E0103"], "control must accuse the inline sig: {control:?}");
+}
+
+/// F6: nor does a stale `.rbi` type the consumers of a source method —
+/// source inference governs (`make` returns its argument, `nil` here). The
+/// control declares the same return inline and types the consumer.
+#[test]
+fn rbi_return_never_types_a_source_method() {
+    const SOURCE: &str = r"
+class ContractRbiResult
+end
+class ContractRbiFactory
+  extend T::Sig
+SIG  def make(input)
+    input
+  end
+end
+ContractRbiFactory.new.make(nil).absent_result_method
+";
+    let diags = check("rbi-return", &SOURCE.replace("SIG", ""), Some(r"
+class ContractRbiFactory
+  sig { params(input: T.untyped).returns(ContractRbiResult) }
+  def make(input); end
+end
+"));
+    assert!(!diags.iter().any(|d| d.message.contains("absent_result_method")), "{diags:?}");
+
+    let inline = SOURCE.replace("SIG", "  sig { params(input: T.untyped).returns(ContractRbiResult) }\n");
+    let control = check("rbi-return-control", &inline, None);
+    assert_eq!(codes(&control), ["E0101"], "{control:?}");
+    assert!(control[0].message.contains("absent_result_method"), "{control:?}");
+}
+
+/// F6: a method that exists only in an external RBI (a gem ancestor) keeps
+/// exactly the consumer typing `main` (05a282e) gave it and nothing more.
+/// Its return still types the consumer (`absent_on_result`, and the Array
+/// category of `names`); its params never accuse a literal; the declared
+/// element type never reaches a consumer (`names.first` is untyped); and a
+/// source method whose own return is inferred through the RBI call stays
+/// untyped (`wrap`), as on `main`. The control is the same shape written
+/// as a source sig, which does accuse the literal argument.
+#[test]
+fn external_rbi_types_only_its_consumer() {
+    let diags = check("external-rbi", r#"
+class ContractExternalResult
+end
+class ContractExternalSite < ContractExternalBase
+  def initialize; end
+end
+class ContractExternalWrapper
+  def wrap
+    ContractExternalSite.new.accept(1)
+  end
+end
+ContractExternalSite.new.accept("bad")
+ContractExternalSite.new.accept(1).absent_on_result
+ContractExternalSite.new.names.absent_on_array
+ContractExternalSite.new.names.first.absent_on_element
+ContractExternalWrapper.new.wrap.absent_through_wrapper
+"#, Some(r"
+class ContractExternalBase
+  sig { params(value: Integer).returns(ContractExternalResult) }
+  def accept(value); end
+  sig { returns(T::Array[ContractExternalResult]) }
+  def names; end
+end
+"));
+    let absent: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.code == "E0101")
+        .filter_map(|d| d.message.split('`').nth(1))
+        .collect();
+    assert_eq!(absent, ["absent_on_result", "absent_on_array"], "{diags:?}");
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("external-rbi-control", r#"
+class ContractExternalSource
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def accept(value); value; end
+end
+ContractExternalSource.new.accept("bad")
+"#, None);
+    assert_eq!(contract_codes(&control), ["E0103"], "{control:?}");
+}
+
+#[test]
+fn source_inline_contract_wins_over_rbi() {
+    let diags = check("source-precedence", r"
+class ContractSourceWins
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+ContractSourceWins.new.echo(1)
+", Some(r"
+class ContractSourceWins
+  sig { params(value: String).returns(String) }
+  def echo(value); end
+end
+"));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+/// The body returns an Integer against the stale RBI's `returns(String)`:
+/// were an RBI ever a source method's contract, E0109 would accuse it. No
+/// RBI is (F6), whatever its layout.
+#[test]
+fn stale_rbi_layout_does_not_type_source_or_calls() {
+    let diags = check("stale", r"
+class ContractStale
+  def echo(actual)
+    1
+  end
+end
+ContractStale.new.echo(1)
+", Some(r"
+class ContractStale
+  sig { params(outdated: String).returns(String) }
+  def echo(outdated); end
+end
+"));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn conflicting_rbi_declarations_do_not_choose_a_contract() {
+    let diags = check("conflicting-rbi", r"
+class ContractConflict
+  def echo(value)
+    value
+  end
+end
+ContractConflict.new.echo(nil)
+", Some(r"
+class ContractConflict
+  sig { params(value: String).returns(String) }
+  def echo(value); end
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); end
+end
+"));
+    assert!(diags.is_empty(), "{diags:?}");
+}
+
+#[test]
+fn overloads_and_unsupported_layouts_do_not_invent_correspondence() {
+    let diags = check("unsupported", r#"
+class ContractUnsupported
+  extend T::Sig
+  sig { params(value: String).returns(String) }
+  sig { params(value: Integer).returns(Integer) }
+  def overloaded(value)
+    value
+  end
+  sig { params(first: Integer, last: String).returns(Integer) }
+  def posts(first = 1, last)
+    "runtime inference only"
+  end
+  sig { params(values: Integer).returns(Integer) }
+  def rest(*values)
+    "runtime inference only"
+  end
+  sig { params(value: Integer, block: T.untyped).returns(Integer) }
+  def callback(value, &block)
+    "runtime inference only"
+  end
+end
+ContractUnsupported.new.overloaded(nil)
+ContractUnsupported.new.posts("last")
+ContractUnsupported.new.rest("values")
+ContractUnsupported.new.callback("value") {}
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// `Item` resolves in the signature's own lexical scope. Instances are not
+/// literals, so neither the subclass nor the unrelated global class is
+/// judged; the literal is, and the message names the lexical class.
+#[test]
+fn lexical_nominal_types_and_subclasses_use_definition_scope() {
+    let source = r#"
+class ContractGlobalItem
+end
+module ContractLexical
+  class Item
+  end
+  class Child < Item
+  end
+  class Factory
+    extend T::Sig
+    sig { params(value: Item).returns(Item) }
+    def echo(value)
+      value
+    end
+  end
+end
+ContractLexical::Factory.new.echo(ContractLexical::Child.new)
+ContractLexical::Factory.new.echo(ContractGlobalItem.new)
+ContractLexical::Factory.new.echo("text")
+"#;
+    let diags = check("lexical", source, None);
+    assert_eq!(diags.len(), 1, "{diags:?}");
+    assert_eq!(diags[0].code, "E0103");
+    assert_eq!(&source[diags[0].start..diags[0].end], "\"text\"", "{diags:?}");
+    assert!(diags[0].message.contains("expects ContractLexical::Item"), "{diags:?}");
+}
+
+#[test]
+fn inherited_and_singleton_signatures_are_not_caller_scoped() {
+    let diags = check("tracks", r#"
+class ContractTrackBase
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); value; end
+  sig { params(value: Integer).returns(Integer) }
+  def self.parse(value); value; end
+end
+class ContractTrackChild < ContractTrackBase
+end
+ContractTrackChild.new.echo("bad")
+ContractTrackChild.parse("bad")
+ContractTrackChild.new.echo(1)
+ContractTrackChild.parse(1)
+"#, None);
+    assert_eq!(contract_codes(&diags), ["E0103", "E0103"], "{diags:?}");
+}
+
+/// A singleton declaration in an RBI accuses nothing (F6); the same sig
+/// written inline on `def self.parse` is the contract of the singleton
+/// track and accuses there. A subclass overriding the INSTANCE `parse`
+/// cannot dispatch the class method, so it leaves that contract alone.
+#[test]
+fn rbi_singleton_declaration_is_silent_and_the_source_track_accuses() {
+    const SOURCE: &str = r#"
+class ContractRbiSingleton
+  extend T::Sig
+SIG  def self.parse(value); value; end
+  def parse(value); value; end
+end
+class ContractRbiSingletonChild < ContractRbiSingleton
+  def parse(value); value; end
+end
+ContractRbiSingleton.parse("bad")
+ContractRbiSingleton.parse(1)
+"#;
+    let diags = check("rbi-singleton", &SOURCE.replace("SIG", ""), Some(r"
+class ContractRbiSingleton
+  sig { params(value: Integer).returns(Integer) }
+  def self.parse(value); end
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let inline = SOURCE.replace("SIG", "  sig { params(value: Integer).returns(Integer) }\n");
+    let control = check("rbi-singleton-control", &inline, None);
+    assert_eq!(contract_codes(&control), ["E0103"], "{control:?}");
+}
+
+#[test]
+fn type_member_never_resolves_to_a_homonymous_global_class() {
+    let diags = check("type-member", r#"
+class ContractElement
+end
+class ContractTypeMember
+  extend T::Sig
+  ContractElement = type_member
+  sig { params(value: ContractElement).returns(ContractElement) }
+  def echo(value); value; end
+end
+ContractTypeMember.new.echo("any type")
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+#[test]
+fn unknown_array_elements_preserve_known_array_checks() {
+    let diags = check("partial-array", r"
+class ContractArray
+  extend T::Sig
+  sig { params(value: T.untyped).returns(T::Array[T.untyped]) }
+  def items(value)
+    value
+  end
+end
+ContractArray.new.items(nil).absent_array_method
+", None);
+    assert!(diags.iter().any(|d| d.code == "E0101" && d.message.contains("absent_array_method")), "{diags:?}");
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+#[test]
+fn open_source_keeps_existing_ruby_checks_without_contract_accusations() {
+    let diags = check("open", r#"
+class ContractOpen
+  extend T::Sig
+  define_method(dynamic_name) {}
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    1 + "bad operand"
+    "unprovable dispatch"
+  end
+end
+ContractOpen.new.echo("unknown")
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    assert!(diags.iter().any(|d| d.code == "E0108"), "{diags:?}");
+}
+
+#[test]
+fn duplicate_source_definitions_do_not_pick_a_signature() {
+    let diags = check("duplicate-source", r"
+class ContractDuplicate
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); value; end
+  sig { params(value: String).returns(String) }
+  def echo(value); value; end
+end
+ContractDuplicate.new.echo(nil)
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A subclass that redefines the method takes the parent's signature off
+/// every call that could dispatch to either body: the sig is no longer
+/// proven to govern the call, so neither the argument nor the parent body
+/// is judged by it. The control — the same parent without the override —
+/// keeps this a contract rather than a blind spot.
+#[test]
+fn descendant_override_keeps_the_parent_contract_off_the_call() {
+    const PARENT: &str = r#"
+class ContractOverrideParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractOverrideParent.new.echo("bad")
+"#;
+    let overridden = format!("{PARENT}class ContractOverrideChild < ContractOverrideParent\n  def echo(value)\n    value\n  end\nend\n");
+    let diags = check("descendant-override", &overridden, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("descendant-override-control", PARENT, None);
+    assert_eq!(contract_codes(&control), ["E0109", "E0103"], "control must accuse without the override: {control:?}");
+}
+
+/// A method the RBI declares on the parent is not the child's source
+/// override, and no RBI is a source method's contract anyway (F6).
+#[test]
+fn inherited_rbi_contract_never_attaches_to_a_source_override() {
+    let diags = check("inherited-rbi", r#"
+class ContractRbiParent
+end
+class ContractRbiChild < ContractRbiParent
+  def echo(value)
+    "wrong"
+  end
+end
+ContractRbiChild.new.echo("bad")
+"#, Some(r"
+class ContractRbiParent
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); end
+end
+class ContractRbiChild < ContractRbiParent
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A sig whose `params` names a parameter the def does not have is not a
+/// contract for that def: nothing it says is guessed onto the remaining
+/// names, so neither the argument nor the body is accused.
+#[test]
+fn sig_naming_an_absent_parameter_is_not_a_contract() {
+    let diags = check("absent-param", r#"
+class ContractAbsentParam
+  extend T::Sig
+  sig { params(value: Integer, extra: String).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractAbsentParam.new.echo("bad")
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// Stacked inline sigs are no contract, and a client RBI never steps in
+/// with its own (F6).
+#[test]
+fn unusable_inline_sig_still_blocks_the_rbi_contract() {
+    let diags = check("unusable-inline", r#"
+class ContractUnusableInline
+  extend T::Sig
+  sig { params(value: String).returns(String) }
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    "wrong"
+  end
+end
+ContractUnusableInline.new.echo("bad")
+"#, Some(r"
+class ContractUnusableInline
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value); end
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A `T.nilable` parameter seeds `Integer | nil` into the body, and this
+/// checker does not strip nil through `||`, `||=` or the usual guards. Each
+/// method below returns a value that is never nil at runtime, so nil
+/// membership in the inferred union is unproven and must not accuse.
+#[test]
+fn nilable_return_through_defaults_and_guards_stays_silent() {
+    let diags = check("nilable-return", r"
+class ContractNilableReturn
+  extend T::Sig
+  def initialize
+    @count = nil
+  end
+  def load_count
+    @count = 3
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def or_default(x)
+    x || 0
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def or_assign(x)
+    x ||= 0
+    x
+  end
+  sig { returns(Integer) }
+  def local_or_assign
+    r = nil
+    r ||= 1
+    r
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def blank_guard(x)
+    return 0 if x.blank?
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def and_guard(x)
+    return 0 unless x && x > 0
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def is_a_guard(x)
+    unless x.is_a?(Integer)
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def eq_nil_guard(x)
+    if x == nil
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def bang_guard(x)
+    if !x
+      return 0
+    end
+    x
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def paren_return_guard(x)
+    (return 0) unless x
+    x
+  end
+  sig { returns(Integer) }
+  def ivar_guard
+    return 0 unless @count
+    @count
+  end
+  sig { params(x: T.nilable(Integer)).returns(Integer) }
+  def explicit_return_after_guard(x)
+    return x if x
+    0
+  end
+  sig { params(x: T.nilable(Integer)).returns(T::Array[Integer]) }
+  def wrapped_in_array(x)
+    return [] if x.nil?
+    [x]
+  end
+end
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// The E0103 side of the same false positive: the caller's own
+/// `T.nilable(String)` parameter reaches a non-nilable parameter only
+/// after a default or a guard this checker does not narrow through.
+#[test]
+fn nilable_argument_through_defaults_and_guards_stays_silent() {
+    let diags = check("nilable-argument", r#"
+class ContractNilableArgument
+  extend T::Sig
+  def initialize
+    @label = nil
+  end
+  def load_label
+    @label = "loaded"
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def or_default(name)
+    shout(name || "anon")
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def or_assign(name)
+    name ||= "anon"
+    shout(name)
+  end
+  sig { returns(String) }
+  def local_or_assign
+    r = nil
+    r ||= "anon"
+    shout(r)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def blank_guard(name)
+    return "anon" if name.blank?
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def and_guard(name)
+    return "anon" unless name && name.size > 0
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def is_a_guard(name)
+    unless name.is_a?(String)
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def eq_nil_guard(name)
+    if name == nil
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def bang_guard(name)
+    if !name
+      return "anon"
+    end
+    shout(name)
+  end
+  sig { params(name: T.nilable(String)).returns(String) }
+  def paren_return_guard(name)
+    (return "anon") unless name
+    shout(name)
+  end
+  sig { returns(String) }
+  def ivar_guard
+    return "anon" unless @label
+    shout(@label)
+  end
+end
+"#, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A bare `nil` read back from a local or an instance variable is a flow
+/// fact, not a proof: writes this checker cannot see (an attribute writer,
+/// a block, reflection) may have replaced it. Only a `nil` written where
+/// the value is consumed proves it. The same holds for a local: a nil local
+/// that reaches a contract unchanged in straight-line code is a real bug
+/// this rule gives up (a false negative, acceptable under invariant #1);
+/// the block-written local is the shape where the read is NOT the value.
+#[test]
+fn nil_read_from_a_variable_is_not_proof() {
+    let diags = check("nil-variable", r"
+class ContractNilVariable
+  extend T::Sig
+  attr_writer :label
+  def initialize
+    @label = nil
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(String) }
+  def ivar_argument
+    shout(@label)
+  end
+  sig { returns(String) }
+  def ivar_return
+    @label
+  end
+  def current_label
+    @label
+  end
+  sig { returns(String) }
+  def call_result_argument
+    shout(current_label)
+  end
+  sig { params(items: T::Array[String]).returns(String) }
+  def block_written_local(items)
+    value = nil
+    items.each { |item| value = item }
+    shout(value)
+  end
+end
+# No writer path the index can see: the ivar still infers as nil, and the
+# contract still refuses to call a nil read back from it proven.
+class ContractNilBareIvar
+  extend T::Sig
+  def initialize
+    @label = nil
+  end
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(String) }
+  def ivar_argument
+    shout(@label)
+  end
+  sig { returns(String) }
+  def ivar_return
+    @label
+  end
+end
+", None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// Controls that keep the nil rule a contract and not a blind spot: a
+/// literal `nil` in return or argument position still accuses, and so
+/// does a union whose non-nil member is itself a mismatch — the unproven
+/// `nil` is dropped from the union, never read as an alibi for it.
+#[test]
+fn literal_nil_and_mismatched_union_members_still_accuse() {
+    let source = r#"
+class ContractNilLiteral
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def shout(label)
+    label
+  end
+  sig { returns(Integer) }
+  def tail_nil
+    nil
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def return_nil(flag)
+    return nil if flag
+    :one
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def mixed_union(flag)
+    flag ? "wrong" : nil
+  end
+end
+ContractNilLiteral.new.shout(nil)
+"#;
+    let diags = check("nil-literal", source, None);
+    let names: Vec<&str> = diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109"))
+        .map(|d| &source[d.start..d.end]).collect();
+    assert_eq!(contract_codes(&diags), ["E0109", "E0109", "E0109", "E0103"], "{diags:?}");
+    assert_eq!(names, ["tail_nil", "return_nil", "mixed_union", "nil"], "{diags:?}");
+}
+
+fn contract_names<'a>(source: &'a str, diags: &[Diagnostic]) -> Vec<&'a str> {
+    diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109")).map(|d| &source[d.start..d.end]).collect()
+}
+
+/// A project reopen of a core class/module is still the core constant: a
+/// bare core name in a sig keeps its scalar meaning or stays `Unknown`, and
+/// never becomes a project `Instance` that no literal value can satisfy.
+/// The reopened `Integer` control keeps the scalar contract live.
+#[test]
+fn reopened_core_names_keep_their_core_meaning() {
+    let source = r#"
+class Hash
+  def contract_core_touch; self; end
+end
+class Array
+  def contract_core_touch; self; end
+end
+class Object
+  def contract_core_touch; self; end
+end
+class BasicObject
+end
+class Numeric
+end
+module Comparable
+end
+module Enumerable
+end
+module Kernel
+end
+class Integer
+  def contract_core_touch; self; end
+end
+class ContractCoreReopen
+  extend T::Sig
+  sig { params(value: Hash).returns(Hash) }
+  def hash_echo(value)
+    { a: 1 }
+  end
+  sig { params(value: Array).returns(Array) }
+  def array_echo(value)
+    [1, 2]
+  end
+  sig { params(value: Object).returns(Object) }
+  def object_echo(value)
+    1
+  end
+  sig { params(value: BasicObject).returns(BasicObject) }
+  def basic_echo(value)
+    "text"
+  end
+  sig { params(value: Numeric).returns(Numeric) }
+  def numeric_echo(value)
+    1.5
+  end
+  sig { params(value: Comparable).returns(Comparable) }
+  def comparable_echo(value)
+    "text"
+  end
+  sig { params(value: Enumerable).returns(Kernel) }
+  def enumerable_echo(value)
+    :sym
+  end
+  sig { returns(Integer) }
+  def still_integer
+    "not an integer"
+  end
+end
+reopen = ContractCoreReopen.new
+reopen.hash_echo({ a: 1 })
+reopen.array_echo([1])
+reopen.object_echo(1)
+reopen.basic_echo(:sym)
+reopen.numeric_echo(2)
+reopen.comparable_echo("x")
+reopen.enumerable_echo([1])
+"#;
+    let diags = check("core-reopen", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["still_integer"], "{diags:?}");
+}
+
+/// A project module mixed into a core class is satisfied by core values the
+/// checker cannot relate to it: the name stays `Unknown`. A project class
+/// that only a project class includes keeps its contract.
+///
+/// A module-typed contract never accuses anyway (see
+/// `module_typed_contracts_never_accuse`), so the `Unknown` is observable on
+/// the consumer. A sig types a consumer only where inference knows nothing,
+/// so `pass` returns its (never bound) param: the declared module is all
+/// that reaches `pass(-1)`. As an instance of the module, `.abs` would
+/// resolve to the mixin's String-returning `abs` and accuse the RBS-comment
+/// call — but `Integer#abs` shadows the mixin on MRI (sorbet-runtime
+/// included) and returns `1`.
+#[test]
+fn project_module_mixed_into_core_never_accuses_core_values() {
+    let source = r#"
+module ContractCoreMixin
+  def abs
+    "a mixin method Integer#abs always shadows"
+  end
+end
+class Integer
+  include ContractCoreMixin
+end
+class ContractMixinTarget
+end
+class ContractMixinUser
+  extend T::Sig
+  sig { params(value: ContractCoreMixin).returns(ContractCoreMixin) }
+  def echo(value)
+    1
+  end
+  sig { params(value: ContractCoreMixin).returns(ContractCoreMixin) }
+  def pass(value)
+    value
+  end
+  #: (Integer) -> void
+  def take_integer(number); end
+  sig { returns(ContractMixinTarget) }
+  def target
+    2
+  end
+end
+ContractMixinUser.new.echo(1)
+ContractMixinUser.new.take_integer(ContractMixinUser.new.pass(-1).abs)
+"#;
+    let diags = check("core-mixin", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["target"], "{diags:?}");
+    assert_eq!(ty_at("core-mixin", source, "ContractMixinUser.new", "echo(1)").as_deref(), Some("Integer"));
+    assert_eq!(ty_at("core-mixin", source, "ContractMixinUser.new.pass(-1)", "pass"), None);
+}
+
+/// Ruby looks a constant up in the ancestors of the cref before the top
+/// level. A name some ancestor namespace could answer, or any name inside a
+/// class whose ancestry is not fully known, is `Unknown`; a fully known,
+/// unshadowed ancestry keeps the top-level binding and its contract. Each
+/// silent shape holds a literal that only the WRONG (top-level) binding
+/// would accuse; instances are never judged, so they cannot tell.
+#[test]
+fn inherited_namespace_constants_never_bind_to_top_level() {
+    let source = r#"
+class ContractNode
+end
+class ContractParent
+  class ContractNode
+  end
+  class String
+  end
+end
+class ContractKid < ContractParent
+  extend T::Sig
+  sig { params(value: ContractNode).returns(ContractNode) }
+  def echo(value)
+    value
+  end
+  sig { returns(ContractNode) }
+  def build
+    "a parent node would not be a string either"
+  end
+  sig { returns(String) }
+  def text
+    :not_a_top_level_string
+  end
+end
+module ContractMix
+  class ContractLeaf
+  end
+end
+class ContractLeaf
+end
+class ContractIncluder
+  extend T::Sig
+  include ContractMix
+  sig { returns(ContractLeaf) }
+  def leaf
+    :not_a_top_level_leaf
+  end
+end
+class ContractUnknownKid < ContractUnresolvedBase
+  extend T::Sig
+  sig { returns(ContractNode) }
+  def build
+    "anything"
+  end
+end
+class ContractPlainParent
+end
+class ContractPlainKid < ContractPlainParent
+  extend T::Sig
+  sig { returns(ContractNode) }
+  def build
+    "not a node"
+  end
+end
+ContractKid.new.echo(:not_a_top_level_node)
+"#;
+    let diags = check("ancestor-namespace", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    assert_eq!(contract_names(source, &diags), ["build"], "{diags:?}");
+    let plain = source.find("class ContractPlainKid").unwrap();
+    assert!(diags.iter().filter(|d| d.code == "E0109").all(|d| d.start > plain), "{diags:?}");
+}
+
+// -- core returns follow their arguments (a wrong precise type would mistype a consumer) --
+
+fn codes(diags: &[Diagnostic]) -> Vec<&str> {
+    diags.iter().map(|d| d.code).collect()
+}
+
+/// Every `(anchor, at, type)` of `source` reads as `type` on hover.
+fn assert_types(name: &str, source: &str, expected: &[(&str, &str, Option<&str>)]) {
+    for (anchor, at, ty) in expected {
+        assert_eq!(ty_at(name, source, anchor, at).as_deref(), *ty, "{name}: `{at}` after `{anchor}`");
+    }
+}
+
+/// Each method's value is inferred, so no contract judges it; a sig never
+/// binds its parameters into the body, so each receiver is a literal and
+/// hover shows what the core model answers.
+#[test]
+fn integer_arithmetic_takes_the_operand_type() {
+    let source = r"
+class ContractIntOperand
+  extend T::Sig
+  sig { params(x: Integer).returns(Float) }
+  def half(x)
+    2 + 0.5
+  end
+  sig { params(x: Integer, y: T.untyped).returns(Float) }
+  def scaled(x, y)
+    2 * y
+  end
+  sig { params(x: Integer).returns(T::Boolean) }
+  def ratio(x)
+    (2 * 1.5).nan?
+  end
+  sig { params(x: Float, y: T.untyped).returns(Integer) }
+  def decimal(x, y)
+    1.5 * y
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def wrong(x)
+    2 * 1.5
+  end
+end
+";
+    let diags = check("int-operand", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("int-operand", source, &[
+        ("def half", "+ 0.5", Some("Float")),
+        ("def scaled", "* y", None),
+        ("def decimal", "* y", None),
+        ("def wrong", "* 1.5", Some("Float")),
+    ]);
+}
+
+#[test]
+fn float_rounding_with_digits_is_not_an_integer() {
+    let source = r"
+class ContractFloatDigits
+  extend T::Sig
+  sig { params(x: Float).returns(Float) }
+  def cents(x)
+    1.25.round(2)
+  end
+  sig { params(x: Float, n: Integer).returns(Float) }
+  def floored(x, n)
+    1.25.floor(n)
+  end
+  sig { params(x: Float).returns(T::Boolean) }
+  def odd_cents(x)
+    1.25.ceil(1).nan?
+  end
+  sig { params(x: Float).returns(String) }
+  def whole(x)
+    1.25.round
+  end
+end
+";
+    let diags = check("float-digits", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    // `round` with no digits still proves an Integer.
+    assert_types("float-digits", source, &[
+        ("def cents", "round(2)", Some("Float")),
+        ("def floored", "floor(n)", None),
+        ("def whole", "round", Some("Integer")),
+    ]);
+}
+
+/// A sig's declared element type never reaches the body (sorbet-runtime
+/// checks only the category), so the receivers here are literals, whose
+/// elements are proven where they are written.
+#[test]
+fn array_count_argument_returns_an_array() {
+    let source = r"
+class ContractArrayCount
+  def head
+    [1, 2].first(2)
+  end
+  def top
+    [1, 2].max(2)
+  end
+  def pairs
+    [1, 2].pop(2).each_slice(2)
+  end
+  def splatted(counts)
+    [1, 2].last(*counts)
+  end
+  def one
+    [1, 2].first
+  end
+end
+";
+    let diags = check("array-count", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("array-count", source, &[
+        ("def head", "first(2)", Some("Array[Integer]")),
+        ("def top", "max(2)", Some("Array[Integer]")),
+        ("def splatted", "last(*", None),
+        ("def one", "first", Some("Integer")),
+    ]);
+}
+
+#[test]
+fn flatten_drops_the_nesting() {
+    let source = r"
+class ContractFlatten
+  def flat
+    [[1], [2]].flatten
+  end
+  # The inner arrays are shared by reference, so what they hold is
+  # unproven after flatten: `first` is Unknown and `abs` stays silent.
+  def head
+    [[1], [2]].flatten.first.abs
+  end
+end
+";
+    let diags = check("flatten", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    // One flat Array, never the nested receiver type.
+    assert_types("flatten", source, &[
+        ("def flat", "flatten", Some("Array[untyped]")),
+        ("def head", "first.abs", None),
+    ]);
+}
+
+#[test]
+fn integer_clamp_with_float_bounds_is_unproven() {
+    let source = r"
+class ContractClamp
+  extend T::Sig
+  sig { params(x: Integer).returns(Float) }
+  def bounded(x)
+    3.clamp(0.5, 2.5)
+  end
+  sig { params(x: Integer).returns(String) }
+  def wrong(x)
+    3.clamp(1, 5)
+  end
+end
+";
+    let diags = check("clamp", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("clamp", source, &[("def bounded", "clamp", None), ("def wrong", "clamp", Some("Integer"))]);
+}
+
+// -- an ivar is proven only when every writer is visible --
+
+#[test]
+fn ivar_with_an_attribute_writer_is_unproven() {
+    let source = r#"
+class ContractIvarWriter
+  extend T::Sig
+  attr_writer :name
+  attr_accessor :mode
+  def initialize
+    @name = nil
+    @mode = :auto
+  end
+  sig { returns(String) }
+  def shout
+    raise "unset" if @name.nil?
+    @name.upcase
+  end
+  sig { returns(String) }
+  def label
+    @mode
+  end
+end
+class ContractIvarReader
+  extend T::Sig
+  def initialize
+    @mode = :auto
+  end
+  sig { returns(String) }
+  def label
+    @mode
+  end
+end
+"#;
+    let diags = check("ivar-writer", source, None);
+    // Every value here is inferred: no contract judges it.
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("ivar-writer", source, &[
+        ("def shout", "@name.upcase", None),
+        ("def label", "@mode", None),
+        // The class with no writer path keeps its proof.
+        ("class ContractIvarReader", "@mode\n  end", Some("Symbol")),
+    ]);
+}
+
+#[test]
+fn ivar_written_by_reflection_is_unproven() {
+    let source = r"
+class ContractIvarReflected
+  extend T::Sig
+  def initialize
+    @count = nil
+  end
+  sig { returns(Integer) }
+  def total
+    raise ArgumentError if @count.nil?
+    @count.abs
+  end
+end
+ContractIvarReflected.new.instance_variable_set(:@count, 3)
+class ContractIvarEvaled
+  extend T::Sig
+  def initialize
+    @size = nil
+  end
+  sig { returns(Integer) }
+  def total
+    @size.abs
+  end
+end
+ContractIvarEvaled.new.instance_eval { @size = 3 }
+";
+    let diags = check("ivar-reflection", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("ivar-reflection", source, &[
+        ("def total", "@count.abs", None),
+        ("class ContractIvarEvaled", "@size.abs", None),
+    ]);
+}
+
+#[test]
+fn ivar_written_elsewhere_in_the_family_is_unproven() {
+    let source = r"
+class ContractIvarThing
+end
+class ContractIvarBase
+  def load
+    @value = compute
+    @cache ||= compute
+  end
+  def compute
+    3
+  end
+end
+class ContractIvarChild < ContractIvarBase
+  extend T::Sig
+  def initialize
+    @value = nil
+    @cache = nil
+    @thing = ContractIvarThing.new
+  end
+  def refill
+    @cache ||= compute
+  end
+  sig { returns(Integer) }
+  def value
+    raise if @value.nil?
+    @value.abs
+  end
+  sig { returns(Integer) }
+  def cache
+    raise if @cache.nil?
+    @cache.abs
+  end
+  def poke
+    @thing.absent_thing_method
+  end
+end
+";
+    let diags = check("ivar-family", source, None);
+    // `@thing` has one visible writer and no other path: still proven.
+    assert_eq!(codes(&diags), ["E0101"], "{diags:?}");
+    assert!(diags[0].message.contains("absent_thing_method"), "{diags:?}");
+    assert_types("ivar-family", source, &[
+        ("def value", "@value.abs", None),
+        ("def cache", "@cache.abs", None),
+        ("def poke", "@thing", Some("ContractIvarThing")),
+    ]);
+}
+
+#[test]
+fn ivar_compound_writes_in_the_same_class_are_unproven() {
+    let source = r"
+class ContractIvarMemo
+  extend T::Sig
+  def initialize
+    @memo = nil
+    @pair = nil
+  end
+  def fill
+    @memo ||= 3
+    @pair, @rest = [1, 2]
+  end
+  sig { returns(Integer) }
+  def memo
+    raise if @memo.nil?
+    @memo.abs
+  end
+  sig { returns(Integer) }
+  def pair
+    raise if @pair.nil?
+    @pair.abs
+  end
+end
+";
+    let diags = check("ivar-compound", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    assert_types("ivar-compound", source, &[("def memo", "@memo.abs", None), ("def pair", "@pair.abs", None)]);
+}
+
+// -- self in a module is an instance of an unknown includer --
+
+/// `self` is never a literal, so no Sorbet contract judges it; the rule
+/// that a module's `self` proves nothing lives on in `compatible`, which
+/// the RBS-comment E0103 still applies to inferred instances.
+#[test]
+fn module_self_is_never_proof_against_an_includer() {
+    let diags = check("module-self", r"
+module ContractGreets
+  extend T::Sig
+  sig { returns(ContractPerson) }
+  def me
+    self
+  end
+  sig { returns(String) }
+  def text
+    self
+  end
+  def register
+    ContractRegistry.new.store(self)
+  end
+end
+class ContractPerson
+  include ContractGreets
+end
+class ContractRegistry
+  extend T::Sig
+  #: (ContractPerson) -> void
+  def store(person); end
+  sig { returns(ContractPerson) }
+  def me
+    self
+  end
+  def again
+    store(self)
+  end
+end
+", None);
+    // A class's own `self` is still proven, against the RBS comment.
+    assert_eq!(codes(&diags), ["E0103"], "{diags:?}");
+    assert!(diags[0].message.contains("got ContractRegistry"), "{diags:?}");
+}
+
+// -- every redefinition path takes a written contract off the method --
+
+/// Several source files, one project: a redefinition written in another
+/// file reaches the class only through a merge-time pass.
+fn check_files(name: &str, sources: &[&str]) -> Vec<Diagnostic> {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-{name}"));
+    let files: Vec<SourceFile> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, text)| SourceFile::new(&db, root.join(format!("source{i}.rb")), (*text).to_owned()))
+        .collect();
+    ProjectFiles::new(&db, files.clone());
+    ClosedWorld::new(&db, true);
+    files.iter().flat_map(|f| check_file(&db, *f).clone()).collect()
+}
+
+const PATCHED_TARGET: &str = r#"
+class ContractPatchSink
+  extend T::Sig
+  sig { params(text: String).void }
+  def self.take(text); end
+end
+class ContractPatchTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def self.echo(value)
+    value
+  end
+end
+ContractPatchTarget.echo("text")
+ContractPatchSink.take(ContractPatchTarget.echo(1))
+"#;
+
+/// An out-of-line `class << X` body redefines `X.echo`: the written
+/// signature no longer governs the method that runs, nor types its result.
+/// The control without the patch keeps this a contract rather than a blind
+/// spot. `take(echo(1))` hands `take` an inferred value, never judged.
+#[test]
+fn singleton_patch_redefinition_takes_the_contract_off() {
+    let patch = r"
+class << ContractPatchTarget
+  def echo(value)
+    value.to_s
+  end
+end
+";
+    let diags = check_files("singleton-patch", &[PATCHED_TARGET, patch]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let result = ty_in("singleton-patch", &[PATCHED_TARGET, patch], "take(ContractPatchTarget", "echo(1)");
+    assert_ne!(result.as_deref(), Some("Integer"), "the stale sig must not type the patched result");
+
+    let control = check_files("singleton-patch-control", &[PATCHED_TARGET]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the patch: {control:?}");
+    assert_eq!(contract_names(PATCHED_TARGET, &control), ["\"text\""], "{control:?}");
+    let result = ty_in("singleton-patch-control", &[PATCHED_TARGET], "take(ContractPatchTarget", "echo(1)");
+    assert_eq!(result.as_deref(), Some("Integer"), "the sig types its result without the patch");
+}
+
+/// A module's `self.extended(base)` hook redefines the extender's method
+/// when `extend` runs, after the signed `def` was written.
+#[test]
+fn extended_hook_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractHookTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+  EXTENSION
+end
+ContractHookTarget.new.echo("text")
+"#;
+    let hook = r"
+module ContractHookInstaller
+  def self.extended(base)
+    base.define_method(:echo) { |value| value.to_s }
+  end
+end
+";
+    let diags = check_files("extended-hook", &[&TARGET.replace("EXTENSION", "extend ContractHookInstaller"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("extended-hook-control", &[&TARGET.replace("EXTENSION", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the extend: {control:?}");
+
+    // `def base.echo` in the hook is read by the extend-hook harvest alone
+    // (`apply_extended_hooks`): no install pass records a `def` through
+    // the hook's own parameter, so only the harvest's redefinition rule
+    // takes the singleton contract off. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036: with the `extend` the call returns
+    // "text"; without it, sorbet-runtime raises `TypeError`.
+    let singleton = r#"
+class ContractHookSingleton
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def self.echo(value)
+    value
+  end
+  EXTENSION
+end
+ContractHookSingleton.echo("text")
+"#;
+    let definer = r"
+module ContractHookDefiner
+  def self.extended(base)
+    def base.echo(value)
+      value.to_s
+    end
+  end
+end
+";
+    let diags = check_files("extended-hook-def", &[&singleton.replace("EXTENSION", "extend ContractHookDefiner"), definer]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let target = singleton.replace("EXTENSION", "");
+    let control = check_files("extended-hook-def-control", &[&target, definer]);
+    assert_eq!(contract_names(&target, &control), ["\"text\""], "control must accuse without the extend: {control:?}");
+}
+
+/// A block reopening in another file redefines the method: like any other
+/// duplicate definition, neither signature is proven to be the one that runs.
+#[test]
+fn class_eval_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractEvalTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+ContractEvalTarget.new.echo("text")
+"#;
+    let reopen = r"
+ContractEvalTarget.class_eval do
+  def echo(value)
+    value.to_s
+  end
+end
+";
+    let diags = check_files("class-eval", &[TARGET, reopen]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let reopened = r"
+class ContractEvalTarget
+  alias_method :echo, :to_s
+end
+";
+    let diags = check_files("alias-reopen", &[TARGET, reopened]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+/// A descendant that mixes in a module answering the name dispatches to
+/// that module, never to the signed parent body.
+#[test]
+fn descendant_mixin_override_keeps_the_parent_contract_off_the_call() {
+    const PARENT: &str = r#"
+class ContractMixinParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+module ContractMixinText
+  def echo(value)
+    value.to_s
+  end
+end
+class ContractMixinChild < ContractMixinParent
+  MIXIN
+end
+class ContractMixinUser
+  def use
+    ContractMixinParent.new.echo("text")
+  end
+end
+"#;
+    let diags = check_files("descendant-mixin", &[&PARENT.replace("MIXIN", "include ContractMixinText")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let diags = check_files("descendant-prepend", &[&PARENT.replace("MIXIN", "prepend ContractMixinText")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("descendant-mixin-control", &[&PARENT.replace("MIXIN", "")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the mixin: {control:?}");
+}
+
+/// A module's signed method runs only where no class between an includer
+/// and the module redefines it. An includer's subclass that does is a
+/// dispatch target the module's contract cannot speak for.
+#[test]
+fn module_contract_yields_to_an_includer_family_override() {
+    const CONCERN: &str = r#"
+module ContractConcern
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+class ContractConcernHost
+  include ContractConcern
+end
+class ContractConcernChild < ContractConcernHost
+  OVERRIDE
+end
+class ContractConcernUser
+  def use
+    ContractConcernHost.new.echo("text")
+  end
+end
+"#;
+    let overridden = CONCERN.replace("OVERRIDE", "def echo(value)\n    value.to_s\n  end");
+    let diags = check_files("module-family", &[&overridden]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("module-family-control", &[&CONCERN.replace("OVERRIDE", "")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the override: {control:?}");
+}
+
+/// A module's `included` hook, in either spelling, redefines the
+/// includer's method when `include` runs, after the signed `def`.
+#[test]
+fn included_hook_redefinition_takes_the_contract_off() {
+    const TARGET: &str = r#"
+class ContractIncludedTarget
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+  INCLUSION
+end
+ContractIncludedTarget.new.echo("text")
+"#;
+    let hook = r"
+module ContractIncludedHook
+  def self.included(base)
+    base.define_method(:echo) { |value| value.to_s }
+  end
+end
+";
+    let concern = r"
+module ContractIncludedConcern
+  extend ActiveSupport::Concern
+  included do
+    def echo(value)
+      value.to_s
+    end
+  end
+end
+";
+    let diags = check_files("included-hook", &[&TARGET.replace("INCLUSION", "include ContractIncludedHook"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let diags = check_files("included-concern", &[&TARGET.replace("INCLUSION", "include ContractIncludedConcern"), concern]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // The block still runs when an earlier macro opened the module first.
+    let macro_first = concern.replace("  included do", "  contract_setting :flag\n  included do");
+    let diags = check_files("included-macro-first", &[&TARGET.replace("INCLUSION", "include ContractIncludedConcern"), &macro_first]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // A hook that installs through a dynamic `send` records no definition
+    // (`hidden_definer_sources`), so no install pass knows its names: only
+    // the include-time rule, reading the hook method itself, takes the
+    // contract off. Measured on ruby 3.4.2 with sorbet-runtime 0.6.13036:
+    // with the `include` the call returns "text"; without it, `TypeError`.
+    let dynamic = r"
+module ContractIncludedSend
+  def self.included(base)
+    definer = :define_method
+    base.send(definer, :echo) { |value| value.to_s }
+  end
+end
+";
+    let diags = check_files("included-dynamic-send", &[&TARGET.replace("INCLUSION", "include ContractIncludedSend"), dynamic]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    // An open module's include-time block also replaces the includer's
+    // own body, whose literal return no call-site lookup guards: only the
+    // include-time rule keeps E0109 off it. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036 and activesupport 8.1.3: with the
+    // `include` `label` returns 1; without it, `TypeError`.
+    let returning_template = r#"
+class ContractIncludedReturn
+  extend T::Sig
+  sig { returns(Integer) }
+  def label
+    "text"
+  end
+  INCLUSION
+end
+ContractIncludedReturn.new.label
+"#;
+    let relabel = "module ContractIncludedRelabel\n  extend ActiveSupport::Concern\n  included do\n    def label\n      1\n    end\n  end\nend\n";
+    let relabel_macro_first = relabel.replace("  included do", "  contract_setting :flag\n  included do");
+    for (i, module) in [relabel, relabel_macro_first.as_str()].iter().enumerate() {
+        let diags = check_files(&format!("included-relabel-{i}"), &[&returning_template.replace("INCLUSION", "include ContractIncludedRelabel"), module]);
+        assert!(contract_codes(&diags).is_empty(), "{module}: {diags:?}");
+    }
+    let returning = returning_template.replace("INCLUSION", "");
+    let control = check_files("included-relabel-control", &[&returning, relabel]);
+    assert_eq!(contract_codes(&control), ["E0109"], "control must accuse without the include: {control:?}");
+    assert_eq!(contract_names(&returning, &control), ["label"], "{control:?}");
+
+    let control = check_files("included-hook-control", &[&TARGET.replace("INCLUSION", ""), hook, concern, dynamic]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
+}
+
+// -- cost: contract work is per definition, never per call --
+
+/// A base class, `members` subclasses in their own files, and twelve calls
+/// per subclass to the base's two methods, checked with a `sorbet/rbi`
+/// directory present (the RBI declares only an unrelated class). Returns
+/// the contract work the whole check did on this thread.
+fn family_work(name: &str, members: usize, signed: bool) -> itaruby_semantic::check::ContractWork {
+    let db = Db::default();
+    let root = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-{name}"));
+    let dir = root.join("sorbet/rbi");
+    std::fs::create_dir_all(&dir).unwrap();
+    let rbi = dir.join("unrelated.rbi");
+    std::fs::write(&rbi, "class ContractUnrelated\n  sig { returns(Integer) }\n  def value; end\nend\n").unwrap();
+    RbiProject::new(&db, itaruby_semantic::rbi::build_rbi_index(&[rbi]).constants);
+    let sig = |text: &str| if signed { format!("  sig {{ {text} }}\n") } else { String::new() };
+    let base = format!(
+        "class ContractFamilyBase\n  extend T::Sig\n{}  def helper\n    1\n  end\n{}  def other(value)\n    value\n  end\nend\n",
+        sig("returns(Integer)"),
+        sig("params(value: Integer).returns(Integer)"),
+    );
+    let mut files = vec![SourceFile::new(&db, root.join("base.rb"), base)];
+    for i in 0..members {
+        let calls = "    a = helper\n    b = other(a)\n    c = ContractFamilyBase.new.helper\n".repeat(4);
+        let text = format!("class ContractFamilyMember{i} < ContractFamilyBase\n  def run\n{calls}    a\n  end\nend\n");
+        files.push(SourceFile::new(&db, root.join(format!("member{i}.rb")), text));
+    }
+    ProjectFiles::new(&db, files.clone());
+    ClosedWorld::new(&db, true);
+    let before = itaruby_semantic::check::contract_work();
+    for file in &files {
+        check_file(&db, *file);
+    }
+    let after = itaruby_semantic::check::contract_work();
+    itaruby_semantic::check::ContractWork {
+        family_visits: after.family_visits - before.family_visits,
+        contract_resolutions: after.contract_resolutions - before.contract_resolutions,
+        return_probes: after.return_probes - before.return_probes,
+    }
+}
+
+/// Measured before this bound existed: a 1500-member family checked in
+/// 26.3s instead of 0.56s once `sorbet/rbi` existed, because every call to
+/// an unsigned method walked the whole family twice. Each file now
+/// resolves a definition's contract once, walks the family only for a
+/// definition that has a contract, and reads the return memo before
+/// asking for a contract at all.
+#[test]
+fn contract_work_is_per_definition_not_per_call() {
+    const MEMBERS: u64 = 60;
+    let files = MEMBERS + 1;
+    let unsigned = family_work("family-unsigned", 60, false);
+    assert_eq!(unsigned.family_visits, 0, "no contract, no family walk: {unsigned:?}");
+    // Per file: the base's two methods and the member's own `run`
+    // (182 measured; one contract per call would be over 900).
+    assert!(unsigned.contract_resolutions <= 4 * files, "{unsigned:?}");
+    // Per file: three return keys, member#helper, member#other and
+    // base#helper (180 measured; one probe per call would be 732).
+    assert!(unsigned.return_probes <= 4 * files, "{unsigned:?}");
+
+    let signed = family_work("family-signed", 60, true);
+    assert!(signed.contract_resolutions <= 4 * files, "{signed:?}");
+    // One walk of the family per signed definition per file (7320
+    // measured; one walk per call would be ten times that).
+    assert!(signed.family_visits <= 3 * MEMBERS * files, "{signed:?}");
+}
+
+/// Include-time code in a subclass may redefine the inherited method on
+/// that subclass, through a body no harvest reads.
+#[test]
+fn include_time_code_in_a_descendant_keeps_the_parent_contract_off_the_call() {
+    const FAMILY: &str = r#"
+class ContractHookParent
+  extend T::Sig
+  sig { params(value: Integer).returns(Integer) }
+  def echo(value)
+    value
+  end
+end
+class ContractHookChild < ContractHookParent
+  INCLUSION
+end
+class ContractHookUser
+  def use
+    ContractHookParent.new.echo("text")
+  end
+end
+"#;
+    let hook = r#"
+module ContractOpaqueHook
+  def self.included(base)
+    base.class_eval("def echo(value) = value.to_s")
+  end
+end
+"#;
+    let diags = check_files("descendant-include-time", &[&FAMILY.replace("INCLUSION", "include ContractOpaqueHook"), hook]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check_files("descendant-include-time-control", &[&FAMILY.replace("INCLUSION", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the include: {control:?}");
+}
+
+/// sorbet-runtime checks that a value IS an Array or a Hash, never what it
+/// holds, so a contract can only hold a value to its collection category.
+/// Symbol-keyed literals under `T::Hash[String, ...]` were measured as false
+/// E0103/E0109 on correct code (corpus-c, 2026-09-22). The control is the
+/// shape the same audit proved a true positive: a Hash returned where the
+/// sig promises a String, which sorbet-runtime rejects on every call.
+#[test]
+fn collection_type_arguments_are_erased_but_the_category_still_accuses() {
+    let source = r#"
+class ContractErasedGenerics
+  extend T::Sig
+  sig { returns(T::Hash[String, T.untyped]) }
+  def payload
+    { user: 1 }
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def request
+    { "user" => 1 }
+  end
+  sig { returns(T::Array[Integer]) }
+  def ids
+    ["a"]
+  end
+  sig { params(data: T::Hash[String, T.untyped]).void }
+  def update(data); end
+  sig { returns(String) }
+  def lookup
+    { plants: "plants" }
+  end
+end
+ContractErasedGenerics.new.update({ meta: { "k" => 1 } })
+ContractErasedGenerics.new.update("not a hash")
+"#;
+    let diags = check("erased-generics", source, None);
+    assert_eq!(contract_codes(&diags), ["E0109", "E0103"], "{diags:?}");
+    assert_eq!(&source[diags[0].start..diags[0].end], "lookup", "{diags:?}");
+    assert!(diags[1].message.contains("data"), "{diags:?}");
+}
+
+/// The keyword loop that binds Sorbet params by name must still WALK every
+/// element it cannot bind. A string or constant key, and a `**splat`, used to
+/// reach `infer_expr` as a bare assoc node that no arm reads, so every
+/// diagnostic inside them vanished (measured 2026-09-22 against main: three
+/// E0104 and one E0101 lost, and 4 public-corpus lines gone with them).
+#[test]
+fn unbindable_keyword_elements_are_still_checked() {
+    let diags = check("keyword-walk", r"
+class ContractKeywordWalk
+  def self.real; end
+end
+class ContractKeywordTaker
+  def take(*args, **opts); end
+end
+ContractKeywordTaker.new.take('str' => NoSuchConstB)
+ContractKeywordTaker.new.take(NoSuchConstC => 1)
+ContractKeywordTaker.new.take(**NoSuchConstF)
+ContractKeywordTaker.new.take('str' => ContractKeywordWalk.nonexistent_class_method)
+ContractKeywordTaker.new.take(sym: NoSuchConstS)
+", None);
+    let found: Vec<(&str, &str)> = diags.iter()
+        .map(|d| (d.code, d.message.as_str()))
+        .collect();
+    for (code, needle) in [("E0104", "NoSuchConstB"), ("E0104", "NoSuchConstC"), ("E0104", "NoSuchConstF"),
+                           ("E0101", "nonexistent_class_method"), ("E0104", "NoSuchConstS")] {
+        assert!(found.iter().any(|(c, m)| *c == code && m.contains(needle)), "missing {code} {needle}: {diags:?}");
+    }
+    assert_eq!(diags.len(), 5, "{diags:?}");
+}
+
+/// A flow-derived union is the set of values the body MIGHT hold, and this
+/// checker does not narrow through `case`/`when`, `is_a?`, `===`, a guard
+/// return or a `raise`, nor through a block, loop or rescue that rewrote a
+/// local. So one member that mismatches is not proof; every method below
+/// runs under sorbet-runtime. Those inferred unions are no longer judged at
+/// all (literal-only); the rule still decides a tail whose branches are all
+/// literals, where this checker cannot tell a dead branch from a live one:
+/// it is accused only when NO leaf can be the declared type — see the
+/// control test that follows.
+#[test]
+fn union_with_one_compatible_member_stays_silent() {
+    let source = r#"
+class ContractUnionShape; end
+class ContractUnionOther; end
+class ContractUnionMembers
+  extend T::Sig
+  sig { params(flag: T.untyped).returns(String) }
+  def literal_ternary(flag)
+    flag ? "fits" : 1
+  end
+  sig { params(k: T.untyped).returns(Integer) }
+  def literal_case(k)
+    case k
+    when :one then "one"
+    else 1
+    end
+  end
+  sig { params(flag: T.untyped).returns(T.nilable(String)) }
+  def literal_missing_branch(flag)
+    1 if flag
+  end
+  sig { params(label: String).returns(String) }
+  def take(label)
+    label
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def case_when(k)
+    case k
+    when Integer then k.to_s
+    else k
+    end
+  end
+  sig { params(k: T.any(Integer, String)).returns(Integer) }
+  def guard_return(k)
+    return k.size unless k.is_a?(Integer)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def guard_raise(k)
+    raise ArgumentError unless k.is_a?(String)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(Integer) }
+  def or_return(k)
+    k.is_a?(Integer) or return 0
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def case_equality(k)
+    return k.to_s unless String === k
+    k
+  end
+  sig { params(k: T.any(ContractUnionShape, ContractUnionOther)).returns(ContractUnionShape) }
+  def project_kind_of(k)
+    return ContractUnionShape.new unless k.kind_of?(ContractUnionShape)
+    k
+  end
+  sig { params(k: T.any(ContractUnionShape, ContractUnionOther)).returns(ContractUnionShape) }
+  def project_instance_of(k)
+    return ContractUnionShape.new unless k.instance_of?(ContractUnionShape)
+    k
+  end
+  sig { params(k: T.any(Integer, String)).returns(String) }
+  def guarded_argument(k)
+    return take(k) if k.is_a?(String) && k.size > 0
+    "none"
+  end
+  sig { params(name: String, n: Integer).returns(String) }
+  def mixed_first(name, n)
+    [name, n].first
+  end
+  sig { params(name: String, n: Integer).returns(Integer) }
+  def mixed_last(name, n)
+    [name, n].last
+  end
+  sig { params(items: T::Array[Integer]).returns(String) }
+  def block_widened(items)
+    x = 1
+    items.each { |i| x = "s#{i}" }
+    take(x)
+  end
+  sig { params(n: Integer).returns(String) }
+  def while_widened(n)
+    x = 1
+    while n > 0
+      x = "s"
+      n -= 1
+    end
+    take(x)
+  end
+  sig { params(items: T::Array[Integer]).returns(String) }
+  def for_widened(items)
+    x = 1
+    for i in items
+      x = "s#{i}"
+    end
+    take(x)
+  end
+  sig { returns(String) }
+  def rescue_widened
+    x = 1
+    begin
+      x = Integer("s").to_s
+    rescue StandardError
+      x = "t"
+    end
+    take(x)
+  end
+  sig { params(s: String).returns(T::Boolean) }
+  def and_predicate(s)
+    s && s.empty?
+  end
+  sig { params(k: T.any(Integer, String), flag: T.untyped).returns(String) }
+  def explicit_union_return(k, flag)
+    return k if flag
+    "none"
+  end
+end
+ContractUnionMembers.new.take([1, "a"].first)
+"#;
+    let diags = check("union-members", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The controls that keep the union rule a contract: literal leaves that ALL
+/// mismatch still accuse — in a tail (a missing branch is a written `nil`),
+/// an explicit `return` beside a mismatching tail, and an argument — and so does a single mismatched
+/// literal. The same shapes built from a sig-typed union are inferred, never
+/// written, and stay silent.
+#[test]
+fn union_with_no_compatible_member_still_accuses() {
+    let source = r"
+class ContractUnionMismatch
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def take(label)
+    label
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def tail_union(flag)
+    flag ? 1 : 2.5
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def missing_branch(flag)
+    1 if flag
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def explicit_union(flag)
+    return 1 if flag
+    2.5
+  end
+  sig { returns(String) }
+  def argument
+    take(1)
+  end
+  sig { returns(String) }
+  def single
+    1
+  end
+end
+";
+    let diags = check("union-mismatch", source, None);
+    assert_eq!(contract_names(source, &diags), ["tail_union", "missing_branch", "explicit_union", "1", "single"], "{diags:?}");
+
+    let inferred = r#"
+class ContractUnionInferred
+  extend T::Sig
+  sig { params(label: String).returns(String) }
+  def take(label)
+    label
+  end
+  sig { params(k: T.any(Integer, Float)).returns(String) }
+  def tail_union(k)
+    k
+  end
+  sig { params(k: T.any(Integer, Float), flag: T.untyped).returns(String) }
+  def explicit_union(k, flag)
+    return k if flag
+    "ok"
+  end
+  sig { params(k: T.any(Integer, Float)).returns(String) }
+  def argument_union(k)
+    take(k)
+  end
+end
+"#;
+    let diags = check("union-inferred", inferred, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+}
+
+
+// -- nominal compatibility: a class proves NOT to be a core value only from a complete ancestry --
+
+/// A project subclass of a core class IS that core value under
+/// sorbet-runtime (`SafeStr.new("x").is_a?(String)`), and so is a subclass
+/// of a project reopen of it or of a class some `.rbi` declares (a gem
+/// class the project reopens without restating its superclass). An
+/// `Instance` is held to a core scalar or collection type only when its
+/// ancestry is complete and names nothing that is, or may be, that core
+/// type — see the control test that follows.
+///
+/// An instance is never a literal, so the Sorbet sigs below judge none of
+/// it; the rule lives on in `compatible`, which the RBS-comment E0103
+/// (`#: (String, ...) -> void`) still applies to inferred instances.
+/// `ContractReopenParams.new` infers nothing (its reopened `Hash` ancestor
+/// is open), so the reopen's rule is held by `self` inside the subclass:
+/// an inferred instance whose complete ancestry names only the OPEN
+/// reopen of `Hash`.
+#[test]
+fn core_subclass_instances_satisfy_core_contracts() {
+    let source = r#"
+class ContractSafeStr < String
+end
+class ContractParams < Hash
+end
+class ContractRows < Array
+end
+class Hash
+  def contract_nominal_touch; self; end
+end
+class ContractReopenParams < Hash
+  def contract_pass_on
+    ContractCoreSubclasses.new.take(ContractSafeStr.new("b"), self, ContractRows.new)
+  end
+end
+class ContractGemBuffer
+  def contract_gem_touch; self; end
+end
+class ContractGemChild < ContractGemBuffer
+end
+class ContractCoreSubclasses
+  extend T::Sig
+  #: (String, Hash[Symbol, untyped], Array[Integer]) -> void
+  def take(text, data, rows); end
+  sig { returns(String) }
+  def text
+    ContractSafeStr.new("x")
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def params
+    ContractParams.new
+  end
+  sig { returns(T::Array[Integer]) }
+  def rows
+    ContractRows.new
+  end
+  sig { returns(T.nilable(String)) }
+  def maybe_text
+    ContractSafeStr.new("y")
+  end
+  sig { returns(T::Hash[String, Integer]) }
+  def reopened
+    ContractReopenParams.new
+  end
+  sig { returns(String) }
+  def gem_buffer
+    ContractGemBuffer.new
+  end
+  sig { returns(String) }
+  def gem_child
+    ContractGemChild.new
+  end
+end
+ContractCoreSubclasses.new.take(ContractSafeStr.new("a"), ContractParams.new, ContractRows.new)
+ContractCoreSubclasses.new.take(ContractGemChild.new, ContractReopenParams.new, ContractRows.new)
+ContractReopenParams.new.contract_pass_on
+"#;
+    let diags = check("core-subclasses", source, Some(r"
+class ContractGemBuffer < String
+end
+"));
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The controls that keep the ancestry rule a contract: a plain project
+/// class, and a project subclass chain, whose complete ancestry names no
+/// core type are still accused against `String`, `Hash` and `Array` by the
+/// RBS-comment E0103, which judges inferred instances. The Sorbet sigs
+/// below are handed instances, never literals: not judged.
+#[test]
+fn closed_project_ancestry_still_accuses_core_contracts() {
+    let source = r"
+class ContractPlainValue
+end
+class ContractPlainChild < ContractPlainValue
+end
+class ContractClosedAncestry
+  extend T::Sig
+  #: (String) -> void
+  def take(text); end
+  #: (Hash[Symbol, untyped]) -> void
+  def take_data(data); end
+  #: (Array[Integer]) -> void
+  def take_rows(rows); end
+  sig { returns(String) }
+  def text
+    ContractPlainValue.new
+  end
+  sig { returns(T::Hash[Symbol, T.untyped]) }
+  def data
+    ContractPlainChild.new
+  end
+  sig { returns(T::Array[Integer]) }
+  def rows
+    ContractPlainValue.new
+  end
+end
+ContractClosedAncestry.new.take(ContractPlainChild.new)
+ContractClosedAncestry.new.take_data(ContractPlainChild.new)
+ContractClosedAncestry.new.take_rows(ContractPlainValue.new)
+";
+    let diags = check("closed-ancestry", source, None);
+    assert_eq!(
+        contract_names(source, &diags),
+        ["ContractPlainChild.new", "ContractPlainChild.new", "ContractPlainValue.new"],
+        "{diags:?}"
+    );
+    assert_eq!(contract_codes(&diags), ["E0103"; 3], "{diags:?}");
+}
+
+/// Any class can gain a module at runtime by reflection the index never
+/// sees as an ancestor edge (`Late.include(M)`, `Late.send(:include, M)`,
+/// `Late.class_eval { include M }`, a class method that calls `include`),
+/// and `extend` makes a class object itself an instance of the module. So
+/// a module-typed contract never accuses anything.
+#[test]
+fn module_typed_contracts_never_accuse() {
+    let source = r#"
+module ContractPlugin
+end
+class ContractLateInclude
+end
+ContractLateInclude.include(ContractPlugin)
+class ContractLateSend
+end
+ContractLateSend.send(:include, ContractPlugin)
+class ContractLateEval
+end
+ContractLateEval.class_eval { include ContractPlugin }
+class ContractLateHook
+  def self.plug
+    include ContractPlugin
+  end
+end
+ContractLateHook.plug
+class ContractLateExtend
+end
+ContractLateExtend.extend(ContractPlugin)
+class ContractPluginUser
+  extend T::Sig
+  sig { params(plugin: ContractPlugin).void }
+  def take(plugin); end
+  sig { returns(ContractPlugin) }
+  def included
+    ContractLateInclude.new
+  end
+  sig { returns(ContractPlugin) }
+  def sent
+    ContractLateSend.new
+  end
+  sig { returns(ContractPlugin) }
+  def evaluated
+    ContractLateEval.new
+  end
+  sig { returns(ContractPlugin) }
+  def hooked
+    ContractLateHook.new
+  end
+  sig { returns(ContractPlugin) }
+  def extended
+    ContractLateExtend
+  end
+  sig { returns(ContractPlugin) }
+  def text
+    "a string with the module mixed in by reflection"
+  end
+end
+ContractPluginUser.new.take(ContractLateInclude.new)
+ContractPluginUser.new.take(ContractLateHook.new)
+ContractPluginUser.new.take(1)
+"#;
+    let diags = check("module-contracts", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(source, &diags));
+}
+
+/// The control for the module rule: a CLASS-typed contract is still held
+/// nominally — a literal is accused, in a return and in an argument. An
+/// unrelated project instance is inferred, never written: not judged.
+#[test]
+fn class_typed_contracts_still_accuse_unrelated_values() {
+    let source = r#"
+class ContractClassTarget
+end
+class ContractClassStranger
+end
+class ContractClassUser
+  extend T::Sig
+  sig { params(target: ContractClassTarget).void }
+  def take(target); end
+  sig { returns(ContractClassTarget) }
+  def stranger
+    ContractClassStranger.new
+  end
+  sig { returns(ContractClassTarget) }
+  def text
+    "text"
+  end
+end
+ContractClassUser.new.take(ContractClassStranger.new)
+ContractClassUser.new.take(:symbol)
+"#;
+    let diags = check("class-contracts", source, None);
+    assert_eq!(contract_names(source, &diags), ["text", ":symbol"], "{diags:?}");
+}
+
+// -- redefinition: every path that redefines or shadows a signed method --
+
+/// A signed class method and a signed instance method, each called once
+/// with a String. `BODY` goes inside the class body.
+const SCALED: &str = r#"
+class ContractScaleCfg
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def self.scale(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+  BODY
+end
+ContractScaleCfg.scale("text")
+ContractScaleCfg.new.grow("text")
+"#;
+
+/// Each answers one of the names with a String-taking body.
+const STRING_SCALE: &str = r"
+module ContractStringScale
+  def scale(x)
+    x.to_s
+  end
+end
+module ContractStringGrow
+  def grow(x)
+    x.to_s
+  end
+end
+";
+
+fn scaled(body: &str) -> String {
+    SCALED.replace("BODY", body)
+}
+
+/// The accused call sites of a `SCALED` project, by receiver method.
+fn scaled_accusations(diags: &[Diagnostic], sources: &[&str]) -> Vec<String> {
+    let calls = sources[0];
+    diags
+        .iter()
+        .filter(|d| matches!(d.code, "E0103" | "E0109"))
+        .map(|d| {
+            let line_start = calls[..d.start].rfind('\n').map_or(0, |i| i + 1);
+            let line_end = calls[d.start..].find('\n').map_or(calls.len(), |i| d.start + i);
+            calls[line_start..line_end].trim().to_owned()
+        })
+        .collect()
+}
+
+/// `def Const.m` written anywhere — top level, another class body, a
+/// method body — redefines `Const`'s singleton `m`: the signed `def
+/// self.m` is no longer proven to be what runs. The instance track keeps
+/// its contract.
+#[test]
+fn def_on_a_constant_redefines_its_singleton_contract() {
+    let base = scaled("");
+    let redefs = [
+        "def ContractScaleCfg.scale(x)\n  x.to_s\nend\n",
+        "class ContractScaleOther\n  def ContractScaleCfg.scale(x)\n    x.to_s\n  end\nend\n",
+        "module ContractScaleBoot\n  def self.boot\n    def ContractScaleCfg.scale(x)\n      x.to_s\n    end\n  end\nend\n",
+    ];
+    for (i, redef) in redefs.iter().enumerate() {
+        let sources = [base.as_str(), *redef];
+        let diags = check_files(&format!("def-on-const-{i}"), &sources);
+        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.new.grow(\"text\")"], "{redef}: {diags:?}");
+    }
+
+    let sources = [base.as_str(), "class ContractScaleOther; end\ndef ContractScaleOther.scale(x)\n  x.to_s\nend\n"];
+    let control = check_files("def-on-const-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the def lands on another constant: {control:?}"
+    );
+    // `def X.grow` lands on the class object, never on its instances.
+    let sources = [base.as_str(), "def ContractScaleCfg.grow(x)\n  x.to_s\nend\n"];
+    let control = check_files("def-on-const-instance-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "a class-object def must keep the instance contract of the same name: {control:?}"
+    );
+    // `def Integer.+` is a class method: `100 + "R$"` still raises
+    // `TypeError` under MRI, so the operand check still accuses it.
+    let diags = check("def-on-core", "def Integer.+(other)\n  other\nend\nprice = 100\nprice + \"R$\"\n", None);
+    assert!(diags.iter().any(|d| d.code == "E0108"), "{diags:?}");
+}
+
+/// A prepend lands in FRONT of the class it targets: a module prepended
+/// to the singleton class — `class << self; prepend M; end` in the body,
+/// `X.singleton_class.prepend(M)` from outside, `class << X` out of line —
+/// shadows the signed class method it answers, also from a method body. A
+/// module whose methods are not fully known takes every contract on that
+/// track off, and may answer `new` too, so `ContractScaleCfg.new` then
+/// proves no instance either.
+#[test]
+fn singleton_prepend_takes_the_shadowed_contract_off() {
+    // The last two shapes' module answers no `scale` itself: its
+    // `prepended` hook defines one on the singleton class it lands on. The
+    // last does it through a dynamic `send`, which records no definition
+    // (`hidden_definer_sources`), so only `known_mixin_names` reading the
+    // hook takes the contract off. Measured on ruby 3.4.2 with
+    // sorbet-runtime 0.6.13036: with the prepend `scale("text")` returns
+    // "text" while `grow("text")` still raises `TypeError`.
+    let shapes: [(&str, &str); 7] = [
+        ("class << self\n    prepend ContractStringScale\n  end", ""),
+        ("", "ContractScaleCfg.singleton_class.prepend(ContractStringScale)\n"),
+        (
+            "",
+            "module ContractScaleInstall\n  def self.install\n    ContractScaleCfg.singleton_class.prepend(ContractStringScale)\n  end\nend\nContractScaleInstall.install\n",
+        ),
+        ("", "class << ContractScaleCfg\n  prepend ContractStringScale\nend\n"),
+        ("class << self\n    prepend ContractScaleUnknown::Patch\n  end", ""),
+        (
+            "class << self\n    prepend ContractScaleHooked\n  end",
+            "module ContractScaleHooked\n  def self.prepended(base)\n    base.define_method(:scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+        (
+            "class << self\n    prepend ContractScaleHooked\n  end",
+            "module ContractScaleHooked\n  def self.prepended(base)\n    definer = :define_method\n    base.send(definer, :scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+    ];
+    for (i, (body, outside)) in shapes.iter().enumerate() {
+        let target = scaled(body);
+        let extra = format!("{STRING_SCALE}{outside}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("singleton-prepend-{i}"), &sources);
+        let expected: &[&str] = if i == 4 { &[] } else { &["ContractScaleCfg.new.grow(\"text\")"] };
+        assert_eq!(scaled_accusations(&diags, &sources), expected, "{body}{outside}: {diags:?}");
+    }
+
+    // A fully known module that does not answer `scale` shadows nothing.
+    let target = scaled("class << self\n    prepend ContractScaleQuiet\n  end");
+    let quiet = "module ContractScaleQuiet\n  def quiet; end\nend\n";
+    let sources = [target.as_str(), quiet];
+    let control = check_files("singleton-prepend-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the prepended module shadows nothing: {control:?}"
+    );
+}
+
+/// An instance-track prepend, in the body or from outside, shadows the
+/// signed instance method it answers; the class method keeps its contract.
+#[test]
+fn instance_prepend_takes_the_shadowed_contract_off() {
+    let shapes: [(&str, &str); 3] = [
+        ("prepend ContractStringGrow", ""),
+        ("", "ContractScaleCfg.prepend(ContractStringGrow)\n"),
+        ("prepend ContractScaleUnknown::Patch", ""),
+    ];
+    for (i, (body, outside)) in shapes.iter().enumerate() {
+        let target = scaled(body);
+        let extra = format!("{STRING_SCALE}{outside}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("instance-prepend-{i}"), &sources);
+        assert_eq!(scaled_accusations(&diags, &sources), ["ContractScaleCfg.scale(\"text\")"], "{body}{outside}: {diags:?}");
+    }
+}
+
+/// An `include`/`extend` written OUTSIDE the class runs the module's
+/// `included`/`extended` hook on it exactly as one in the body does: the
+/// hook may redefine or prepend over anything, so every contract of the
+/// class comes off. A hookless module mixed in from outside keeps them.
+#[test]
+fn external_mixin_hook_takes_the_contract_off() {
+    let hooks = [
+        (
+            "ContractScaleCfg.extend(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.extended(base)\n    base.define_singleton_method(:scale) { |x| x.to_s }\n  end\nend\n",
+        ),
+        (
+            "ContractScaleCfg.extend(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.extended(base)\n    base.singleton_class.prepend(ContractStringScale)\n  end\nend\n",
+        ),
+        (
+            "ContractScaleCfg.include(ContractScaleHook)\n",
+            "module ContractScaleHook\n  def self.included(base)\n    base.prepend(ContractStringGrow)\n  end\nend\n",
+        ),
+    ];
+    for (i, (call, hook)) in hooks.iter().enumerate() {
+        let target = scaled("");
+        let extra = format!("{STRING_SCALE}{hook}{call}");
+        let sources = [target.as_str(), extra.as_str()];
+        let diags = check_files(&format!("external-hook-{i}"), &sources);
+        assert!(scaled_accusations(&diags, &sources).is_empty(), "{hook}{call}: {diags:?}");
+    }
+
+    // The in-body spelling stays silent too.
+    let target = scaled("extend ContractScaleHook");
+    let extra = format!("{STRING_SCALE}{}", hooks[1].1);
+    let sources = [target.as_str(), extra.as_str()];
+    let diags = check_files("external-hook-in-body", &sources);
+    assert!(scaled_accusations(&diags, &sources).is_empty(), "{diags:?}");
+
+    let target = scaled("");
+    let plain = "module ContractScalePlain\n  def plain; end\nend\nContractScaleCfg.include(ContractScalePlain)\nContractScaleCfg.extend(ContractScalePlain)\n";
+    let sources = [target.as_str(), plain];
+    let control = check_files("external-hook-control", &sources);
+    assert_eq!(
+        scaled_accusations(&control, &sources),
+        ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"],
+        "control must accuse when the external mixin has no hook: {control:?}"
+    );
+}
+
+/// Whatever redefines a subclass from outside its body — a hooked mixin, a
+/// `define_method`, a prepend of a module nobody can read — is a dispatch
+/// target the parent's contract cannot speak for.
+#[test]
+fn outside_redefinition_of_a_subclass_keeps_the_parent_contract_off_the_call() {
+    const FAMILY: &str = r#"
+class ContractScaleParent
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+class ContractScaleChild < ContractScaleParent
+  CHILD
+end
+class ContractScaleUser
+  def use
+    ContractScaleParent.new.grow("text")
+  end
+end
+"#;
+    let hook = "module ContractScaleHook\n  def self.included(base)\n    base.define_method(:grow) { |x| x.to_s }\n  end\nend\n";
+    let shapes = [
+        ("", format!("{hook}ContractScaleChild.include(ContractScaleHook)\n")),
+        ("", "ContractScaleChild.define_method(:grow) { |x| x.to_s }\n".to_owned()),
+        ("prepend ContractScaleUnknown::Patch", String::new()),
+    ];
+    for (i, (child, outside)) in shapes.iter().enumerate() {
+        let family = FAMILY.replace("CHILD", child);
+        let diags = check_files(&format!("outside-family-{i}"), &[&family, outside]);
+        assert!(contract_codes(&diags).is_empty(), "{child}{outside}: {diags:?}");
+    }
+
+    let control = check_files("outside-family-control", &[&FAMILY.replace("CHILD", ""), hook]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse without the redefinition: {control:?}");
+}
+
+/// `+`, `concat`, `<<`, `push` and `merge` answer a collection holding BOTH
+/// sides: the union of the element types when every side is known, Unknown
+/// elements otherwise — never the receiver's type alone. The values are
+/// inferred, so no contract judges them; hover shows the elements.
+#[test]
+fn combinators_hold_both_sides_elements() {
+    let source = r#"
+class ContractCombine
+  def plus
+    ([1] + ["a"]).last
+  end
+  def concat
+    [1].concat(["s"]).last
+  end
+  def shovel
+    ([1] << "s").last
+  end
+  def push
+    [1].push("s").last
+  end
+  def merge
+    {a: 1}.merge({b: "x"}).values.last
+  end
+  def merge_keywords
+    {a: 1}.merge(b: "x").values.last
+  end
+  def unknown_side(other)
+    ([1] + other).last
+  end
+  def plus_same
+    ([1] + [2]).last
+  end
+  def merge_same
+    {a: 1}.merge({b: 2}).values.last
+  end
+end
+"#;
+    let diags = check("combinators", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    let both = Some("Integer | String");
+    assert_types("combinators", source, &[
+        ("def plus\n", "last", both),
+        ("def concat", "last", both),
+        ("def shovel", "last", both),
+        ("def push", "last", both),
+        ("def merge\n", "last", both),
+        // Keyword arguments hide the argument shape: never the receiver's.
+        ("def merge_keywords", "last", None),
+        ("def unknown_side", "last", None),
+        ("def plus_same", "last", Some("Integer")),
+        ("def merge_same", "last", Some("Integer")),
+    ]);
+}
+
+/// An iterator called without a block answers an `Enumerator`, never the
+/// receiver: `Enumerator#to_a`/`#with_index` exist, `Array#with_index`
+/// and `String#to_a` do not.
+#[test]
+fn blockless_iterators_answer_an_enumerator() {
+    let diags = check("blockless", r#"
+class ContractBlockless
+  extend T::Sig
+  sig { params(pair: T::Array[Integer]).returns(Integer) }
+  def take(pair)
+    1
+  end
+  def calls
+    take([3, 1].each_with_index.to_a.last)
+    [1].sort_by.with_index { |x, i| i }
+    {a: 1}.each.with_index { |pair, i| i }
+    "abc".gsub(/b/).to_a
+  end
+end
+"#, None);
+    assert!(diags.is_empty(), "{diags:?}");
+
+    // With the block, the receiver comes back: its element is proven (and
+    // no contract judges the inferred value), and `Hash#with_index` does
+    // not exist.
+    let control_source = r"
+class ContractBlocklessControl
+  extend T::Sig
+  sig { params(pair: T::Array[Integer]).returns(Integer) }
+  def take(pair)
+    1
+  end
+  def calls
+    take([3, 1].each_with_index { |x, i| x }.last)
+    {a: 1}.each { |k, v| k }.with_index
+  end
+end
+";
+    let control = check("blockless-control", control_source, None);
+    assert_eq!(codes(&control), ["E0101"], "{control:?}");
+    assert_eq!(ty_at("blockless-control", control_source, "take([3, 1]", "last").as_deref(), Some("Integer"));
+    let blockless = "x = [3, 1].each_with_index.to_a.last\n";
+    assert_eq!(ty_at("blockless", blockless, "x = ", "last"), None);
+}
+
+/// A method that builds its result from the block answers what the block
+/// returned; `split`/`chars` with a block answer the receiver string.
+#[test]
+fn block_built_core_results_are_unproven() {
+    const SOURCE: &str = r#"
+class ContractBlockBuilt
+  extend T::Sig
+  sig { params(s: String).returns(Integer) }
+  def take(s)
+    1
+  end
+  def calls
+    take({a: 1}.to_h BLOCK_TO_H.values.last)
+    take({a: 1}.merge({a: 2}) BLOCK_MERGE.values.last)
+    take("a b".split(" ") BLOCK_SPLIT)
+  end
+end
+"#;
+    let built = SOURCE
+        .replace("BLOCK_TO_H", "{ |k, v| [k.to_s, v.to_s] }")
+        .replace("BLOCK_MERGE", "{ |k, x, y| \"s\" }")
+        .replace("BLOCK_SPLIT", "{ |w| w }");
+    let diags = check("block-built", &built, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let plain = SOURCE.replace("BLOCK_TO_H", "").replace("BLOCK_MERGE", "").replace("BLOCK_SPLIT", "");
+    let control = check("block-built-control", &plain, None);
+    // The arguments are inferred: no contract judges them either way.
+    assert!(contract_codes(&control).is_empty(), "{control:?}");
+    for (anchor, at, plain_ty) in [("take({a: 1}.to_h", "last", Some("Integer")),
+                                   ("take({a: 1}.merge", "last", Some("Integer")),
+                                   ("take(\"a b\"", "split", Some("Array[String]"))] {
+        assert_eq!(ty_at("block-built", &built, anchor, at), None, "{anchor}");
+        assert_eq!(ty_at("block-built-control", &plain, anchor, at).as_deref(), plain_ty, "{anchor}");
+    }
+}
+
+/// A local collection changed in place, or handed to anything that can
+/// change it, holds unproven elements on every read in its scope.
+#[test]
+fn in_place_changes_unprove_a_local_collection() {
+    let source = r#"
+class ContractInPlace
+  extend T::Sig
+  sig { returns(String) }
+  def shovel
+    arr = [1]
+    arr << "s"
+    arr.last
+  end
+  sig { returns(String) }
+  def map_bang
+    arr = [1]
+    arr.map!(&:to_s)
+    arr.last
+  end
+  sig { returns(String) }
+  def replace
+    arr = [1]
+    arr.replace(["s"])
+    arr.last
+  end
+  sig { returns(String) }
+  def unshift
+    arr = [1]
+    arr.unshift("s")
+    arr.first
+  end
+  sig { returns(String) }
+  def fill
+    arr = [1]
+    arr.fill("s")
+    arr.last
+  end
+  sig { returns(String) }
+  def clear_push
+    arr = [1]
+    arr.clear.push("s")
+    arr.last
+  end
+  sig { returns(String) }
+  def helper
+    arr = [1]
+    mutate(arr)
+    arr.last
+  end
+  sig { returns(String) }
+  def alias_write
+    arr = [1]
+    other = arr
+    other << "s"
+    arr.last
+  end
+  sig { returns(String) }
+  def store
+    h = {a: 1}
+    h[:b] = "s"
+    h.values.last
+  end
+  sig { returns(String) }
+  def iteration_value
+    arr = [1]
+    other = (arr.each(&:to_s))
+    other << "s"
+    arr.last
+  end
+  def mutate(a)
+    a << "s"
+  end
+end
+class ContractInPlaceScopes
+  list = [1]
+  list.size
+  class << self
+    list = [1]
+    list << "s"
+    list.last.upcase
+  end
+end
+"#;
+    let diags = check("in-place", source, None);
+    assert!(diags.is_empty(), "{diags:?}");
+    for method in ["shovel", "map_bang", "replace", "unshift", "fill", "clear_push", "helper", "alias_write", "store", "iteration_value"] {
+        let tail = if method == "unshift" { "first\n  end" } else { "last\n  end" };
+        assert_eq!(ty_at("in-place", source, &format!("def {method}\n"), tail), None, "{method}");
+    }
+    assert_eq!(ty_at("in-place", source, "class << self", "last.upcase"), None);
+
+    // A string `eval` can rewrite any local of its scope.
+    let evaled_source = r#"
+class ContractInPlaceSink
+  extend T::Sig
+  sig { params(s: String).returns(String) }
+  def take(s)
+    s
+  end
+end
+arr = [1]
+eval("arr << 's'")
+ContractInPlaceSink.new.take(arr.last)
+"#;
+    let evaled = check("in-place-eval", evaled_source, None);
+    assert!(evaled.is_empty(), "{evaled:?}");
+    assert_eq!(ty_at("in-place-eval", evaled_source, "ContractInPlaceSink.new.take", "last"), None);
+    // A block handed to `eval` is ignored: it is still a string `eval`
+    // (MRI: `arr = [1]; eval("arr << 's'") { }; arr.last # => "s"`).
+    let evaled_block = evaled_source.replace("eval(\"arr << 's'\")", "eval(\"arr << 's'\") { }");
+    let evaled = check("in-place-eval-block", &evaled_block, None);
+    assert!(evaled.is_empty(), "{evaled:?}");
+    assert_eq!(ty_at("in-place-eval-block", &evaled_block, "ContractInPlaceSink.new.take", "last"), None);
+
+    // Reads that neither change nor hand out the collection keep it: a
+    // query, and an iteration whose value is dropped. The value is inferred,
+    // so no contract judges it.
+    let control_source = r"
+class ContractInPlaceControl
+  extend T::Sig
+  sig { returns(String) }
+  def reads
+    arr = [1]
+    arr.size
+    arr.each(&:to_s)
+    arr.last
+  end
+end
+";
+    let control = check("in-place-control", control_source, None);
+    assert!(control.is_empty(), "{control:?}");
+    assert_eq!(ty_at("in-place-control", control_source, "def reads", "last\n  end").as_deref(), Some("Integer"));
+}
+
+/// A collection inside a collection is shared by reference: changing it
+/// through one path changes what the outer one holds.
+#[test]
+fn a_collection_inside_a_collection_is_shared() {
+    let source = r#"
+class ContractNested
+  extend T::Sig
+  sig { returns(String) }
+  def first_inner
+    outer = [[1]]
+    outer.first << "s"
+    outer.first.last
+  end
+  sig { returns(String) }
+  def hash_values
+    outer = {a: [1]}
+    outer[:a] << "s"
+    outer.values.first.last
+  end
+  sig { returns(String) }
+  def flattened
+    outer = [[1]]
+    outer.first << "s"
+    outer.flatten.last
+  end
+end
+"#;
+    let diags = check("nested", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    for method in ["first_inner", "hash_values", "flattened"] {
+        assert_eq!(ty_at("nested", source, &format!("def {method}"), "last\n  end"), None, "{method}");
+    }
+
+    // The category of the inner collection is still proven.
+    let control_source = r"
+class ContractNestedControl
+  extend T::Sig
+  sig { returns(String) }
+  def first_inner
+    outer = [[1]]
+    outer.first
+  end
+end
+";
+    let control = check("nested-control", control_source, None);
+    assert!(contract_codes(&control).is_empty(), "{control:?}");
+    assert_eq!(ty_at("nested-control", control_source, "def first_inner", "first\n  end").as_deref(), Some("Array[untyped]"));
+}
+
+/// An ivar collection can be changed in place by any method of the object;
+/// the write fold never sees it, so its elements are unproven.
+#[test]
+fn ivar_collections_hold_unproven_elements() {
+    let source = r"
+class ContractIvarCollection
+  extend T::Sig
+  def initialize
+    @items = [1]
+  end
+  def add(item)
+    @items << item
+  end
+  sig { returns(String) }
+  def newest
+    @items.last
+  end
+end
+";
+    let diags = check("ivar-collection", source, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    assert_eq!(ty_at("ivar-collection", source, "def newest", "last"), None);
+
+    // Its category is still proven; the value is inferred, so no contract
+    // judges it.
+    let control_source = r"
+class ContractIvarCollectionControl
+  extend T::Sig
+  def initialize
+    @items = [1]
+  end
+  sig { returns(String) }
+  def all
+    @items
+  end
+end
+";
+    let control = check("ivar-collection-control", control_source, None);
+    assert!(contract_codes(&control).is_empty(), "{control:?}");
+    assert_eq!(ty_at("ivar-collection-control", control_source, "def all", "@items\n  end").as_deref(), Some("Array[untyped]"));
+}
+
+/// The memoized writer lookup behind ivar proofs still sees what a
+/// descendant brings along: a module it includes that defines the writer,
+/// or a `method_missing` (here a literal `alias_method`, which leaves the
+/// class closed) that answers any name.
+#[test]
+fn ivar_writer_supplied_below_the_reader_is_unproven() {
+    const SOURCE: &str = r"
+module ContractIvarNamed
+  attr_writer :name
+end
+class ContractIvarModBase
+  extend T::Sig
+  def initialize
+    @name = :anon
+  end
+  sig { returns(String) }
+  def label
+    @name
+  end
+end
+class ContractIvarModChild < ContractIvarModBase
+  MIXIN
+end
+class ContractIvarGhostBase
+  extend T::Sig
+  def initialize
+    @name = :anon
+  end
+  sig { returns(String) }
+  def label
+    @name
+  end
+end
+class ContractIvarGhostChild < ContractIvarGhostBase
+  GHOST
+end
+";
+    let supplied = SOURCE
+        .replace("MIXIN", "include ContractIvarNamed")
+        .replace("GHOST", "def ghost(name, *args)\n    nil\n  end\n  alias_method :method_missing, :ghost");
+    let diags = check("ivar-writer-below", &supplied, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let plain = SOURCE.replace("MIXIN", "").replace("GHOST", "");
+    let control = check("ivar-writer-below-control", &plain, None);
+    assert!(contract_codes(&control).is_empty(), "{control:?}");
+    for base in ["class ContractIvarModBase", "class ContractIvarGhostBase"] {
+        assert_eq!(ty_at("ivar-writer-below", &supplied, base, "@name\n  end"), None, "{base}");
+        assert_eq!(ty_at("ivar-writer-below-control", &plain, base, "@name\n  end").as_deref(), Some("Symbol"), "{base}");
+    }
+}
+
+/// Every class of a deep hierarchy reads an ivar it writes: whether some
+/// other writer hides it is settled once per (class, ivar) on memoized
+/// ancestries, so the check linearizes each class a bounded number of
+/// times instead of once per descendant per read.
+#[test]
+fn deep_hierarchy_ivar_reads_linearize_each_class_once() {
+    const DEPTH: u64 = 150;
+    let chain: Vec<String> = (1..DEPTH)
+        .map(|i| format!("class Deep{i} < Deep{}\n  def w{i}\n    @b{i} = 1\n    @b{i}.abs\n  end\nend\n", i - 1))
+        .collect();
+    let source = format!("class Deep0\n  def initialize\n    @a = 1\n  end\n  def r0\n    @a.abs\n  end\nend\n{}", chain.concat());
+    let before = itaruby_semantic::ancestor_walks();
+    let diags = check("deep-hierarchy", &source, None);
+    let walks = itaruby_semantic::ancestor_walks() - before;
+    assert!(diags.is_empty(), "{diags:?}");
+    // Once per class; the old per-read walk did ~DEPTH^2 / 2.
+    assert!(walks <= 2 * DEPTH, "{walks} linearizations for {DEPTH} classes");
+}
+
+// -- literal-only: a contract accuses only a value WRITTEN as a literal --
+
+/// Every literal kind, in return position (E0109) and argument position
+/// (E0103), against a contract it cannot satisfy. A bare keyword hash
+/// (`str(a: 1)`) is never judged: its pairs bind keyword parameters by
+/// name, and without a keyword layout which parameter receives it as a
+/// Hash is never guessed (see
+/// `keywords_and_defaults_keep_named_correspondence`); Ruby has no bare
+/// keyword hash in return position.
+const LITERAL_RETURNS: &str = r#"
+class ContractLiteralReturns
+  extend T::Sig
+  sig { returns(Integer) }
+  def plain_string
+    "s"
+  end
+  sig { params(n: T.untyped).returns(Integer) }
+  def interpolated_string(n)
+    "s#{n}"
+  end
+  sig { returns(String) }
+  def plain_symbol
+    :s
+  end
+  sig { params(n: T.untyped).returns(String) }
+  def interpolated_symbol(n)
+    :"s#{n}"
+  end
+  sig { returns(String) }
+  def integer_value
+    1
+  end
+  sig { returns(Integer) }
+  def float_value
+    1.5
+  end
+  sig { returns(Integer) }
+  def rational_value
+    3r
+  end
+  sig { returns(Float) }
+  def imaginary_value
+    2i
+  end
+  sig { returns(String) }
+  def nil_value
+    nil
+  end
+  sig { returns(String) }
+  def true_value
+    true
+  end
+  sig { returns(Integer) }
+  def false_value
+    false
+  end
+  sig { returns(String) }
+  def array_value
+    [1]
+  end
+  sig { returns(T::Array[Integer]) }
+  def hash_value
+    { a: 1 }
+  end
+  sig { returns(String) }
+  def parenthesized_return
+    return({ a: 1 })
+  end
+  sig { returns(T::Array[Integer]) }
+  def range_value
+    (1..2)
+  end
+  sig { returns(Integer) }
+  def file_value
+    __FILE__
+  end
+  sig { returns(String) }
+  def line_value
+    __LINE__
+  end
+  sig { returns(String) }
+  def regexp_value
+    /s/
+  end
+  sig { returns(Integer) }
+  def parenthesized_value
+    ("s")
+  end
+  sig { returns(String) }
+  def bare_return
+    return
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def explicit_return(flag)
+    return 1 if flag
+    :s
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def every_branch(flag)
+    flag ? 1 : :s
+  end
+end
+"#;
+
+const LITERAL_ARGUMENTS: &str = r#"
+class ContractLiteralArgs
+  extend T::Sig
+  sig { params(n: Integer).void }
+  def int(n); end
+  sig { params(s: String).void }
+  def str(s); end
+  sig { params(n: Integer).void }
+  def kw(n:); end
+end
+ContractLiteralArgs.new.int("s")
+ContractLiteralArgs.new.int("s#{1}")
+ContractLiteralArgs.new.int(:s)
+ContractLiteralArgs.new.int(:"s#{1}")
+ContractLiteralArgs.new.str(1)
+ContractLiteralArgs.new.int(1.5)
+ContractLiteralArgs.new.int(3r)
+ContractLiteralArgs.new.int(2i)
+ContractLiteralArgs.new.int(nil)
+ContractLiteralArgs.new.int(true)
+ContractLiteralArgs.new.int(false)
+ContractLiteralArgs.new.int([1])
+ContractLiteralArgs.new.int({ a: 1 })
+ContractLiteralArgs.new.int(1..2)
+ContractLiteralArgs.new.int(__FILE__)
+ContractLiteralArgs.new.str(__LINE__)
+ContractLiteralArgs.new.int(/s/)
+ContractLiteralArgs.new.int(("s"))
+ContractLiteralArgs.new.kw(n: "s")
+ContractLiteralArgs.new.str(a: 1)
+"#;
+
+/// Values that are not literals are never judged, however precisely they
+/// infer. Each shape below contradicts its signature by inference alone;
+/// `mixed_tail` and `mixed_return` pair a mismatching literal with a return
+/// point that is not one, where the literal is not the whole story.
+const NON_LITERAL_VALUES: &str = r#"
+class ContractPlainThing
+end
+class ContractNonLiteral
+  extend T::Sig
+  sig { params(n: Integer).returns(String) }
+  def param_bound(n)
+    n
+  end
+  sig { returns(Integer) }
+  def count
+    1
+  end
+  sig { returns(String) }
+  def call_typed_by_sig
+    count
+  end
+  sig { params(n: Integer).returns(String) }
+  def self.build(n)
+    n.to_s
+  end
+  sig { returns(Integer) }
+  def call_typed_by_class_sig
+    ContractNonLiteral.build(1)
+  end
+  sig { returns(Integer) }
+  def local_assigned
+    text = "s"
+    text
+  end
+  sig { params(n: Integer).returns(Integer) }
+  def converted(n)
+    n.to_s
+  end
+  sig { returns(String) }
+  def project_instance
+    ContractPlainThing.new
+  end
+  sig { returns(ContractPlainThing) }
+  def self_value
+    self
+  end
+  sig { params(flag: T.untyped).returns(Integer) }
+  def ternary(flag)
+    flag ? count : "s".size
+  end
+  sig { params(flag: T.untyped, text: String).returns(String) }
+  def mixed_tail(flag, text)
+    flag ? text : 1
+  end
+  sig { params(flag: T.untyped, text: String).returns(Integer) }
+  def mixed_return(flag, text)
+    return text if flag
+    :s
+  end
+  sig { params(s: String).void }
+  def take(s); end
+  def calls(n)
+    take(n)
+    take(count)
+    take(ContractPlainThing.new)
+    take(self)
+    take(n > 0 ? 1 : "s")
+    take((1 + 1))
+    take(1 #: as untyped
+    )
+  end
+end
+ContractNonLiteral.new.take(ContractNonLiteral.new.count)
+"#;
+
+/// The review's shapes (each runs under sorbet-runtime): every value they
+/// hold to a sig is inferred, never written.
+const REVIEW_SILENT: [(&str, &str); 8] = [
+    ("j-class-eval", r#"
+class JOrder
+  def a = 1
+end
+JOrder.class_eval { def a = "s" }
+class JUse
+  extend T::Sig
+  sig { returns(String) }
+  def ua = JOrder.new.a
+end
+"#),
+    ("k-override", r#"
+class KOrder
+  def a = 1
+end
+class KSub < KOrder
+  def a = "s"
+end
+class KUse
+  extend T::Sig
+  sig { params(o: KOrder).returns(String) }
+  def ua(o) = o.a
+end
+"#),
+    ("c-overridden-new", r"
+class CShape
+  def self.new(kind)
+    kind == :circle ? CCircle.allocate : super()
+  end
+end
+class CCircle < CShape
+end
+class CUse
+  extend T::Sig
+  sig { returns(CCircle) }
+  def circle = CShape.new(:circle)
+end
+"),
+    ("f-declared-supertype", r"
+class FNode
+end
+class FLeaf < FNode
+end
+class FTree
+  extend T::Sig
+  sig { returns(FNode) }
+  def self.find = FLeaf.new
+  sig { returns(FLeaf) }
+  def found = FTree.find
+end
+"),
+    ("h-setter-value", r"
+class HPerson
+  extend T::Sig
+  sig { params(value: String).returns(Integer) }
+  def age=(value)
+    @age = Integer(value)
+  end
+  sig { params(raw: String).returns(String) }
+  def update_age(raw) = (self.age = raw)
+end
+"),
+    ("a-is-a-override", r"
+class AFoo
+end
+class ALiar
+  def is_a?(klass) = klass == AFoo || super
+end
+class AUse
+  extend T::Sig
+  sig { returns(AFoo) }
+  def foo = ALiar.new
+end
+"),
+    ("b-declared-elements", r#"
+class BIds
+  extend T::Sig
+  sig { returns(T::Array[Integer]) }
+  def ids = ["a"]
+  sig { returns(String) }
+  def first_id = ids.first
+end
+"#),
+    ("d-refinement", r#"
+class DCfg
+  def scale = 1
+end
+module DRefine
+  refine DCfg do
+    def scale = "big"
+  end
+end
+using DRefine
+class DUse
+  extend T::Sig
+  sig { returns(String) }
+  def a = DCfg.new.scale
+end
+"#),
+];
+
+#[test]
+fn contracts_accuse_only_literal_values() {
+    let diags = check("literal-returns", LITERAL_RETURNS, None);
+    let accused = contract_names(LITERAL_RETURNS, &diags);
+    let defined: Vec<&str> = LITERAL_RETURNS
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("def "))
+        .map(|rest| rest.split('(').next().unwrap_or(rest))
+        .collect();
+    assert_eq!(accused, defined, "{diags:?}");
+    assert!(diags.iter().all(|d| d.code == "E0109"), "{diags:?}");
+    for (method, got) in [("line_value", "got Integer"), ("rational_value", "got Rational"), ("imaginary_value", "got Complex"),
+                          ("range_value", "got Range"), ("regexp_value", "got Regexp"), ("every_branch", "got Integer | Symbol")] {
+        let d = diags.iter().find(|d| &LITERAL_RETURNS[d.start..d.end] == method).unwrap();
+        assert!(d.message.contains(got), "{method}: {d:?}");
+    }
+
+    let diags = check("literal-arguments", LITERAL_ARGUMENTS, None);
+    let calls: Vec<&str> = LITERAL_ARGUMENTS
+        .lines()
+        .filter_map(|line| line.strip_prefix("ContractLiteralArgs.new."))
+        .filter(|call| !call.starts_with("str(a:"))
+        .map(|call| {
+            let inner = &call[call.find('(').unwrap() + 1..call.len() - 1];
+            inner.strip_prefix("n: ").unwrap_or(inner)
+        })
+        .collect();
+    assert_eq!(contract_names(LITERAL_ARGUMENTS, &diags), calls, "{diags:?}");
+    assert!(diags.iter().all(|d| d.code == "E0103"), "{diags:?}");
+
+    let diags = check("non-literal-values", NON_LITERAL_VALUES, None);
+    assert!(contract_codes(&diags).is_empty(), "{:?}", contract_names(NON_LITERAL_VALUES, &diags));
+    for (name, source) in REVIEW_SILENT {
+        let diags = check(name, source, None);
+        assert!(contract_codes(&diags).is_empty(), "{name}: {diags:?}");
+    }
+}
+
+/// `__LINE__` is an Integer and a rational or complex literal no modeled
+/// type, for every consumer — not only for a contract.
+#[test]
+fn source_line_and_exotic_numerics_type_their_consumers() {
+    let source = "x = __LINE__\ny = 3r\nz = 2i\nw = __FILE__\n";
+    assert_eq!(ty_at("line", source, "x = ", "__LINE__").as_deref(), Some("Integer"));
+    assert_eq!(ty_at("rational", source, "y = ", "3r"), None);
+    assert_eq!(ty_at("imaginary", source, "z = ", "2i"), None);
+    assert_eq!(ty_at("file", source, "w = ", "__FILE__").as_deref(), Some("String"));
+}
+
+/// A Range, Regexp, Rational or Complex literal satisfies a contract this
+/// checker cannot read — a core name it does not model, a project reopen of
+/// that very class, a module — and nothing else.
+#[test]
+fn unmodeled_core_literals_fit_only_what_the_checker_cannot_read() {
+    let source = r"
+class Range
+  def contract_range_touch; self; end
+end
+module ContractRangeLike
+end
+class ContractUnmodeled
+  extend T::Sig
+  sig { returns(Range) }
+  def reopened
+    (1..2)
+  end
+  sig { returns(Regexp) }
+  def core_name
+    /s/
+  end
+  sig { returns(Numeric) }
+  def numeric
+    3r
+  end
+  sig { returns(ContractRangeLike) }
+  def module_typed
+    (1..2)
+  end
+  sig { returns(T.nilable(String)) }
+  def nilable
+    /s/
+  end
+end
+";
+    let diags = check("unmodeled-core", source, None);
+    assert_eq!(contract_names(source, &diags), ["nilable"], "{diags:?}");
+}
+
+/// A project that sets `T::Configuration.default_checked_level = :never`
+/// runs no sig check at all, so no Sorbet contract accuses anything there.
+/// The controls: the same project without that line, or with a literal
+/// `:always`, still accuses (`:tests` and expressions are inert too — see
+/// `default_checked_level_other_than_always_makes_sigs_inert`).
+#[test]
+fn default_checked_level_never_turns_contract_accusations_off() {
+    const SOURCE: &str = r#"
+LEVEL
+class ContractUnchecked
+  extend T::Sig
+  sig { params(n: Integer).returns(Integer) }
+  def echo(n)
+    "wrong"
+  end
+end
+ContractUnchecked.new.echo("bad")
+"#;
+    let off = SOURCE.replace("LEVEL", "T::Configuration.default_checked_level = :never");
+    let diags = check("checked-never", &off, None);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let config = "module ContractBoot\n  def self.boot\n    ::T::Configuration.default_checked_level = :never\n  end\nend\n";
+    let diags = check_files("checked-never-elsewhere", &[&SOURCE.replace("LEVEL", ""), config]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    for (i, level) in ["", "T::Configuration.default_checked_level = :always"]
+        .iter()
+        .enumerate()
+    {
+        let control = check(&format!("checked-control-{i}"), &SOURCE.replace("LEVEL", level), None);
+        assert_eq!(contract_codes(&control), ["E0109", "E0103"], "{level}: {control:?}");
+    }
+}
+
+/// `include A, B` is linearized here in reverse of Ruby's order (Ruby puts
+/// `A` first), so a name both modules answer would resolve to `B`'s signed
+/// method and accuse a literal that Ruby hands to `A`'s. Until that
+/// ancestry bug is fixed, a contract written in a module named by a
+/// multi-argument `include`/`prepend`/`extend` — or in an ancestor of one —
+/// is not trusted. One module per call keeps its contract.
+#[test]
+fn multi_argument_mixin_takes_the_contract_off() {
+    const SOURCE: &str = r#"
+module ContractQ
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def k(x) = x
+end
+module ContractR
+  def k(x) = x.to_s
+end
+class ContractE2
+  MIXIN
+end
+ContractE2.new.k("s")
+"#;
+    for (i, mixin) in ["include ContractR, ContractQ", "prepend ContractR, ContractQ", "include ContractR, ContractWrapsQ"]
+        .iter()
+        .enumerate()
+    {
+        let source = format!("module ContractWrapsQ\n  include ContractQ\nend\n{}", SOURCE.replace("MIXIN", mixin));
+        let diags = check(&format!("multi-mixin-{i}"), &source, None);
+        assert!(contract_codes(&diags).is_empty(), "{mixin}: {diags:?}");
+    }
+    let diags = check_files("multi-mixin-extend", &[&SOURCE.replace("MIXIN", "extend ContractR, ContractQ").replace("ContractE2.new.k", "ContractE2.k")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+
+    let control = check("multi-mixin-control", &SOURCE.replace("MIXIN", "include ContractQ"), None);
+    assert_eq!(contract_codes(&control), ["E0103"], "control must accuse with one module per call: {control:?}");
+}
+
+/// A collection literal is named by the category the contract compared,
+/// never by type arguments the verdict did not read.
+#[test]
+fn collection_literal_is_named_by_its_category() {
+    let diags = check("literal-name", r#"
+class ContractLiteralName
+  extend T::Sig
+  sig { returns(String) }
+  def lookup
+    { plants: "plants" }
+  end
+  sig { returns(Integer) }
+  def list = [1, 2]
+end
+"#, None);
+    let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
+    assert_eq!(messages, [
+        "return of `lookup` expects String, got Hash",
+        "return of `list` expects Integer, got Array",
+    ], "{diags:?}");
+}
+
+/// One signed class for the runtime-enforcement gates: `echo` breaks its
+/// contract with a literal on both sides (E0109, E0103), and `pass`
+/// returns its untyped argument, so only its DECLARED return can type the
+/// consumer that calls an absent method on the result (E0101). A sig
+/// sorbet-runtime does not enforce is inert: all three stay silent.
+/// `PRELUDE` goes before the class, `BODY` first inside it, and
+/// `CHECKED` after each builder chain.
+const RUNTIME_GATE: &str = r#"
+PRELUDE
+class ContractGateResult
+end
+class ContractGate < ContractGateBase
+  BODY
+  sig { params(n: Integer).returns(Integer)CHECKED }
+  def echo(n)
+    "wrong"
+  end
+  sig { params(n: T.untyped).returns(ContractGateResult)CHECKED }
+  def pass(n) = n
+end
+ContractGate.new.echo("bad")
+ContractGate.new.pass(nil).absent_gate_result
+"#;
+
+/// `RUNTIME_GATE` with its three holes filled, and the base class
+/// `ContractGate` inherits from written first with `base` as its body.
+fn runtime_gate(prelude: &str, base: &str, body: &str, checked: &str) -> String {
+    let prelude = format!("{prelude}\nclass ContractGateBase\n  {base}\nend");
+    RUNTIME_GATE.replace("PRELUDE", &prelude).replace("BODY", body).replace("CHECKED", checked)
+}
+
+/// The contract codes a gate fixture produces, sorted, with E0101 only for
+/// the typed consumer (a class with no `sig` method at all is a separate,
+/// true E0101 on the `sig` call itself).
+fn gate_codes(diags: &[Diagnostic]) -> Vec<&str> {
+    let typed = |d: &Diagnostic| d.code == "E0101" && d.message.contains("absent_gate_result");
+    let mut codes: Vec<&str> =
+        diags.iter().filter(|d| matches!(d.code, "E0103" | "E0109") || typed(d)).map(|d| d.code).collect();
+    codes.sort_unstable();
+    codes
+}
+
+const ENFORCED: [&str; 3] = ["E0101", "E0103", "E0109"];
+
+/// F1: `.checked(:never)` and `.checked(:tests)` are sigs sorbet-runtime
+/// does not check in the running program (measured, sorbet-runtime
+/// 0.6.13036: the call returns the wrong value unraised). The controls —
+/// no `checked`, or `.checked(:always)` — still accuse and type.
+#[test]
+fn checked_never_or_tests_sig_is_inert() {
+    for (i, checked) in [".checked(:never)", ".checked(:tests)"].iter().enumerate() {
+        let diags = check(&format!("checked-inert-{i}"), &runtime_gate("", "", "extend T::Sig", checked), None);
+        assert!(gate_codes(&diags).is_empty(), "{checked}: {diags:?}");
+    }
+    for (i, checked) in ["", ".checked(:always)"].iter().enumerate() {
+        let diags = check(&format!("checked-enforced-{i}"), &runtime_gate("", "", "extend T::Sig", checked), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{checked}: {diags:?}");
+    }
+}
+
+/// F2: `default_checked_level` set to anything but a literal `:always`
+/// — `:never`, `:tests`, or an expression this checker does not evaluate
+/// — leaves every sig possibly unchecked. The sig then neither accuses
+/// nor types its consumers. An RBI-only declaration's arguments are never
+/// accused, at any level (F6). The controls — no assignment, or a literal
+/// `:always` — still accuse and type.
+#[test]
+fn default_checked_level_other_than_always_makes_sigs_inert() {
+    let rbi = "class ContractGateGem\n  sig { params(value: Integer).returns(String) }\n  def accept(value); end\nend\n";
+    let external = "class ContractGateSite < ContractGateGem\n  def initialize; end\nend\nContractGateSite.new.accept(\"bad\")\n";
+    for (i, level) in [":never", ":tests", "ENV[\"STRICT\"] ? :always : :never"].iter().enumerate() {
+        let source = runtime_gate(&format!("T::Configuration.default_checked_level = {level}"), "", "extend T::Sig", "");
+        let diags = check(&format!("level-inert-{i}"), &format!("{source}{external}"), Some(rbi));
+        assert!(gate_codes(&diags).is_empty(), "{level}: {diags:?}");
+    }
+    for (i, prelude) in ["", "T::Configuration.default_checked_level = :always"].iter().enumerate() {
+        let source = runtime_gate(prelude, "", "extend T::Sig", "");
+        let diags = check(&format!("level-enforced-{i}"), &format!("{source}{external}"), Some(rbi));
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
+    }
+}
+
+/// F3: any `T::Configuration.*_handler` assignment may log instead of
+/// raising (measured: a `call_validation_error_handler` lambda lets the
+/// broken call run to its end), so no sig is proven enforced. The
+/// control — a `*_handler=` on a receiver that is not
+/// `T::Configuration` — still accuses and types; any other
+/// `T::Configuration` setting is inert too
+/// (`any_runtime_configuration_reference_makes_sigs_inert`).
+#[test]
+fn soft_runtime_error_handler_makes_sigs_inert() {
+    for (i, handler) in ["call_validation_error_handler", "sig_validation_error_handler", "inline_type_error_handler"]
+        .iter()
+        .enumerate()
+    {
+        let prelude = format!("::T::Configuration.{handler} = lambda {{ |*args| args }}");
+        let diags = check(&format!("handler-inert-{i}"), &runtime_gate(&prelude, "", "extend T::Sig", ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{handler}: {diags:?}");
+    }
+    let prelude = "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }";
+    let diags = check("handler-enforced", &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
+}
+
+/// F7: a bare `sig` is sorbet-runtime's only when `T::Sig` is on the
+/// class object: extended by the class or a superclass, or included into
+/// every class (`class Module; include T::Sig; end`,
+/// `Module.include(T::Sig)`). With no `T::Sig` (a homemade `def
+/// self.sig`, or an instance-side `include T::Sig`), or a homemade `def
+/// self.sig` that answers before an extended `T::Sig`, the sig is inert.
+#[test]
+fn sig_not_provided_by_t_sig_is_inert() {
+    for (i, (prelude, base, body)) in [
+        ("", "", ""),
+        ("", "", "include T::Sig"),
+        ("", "", "def self.sig(*args) = args"),
+        ("", "", "extend T::Sig\n  def self.sig(*args) = args"),
+        ("", "extend T::Sig\n  def self.sig(*args) = args", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("tsig-inert-{i}"), &runtime_gate(prelude, base, body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{base}|{body}: {diags:?}");
+    }
+    for (i, (prelude, base, body)) in [
+        ("", "", "extend T::Sig"),
+        ("", "extend T::Sig", ""),
+        ("", "", "class << self\n    include T::Sig\n  end"),
+        ("class Module\n  include T::Sig\nend", "", ""),
+        ("Module.include(T::Sig)", "", ""),
+        ("include T::Sig", "", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("tsig-enforced-{i}"), &runtime_gate(prelude, base, body, ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}|{base}|{body}: {diags:?}");
+    }
+}
+
+/// F8: sorbet-runtime attaches a sig to its def from the class's
+/// `method_added` hook; a project `self.method_added` that never calls
+/// `super` swallows it (measured: the broken call runs unraised). The
+/// class's own hook, or one on an ancestor, makes every sig of the class
+/// inert. The controls — a hook that calls `super`, bare or explicit —
+/// still accuse and type.
+#[test]
+fn method_added_hook_without_super_makes_sigs_inert() {
+    for (i, (base, body)) in [
+        ("", "extend T::Sig\n  def self.method_added(name); end"),
+        ("", "extend T::Sig\n  class << self\n    def singleton_method_added(name) = name\n  end"),
+        ("def self.method_added(name); end", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("hook-inert-{i}"), &runtime_gate("", base, body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{base}|{body}: {diags:?}");
+    }
+    for (i, (base, body)) in [
+        ("", "extend T::Sig\n  def self.method_added(name)\n    super\n  end"),
+        ("def self.method_added(name)\n    super(name)\n  end", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("hook-enforced-{i}"), &runtime_gate("", base, body, ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{base}|{body}: {diags:?}");
+    }
+}
+
+/// F7, lockfile half: a `Gemfile.lock` visible to the project that does
+/// not install the real sorbet-runtime — it names `sorbet-runtime-stub`,
+/// or never names `sorbet-runtime` — makes every sig inert. The control
+/// lock names `sorbet-runtime` and still accuses and types; a project with
+/// no lock at all keeps judging from source (every other test here).
+#[test]
+fn lockfile_without_real_sorbet_runtime_makes_sigs_inert() {
+    let run = |name: &str, lock: &str| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-lock-{name}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Gemfile.lock"), lock).unwrap();
+        let mut db = Db::default();
+        itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&dir));
+        let file = SourceFile::new(&db, dir.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+        ProjectFiles::new(&db, vec![file]);
+        ClosedWorld::new(&db, true);
+        check_file(&db, file).clone()
+    };
+    let lock = |specs: &str, deps: &str| {
+        format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n{deps}\n")
+    };
+    let stub = lock("    sorbet-runtime-stub (0.2.0)\n", "  sorbet-runtime-stub\n");
+    let absent = lock("    rake (13.0.6)\n", "  rake\n");
+    for (name, text) in [("stub", &stub), ("absent", &absent)] {
+        let diags = run(name, text);
+        assert!(gate_codes(&diags).is_empty(), "{name}: {diags:?}");
+    }
+    let real = lock("    sorbet-runtime (0.5.11934)\n", "  sorbet-runtime\n");
+    let diags = run("real", &real);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (b): a reference to `T::Configuration` or `T::Private`
+/// can reach sorbet-runtime's switches through any spelling — `send`, an
+/// alias constant, a block parameter, `instance_eval`, `RuntimeLevels`, a
+/// lexical `module T`, `const_get` — so any reference other than the
+/// literal statement `T::Configuration.default_checked_level = :always`
+/// makes every sig inert. The controls — that statement alone, homonymous
+/// constants under another namespace, a handler on another receiver —
+/// still accuse and type.
+#[test]
+fn any_runtime_configuration_reference_makes_sigs_inert() {
+    for (i, prelude) in [
+        "T::Configuration.public_send(:default_checked_level=, :never)",
+        "T::Configuration.send(:call_validation_error_handler=, lambda { |*args| args })",
+        "ContractGateConfig = T::Configuration\nContractGateConfig.default_checked_level = :never",
+        "T::Configuration.tap { |c| c.default_checked_level = :never }",
+        "T::Configuration.instance_eval { self.default_checked_level = :never }",
+        "T::Private::RuntimeLevels.default_checked_level = :never",
+        "module T\n  Configuration.default_checked_level = :never\nend",
+        "T.const_get(:Configuration).default_checked_level = :never",
+        "Object.const_get(\"T::Configuration\").default_checked_level = :never",
+        "ContractGateRuntime = Object.const_get(:\"T::Private\")",
+        "T::Configuration.enable_final_checks_on_hooks",
+        "T::Configuration.default_checked_level = :always\nT::Configuration&.default_checked_level = :never",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("config-ref-inert-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}: {diags:?}");
+    }
+    for (i, prelude) in [
+        "T::Configuration.default_checked_level = :always",
+        "::T::Configuration.default_checked_level = :always",
+        "module ContractGateConfig\n  Configuration = 1\n  Private = 2\nend\nContractGateConfig::Configuration",
+        "ContractGateLogger.call_validation_error_handler = lambda { |*args| args }",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("config-ref-enforced-{i}"), &runtime_gate(prelude, "", "extend T::Sig", ""), None);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{prelude}: {diags:?}");
+    }
+}
+
+/// r4-runtime-gates (c): a project method named `sig` anywhere — a module
+/// extended after `T::Sig`, a reopened `T::Sig`, an unrelated class, a
+/// `define_method`/`alias`/`attr_reader` spelling — may answer a bare
+/// `sig` before sorbet-runtime's, so every sig is inert. The controls —
+/// methods whose names only start with `sig` — still accuse and type.
+#[test]
+fn any_project_sig_definition_makes_sigs_inert() {
+    for (i, (prelude, body)) in [
+        ("module ContractQuietSig\n  def sig(*args) = args\nend", "extend T::Sig\n  extend ContractQuietSig"),
+        ("module T\n  module Sig\n    def sig(*args) = args\n  end\nend", "extend T::Sig"),
+        ("module ContractElsewhere\n  def self.sig(*args) = args\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  define_method(:sig) { |*args| args }\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  alias sig inspect\nend", "extend T::Sig"),
+        ("class ContractElsewhere\n  attr_reader :sig\nend", "extend T::Sig"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = check(&format!("sig-def-inert-{i}"), &runtime_gate(prelude, "", body, ""), None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{body}: {diags:?}");
+    }
+    let control = "class ContractElsewhere\n  def signature(*args) = args\n  define_method(:sig_off) { nil }\n  attr_reader :signal\nend";
+    let diags = check("sig-def-enforced", &runtime_gate(control, "", "extend T::Sig", ""), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (d): a `method_added`/`singleton_method_added` that
+/// does not call `super`, defined anywhere — a module extended on a
+/// subclass, a module prepended to `class << self`, the top level, a
+/// `define_method` spelling — may swallow sorbet-runtime's attachment, so
+/// every sig is inert. The controls — the same hooks calling `super` —
+/// still accuse and type.
+#[test]
+fn any_swallowing_method_added_hook_makes_sigs_inert() {
+    let subclass = "class ContractGateSub < ContractGate\n  extend ContractHooky\nend\n";
+    let swallow = "module ContractHooky\n  def method_added(name); end\nend";
+    for (i, (prelude, body, after)) in [
+        (swallow, "extend T::Sig", subclass),
+        ("", "extend T::Sig\n  class << self\n    prepend(Module.new { def method_added(name) = name })\n  end", ""),
+        ("def singleton_method_added(name); end", "extend T::Sig", ""),
+        ("class ContractElsewhere\n  define_method(:method_added) { |name| super(name) }\nend", "extend T::Sig", ""),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let source = format!("{}{after}", runtime_gate(prelude, "", body, ""));
+        let diags = check(&format!("hook-anywhere-inert-{i}"), &source, None);
+        assert!(gate_codes(&diags).is_empty(), "{prelude}|{body}: {diags:?}");
+    }
+    let calling = "module ContractHooky\n  def method_added(name)\n    super\n  end\nend\ndef singleton_method_added(name)\n  super(name)\nend";
+    let diags = check("hook-anywhere-enforced", &format!("{}{subclass}", runtime_gate(calling, "", "extend T::Sig", "")), None);
+    assert_eq!(gate_codes(&diags), ENFORCED, "{diags:?}");
+}
+
+/// r4-runtime-gates (a): the project-wide facts come from the whole
+/// project root (the nearest directory holding a `Gemfile`,
+/// `Gemfile.lock` or `.git`), not only from the checked paths: checking
+/// `app/` still reads `config/initializers`, a `Rakefile`, a `.rake`
+/// task (inside the checked path too: only its `.rb` files are loaded), a
+/// `bin/` script, `config.ru`, and a core extension defining a type test. The controls — the same files saying nothing hazardous —
+/// still accuse and type.
+#[test]
+fn project_root_hazards_reach_a_partial_check() {
+    let run = |name: &str, rel: &str, text: &str| {
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("sorbet-contract-root-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let app = dir.join("app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(dir.join("Gemfile"), "source \"https://rubygems.org\"\n").unwrap();
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        let mut db = Db::default();
+        itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&app));
+        let file = SourceFile::new(&db, app.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+        ProjectFiles::new(&db, vec![file]);
+        ClosedWorld::new(&db, true);
+        check_file(&db, file).clone()
+    };
+    for (i, (rel, text)) in [
+        ("config/initializers/sorbet.rb", "T::Configuration.default_checked_level = :never\n"),
+        ("Rakefile", "T::Configuration.default_checked_level = :never\n"),
+        ("lib/tasks/gate.rake", "module ContractTask\n  def sig(*args) = args\nend\n"),
+        ("bin/setup", "#!/usr/bin/env ruby\nclass ContractBin\n  def self.method_added(name); end\nend\n"),
+        ("config.ru", "T::Private::RuntimeLevels.default_checked_level = :never\n"),
+        ("app/tasks/gate.rake", "def method_added(name); end\n"),
+        ("lib/core_ext.rb", "class Object\n  def is_a?(klass) = true\nend\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = run(&format!("inert-{i}"), rel, text);
+        assert!(gate_codes(&diags).is_empty(), "{rel}: {diags:?}");
+    }
+    for (i, (rel, text)) in [
+        ("config/initializers/sorbet.rb", "T::Configuration.default_checked_level = :always\n"),
+        ("Rakefile", "task :default\n"),
+        ("lib/core_ext.rb", "class Object\n  def is_a_thing? = true\nend\n"),
+    ]
+    .iter()
+    .enumerate()
+    {
+        let diags = run(&format!("enforced-{i}"), rel, text);
+        assert_eq!(gate_codes(&diags), ENFORCED, "{rel}: {diags:?}");
+    }
+    // An ignore file ABOVE the project root says nothing about the
+    // project: Ruby still loads the hazard, so the sig stays inert. The
+    // layout is built under this test's own directory, the `.ignore`
+    // (honoured with or without git) one level above the `Gemfile`.
+    let outer = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("sorbet-contract-root-parent-ignore");
+    let _ = std::fs::remove_dir_all(&outer);
+    let project = outer.join("project");
+    let app = project.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::create_dir_all(project.join("config/initializers")).unwrap();
+    std::fs::write(outer.join(".ignore"), "sorbet.rb\n").unwrap();
+    std::fs::write(project.join("Gemfile"), "source \"https://rubygems.org\"\n").unwrap();
+    std::fs::write(project.join("config/initializers/sorbet.rb"), "T::Configuration.default_checked_level = :never\n")
+        .unwrap();
+    let mut db = Db::default();
+    itaruby_semantic::wire_declaration_sources(&mut db, std::slice::from_ref(&app));
+    let file = SourceFile::new(&db, app.join("source.rb"), runtime_gate("", "", "extend T::Sig", ""));
+    ProjectFiles::new(&db, vec![file]);
+    ClosedWorld::new(&db, true);
+    let diags = check_file(&db, file).clone();
+    assert!(gate_codes(&diags).is_empty(), "parent .ignore: {diags:?}");
+}
+
+/// F4: sorbet-runtime checks a generic's category, never its type
+/// arguments (`T::Array[String]` accepts `[1]` at run time), so a declared
+/// element, key or value type never types a consumer through the return.
+/// The category survives, and `T.nilable` keeps its member's:
+/// `names.absent_on_array` is still accused. A parameter is never bound
+/// into the body at all, so `items.absent_on_param_array` is silent.
+#[test]
+fn declared_type_arguments_never_type_consumers() {
+    let source = r"
+class ContractErasedItem
+end
+class ContractErased
+  extend T::Sig
+  # Opaque bodies: a declared return types a consumer only where body
+  # inference answers Unknown.
+  sig { returns(T::Array[String]) }
+  def names; @names; end
+  sig { returns(T.nilable(T::Hash[Symbol, Integer])) }
+  def table; @table; end
+  sig { params(items: T::Array[ContractErasedItem]).returns(Integer) }
+  def probe(items)
+    items.absent_on_param_array
+    1
+  end
+end
+ContractErased.new.names.first
+ContractErased.new.table
+ContractErased.new.names.absent_on_array
+";
+    let diags = check("erased", source, None);
+    let absent: Vec<&str> = diags
+        .iter()
+        .filter(|d| d.code == "E0101")
+        .filter_map(|d| d.message.split('`').nth(1))
+        .collect();
+    assert_eq!(absent, ["absent_on_array"], "{diags:?}");
+    assert_types("erased", source, &[
+        ("ContractErased.new.names.first", "names", Some("Array[untyped]")),
+        ("ContractErased.new.names.first", "first", None),
+        ("ContractErased.new.table", "table", Some("Hash[untyped, untyped] | nil")),
+    ]);
+}
+
+// -- redefinition through a receiver no constant names (review F5, F11) --
+
+/// `SCALED`'s two signed methods, called once more with an Integer: hover
+/// on each call tells whether the sig still types its consumer.
+const SCALED_CONSUMERS: &str = "ContractScaleCfg.scale(1)\nContractScaleCfg.new.grow(1)\n";
+
+/// The accusations left, and whether each signed method still types its
+/// consumer, when `outside` is added to a `SCALED` project.
+fn hidden_outcome(name: &str, outside: &str) -> (Vec<String>, [Option<String>; 2]) {
+    let base = scaled("");
+    let with_strings = format!("{STRING_SCALE}{outside}");
+    let sources = [base.as_str(), with_strings.as_str()];
+    let accused = scaled_accusations(&check_files(name, &sources), &sources);
+    let typed = |at: &str| ty_in(&format!("{name}-{at}"), &[SCALED_CONSUMERS, &base, &with_strings], at, at);
+    (accused, [typed("scale"), typed("grow")])
+}
+
+/// Wraps `body` in a method whose parameters (`k`, `name`) no constant names.
+fn hidden_patch(body: &str) -> String {
+    format!("module ContractHiddenPatch\n  def self.patch(k, name)\n    {body}\n  end\nend\n")
+}
+
+/// A method defined through a receiver the index cannot name may land on
+/// ANY class, so every contract of that name — both tracks — comes off,
+/// and the sig no longer types its consumer. A name nobody can read, a
+/// string body, or a module nobody can enumerate takes every contract off.
+#[test]
+fn redefinition_through_an_unnamed_receiver_poisons_by_name() {
+    let grow_def = "do\n      def grow(x)\n        x.to_s\n      end\n    end";
+    let scale_def = "do\n      def scale(x)\n        x.to_s\n      end\n    end";
+    let grow_only = [
+        hidden_patch(&format!("k.class_eval {grow_def}")),
+        hidden_patch(&format!("k.class_exec {grow_def}")),
+        hidden_patch(&format!("k.module_eval {grow_def}")),
+        hidden_patch(&format!("k.instance_eval {grow_def}")),
+        hidden_patch("k.define_method(:grow) { |x| x.to_s }"),
+        hidden_patch("k.send(:define_method, :grow) { |x| x.to_s }"),
+        hidden_patch("k.alias_method(:grow, :to_s)"),
+        hidden_patch("k.prepend(ContractStringGrow)"),
+        hidden_patch("k.include(ContractStringGrow)"),
+        hidden_patch("k.define_singleton_method(:grow) { |x| x.to_s }"),
+        hidden_patch("def k.grow(x)\n      x.to_s\n    end"),
+        format!("Object.const_get(:ContractScaleCfg).class_eval {grow_def}\n"),
+        format!("ObjectSpace.each_object(Class) do |k|\n  k.class_eval {grow_def}\nend\n"),
+        format!("[ContractScaleCfg, String].each do |k|\n  k.class_eval {grow_def}\nend\n"),
+        "obj = ContractScaleCfg.new\nclass << obj\n  def grow(x)\n    x.to_s\n  end\nend\n".to_owned(),
+        format!("module ContractHiddenRefine\n  refine Object.const_get(:ContractScaleCfg) {grow_def}\nend\n"),
+    ];
+    for (i, outside) in grow_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-grow-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    let scale_only = [
+        hidden_patch("k.define_singleton_method(:scale) { |x| x.to_s }"),
+        hidden_patch("class << k\n      def scale(x)\n        x.to_s\n      end\n    end"),
+        hidden_patch("k.extend(ContractStringScale)"),
+        hidden_patch("k.singleton_class.define_method(:scale) { |x| x.to_s }"),
+        hidden_patch("k.singleton_class.prepend(ContractStringScale)"),
+        hidden_patch(&format!("k.singleton_class.class_eval {scale_def}")),
+    ];
+    for (i, outside) in scale_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-scale-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+        assert_eq!(typed, [None, Some("Integer".to_owned())], "{outside}");
+    }
+    let every_name = [
+        hidden_patch("k.define_method(name) { |x| x.to_s }"),
+        hidden_patch("k.send(:define_method, name) { |x| x.to_s }"),
+        hidden_patch("k.define_singleton_method(name) { |x| x.to_s }"),
+        hidden_patch("k.class_eval(\"def grow(x) x.to_s end\")"),
+        hidden_patch("k.class_eval do\n      define_method(name) { |x| x.to_s }\n    end"),
+        hidden_patch("k.include(ContractScaleUnknown::Patch)"),
+        "eval(\"class ContractScaleCfg; def grow(x) = x.to_s; end\")\n".to_owned(),
+        // A type test decides what a literal of whatever class it lands on
+        // satisfies.
+        hidden_patch("k.define_method(:is_a?) { |_klass| true }"),
+    ];
+    for (i, outside) in every_name.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-all-{i}"), outside);
+        assert!(accused.is_empty(), "{outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "{outside}");
+    }
+
+    // Controls: an unnamed receiver that defines another name, and a named
+    // receiver defining the same name on another class, take nothing off.
+    let controls = [
+        hidden_patch("k.class_eval do\n      def unrelated(x)\n        x\n      end\n    end"),
+        hidden_patch("k.define_method(:unrelated) { |x| x }"),
+        // A `send` of a name nobody can read is a call, not a definition.
+        hidden_patch("k.send(name, 1)\n    k.public_send(name)"),
+        // An `instance_eval` DSL body calls methods; only its defs define.
+        hidden_patch("k.instance_eval do\n      setting :grow\n    end"),
+        hidden_patch("k.prepend(ContractHiddenQuiet)\n    k.extend(ContractHiddenQuiet)")
+            + "module ContractHiddenQuiet\n  def quiet; end\nend\n",
+        format!("class ContractScaleOther; end\nContractScaleOther.class_eval {grow_def}\nContractScaleOther.define_singleton_method(:scale) {{ |x| x.to_s }}\n"),
+        // A mixin hook's own receiver is the module's includers, which the
+        // include-time passes judge: a hook nobody includes redefines nothing.
+        format!("module ContractHiddenHook\n  def self.included(base)\n    base.define_method(:grow) {{ |x| x.to_s }}\n    base.class_eval {grow_def}\n  end\n  def self.extended(base)\n    base.define_singleton_method(:scale) {{ |x| x.to_s }}\n  end\nend\n"),
+    ];
+    for (i, outside) in controls.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-control-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "control: {outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), Some("Integer".to_owned())], "control: {outside}");
+    }
+}
+
+/// `Alias = Foo; class Alias; def m` reopens `Foo` itself: the second
+/// definition of a signed method is a redefinition like any other.
+#[test]
+fn reopen_through_a_constant_alias_is_a_redefinition() {
+    // Reopening a subclass through its alias overrides the parent's
+    // signed method for every instance of that subclass.
+    const FAMILY: &str = r#"
+class ContractAliasParent
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+class ContractAliasChild < ContractAliasParent
+end
+class ContractAliasUser
+  def use
+    ContractAliasParent.new.grow("text")
+  end
+end
+"#;
+    let reopens = [
+        ("ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def grow(x)\n    x.to_s\n  end\nend\n", "ContractScaleCfg.scale(\"text\")"),
+        ("ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def self.scale(x)\n    x.to_s\n  end\nend\n", "ContractScaleCfg.new.grow(\"text\")"),
+    ];
+    for (i, (outside, left)) in reopens.iter().enumerate() {
+        let (accused, _) = hidden_outcome(&format!("alias-reopen-{i}"), outside);
+        assert_eq!(accused, [*left], "{outside}");
+    }
+    let control = "ContractScaleAlias = ContractScaleCfg\nclass ContractScaleAlias\n  def unrelated(x)\n    x\n  end\nend\n";
+    let (accused, _) = hidden_outcome("alias-reopen-control", control);
+    assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "control: {control}");
+
+    let reopen = "ContractAliasSpelling = ContractAliasChild\nclass ContractAliasSpelling\n  def METHOD(x)\n    x.to_s\n  end\nend\n";
+    let diags = check_files("alias-reopen-parent", &[FAMILY, &reopen.replace("METHOD", "grow")]);
+    assert!(contract_codes(&diags).is_empty(), "{diags:?}");
+    let control = check_files("alias-reopen-parent-control", &[FAMILY, &reopen.replace("METHOD", "unrelated")]);
+    assert_eq!(contract_codes(&control), ["E0103"], "control: {control:?}");
+}
+
+/// sorbet-runtime checks a value with `is_a?`: a project that redefines
+/// `is_a?`, `kind_of?` or `instance_of?` on a core class — in its reopen,
+/// in a module it includes, or on `Object`/`Kernel` — decides what that
+/// class's literals satisfy, so none of them accuses. Other core classes
+/// still do.
+#[test]
+fn redefined_type_test_on_a_core_class_silences_its_literals() {
+    const TAKE: &str = r#"
+class ContractTypeTest
+  extend T::Sig
+  sig { params(x: Integer).void }
+  def take(x); end
+  sig { returns(Integer) }
+  def text
+    "text"
+  end
+end
+ContractTypeTest.new.take("text")
+ContractTypeTest.new.take(:sym)
+"#;
+    let patches = [
+        "class String\n  def is_a?(klass)\n    true\n  end\nend\n",
+        "class String\n  def kind_of?(klass)\n    true\n  end\nend\n",
+        "class String\n  def instance_of?(klass)\n    true\n  end\nend\n",
+        "module ContractLenient\n  def is_a?(klass)\n    true\n  end\nend\nclass String\n  include ContractLenient\nend\n",
+    ];
+    for (i, patch) in patches.iter().enumerate() {
+        let source = format!("{patch}{TAKE}");
+        let diags = check(&format!("type-test-{i}"), &source, None);
+        assert_eq!(contract_names(&source, &diags), [":sym"], "{patch}: {diags:?}");
+    }
+    let source = format!("module Kernel\n  def is_a?(klass)\n    true\n  end\nend\n{TAKE}");
+    let diags = check("type-test-kernel", &source, None);
+    assert!(contract_names(&source, &diags).is_empty(), "{diags:?}");
+
+    let source = format!("class String\n  def shout\n    upcase\n  end\nend\n{TAKE}");
+    let control = check("type-test-control", &source, None);
+    assert_eq!(contract_names(&source, &control), ["text", "\"text\"", ":sym"], "control: {control:?}");
+}
+
+/// F9: a body is accused only when EVERY return point — each reachable
+/// explicit `return` and each leaf of the reachable implicit tail — is a
+/// literal and none of them fits. Each silent method below runs under
+/// sorbet-runtime: a non-literal point (`x`), or one fitting literal, is how
+/// it keeps its promise. A statement after one that always leaves the
+/// method (`return`, `raise`, an `unless … else …` or a `case … else`
+/// whose every branch does) never runs, so it is no return point.
+#[test]
+fn every_return_point_must_be_a_mismatching_literal() {
+    let source = r#"
+class ContractReachability
+  extend T::Sig
+  sig { params(x: String).returns(String) }
+  def guarded(x) = (return nil unless x; x)
+  sig { params(k: Symbol).returns(String) }
+  def case_raises(k)
+    case k when :a then return "A" else raise ArgumentError end
+    nil
+  end
+  sig { params(ok: T.untyped).returns(String) }
+  def unless_else(ok)
+    unless ok then return "n" else return "y" end
+    nil
+  end
+  sig { returns(String) }
+  def version_guard
+    return nil if RUBY_VERSION < "3.0"
+    "modern"
+  end
+  sig { params(k: Symbol).returns(String) }
+  def case_falls_through(k)
+    case k when :a then return 1 end
+    "fits"
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def every_point_mismatches(flag)
+    return nil if flag
+    :s
+  end
+  sig { params(ok: T.untyped).returns(String) }
+  def unless_else_unreached_tail(ok)
+    unless ok then return 1 else return 2 end
+    "unreached"
+  end
+  sig { params(k: Symbol).returns(String) }
+  def case_else_raise_unreached_tail(k)
+    case k when :a then return 1 else raise ArgumentError end
+    "unreached"
+  end
+  sig { returns(String) }
+  def return_then_unreached_tail
+    return 1
+    "unreached"
+  end
+  sig { returns(String) }
+  def return_then_unreached_return
+    return 1
+    return "unreached"
+  end
+  sig { params(flag: T.untyped).returns(String) }
+  def raise_leaf(flag)
+    if flag then 1 else raise "no" end
+  end
+end
+"#;
+    let diags = check("reachability", source, None);
+    assert_eq!(contract_names(source, &diags), [
+        "every_point_mismatches",
+        "unless_else_unreached_tail",
+        "case_else_raise_unreached_tail",
+        "return_then_unreached_tail",
+        "return_then_unreached_return",
+        "raise_leaf",
+    ], "{diags:?}");
+    assert!(diags.iter().all(|d| d.code == "E0109"), "{diags:?}");
+    let every = diags.iter().find(|d| &source[d.start..d.end] == "every_point_mismatches").unwrap();
+    assert!(every.message.contains("got nil | Symbol"), "{every:?}");
+}
+
+const REBOUND_TARGETS: &str = r"
+class ContractReboundA
+  extend T::Sig
+  sig { params(x: Integer).void }
+  def take(x); end
+end
+class ContractReboundB
+  def take(x); end
+  def only_b; end
+end
+";
+
+/// F10: a local whose value no flow walk follows types no receiver, so no
+/// signature governs a call on it and no method is missing from it (E0103
+/// and E0101 alike): a `for` index, a nested or splatted multi-assignment
+/// target, a pattern or named regexp capture, a scope with a string `eval`, an escaping `binding` or a
+/// `local_variable_set` (the whole scope — a loop or a closure reaches
+/// the reads above it again), and a local given a singleton method. Each
+/// control keeps the same receiver readable and still accuses.
+#[test]
+fn rebound_receivers_are_unknown() {
+    let silent = [
+        "item = ContractReboundA.new\n    for item in [ContractReboundB.new]\n      item.take(\"s\")\n      item.only_b\n    end\n    item.take(\"s\")",
+        "l = ContractReboundA.new\n    (l, y), z = [[ContractReboundB.new, 1], 2]\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    a, *l = [1, ContractReboundB.new]\n    l.take(\"s\")",
+        "l = ContractReboundA.new\n    ContractReboundB.new => l\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    [ContractReboundB.new] in [l]\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    /(?<l>x)/ =~ \"x\"\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    binding.local_variable_set(:l, ContractReboundB.new)\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    [1, 2].each do\n      l.take(\"s\")\n      binding.local_variable_set(:l, ContractReboundB.new)\n    end",
+        "l = ContractReboundA.new\n    instance_eval(\"l = ContractReboundB.new\")\n    l.take(\"s\")\n    l.only_b",
+        "l = ContractReboundA.new\n    eval(\"l = ContractReboundB.new\")\n    l.only_b",
+        "l = ContractReboundA.new\n    def l.only_b; end\n    l.only_b",
+        "l = ContractReboundA.new\n    class << l\n      def only_b; end\n    end\n    l.only_b",
+    ];
+    for (i, body) in silent.iter().enumerate() {
+        let source = format!("{REBOUND_TARGETS}class ContractReboundUse\n  def run\n    {body}\n  end\nend\n");
+        let diags = check(&format!("rebound-{i}"), &source, None);
+        assert!(!diags.iter().any(|d| matches!(d.code, "E0101" | "E0103")), "{body}: {diags:?}");
+    }
+
+    let controls = [
+        "item = ContractReboundA.new\n    for other in [ContractReboundB.new]\n      item.take(\"s\")\n      item.only_b\n    end",
+        "l = ContractReboundA.new\n    ContractReboundB.class_eval do\n    end\n    l.take(\"s\")\n    l.only_b",
+        // Opacity is per scope: the next method's locals are its own.
+        "l = ContractReboundA.new\n    l.take(\"s\")\n    l.only_b\n  end\n  def patched\n    o = ContractReboundA.new\n    def o.helper; end\n    binding.local_variable_set(:o, 1)",
+    ];
+    let expected: [&[&str]; 3] = [&["E0103", "E0101"], &["E0103", "E0101"], &["E0103", "E0101"]];
+    for (i, (body, codes)) in controls.iter().zip(expected).enumerate() {
+        let source = format!("{REBOUND_TARGETS}class ContractReboundUse\n  def run\n    {body}\n  end\nend\n");
+        let diags = check(&format!("rebound-control-{i}"), &source, None);
+        let got: Vec<&str> = diags.iter().filter(|d| matches!(d.code, "E0101" | "E0103")).map(|d| d.code).collect();
+        assert_eq!(got, codes, "control: {body}: {diags:?}");
+    }
+}
+
+// -- a hidden definition is bounded wherever its target can be (r4) --
+
+/// Both accusations and both consumer types of a `SCALED` project: what
+/// `outside` adds takes nothing off.
+fn assert_hidden_untouched(name: &str, outside: &str) {
+    let (accused, typed) = hidden_outcome(name, outside);
+    assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")", "ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+    assert_eq!(typed, [Some("Integer".to_owned()), Some("Integer".to_owned())], "{outside}");
+}
+
+/// `path.prepend("/")` and `list.prepend(1)` are `String#prepend` and
+/// `Array#prepend`: `Module#prepend` raises `TypeError` on an argument no
+/// module can be, before it mixes anything in. Such a call defines nothing.
+/// An argument that may be a module still takes every contract off.
+#[test]
+fn literal_argument_to_an_unnamed_mixin_is_no_mixin() {
+    let calls = [
+        hidden_patch("k.prepend(\"/\")"),
+        hidden_patch("k.prepend(\"#{name}/\")\n    k.prepend(:x, 1, 2.0, nil, true, [name], { a: 1 })"),
+        hidden_patch("k.include(/x/)\n    k.extend(1..2)"),
+    ];
+    for (i, outside) in calls.iter().enumerate() {
+        assert_hidden_untouched(&format!("hidden-literal-{i}"), outside);
+    }
+    // Controls: a value that may be a module is still unreadable.
+    for (i, outside) in [hidden_patch("k.prepend(name)"), hidden_patch("k.prepend(\"/\", name)")].iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hidden-literal-control-{i}"), outside);
+        assert!(accused.is_empty(), "control: {outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "control: {outside}");
+    }
+}
+
+/// `x.routes.url_helpers` is Rails' route-helper module: mixed into a
+/// receiver no constant names, it takes off every contract whose name a
+/// route helper can have (`*_path`, `*_url`, `url_for`, `_routes`, the
+/// private `polymorphic_mapping`, ...), never the rest. Another module
+/// built by a call stays unreadable.
+#[test]
+fn route_helpers_on_an_unnamed_receiver_take_route_names_off() {
+    const ROUTED: &str = r#"
+class ContractRouted
+  extend T::Sig
+  sig { params(x: Integer).returns(Integer) }
+  def home_path(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def polymorphic_mapping(x)
+    x
+  end
+  sig { params(x: Integer).returns(Integer) }
+  def grow(x)
+    x
+  end
+end
+ContractRouted.new.home_path("text")
+ContractRouted.new.polymorphic_mapping("text")
+ContractRouted.new.grow("text")
+"#;
+    let accused = |name: &str, outside: &str| -> Vec<String> {
+        let diags = check_files(name, &[ROUTED, outside]);
+        contract_names(ROUTED, &diags).into_iter().map(str::to_owned).collect()
+    };
+    let routed = [
+        "Gem.helper_host(:x).include Rails.application.routes.url_helpers\n".to_owned(),
+        hidden_patch("k.include(Rails.application.routes.url_helpers)"),
+        hidden_patch("k.extend(MyEngine::Engine.routes.url_helpers)"),
+    ];
+    for (i, outside) in routed.iter().enumerate() {
+        assert_eq!(accused(&format!("hidden-routes-{i}"), outside), ["\"text\""], "{outside}");
+        let diags = check_files(&format!("hidden-routes-left-{i}"), &[ROUTED, outside]);
+        let line = diags.iter().find(|d| d.code == "E0103").map(|d| &ROUTED[..d.start]);
+        assert!(line.is_some_and(|l| l.ends_with("ContractRouted.new.grow(")), "{outside}: {diags:?}");
+    }
+    // Controls: a helper module with an argument, or another built module,
+    // may hold any name.
+    // A project `url_helpers` may hand back a module of its own.
+    let unreadable = [
+        hidden_patch("k.include(Rails.application.routes.url_helpers(false))"),
+        hidden_patch("k.include(Rails.application.routes.mounted_helpers)"),
+        hidden_patch("k.include(Rails.application.routes.url_helpers)")
+            + "class ContractOwnRoutes\n  def url_helpers\n    ContractStringGrow\n  end\nend\n",
+    ];
+    for (i, outside) in unreadable.iter().enumerate() {
+        assert!(accused(&format!("hidden-routes-control-{i}"), outside).is_empty(), "control: {outside}");
+    }
+    let quiet = hidden_patch("k.define_method(:unrelated) { |x| x }");
+    assert_eq!(accused("hidden-routes-quiet", &quiet), ["\"text\"", "\"text\"", "\"text\""], "control: {quiet}");
+}
+
+/// What a mixin hook installs through its receiver parameter lands on the
+/// module's own includers and extenders, not on every class: each of them
+/// loses the contracts of the names the install defines (every contract
+/// when those are unknown). `class << self; def extended(base)` is the
+/// same hook. A hook that defines a type test is judged like any hidden
+/// definition, wherever its module is mixed in.
+#[test]
+fn hook_installs_land_on_the_modules_mixers() {
+    let hook = |def: &str, install: &str| format!("module ContractHookInstall\n  {def}\n    {install}\n  end\nend\n");
+    let singleton = |install: &str| {
+        format!("module ContractHookInstall\n  class << self\n    def extended(base)\n      {install}\n    end\n  end\nend\n")
+    };
+    let extender = "class ContractScaleCfg\n  extend ContractHookInstall\nend\n";
+    let grow_only = [
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)") + extender,
+        singleton("base.prepend(ContractStringGrow)") + extender,
+        hook("def self.extended(base)", "base.class_eval do\n      def grow(x) = x.to_s\n    end") + extender,
+    ];
+    for (i, outside) in grow_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-grow-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    let scale_only = [
+        hook("def self.extended(base)", "def base.scale(x)\n      x.to_s\n    end") + extender,
+    ];
+    for (i, outside) in scale_only.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-scale-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.new.grow(\"text\")"], "{outside}");
+        assert_eq!(typed, [None, Some("Integer".to_owned())], "{outside}");
+    }
+    let every = [
+        hook("def self.extended(base)", "base.extend(ContractHookUnknown)") + extender,
+        singleton("base.define_method(name) { |x| x.to_s }") + extender,
+        // A type test decides what a literal satisfies wherever it lands.
+        hook("def self.included(base)", "base.define_method(:is_a?) { |_klass| true }"),
+    ];
+    for (i, outside) in every.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-every-{i}"), outside);
+        assert!(accused.is_empty(), "{outside}: {accused:?}");
+        assert_eq!(typed, [None, None], "{outside}");
+    }
+    // Controls: a hook nobody mixes in, and a mixer of another module,
+    // take nothing off.
+    let controls = [
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)"),
+        singleton("base.prepend(ContractStringGrow)"),
+        singleton("base.define_method(:grow) { |x| x.to_s }\n      base.extend(ContractHookUnknown)"),
+        hook("def self.extended(base)", "base.prepend(ContractStringGrow)")
+            + "module ContractHookOther\nend\nclass ContractScaleCfg\n  extend ContractHookOther\nend\n",
+    ];
+    for (i, outside) in controls.iter().enumerate() {
+        assert_hidden_untouched(&format!("hook-control-{i}"), outside);
+    }
+}
+
+/// A hook parameter the hook body can rebind (`base = base.superclass`, a
+/// multi-assignment, `binding.local_variable_set`) no longer names the
+/// includer: what is installed through it may land anywhere, so it is an
+/// unnamed receiver and takes its names off every class. A hook that only
+/// reads it stays bounded by the module's mixers.
+#[test]
+fn a_rebound_hook_param_is_an_unnamed_receiver() {
+    let hook = |body: &str| {
+        format!(
+            "module ContractHookRebound\n  def self.included(base)\n    {body}\n    base.prepend(ContractStringGrow)\n  end\nend\nclass ContractHookHost\n  include ContractHookRebound\nend\n"
+        )
+    };
+    let rebound = [
+        hook("base = base.superclass"),
+        hook("base, _ = base.superclass, 1"),
+        hook("base ||= nil"),
+        hook("[1].each { |x| base = base.superclass }"),
+        hook("binding.local_variable_set(:base, base.superclass)"),
+    ];
+    for (i, outside) in rebound.iter().enumerate() {
+        let (accused, typed) = hidden_outcome(&format!("hook-rebound-{i}"), outside);
+        assert_eq!(accused, ["ContractScaleCfg.scale(\"text\")"], "{outside}");
+        assert_eq!(typed, [Some("Integer".to_owned()), None], "{outside}");
+    }
+    // Controls: reading the parameter, or writing another local, leaves
+    // the install on the module's own includer.
+    for (i, outside) in [hook("base.name"), hook("other = base.name")].iter().enumerate() {
+        assert_hidden_untouched(&format!("hook-rebound-control-{i}"), outside);
+    }
+}
+

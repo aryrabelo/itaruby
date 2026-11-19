@@ -27,6 +27,31 @@ pub enum TableNameDecl {
     Dynamic,
 }
 
+/// `ProjectIndex::const_fallback`'s answer for a Sorbet sig name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstFallback {
+    /// Every cref's ancestry is known and none carries the name.
+    Proven,
+    /// A known ancestor namespace carries the name as another binding.
+    Shadowed,
+    /// Some ancestry cannot be inspected; no namespace is known to shadow.
+    Opaque,
+}
+
+/// Open reasons that say nothing about a class's ancestors or constants.
+fn constant_neutral_open(reason: Option<OpenReason>) -> bool {
+    matches!(
+        reason,
+        Some(
+            OpenReason::MethodMissing
+                | OpenReason::AbstractRaise
+                | OpenReason::DynamicAttrArg
+                | OpenReason::DynamicDefineMethod
+                | OpenReason::DynamicAliasMethod
+        )
+    )
+}
+
 /// Why a class fragment was marked `open` (bead ita-anc, census only — see
 /// `ProjectIndex::inconclusive_reason`). Recorded at every `open = true`
 /// site in `DefWalker`/`merge_declared_fragment`; first reason wins when
@@ -291,16 +316,10 @@ pub struct MethodDef {
     pub kwrest: bool,
     pub block: bool,
     pub sig: Option<RbsSig>,
-    /// Raw text of a preceding sorbet `sig { ... }`'s `.returns(...)`
-    /// argument (bead ita-uh1) — e.g. `"T.nilable(String)"`. `None` for
-    /// `.void`, for no sig at all, and for any sig shape `index.rs`'s
-    /// `extract_sig_return` doesn't recognize. Deliberately separate from
-    /// `sig` above (which comes from this project's own `#:` RBS
-    /// comments and drives arity checking): a Tapioca-rendered RBI sig
-    /// can go stale relative to the gem actually installed, so this
-    /// field NEVER feeds arity — only `sorbet_sig::sorbet_ret_ty` ever
-    /// consumes it, to type the call's return, never its parameters.
-    pub sorbet_ret: Option<String>,
+    /// Named Sorbet contract; never inferred from a declaration's empty body.
+    pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
+    /// Ruby positional names, only for an unambiguous parameter layout.
+    pub positional_names: Option<Vec<String>>,
     /// If true, arity/args are unchecked (synthetic: `define_method`, alias).
     pub arity_unknown: bool,
     /// The def body contains `raise NotImplementedError` — an abstract
@@ -324,7 +343,8 @@ impl MethodDef {
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_ret: None,
+            sorbet_sig: None,
+            positional_names: Some(Vec::new()),
             arity_unknown: false,
             abstract_stub: false,
             name_span: span,
@@ -351,6 +371,13 @@ pub struct ClassFragment {
     pub includes: Vec<String>,
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
+    /// Modules prepended to the SINGLETON class (`class << self; prepend
+    /// M; end`, `X.singleton_class.prepend(M)`, `class << X; prepend M;
+    /// end`). Each is also an `extends` edge, which is how lookup reads
+    /// it; this list keeps the one thing that edge loses — a prepend
+    /// lands IN FRONT of the class's own singleton methods, so it can
+    /// shadow a signed one (`poison_prepend_shadowed_contracts`).
+    pub singleton_prepends: Vec<String>,
     /// `mixes_in_class_methods ::X` args (Sorbet `T::Helpers` — Tapioca's
     /// RBI rendering of the `included do extend X end` /
     /// `ActiveSupport::Concern` `ClassMethods` idiom). Never consulted by
@@ -420,6 +447,7 @@ impl ClassFragment {
             includes: Vec::new(),
             prepends: Vec::new(),
             extends: Vec::new(),
+            singleton_prepends: Vec::new(),
             methods: Vec::new(),
             singleton_methods: Vec::new(),
             consts: Vec::new(),
@@ -560,6 +588,39 @@ pub struct FileDefs {
     /// never visits a `def` body, which is where every rails call site
     /// lives).
     pub load_hook_bases: Vec<(String, Vec<String>)>,
+    /// Instance-variable names this file writes through a path the
+    /// checker's per-class ivar walk cannot attribute to a class: outside
+    /// an instance `def` of a class/module body, inside a block that may
+    /// rebind `self`, a multiple/rescue/`for` target, or reflection
+    /// (`instance_variable_set(:@x, ...)`, `remove_instance_variable`).
+    /// See `ProjectIndex::hidden_ivar_writes`.
+    pub hidden_ivar_writes: Vec<String>,
+    /// Reflection wrote an instance variable whose name is not a literal.
+    pub hidden_ivar_writes_any: bool,
+    /// This file leaves sorbet-runtime's enforcement unproven project-wide
+    /// (`crate::runtime_gate`): it references `T::Configuration` or
+    /// `T::Private` other than to set `default_checked_level` to a literal
+    /// `:always`, defines a method named `sig`, or defines a
+    /// `method_added`/`singleton_method_added` that does not call `super`.
+    /// No sig is proven to be enforced.
+    pub sorbet_runtime_unchecked: bool,
+    /// This file writes `include T::Sig` into `Object`, `Module` or
+    /// `Class` (a reopen, `Module.include(T::Sig)`, or a bare top-level
+    /// `include`): sorbet-runtime's `sig` is on every class and module.
+    pub sorbet_sig_everywhere: bool,
+    /// Every constant argument of an `include`/`prepend`/`extend` call
+    /// with more than one argument, with the lexical nesting at the call:
+    /// see `ProjectIndex::ambiguous_mixins`.
+    pub ambiguous_mixins: Vec<(String, Vec<String>)>,
+    /// What each definition or mixin aimed at a receiver no constant names
+    /// can put on it, with the lexical nesting at the site: see
+    /// `FileScan::note_hidden` and `poison_hidden_redefinitions`.
+    pub hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
+    /// What a mixin hook installs through its own receiver parameter
+    /// (`def self.included(base); base.prepend(M)`), with the lexical
+    /// nesting of the hook — whose last entry is the hook's module: see
+    /// `poison_hook_installs`.
+    pub hook_installs: Vec<(Vec<String>, PollutionSource)>,
 }
 
 /// Extract definitions from one file. Depends only on this file's text.
@@ -613,7 +674,7 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         toplevel_consts: Vec::new(),
         qualified_writes: Vec::new(),
         const_aliases: Vec::new(),
-        pending_sorbet_ret: None,
+        pending_sorbet_sig: None,
     };
     w.walk_body("", &[], false, &parse.node());
     // ONE file-wide traversal answering both "does this shape appear
@@ -632,6 +693,16 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         const_returning_methods: Vec::new(),
         load_hook_bases: Vec::new(),
         def_locals: Vec::new(),
+        ivar_scopes: Vec::new(),
+        call_blocks_lexical: Vec::new(),
+        hidden_ivar_writes: Vec::new(),
+        hidden_ivar_writes_any: false,
+        sorbet_sig_everywhere: false,
+        ambiguous_mixins: Vec::new(),
+        hidden_definitions: Vec::new(),
+        hook_installs: Vec::new(),
+        hook_frames: Vec::new(),
+        self_singleton_depths: Vec::new(),
     };
     scan.visit(&parse.node());
     FileDefs {
@@ -653,6 +724,14 @@ pub fn parse_defs_text(text: &str) -> FileDefs {
         attributed_mixin_edges: scan.attributed_mixin_edges,
         const_returning_methods: scan.const_returning_methods,
         load_hook_bases: scan.load_hook_bases,
+        hidden_ivar_writes: scan.hidden_ivar_writes,
+        hidden_ivar_writes_any: scan.hidden_ivar_writes_any,
+        sorbet_runtime_unchecked: crate::runtime_gate::mentions_hazard(text, false)
+            && crate::runtime_gate::tree_hazard(&parse.node(), false),
+        sorbet_sig_everywhere: scan.sorbet_sig_everywhere,
+        ambiguous_mixins: scan.ambiguous_mixins,
+        hidden_definitions: scan.hidden_definitions,
+        hook_installs: scan.hook_installs,
     }
 }
 
@@ -761,6 +840,12 @@ pub enum PollutionSource {
     /// include M; end`), resolved project-wide once every file is merged
     /// — see `resolve_keyed_pollution`.
     Module(String),
+    /// The inner source, landing on the target's SINGLETON track only
+    /// (`def X.m` written anywhere, `X.singleton_class.prepend(M)`,
+    /// `X.singleton_class.define_method(:m)`). A class-object method is
+    /// never an instance operator or coercion hook, so core pollution
+    /// ignores it; it only takes written contracts off.
+    Singleton(Box<PollutionSource>),
     /// A body no AST here can read (a string eval, a dynamic
     /// `define_method`, a class-body block, an unrecognized macro): any
     /// method name at all.
@@ -855,6 +940,41 @@ struct FileScan {
     /// name OVERWRITES the entry with nothing — a local reassigned to
     /// something else must not keep resolving to its old value.
     def_locals: Vec<FxHashMap<String, Vec<MixinReceiver>>>,
+    /// Where an `@x` write here would land, innermost last — see
+    /// `IvarScope` and `FileDefs::hidden_ivar_writes`.
+    ivar_scopes: Vec<IvarScope>,
+    /// One entry per call node being visited: does its block provably
+    /// keep lexical `self` (`core::core_block_keeps_lexical_self`)?
+    call_blocks_lexical: Vec<bool>,
+    hidden_ivar_writes: Vec<String>,
+    hidden_ivar_writes_any: bool,
+    sorbet_sig_everywhere: bool,
+    ambiguous_mixins: Vec<(String, Vec<String>)>,
+    hidden_definitions: Vec<(Vec<String>, PollutionSource)>,
+    hook_installs: Vec<(Vec<String>, PollutionSource)>,
+    /// The `ivar_scopes` depth of each `class << self` body written
+    /// directly in a class or module body: a `def included(base)` there is
+    /// the module's own hook (`mixin_hook_param`).
+    self_singleton_depths: Vec<usize>,
+    /// One frame per `def` being walked: the receiver parameter of a
+    /// mixin hook (`def self.included(base)`) and how many block scopes
+    /// deep the walk is inside it — see `FileScan::hidden_receiver`.
+    hook_frames: Vec<(Option<String>, u32)>,
+}
+
+/// Whose instance variable an `@x` write at this point of `FileScan`'s
+/// walk provably targets. Only `InstanceDef` is a place the checker's
+/// per-class walk (`Checker::ivar_ty`) sees as a write on that class.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum IvarScope {
+    /// A `class`/`module` body itself.
+    Body,
+    /// A receiverless `def` directly in a class/module body, or a block
+    /// inside one that provably keeps lexical `self`.
+    InstanceDef,
+    /// Anything else: toplevel, `def self.x`, `class << self`, a `def`
+    /// nested in a block, or a block that may rebind `self`.
+    Opaque,
 }
 
 impl FileScan {
@@ -883,15 +1003,68 @@ impl<'pr> Visit<'pr> for FileScan {
     fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
         let path = node.constant_path();
         self.push_scope(&path);
+        self.ivar_scopes.push(IvarScope::Body);
         ruby_prism::visit_class_node(self, node);
+        self.ivar_scopes.pop();
         self.pop_scope(&path);
     }
 
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         let path = node.constant_path();
         self.push_scope(&path);
+        self.ivar_scopes.push(IvarScope::Body);
         ruby_prism::visit_module_node(self, node);
+        self.ivar_scopes.pop();
         self.pop_scope(&path);
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        // `class << obj` on anything but `self` or a constant: its body
+        // defines on an object nobody can name.
+        if self.hidden_receiver(&node.expression()) {
+            let sources = statements_pollution(node.body().as_ref(), 0);
+            self.note_hidden(sources);
+        }
+        let own = node.expression().as_self_node().is_some() && self.ivar_scopes.last() == Some(&IvarScope::Body);
+        self.ivar_scopes.push(IvarScope::Opaque);
+        if own {
+            self.self_singleton_depths.push(self.ivar_scopes.len());
+        }
+        ruby_prism::visit_singleton_class_node(self, node);
+        if own {
+            self.self_singleton_depths.pop();
+        }
+        self.ivar_scopes.pop();
+    }
+
+    fn visit_instance_variable_write_node(&mut self, node: &ruby_prism::InstanceVariableWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_write_node(self, node);
+    }
+
+    fn visit_instance_variable_or_write_node(&mut self, node: &ruby_prism::InstanceVariableOrWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_or_write_node(self, node);
+    }
+
+    fn visit_instance_variable_and_write_node(&mut self, node: &ruby_prism::InstanceVariableAndWriteNode<'pr>) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_and_write_node(self, node);
+    }
+
+    fn visit_instance_variable_operator_write_node(
+        &mut self,
+        node: &ruby_prism::InstanceVariableOperatorWriteNode<'pr>,
+    ) {
+        self.note_ivar_write(node.name().as_slice());
+        ruby_prism::visit_instance_variable_operator_write_node(self, node);
+    }
+
+    fn visit_instance_variable_target_node(&mut self, node: &ruby_prism::InstanceVariableTargetNode<'pr>) {
+        // `@a, @b = ...`, `rescue => @e`, `for @x in ...`: the checker's
+        // ivar walk captures none of these, so each is hidden everywhere.
+        self.hide_ivar(node.name().as_slice());
+        ruby_prism::visit_instance_variable_target_node(self, node);
     }
 
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
@@ -910,18 +1083,48 @@ impl<'pr> Visit<'pr> for FileScan {
                 ));
             }
         }
+        // `def X.m` anywhere — top level, another class, a method body —
+        // redefines `X`'s class method `m` when it runs.
+        if let Some(target) = node.receiver().as_ref().and_then(const_path_str) {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            let source = PollutionSource::Names(vec![name]);
+            self.push_keyed(Some(target.trim_start_matches("::")), vec![PollutionSource::Singleton(Box::new(source))]);
+        }
+        self.note_hidden_def(node);
         self.note_const_returning_body(node);
+        let in_body = self.ivar_scopes.last() == Some(&IvarScope::Body);
+        let in_own_singleton = self.self_singleton_depths.last() == Some(&self.ivar_scopes.len());
+        let scope = if in_body && node.receiver().is_none() { IvarScope::InstanceDef } else { IvarScope::Opaque };
+        self.ivar_scopes.push(scope);
         self.nested += 1;
         self.def_locals.push(FxHashMap::default());
+        self.hook_frames.push((mixin_hook_param(node, in_body, in_own_singleton), 0));
         ruby_prism::visit_def_node(self, node);
+        self.hook_frames.pop();
         self.def_locals.pop();
         self.nested -= 1;
+        self.ivar_scopes.pop();
+    }
+
+    fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
+        self.enter_block_scope(1);
+        ruby_prism::visit_lambda_node(self, node);
+        self.enter_block_scope(-1);
     }
 
     fn visit_block_node(&mut self, node: &ruby_prism::BlockNode<'pr>) {
+        // The call that owns this block is the innermost one being
+        // visited: its receiver and arguments were walked (and popped)
+        // before its block.
+        let lexical = self.call_blocks_lexical.last() == Some(&true);
+        let in_def = self.ivar_scopes.last() == Some(&IvarScope::InstanceDef);
+        self.ivar_scopes.push(if lexical && in_def { IvarScope::InstanceDef } else { IvarScope::Opaque });
         self.nested += 1;
+        self.enter_block_scope(1);
         ruby_prism::visit_block_node(self, node);
+        self.enter_block_scope(-1);
         self.nested -= 1;
+        self.ivar_scopes.pop();
     }
 
     fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
@@ -951,17 +1154,97 @@ impl<'pr> Visit<'pr> for FileScan {
     }
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        self.note_ivar_reflection(node);
+        let name = String::from_utf8_lossy(node.name().as_slice());
+        self.call_blocks_lexical.push(core::core_block_keeps_lexical_self(&name));
         self.note_dynamic_mixin(node);
         self.note_attributed_mixin(node);
         self.note_refinement(node);
         self.note_opaque_eval(node);
         self.note_injection(node);
+        self.note_hidden_call(node);
         self.note_load_hook_base(node);
+        self.note_sorbet_runtime_hazard(node);
         ruby_prism::visit_call_node(self, node);
+        self.call_blocks_lexical.pop();
     }
 }
 
 impl FileScan {
+    /// An `@x` write the checker's per-class walk would not attribute to
+    /// the class it really lands on — see `IvarScope`.
+    fn note_ivar_write(&mut self, name: &[u8]) {
+        if self.ivar_scopes.last() != Some(&IvarScope::InstanceDef) {
+            self.hide_ivar(name);
+        }
+    }
+
+    fn hide_ivar(&mut self, name: &[u8]) {
+        let name = String::from_utf8_lossy(name).into_owned();
+        if !self.hidden_ivar_writes.contains(&name) {
+            self.hidden_ivar_writes.push(name);
+        }
+    }
+
+    /// Project-wide facts that decide whether a Sorbet sig is a contract
+    /// sorbet-runtime enforces as written (the rest are
+    /// `crate::runtime_gate`'s): an
+    /// `include T::Sig` that reaches every class (`note_sig_everywhere`),
+    /// and a multi-argument `include A, B` (and `prepend`/`extend`), whose
+    /// ancestor order this index does not yet linearize the way Ruby does,
+    /// so a method both modules answer may resolve to the wrong one.
+    fn note_sorbet_runtime_hazard(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let name = node.name();
+        let args: Vec<Node<'_>> = node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        self.note_sig_everywhere(node, &args);
+        if matches!(name.as_slice(), b"include" | b"prepend" | b"extend") && args.len() > 1 {
+            for path in args.iter().filter_map(const_path_str) {
+                self.ambiguous_mixins.push((path, self.nesting.clone()));
+            }
+        }
+    }
+
+    /// `include T::Sig` landing on `Object`, `Module` or `Class`: a
+    /// reopen's body, an explicit `Module.include(T::Sig)`, or a bare
+    /// include at true file toplevel (which is `Object`'s). Any other
+    /// receiver or spelling is not read, which only leaves sigs inert.
+    fn note_sig_everywhere(&mut self, node: &ruby_prism::CallNode<'_>, args: &[Node<'_>]) {
+        let sig_arg = matches!(args, [arg] if const_path_str(arg).is_some_and(|p| p.trim_start_matches("::") == "T::Sig"));
+        if node.name().as_slice() != b"include" || !sig_arg {
+            return;
+        }
+        let target = match node.receiver() {
+            None if self.nested == 0 => self.nesting.last().cloned().unwrap_or_else(|| "Object".to_owned()),
+            None => return,
+            Some(receiver) => match const_path_str(&receiver) {
+                Some(path) => path,
+                None => return,
+            },
+        };
+        if matches!(target.trim_start_matches("::"), "Object" | "Module" | "Class") {
+            self.sorbet_sig_everywhere = true;
+        }
+    }
+
+    /// `instance_variable_set(:@x, v)` / `remove_instance_variable(:@x)`
+    /// on any receiver: a write to `@x` of whatever object it reaches. A
+    /// name that is not a plain literal could be any ivar.
+    fn note_ivar_reflection(&mut self, node: &ruby_prism::CallNode<'_>) {
+        if !matches!(node.name().as_slice(), b"instance_variable_set" | b"remove_instance_variable") {
+            return;
+        }
+        let first = node.arguments().and_then(|args| args.arguments().iter().next());
+        let literal = first.as_ref().and_then(|arg| {
+            arg.as_symbol_node()
+                .map(|sym| sym.unescaped().to_vec())
+                .or_else(|| arg.as_string_node().map(|s| s.unescaped().to_vec()))
+        });
+        match literal {
+            Some(name) => self.hide_ivar(&name),
+            None => self.hidden_ivar_writes_any = true,
+        }
+    }
+
     /// `<dynamic-receiver>.include/extend/prepend(<literal constant>)` —
     /// see this struct's doc comment for why the RECEIVER is never the
     /// key.
@@ -1141,6 +1424,9 @@ impl FileScan {
             .and_then(|a| const_path_str(&a))
             .map(|p| p.trim_start_matches("::").to_string());
         let sources = block_pollution(node.block().as_ref());
+        if target.is_none() {
+            self.note_hidden(sources.clone());
+        }
         self.push_keyed(target.as_deref(), sources);
         match node
             .arguments()
@@ -1424,6 +1710,12 @@ impl FileScan {
         if sources.is_empty() {
             return;
         }
+        // `X.singleton_class.<definer>` lands on `X`'s class object.
+        if let Some(owner) = singleton_class_owner(node) {
+            let sources = sources.into_iter().map(|s| PollutionSource::Singleton(Box::new(s))).collect();
+            self.push_keyed(Some(owner.trim_start_matches("::")), sources);
+            return;
+        }
         let Some(target) = self.injection_target(node) else {
             return;
         };
@@ -1460,6 +1752,330 @@ impl FileScan {
         const_path_str(&recv).map(|p| p.trim_start_matches("::").to_string())
     }
 
+    /// A definition or mixin aimed at a receiver no constant names
+    /// (`k.class_eval { def m }`, `k.define_method(:m)`,
+    /// `Object.const_get(x).prepend(M)`, a block parameter of
+    /// `[A, B].each`): the method may land on ANY class, so what it can
+    /// define poisons contracts by name project-wide
+    /// (`poison_hidden_redefinitions`). A `Module`-level eval body is read
+    /// like a class body — an unrecognized macro there may define
+    /// anything; an `instance_eval`/`instance_exec` block is a DSL body
+    /// whose unrecognized calls are calls, so only its `def`s and literal
+    /// definers count (`instance_block_definitions`). A string body, a
+    /// block argument to a `Module`-level eval and a bare `eval` can
+    /// define anything.
+    fn note_hidden_call(&mut self, node: &ruby_prism::CallNode<'_>) {
+        let id = node.name();
+        let name = id.as_slice();
+        let has_arg = node.arguments().is_some_and(|a| a.arguments().iter().next().is_some());
+        if name == b"eval" {
+            if has_arg {
+                self.note_hidden(vec![PollutionSource::Opaque]);
+            }
+            return;
+        }
+        // Name test before the receiver test, which allocates: this runs
+        // on every call node in every file.
+        let evals = matches!(
+            name,
+            b"class_eval" | b"module_eval" | b"class_exec" | b"module_exec" | b"instance_eval" | b"instance_exec"
+        );
+        if !evals && !is_definer_name(name) {
+            return;
+        }
+        let Some(recv) = node.receiver() else { return };
+        if self.hidden_receiver(&recv) {
+            self.note_hidden(hidden_call_sources(node, has_arg));
+        } else if self.hook_param_read(&recv) {
+            self.hook_installs_push(hidden_call_sources(node, has_arg));
+        }
+    }
+
+    /// `def obj.m` on a receiver nobody can name.
+    fn note_hidden_def(&mut self, node: &ruby_prism::DefNode<'_>) {
+        if node.receiver().is_some_and(|recv| self.hidden_receiver(&recv)) {
+            let name = String::from_utf8_lossy(node.name().as_slice()).into_owned();
+            self.note_hidden(vec![PollutionSource::Names(vec![name])]);
+        }
+    }
+
+    /// A receiver no constant names, other than a mixin hook's own
+    /// receiver parameter read from the hook's scope (`hook_param_read`).
+    fn hidden_receiver(&self, recv: &Node<'_>) -> bool {
+        if !unnamed_receiver(recv) {
+            return false;
+        }
+        let hook_param = self.hook_param_read(recv);
+        !hook_param
+    }
+
+    /// A mixin hook's own receiver parameter, read from the hook's scope:
+    /// what `def self.included(base); base.define_method(:m)` installs
+    /// lands on the module's includers and extenders alone, never on an
+    /// arbitrary class — `poison_hook_installs` for a call through it, the
+    /// include-time rule and the extend-hook harvest (`apply_extended_hooks`)
+    /// for `def base.m` and `class << base`. A block parameter shadowing
+    /// that name is a different object.
+    fn hook_param_read(&self, recv: &Node<'_>) -> bool {
+        recv.as_local_variable_read_node().is_some_and(|read| {
+            self.hook_frames.last().is_some_and(|(param, blocks)| {
+                param.as_deref().is_some_and(|p| p.as_bytes() == read.name().as_slice()) && read.depth() == *blocks
+            })
+        })
+    }
+
+    fn hook_installs_push(&mut self, sources: Vec<PollutionSource>) {
+        for source in sources {
+            self.hook_installs.push((self.nesting.clone(), source));
+        }
+    }
+
+    /// One block or lambda scope entered (`1`) or left (`-1`) inside the
+    /// innermost `def`: see `hidden_receiver`.
+    fn enter_block_scope(&mut self, step: i32) {
+        if let Some((_, blocks)) = self.hook_frames.last_mut() {
+            *blocks = blocks.saturating_add_signed(step);
+        }
+    }
+
+    fn note_hidden(&mut self, sources: Vec<PollutionSource>) {
+        for source in sources {
+            self.hidden_definitions.push((self.nesting.clone(), source));
+        }
+    }
+}
+
+/// What one call on an unnamed receiver can define — see
+/// `FileScan::note_hidden_call`.
+fn hidden_call_sources(node: &ruby_prism::CallNode<'_>, has_arg: bool) -> Vec<PollutionSource> {
+    let id = node.name();
+    match id.as_slice() {
+        b"class_eval" | b"module_eval" | b"instance_eval" if has_arg => vec![PollutionSource::Opaque],
+        b"class_eval" | b"module_eval" | b"class_exec" | b"module_exec" => block_pollution(node.block().as_ref()),
+        b"instance_eval" | b"instance_exec" => match node.block().as_ref().and_then(Node::as_block_node) {
+            Some(block) => instance_block_definitions(block.body().as_ref(), 0),
+            None => Vec::new(),
+        },
+        name if is_definer_name(name) && singleton_class_owner(node).is_none() => hidden_definer_sources(node),
+        _ => Vec::new(),
+    }
+}
+
+/// The receiver parameter of a mixin hook (`def self.included(base)`,
+/// `extended`, `prepended`, ...) written directly in a module body, or as
+/// `def included(base)` directly in that body's `class << self`.
+fn mixin_hook_param(node: &ruby_prism::DefNode<'_>, in_body: bool, in_own_singleton: bool) -> Option<String> {
+    let own = match node.receiver() {
+        Some(r) => in_body && r.as_self_node().is_some(),
+        None => in_own_singleton,
+    };
+    let hook = own
+        && INCLUDE_HOOKS.iter().chain(EXTEND_HOOKS).any(|h| node.name().as_slice() == h.as_bytes());
+    let param = hook.then(|| DefWalker::hook_receiver_param_name(node)).flatten()?;
+    let rebound = node.body().is_some_and(|body| local_rebound(&body, &param));
+    (!rebound).then_some(param)
+}
+
+/// Can the hook body make `name` hold something other than the includer?
+/// Any write to it — plain, operator, `||=`/`&&=`, a multi-assignment,
+/// `for`, `rescue =>` or pattern target, a named regexp capture — and any
+/// `binding` or `local_variable_set` call, at any block depth. Such a
+/// parameter is no longer bounded by the module's mixers, so a read of it
+/// is an unnamed receiver like any other (`hidden_receiver`).
+fn local_rebound(body: &Node<'_>, name: &str) -> bool {
+    struct Writes<'a> {
+        name: &'a str,
+        hit: bool,
+    }
+    impl Writes<'_> {
+        fn note(&mut self, written: &[u8]) {
+            self.hit |= written == self.name.as_bytes();
+        }
+    }
+    impl<'pr> Visit<'pr> for Writes<'_> {
+        fn visit_local_variable_write_node(&mut self, node: &ruby_prism::LocalVariableWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_write_node(self, node);
+        }
+        fn visit_local_variable_operator_write_node(&mut self, node: &ruby_prism::LocalVariableOperatorWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_operator_write_node(self, node);
+        }
+        fn visit_local_variable_or_write_node(&mut self, node: &ruby_prism::LocalVariableOrWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_or_write_node(self, node);
+        }
+        fn visit_local_variable_and_write_node(&mut self, node: &ruby_prism::LocalVariableAndWriteNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_and_write_node(self, node);
+        }
+        fn visit_local_variable_target_node(&mut self, node: &ruby_prism::LocalVariableTargetNode<'pr>) {
+            self.note(node.name().as_slice());
+            ruby_prism::visit_local_variable_target_node(self, node);
+        }
+        fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+            self.hit |= matches!(node.name().as_slice(), b"binding" | b"local_variable_set");
+            ruby_prism::visit_call_node(self, node);
+        }
+    }
+    let mut writes = Writes { name, hit: false };
+    writes.visit(body);
+    writes.hit
+}
+
+/// Anything but `self` or a constant path: a receiver whose class the
+/// index cannot name.
+fn unnamed_receiver(recv: &Node<'_>) -> bool {
+    recv.as_self_node().is_none() && const_path_str(recv).is_none()
+}
+
+/// `definer_sources` for a call on an unnamed receiver, except that a
+/// `send` whose method name is not a literal is a call, not a proven
+/// definition: `record.send(attr)` is everywhere, and reading every one
+/// as "defines anything" would take every contract off every project.
+fn hidden_definer_sources(call: &ruby_prism::CallNode<'_>) -> Vec<PollutionSource> {
+    let dynamic_send = matches!(call.name().as_slice(), b"send" | b"public_send" | b"__send__")
+        && call
+            .arguments()
+            .and_then(|a| a.arguments().iter().next())
+            .as_ref()
+            .and_then(literal_method_name)
+            .is_none();
+    if dynamic_send {
+        return Vec::new();
+    }
+    if matches!(call.name().as_slice(), b"include" | b"extend" | b"prepend") {
+        return call.arguments().iter().flat_map(|a| a.arguments().iter()).filter_map(|arg| hidden_mixin_source(&arg)).collect();
+    }
+    definer_sources(call)
+}
+
+/// What one argument of `include`/`extend`/`prepend` on an unnamed
+/// receiver can define. A literal no module can be (`path.prepend("/")`,
+/// `list.prepend(1)`) makes the call `String#prepend` or `Array#prepend`
+/// — `Module#prepend` raises `TypeError` before mixing anything in — so it
+/// defines nothing. `<x>.routes.url_helpers` is the one gem-built module
+/// read by name: Rails' route helpers (`ROUTE_HELPERS`). Anything else is
+/// `mixin_sources`' reading.
+fn hidden_mixin_source(arg: &Node<'_>) -> Option<PollutionSource> {
+    if never_a_module(arg) {
+        return None;
+    }
+    if route_helpers_module(arg) {
+        return Some(PollutionSource::Names(vec![ROUTE_HELPERS.to_owned()]));
+    }
+    Some(match const_path_str(arg) {
+        Some(p) => PollutionSource::Module(p.trim_start_matches("::").to_string()),
+        None => PollutionSource::Opaque,
+    })
+}
+
+/// A literal whose value is never a `Module`.
+fn never_a_module(arg: &Node<'_>) -> bool {
+    matches!(
+        arg,
+        Node::StringNode { .. }
+            | Node::InterpolatedStringNode { .. }
+            | Node::XStringNode { .. }
+            | Node::SymbolNode { .. }
+            | Node::InterpolatedSymbolNode { .. }
+            | Node::IntegerNode { .. }
+            | Node::FloatNode { .. }
+            | Node::RationalNode { .. }
+            | Node::ImaginaryNode { .. }
+            | Node::NilNode { .. }
+            | Node::TrueNode { .. }
+            | Node::FalseNode { .. }
+            | Node::ArrayNode { .. }
+            | Node::HashNode { .. }
+            | Node::KeywordHashNode { .. }
+            | Node::RegularExpressionNode { .. }
+            | Node::InterpolatedRegularExpressionNode { .. }
+            | Node::RangeNode { .. }
+    )
+}
+
+/// `<x>.routes.url_helpers`, argument- and block-free: the module
+/// `ActionDispatch::Routing::RouteSet#url_helpers` builds.
+fn route_helpers_module(arg: &Node<'_>) -> bool {
+    let bare = |call: &ruby_prism::CallNode<'_>, name: &[u8]| {
+        call.name().as_slice() == name && call.arguments().is_none() && call.block().is_none()
+    };
+    arg.as_call_node().is_some_and(|helpers| {
+        bare(&helpers, b"url_helpers")
+            && helpers.receiver().and_then(|r| r.as_call_node()).is_some_and(|routes| bare(&routes, b"routes"))
+    })
+}
+
+/// A name no Ruby method can have, standing in a hidden source's name
+/// list for every name Rails' route-helper module can put on its
+/// includer (`route_helper_name`).
+const ROUTE_HELPERS: &str = "<route helpers>";
+
+/// What `RouteSet#url_helpers` and the `ActionDispatch::Routing::UrlFor`
+/// / `PolymorphicRoutes` modules it includes define, across Rails
+/// versions: every named route's `*_path`/`*_url`, `url_for`,
+/// `full_url_for`, `route_for`, `url_options`, `default_url_options`
+/// (and its `=`/`?`), `polymorphic_*`, `optimize_routes_generation?`,
+/// underscored plumbing (`_routes`, `_with_routes`, ...), the private
+/// `polymorphic_mapping` and `initialize`. Read wide on purpose: any name
+/// that mentions a url, a path, a route or `polymorphic`, or starts with
+/// `_`.
+fn route_helper_name(name: &str) -> bool {
+    ["url", "path", "route", "polymorphic"].iter().any(|part| name.contains(part))
+        || name.starts_with('_')
+        || name == "initialize"
+}
+
+/// Does any project class or module define `name`, on either track? A
+/// project `url_helpers` may hand `<x>.routes.url_helpers` a module of its
+/// own, whose names are then unknown (`hidden_names`).
+fn project_defines(index: &ProjectIndex, name: &str) -> bool {
+    index.classes.iter().any(|class| class.methods.contains_key(name) || class.singleton_methods.contains_key(name))
+}
+
+/// Does a hidden source's name set reach `name`?
+fn defines_name(names: &FxHashSet<String>, name: &str) -> bool {
+    names.contains(name) || (names.contains(ROUTE_HELPERS) && route_helper_name(name))
+}
+
+/// What an `instance_eval`/`instance_exec` block can define: every
+/// `def` and `alias`, every literal definer call written receiverless,
+/// through the same transparent wrappers `statements_pollution` reads.
+/// Any other receiverless call is the receiver's own DSL method, not an
+/// unknown definer.
+fn instance_block_definitions(body: Option<&Node<'_>>, depth: usize) -> Vec<PollutionSource> {
+    let Some(body) = body else { return Vec::new() };
+    if depth > 3 {
+        return vec![PollutionSource::Opaque];
+    }
+    if let Some(stmts) = body.as_statements_node() {
+        return stmts.body().iter().flat_map(|st| instance_statement_definitions(&st, depth)).collect();
+    }
+    instance_statement_definitions(body, depth)
+}
+
+fn instance_statement_definitions(st: &Node<'_>, depth: usize) -> Vec<PollutionSource> {
+    if st.as_def_node().is_some() || st.as_alias_method_node().is_some() {
+        return statement_pollution(st, depth);
+    }
+    if let Some(call) = st.as_call_node() {
+        let mut out: Vec<PollutionSource> = call
+            .arguments()
+            .iter()
+            .flat_map(|args| args.arguments().iter())
+            .filter_map(|arg| arg.as_def_node().map(|def| String::from_utf8_lossy(def.name().as_slice()).into_owned()))
+            .map(|name| PollutionSource::Names(vec![name]))
+            .collect();
+        if call.receiver().is_none() && is_definer_name(call.name().as_slice()) {
+            out.extend(hidden_definer_sources(&call));
+        }
+        return out;
+    }
+    nested_statements(st)
+        .iter()
+        .flat_map(|inner| instance_block_definitions(Some(inner), depth + 1))
+        .collect()
 }
 
 /// What a block body can define — the `refine`/`class_eval { }`
@@ -1775,14 +2391,8 @@ struct DefWalker<'a> {
     qualified_writes: Vec<(String, String)>,
     /// See `FileDefs::const_aliases`.
     const_aliases: Vec<(String, Vec<String>, String)>,
-    /// Raw `.returns(...)` text of the most recently walked `sig { ... }`
-    /// statement (bead ita-uh1), threaded from one class-body statement
-    /// to the immediately next one by `walk_stmts` so the `def` that
-    /// follows a `sig` can pick it up in `method_def`. Cleared before any
-    /// statement that is neither a `sig` call nor a `def` — only
-    /// direct-adjacency counts, matching the contract's "def vier
-    /// precedido de um sig".
-    pending_sorbet_ret: Option<String>,
+    /// See `PendingSig`. Only an immediately adjacent def consumes it.
+    pending_sorbet_sig: Option<PendingSig>,
 }
 
 impl DefWalker<'_> {
@@ -2128,6 +2738,19 @@ impl DefWalker<'_> {
         frag.declared_owner_required = true;
         self.fragments.push(frag);
         self.fragments.len() - 1
+    }
+
+    /// An `include`/`prepend` that lands on fragment `i`'s SINGLETON
+    /// class: the `extends` edge lookup walks, and for a prepend the
+    /// record that it answers first (`ClassFragment::singleton_prepends`).
+    fn singleton_mixin(&mut self, i: usize, name: &[u8], path: String) {
+        let frag = &mut self.fragments[i];
+        if name == b"prepend" && !frag.singleton_prepends.contains(&path) {
+            frag.singleton_prepends.push(path.clone());
+        }
+        if !frag.extends.contains(&path) {
+            frag.extends.push(path);
+        }
     }
 
 
@@ -2485,15 +3108,10 @@ impl DefWalker<'_> {
     ) {
         if let Some(stmts) = node.as_statements_node() {
             for stmt in &stmts.body() {
-                // Bead ita-uh1: a `sig { ... }` immediately followed by a
-                // `def` threads its captured `.returns(...)` text into
-                // that `def` via `pending_sorbet_ret` (set in the
-                // `Node::CallNode` arm below, consumed in `method_def`).
-                // Any statement that is neither the `sig` call itself nor
-                // the `def` breaks the adjacency — clear it so an
-                // unrelated later `def` never inherits a stale sig.
+                // Adjacency is statement-local; an overloaded sig sequence
+                // is retained as poison rather than choosing its last overload.
                 if !is_sig_call_or_def(&stmt) {
-                    self.pending_sorbet_ret = None;
+                    self.pending_sorbet_sig = None;
                 }
                 self.walk_stmt(scope, nesting, frag_idx, in_singleton, &stmt);
             }
@@ -2944,21 +3562,23 @@ impl DefWalker<'_> {
                             None => self.open_class(i, OpenReason::DynamicDefineMethod),
                         }
                     } else if call.name().as_slice() == b"sig" && call.receiver().is_none() {
-                        // Sorbet `sig { ... }` (bead ita-uh1): captured
-                        // purely as data for the immediately-following
-                        // `def` (threaded through `pending_sorbet_ret` by
-                        // `walk_stmts`). Bead ita-4xy narrows the open
-                        // marking: only an UNRECOGNIZED shape still opens
-                        // — `extract_sig_return`/`sig_block_is_recognized`
-                        // share one shape check, so "recognized" here is
-                        // exactly "the text `method_return`'s fallback
-                        // could ever consume, or a `void` sig with none to
-                        // consume", never a broader guess. A `sig` call
-                        // this bead can't classify (multi-statement block,
-                        // unrecognized outermost call, ...) is exactly as
-                        // unknown as before — still opens.
-                        self.pending_sorbet_ret = extract_sig_return(self.text, &call);
-                        if !sig_block_is_recognized(&call) {
+                        let sig = crate::sorbet_sig::extract_sig(node);
+                        // Opening the class is about whether the block can
+                        // define anything, not about whether it is a
+                        // contract: a builder chain ending in `returns(X)`
+                        // or `void` is type metadata even when the contract
+                        // grammar refuses a clause (`type_parameters`,
+                        // `bind`, ...), exactly as on `main`.
+                        let recognized = sig.is_some() || sig_block_is_recognized(&call);
+                        let stacked = self.pending_sorbet_sig.is_some();
+                        // A sig sorbet-runtime does not check at run time
+                        // (`.checked(:never)`/`.checked(:tests)`) is
+                        // written but inert: annotated, never a contract.
+                        self.pending_sorbet_sig = Some(match sig {
+                            Some(parsed) if !stacked && !parsed.unchecked => PendingSig::Parsed(parsed),
+                            _ => PendingSig::Unusable,
+                        });
+                        if !recognized {
                             self.open_class(i, OpenReason::ClassBodyBlock);
                         }
                     } else if call.name().as_slice() == b"class_methods"
@@ -3069,11 +3689,7 @@ impl DefWalker<'_> {
                         if let Some(args) = call.arguments() {
                             for arg in &args.arguments() {
                                 match const_path_str(&arg) {
-                                    Some(path) => {
-                                        if !self.fragments[oi].extends.contains(&path) {
-                                            self.fragments[oi].extends.push(path);
-                                        }
-                                    }
+                                    Some(path) => self.singleton_mixin(oi, call.name().as_slice(), path),
                                     None => all_literal = false,
                                 }
                             }
@@ -3121,9 +3737,7 @@ impl DefWalker<'_> {
                                     // conclusive miss) and claimed an
                                     // instance surface the code never gets.
                                     "include" | "prepend" if in_singleton => {
-                                        if !self.fragments[i].extends.contains(&path) {
-                                            self.fragments[i].extends.push(path);
-                                        }
+                                        self.singleton_mixin(i, call.name().as_slice(), path);
                                     }
                                     "include" => self.fragments[i].includes.push(path),
                                     "extend" => self.fragments[i].extends.push(path),
@@ -3784,8 +4398,68 @@ impl DefWalker<'_> {
             self.line_index,
             self.sig_comments,
             &mut self.sig_errors,
-            self.pending_sorbet_ret.take(),
+            self.pending_sorbet_sig.take(),
         )
+    }
+}
+
+/// What the `sig` calls sitting immediately above a `def` amount to.
+/// `Option<PendingSig>` keeps the three states apart: `None` — no `sig`
+/// was written; `Some(Unusable)` — one was, but this checker cannot use
+/// it; `Some(Parsed)` — exactly one, understood.
+pub(crate) enum PendingSig {
+    Parsed(crate::sorbet_sig::SorbetSig),
+    /// An unsupported spelling, or two `sig` blocks stacked on one
+    /// definition: never a contract, and a third `sig` still stacks on it.
+    Unusable,
+}
+
+impl PendingSig {
+    fn parsed(self) -> Option<crate::sorbet_sig::SorbetSig> {
+        match self {
+            Self::Parsed(sig) => Some(sig),
+            Self::Unusable => None,
+        }
+    }
+}
+
+/// The block's single statement of a `sig { ... }` call, or `None` for a
+/// call with no block, an empty block, or more than one statement.
+fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
+    let block = call.block()?.as_block_node()?;
+    let body = block.body()?;
+    match body.as_statements_node() {
+        Some(stmts) => {
+            let mut iter = stmts.body().iter();
+            let first = iter.next()?;
+            if iter.next().is_some() {
+                return None;
+            }
+            Some(first)
+        }
+        None => Some(body),
+    }
+}
+
+/// Bead ita-4xy: is `call`'s block a RECOGNIZED sig shape, one whose
+/// outermost builder call is `returns` with exactly one argument or a
+/// bare `void`? Such a block is Sorbet type metadata and never itself
+/// defines a method, so it does not open its class even when
+/// `sorbet_sig::extract_sig` refuses one of its clauses (that sig is
+/// simply no contract). Anything else — several statements, no block, or
+/// another outermost call — still opens it. This decides only whether
+/// the class opens, never a type or a contract.
+fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
+        return false;
+    };
+    match outer.name().as_slice() {
+        b"returns" => outer.arguments().is_some_and(|args| {
+            let mut iter = args.arguments().iter();
+            iter.next().is_some() && iter.next().is_none()
+        }),
+        b"void" => true,
+        _ => false,
     }
 }
 
@@ -3793,7 +4467,7 @@ impl DefWalker<'_> {
 /// def collector inside `dynamic_defs_in_body`'s scanner needs the exact
 /// same construction but holds no `DefWalker` — only the three references
 /// this function needs. The ONE deliberate difference: nested defs take
-/// no `pending_sorbet_ret` (`sig`/`def` adjacency across a block boundary
+/// no pending Sorbet sig (`sig`/`def` adjacency across a block boundary
 /// is not a thing Tapioca or a human writes) and their `#:` sig-comment
 /// lookup still runs, same as any def.
 fn build_method_def(
@@ -3802,7 +4476,7 @@ fn build_method_def(
     line_index: &LineIndex,
     sig_comments: &HashMap<u32, (usize, usize)>,
     sig_errors: &mut Vec<(usize, usize, String)>,
-    pending_sorbet_ret: Option<String>,
+    pending_sorbet_sig: Option<PendingSig>,
 ) -> MethodDef {
     let name = String::from_utf8_lossy(def.name().as_slice()).into_owned();
     let name_loc = def.name_loc();
@@ -3816,7 +4490,8 @@ fn build_method_def(
             kwrest: false,
             block: false,
             sig: None,
-            sorbet_ret: pending_sorbet_ret,
+            sorbet_sig: pending_sorbet_sig.and_then(PendingSig::parsed),
+            positional_names: Some(Vec::new()),
             arity_unknown: false,
             abstract_stub: false,
             name_span: (name_loc.start_offset(), name_loc.end_offset()),
@@ -3825,6 +4500,17 @@ fn build_method_def(
 
         if let Some(params) = def.parameters() {
             fill_def_params(&mut md, &params);
+        }
+        // Do not turn Sorbet's named params into a guessed positional zip.
+        if let Some(sig) = &md.sorbet_sig {
+            let matches = md.positional_names.as_ref().is_some_and(|names| {
+                sig.params.iter().all(|(name, _)| {
+                        names.contains(name) || md.keywords.iter().any(|(kw, _)| kw == name)
+                    })
+            });
+            if !matches {
+                md.sorbet_sig = None;
+            }
         }
 
         // `#:` sig on the line right above the def.
@@ -3879,6 +4565,17 @@ fn fill_def_params(md: &mut MethodDef, params: &ruby_prism::ParametersNode<'_>) 
     }
     md.kwrest = params.keyword_rest().is_some();
     md.block = params.block().is_some();
+    md.positional_names = if md.rest || md.kwrest || md.block || params.posts().iter().next().is_some() {
+        None
+    } else {
+        params.requireds().iter().map(|p| {
+            p.as_required_parameter_node()
+                .map(|p| String::from_utf8_lossy(p.name().as_slice()).into_owned())
+        }).chain(params.optionals().iter().map(|p| {
+            p.as_optional_parameter_node()
+                .map(|p| String::from_utf8_lossy(p.name().as_slice()).into_owned())
+        })).collect()
+    };
 }
 
 fn span_of(node: &Node<'_>) -> (usize, usize) {
@@ -3886,13 +4583,7 @@ fn span_of(node: &Node<'_>) -> (usize, usize) {
     (loc.start_offset(), loc.end_offset())
 }
 
-/// True for a `def`, or for a bare `sig { ... }` call — the two shapes
-/// `walk_stmts`' adjacency check (bead ita-uh1) never clears
-/// `pending_sorbet_ret` for. Deliberately loose about whether the `sig`
-/// call's block is actually a recognized return-type shape: even an
-/// unrecognized `sig` still legitimately precedes the `def` it types
-/// (with `sorbet_ret` staying `None`), so it must not be treated as an
-/// unrelated statement that breaks adjacency.
+/// A sig, including an unsupported one, remains adjacent to its def.
 fn is_sig_call_or_def(node: &Node<'_>) -> bool {
     node.as_def_node().is_some()
         || node.as_call_node().is_some_and(|c| {
@@ -3900,27 +4591,6 @@ fn is_sig_call_or_def(node: &Node<'_>) -> bool {
         })
 }
 
-/// Shared block-unwrapping for a `sig { ... }` call: the block's single
-/// statement, or `None` for a call with no block, a block whose body
-/// isn't exactly one statement, or an empty block. Factored out so
-/// `extract_sig_return` (the `.returns(X)` text extractor) and
-/// `sig_block_is_recognized` (bead ita-4xy's open-class carve-out) share
-/// one shape check instead of two.
-fn sig_block_stmt<'pr>(call: &ruby_prism::CallNode<'pr>) -> Option<Node<'pr>> {
-    let block = call.block()?.as_block_node()?;
-    let body = block.body()?;
-    match body.as_statements_node() {
-        Some(stmts) => {
-            let mut iter = stmts.body().iter();
-            let first = iter.next()?;
-            if iter.next().is_some() {
-                return None;
-            }
-            Some(first)
-        }
-        None => Some(body),
-    }
-}
 
 /// Every call name `body_def_reason` can react to. Used ONLY as a cheap
 /// substring prefilter over a `def`'s own source span before the AST
@@ -4301,58 +4971,6 @@ fn body_def_reason_named(name: &[u8], args: &[Node<'_>]) -> Option<OpenReason> {
     }
 }
 
-/// Raw text of a `sig { ... }` call's `.returns(...)` argument (bead
-/// ita-uh1). Recognizes exactly the shapes Tapioca actually emits in
-/// gem RBIs: `sig { returns(X) }`, `sig { void }`, `sig {
-/// params(...).returns(X) }`, `sig { params(...).void }`, and any of
-/// those with a leading `override.`/`abstract.` (`sig(:final)`'s own
-/// argument is irrelevant here — only the block body matters). The block
-/// body must be exactly one statement whose OUTERMOST call is `returns`
-/// with exactly one positional argument; `void`, more than one
-/// statement, more than one `returns` argument, or any other shape all
-/// return `None` — never a guess, matching every other `None` this
-/// walker produces.
-fn extract_sig_return(text: &str, call: &ruby_prism::CallNode<'_>) -> Option<String> {
-    let stmt = sig_block_stmt(call)?;
-    let outer = stmt.as_call_node()?;
-    if outer.name().as_slice() != b"returns" {
-        return None;
-    }
-    let args = outer.arguments()?;
-    let mut arg_iter = args.arguments().iter();
-    let arg = arg_iter.next()?;
-    if arg_iter.next().is_some() {
-        return None;
-    }
-    let (s, e) = span_of(&arg);
-    Some(text[s..e].trim().to_string())
-}
-
-/// Bead ita-4xy: does `call`'s block classify as a RECOGNIZED sig shape
-/// — same `sig_block_stmt` shape check `extract_sig_return` uses, outer
-/// call named `returns` (exactly one positional argument, exactly like
-/// `extract_sig_return` requires before it slices the text) OR bare
-/// `void` (zero return-type text to consume, but still a real,
-/// classified sig — see `extract_sig_return`'s own doc comment: `void`
-/// legitimately returns `None` there without being "unrecognized").
-/// `false` for anything `extract_sig_return` would also refuse to guess
-/// at: multi-statement block, no block at all, or an outermost call
-/// that's neither `returns` nor `void`. The `Node::CallNode` arm above
-/// is the only caller — this decides whether the class-body `sig` call
-/// opens the class, never anything about the type it maps to.
-fn sig_block_is_recognized(call: &ruby_prism::CallNode<'_>) -> bool {
-    let Some(outer) = sig_block_stmt(call).and_then(|s| s.as_call_node()) else {
-        return false;
-    };
-    match outer.name().as_slice() {
-        b"returns" => outer.arguments().is_some_and(|args| {
-            let mut iter = args.arguments().iter();
-            iter.next().is_some() && iter.next().is_none()
-        }),
-        b"void" => true,
-        _ => false,
-    }
-}
 
 fn join_path(scope: &str, name: &str) -> String {
     if scope.is_empty() || name.starts_with("::") {
@@ -4664,13 +5282,10 @@ pub struct MethodSig {
     pub keywords: Vec<(String, bool)>,
     pub kwrest: bool,
     pub sig: Option<RbsSig>,
-    /// Bead ita-4xy: raw text of a preceding sorbet `sig { ... }`'s
-    /// `.returns(...)` argument, copied verbatim from `MethodDef::sorbet_ret`
-    /// (see that field's doc comment — same text, same "arity never reads
-    /// this" rule). `None` for `#:` RBS methods, `.void` sigs, and plain
-    /// unsigned defs alike; `method_return` in `check.rs` only consults it
-    /// when body inference itself lands on `Ty::Unknown`.
-    pub sorbet_ret: Option<String>,
+    pub sorbet_sig: Option<crate::sorbet_sig::SorbetSig>,
+    pub positional_names: Option<Vec<String>>,
+    /// Definition-site lexical scope, not the caller's Module.nesting.
+    pub nesting: Vec<String>,
     pub arity_unknown: bool,
     /// Copied from `MethodDef::abstract_stub`: the def body raises
     /// `NotImplementedError`. `check.rs` skips arity on a shadowed stub —
@@ -4708,6 +5323,8 @@ pub struct ClassDef {
     pub includes: Vec<String>,
     pub prepends: Vec<String>,
     pub extends: Vec<String>,
+    /// See `ClassFragment::singleton_prepends`.
+    pub singleton_prepends: Vec<String>,
     pub methods: FxHashMap<String, MethodSig>,
     pub singleton_methods: FxHashMap<String, MethodSig>,
     pub consts: Vec<String>,
@@ -4722,6 +5339,14 @@ pub struct ClassDef {
     pub hook_installs_opaque: bool,
     /// Table this class maps to, if it looks like an `ActiveRecord` model.
     pub table_name: Option<TableNameDecl>,
+}
+
+/// One reverse mixin edge: `class` includes or prepends the keyed module,
+/// or (`extends`) puts it on its singleton.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Mixer {
+    pub class: ClassId,
+    pub extends: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Default)]
@@ -4804,6 +5429,54 @@ pub struct ProjectIndex {
     /// supplied by a descendant, and claiming `NotFound` there is a false
     /// positive (see `descendant_defines`).
     pub subclasses: FxHashMap<ClassId, Vec<ClassId>>,
+    /// Every class or module that includes, prepends or extends a module,
+    /// keyed by that module (`build_mixer_map`).
+    pub mixers: FxHashMap<ClassId, Vec<Mixer>>,
+    /// Classes something may redefine behind their written bodies: an
+    /// `include`/`prepend` that runs code on them
+    /// (`poison_include_time_redefinitions`), a source written outside
+    /// them (`poison_injected_contracts`), or a prepend whose module is not
+    /// fully known (`poison_prepend_shadowed_contracts`). A contract higher
+    /// in their family never treats one as a plain inheritor.
+    pub include_time_code: FxHashSet<ClassId>,
+    /// Classes and modules a source written outside their body may give a
+    /// `new` (`def X.new`, `X.extend(M)`, a body nobody can read), so
+    /// `X.new` proves no `X` (`singleton_new_hidden`).
+    pub outside_new: FxHashSet<ClassId>,
+    /// Every ivar name some file writes through a path the checker's
+    /// per-class ivar walk cannot attribute (`FileDefs::hidden_ivar_writes`),
+    /// project-wide and name-keyed: the receiving object may be of any
+    /// class, so the name is unproven on every class.
+    pub hidden_ivar_writes: FxHashSet<String>,
+    /// Some file wrote an ivar by a non-literal name: every ivar is unproven.
+    pub hidden_ivar_writes_any: bool,
+    /// sorbet-runtime is not proven to raise on a broken sig anywhere in
+    /// the project: some Ruby file under the project root carries a
+    /// `crate::runtime_gate` hazard (a checked file's own
+    /// `FileDefs::sorbet_runtime_unchecked`, any other file's
+    /// `crate::discovery::SorbetRuntimeHazard`), or the project's visible
+    /// `Gemfile.lock` names `sorbet-runtime-stub` or does not name
+    /// `sorbet-runtime` (`crate::discovery::SorbetRuntimeLock`). No
+    /// Sorbet contract accuses or types anything then.
+    pub sorbet_runtime_unchecked: bool,
+    /// Some file puts `T::Sig` on every class and module
+    /// (`FileDefs::sorbet_sig_everywhere`).
+    pub sorbet_sig_everywhere: bool,
+    /// Modules named together by one `include A, B` (or `prepend`/
+    /// `extend`), as `(path, nesting)`. This index linearizes such a call
+    /// in reverse of Ruby's order (a known ancestry bug), so which module
+    /// answers a name both define is unproven: every contract of these
+    /// modules and of their ancestors comes off
+    /// (`poison_ambiguous_mixin_contracts`).
+    pub ambiguous_mixins: Vec<(String, Vec<String>)>,
+    /// Every definition or mixin aimed at a receiver no constant names,
+    /// merged from `FileDefs::hidden_definitions` and consumed by
+    /// `poison_hidden_redefinitions`.
+    hidden_raw: Vec<(Vec<String>, PollutionSource)>,
+    /// Every install a mixin hook makes through its receiver parameter,
+    /// merged from `FileDefs::hook_installs` and consumed by
+    /// `poison_hook_installs`.
+    hook_raw: Vec<(Vec<String>, PollutionSource)>,
     /// Distinct literal `require '<lib>'` targets across every project
     /// file (W3 require/autoload). Ruby's `require` is process-global, so
     /// the stdlib gate consults this project-wide set, never per-file:
@@ -4976,6 +5649,17 @@ fn build_index(db: &dyn salsa::Database, merge_ignored: bool) -> ProjectIndex {
         // the method name alone.
         apply_mock_singleton_surface(&mut index, gem_ns.namespaces(db));
     }
+    // A visible `Gemfile.lock` that does not install the real
+    // sorbet-runtime means no sig is enforced. No lock found keeps the
+    // source-only answer (`SorbetRuntimeLock`'s doc comment).
+    if crate::discovery::SorbetRuntimeLock::try_get(db).is_some_and(|lock| !lock.enforced(db)) {
+        index.sorbet_runtime_unchecked = true;
+    }
+    // A hazard in a project file outside the checked set
+    // (`SorbetRuntimeHazard`'s doc comment).
+    if crate::discovery::SorbetRuntimeHazard::try_get(db).is_some() {
+        index.sorbet_runtime_unchecked = true;
+    }
     // Bead ita-c8h: generalizes past `apply_gem_reopenings` itself — a
     // reopening under a namespace no project file ever wrapped bare stays
     // open even when no `Gemfile.lock` gem's guessed name happens to
@@ -5028,6 +5712,8 @@ fn build_index(db: &dyn salsa::Database, merge_ignored: bool) -> ProjectIndex {
     apply_attributed_mixin_edges(&mut index);
     resolve_refined_core(&mut index);
     resolve_eval_polluted_core(&mut index);
+    // Before `resolve_keyed_pollution` consumes the raw name-keyed sources.
+    poison_injected_contracts(&mut index);
     // Name-keyed pollution resolves LAST of the three: it is the only
     // one that reads other classes' method sets (`Module(...)`), so
     // every fragment, declaration and gem-reopening pass must already
@@ -5063,6 +5749,14 @@ fn build_index(db: &dyn salsa::Database, merge_ignored: bool) -> ProjectIndex {
         apply_ignored_openness(db, &mut index);
     }
     build_subclass_map(&mut index);
+    build_mixer_map(&mut index);
+    poison_include_time_redefinitions(&mut index);
+    poison_prepend_shadowed_contracts(&mut index);
+    poison_ambiguous_mixin_contracts(&mut index);
+    poison_runtime_inert_contracts(&mut index);
+    poison_hook_installs(&mut index);
+    poison_hidden_redefinitions(&mut index);
+    poison_alias_reopen_redefinitions(&mut index);
     build_methods_by_name(&mut index);
     index
 }
@@ -5155,6 +5849,74 @@ pub fn project_consts(
 /// resolves here rather than a scan of every class on each miss — the
 /// naive version would run on the E0101 candidate path, which is hot
 /// (bead ita-9p9 is the standing reminder of what that costs).
+/// Singleton methods Ruby runs on the includer when `include`/`prepend`
+/// itself runs.
+const INCLUDE_HOOKS: &[&str] = &["included", "prepended", "append_features", "prepend_features"];
+
+/// An `include`/`prepend` whose module chain runs code on the includer —
+/// a hook method, or a module-body block such as a concern's `included do`
+/// — may redefine any of the includer's methods, and nothing orders that
+/// against the includer's own `def`s. Every contract on such a class is
+/// poisoned, and the class is remembered so a contract higher in its
+/// family does not treat it as a plain inheritor.
+fn poison_include_time_redefinitions(index: &mut ProjectIndex) {
+    let hit: Vec<ClassId> = (0..index.classes.len())
+        .filter_map(|i| u32::try_from(i).ok().map(ClassId))
+        .filter(|&id| {
+            let class = index.class(id);
+            class.includes.iter().chain(&class.prepends).any(|name| {
+                let Some(module) = index.resolve_const(&class.nesting, name) else { return false };
+                index.ancestors(module).0.iter().any(|&a| runs_code_on_includer(index.class(a)))
+            })
+        })
+        .collect();
+    for id in hit {
+        let class = &mut index.classes[id.0 as usize];
+        class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
+        index.include_time_code.insert(id);
+    }
+}
+
+/// A hook method, or a project module this index could not read to the
+/// end: an open module's first recorded reason can hide a later
+/// `included do` block, so any project-side openness counts. A gem's own
+/// module (declared or reopened external, or never resolved) stays out of
+/// reach, as it is for every other check.
+fn runs_code_on_includer(module: &ClassDef) -> bool {
+    INCLUDE_HOOKS.iter().any(|hook| module.singleton_methods.contains_key(*hook))
+        || (module.open
+            && !matches!(
+                module.open_reason,
+                Some(OpenReason::DeclaredExternal | OpenReason::ReopenedExternal | OpenReason::AbstractRaise)
+            ))
+}
+
+/// Reverse `include`/`prepend`/`extend` edges, resolved exactly as
+/// `linearize` and `extended_module_surface` resolve them. Built after
+/// every merge pass, so a concern's `ClassMethods` edge is included.
+fn build_mixer_map(index: &mut ProjectIndex) {
+    let mut edges: Vec<(ClassId, Mixer)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        let Ok(raw) = u32::try_from(i) else { continue };
+        let mixer = ClassId(raw);
+        for name in class.includes.iter().chain(&class.prepends) {
+            if let Some(module) = index.resolve_const(&class.nesting, name) {
+                edges.push((module, Mixer { class: mixer, extends: false }));
+            }
+        }
+        for name in &class.extends {
+            if let Some(module) = index.resolve_const(&class.nesting, name) {
+                edges.push((module, Mixer { class: mixer, extends: true }));
+            }
+        }
+    }
+    for (module, mixer) in edges {
+        if module != mixer.class {
+            index.mixers.entry(module).or_default().push(mixer);
+        }
+    }
+}
+
 fn build_subclass_map(index: &mut ProjectIndex) {
     let edges: Vec<(ClassId, ClassId)> = (0..index.classes.len())
         .filter_map(|i| {
@@ -5256,6 +6018,13 @@ fn merge_file_accumulators(index: &mut ProjectIndex, defs: &FileDefs) {
     index.dynamic_mixin_raw.extend(defs.dynamic_mixin_targets.iter().cloned());
     index.attributed_mixin_raw.extend(defs.attributed_mixin_edges.iter().cloned());
     index.load_hook_raw.extend(defs.load_hook_bases.iter().cloned());
+    index.hidden_ivar_writes.extend(defs.hidden_ivar_writes.iter().cloned());
+    index.hidden_ivar_writes_any |= defs.hidden_ivar_writes_any;
+    index.sorbet_runtime_unchecked |= defs.sorbet_runtime_unchecked;
+    index.sorbet_sig_everywhere |= defs.sorbet_sig_everywhere;
+    index.ambiguous_mixins.extend(defs.ambiguous_mixins.iter().cloned());
+    index.hidden_raw.extend(defs.hidden_definitions.iter().cloned());
+    index.hook_raw.extend(defs.hook_installs.iter().cloned());
     for name in &defs.string_source_consts {
         if !index.string_source_consts.contains(name) {
             index.string_source_consts.push(name.clone());
@@ -5287,6 +6056,9 @@ fn merge_file_fragments(
     index: &mut ProjectIndex,
     qualified_writes: &mut Vec<(String, String)>,
 ) {
+    if file.path(db).extension().is_some_and(|ext| ext == "rbi") {
+        return;
+    }
     let defs = file_defs(db, file);
     merge_file_accumulators(index, defs);
     qualified_writes.extend(defs.qualified_writes.iter().cloned());
@@ -5320,14 +6092,13 @@ fn merge_file_fragments(
         class.includes.extend(frag.includes.iter().cloned());
         class.prepends.extend(frag.prepends.iter().cloned());
         class.extends.extend(frag.extends.iter().cloned());
+        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());
         class.consts.extend(frag.consts.iter().cloned());
         for md in &frag.methods {
-            class.methods.insert(md.name.clone(), method_sig(md, file));
+            merge_source_method(&mut class.methods, md, file, &frag.nesting);
         }
         for md in &frag.singleton_methods {
-            class
-                .singleton_methods
-                .insert(md.name.clone(), method_sig(md, file));
+            merge_source_method(&mut class.singleton_methods, md, file, &frag.nesting);
         }
         merge_hook_installs(class, frag, file);
     }
@@ -5782,19 +6553,30 @@ fn apply_one_extended_hook(index: &mut ProjectIndex, extender: ClassId, module: 
     };
     let class = &mut index.classes[extender.0 as usize];
     for (name, span, file) in instance {
-        class
-            .methods
-            .entry(name)
-            .or_insert_with(|| hook_install_sig(span, file));
+        install_hook_method(&mut class.methods, name, span, file);
     }
     for (name, span, file) in singleton {
-        class
-            .singleton_methods
-            .entry(name)
-            .or_insert_with(|| hook_install_sig(span, file));
+        install_hook_method(&mut class.singleton_methods, name, span, file);
     }
     if opaque {
         merge_open(index, extender, OpenReason::EvalOrSend);
+    }
+}
+
+/// First-wins for the body, as every merge here. An install over a method
+/// the extender already defines runs when `extend` runs, so the written
+/// signature of that method is no longer proven to govern it.
+fn install_hook_method(
+    methods: &mut FxHashMap<String, MethodSig>,
+    name: String,
+    span: (usize, usize),
+    file: SourceFile,
+) {
+    match methods.entry(name) {
+        std::collections::hash_map::Entry::Vacant(slot) => {
+            slot.insert(hook_install_sig(span, file));
+        }
+        std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),
     }
 }
 
@@ -5812,7 +6594,9 @@ fn hook_install_sig(span: (usize, usize), file: SourceFile) -> MethodSig {
         keywords: Vec::new(),
         kwrest: false,
         sig: None,
-        sorbet_ret: None,
+        sorbet_sig: None,
+        positional_names: None,
+        nesting: Vec::new(),
         arity_unknown: true,
         abstract_stub: false,
         file,
@@ -6233,16 +7017,21 @@ fn apply_singleton_patches(index: &mut ProjectIndex) {
         let class = &mut index.classes[id.0 as usize];
         // Before the `extends` loop below moves `frag.extends` out.
         merge_hook_installs(class, &frag, file);
+        class.singleton_prepends.extend(frag.singleton_prepends.iter().cloned());
         for path in frag.extends {
             if !class.extends.contains(&path) {
                 class.extends.push(path);
             }
         }
         for md in &frag.singleton_methods {
-            class
-                .singleton_methods
-                .entry(md.name.clone())
-                .or_insert_with(|| method_sig(md, file));
+            match class.singleton_methods.entry(md.name.clone()) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(method_sig(md, file, &frag.nesting));
+                }
+                // The body kept here is still the first one, but the patch
+                // redefined it: no written signature is proven to govern.
+                std::collections::hash_map::Entry::Occupied(mut slot) => poison_contract(slot.get_mut()),
+            }
         }
         if frag.open {
             class.open = true;
@@ -6309,6 +7098,7 @@ fn resolve_keyed_pollution(index: &mut ProjectIndex) {
     for (target, nesting, source) in std::mem::take(&mut index.keyed_raw) {
         let names: Vec<String> = match &source {
             PollutionSource::Names(n) => n.clone(),
+            PollutionSource::Singleton(_) => continue,
             PollutionSource::Opaque => Vec::new(),
             // An unresolvable module — a gem's, a `DeclaredExternal`
             // namespace's, or one this project reopens dynamically — can
@@ -6836,6 +7626,18 @@ pub fn rbi_alias_expand<S: std::hash::BuildHasher>(qualified: &str, rbi_map: &Ha
     None
 }
 
+thread_local! {
+    static ANCESTOR_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times `ProjectIndex::ancestors` has linearized a class on
+/// this thread so far — a deterministic cost probe: a regression test
+/// bounds how many linearizations one check of a deep hierarchy may do
+/// (a wall-clock bound would be flaky across machines).
+pub fn ancestor_walks() -> u64 {
+    ANCESTOR_WALKS.with(std::cell::Cell::get)
+}
+
 /// Distinct `.rbi` files `rbi_declares` has actually read and parsed so
 /// far in this process — bead ita-vto's acceptance evidence that phase 2
 /// stays lazy (nowhere close to every file `RbiProject`'s phase-1 scan
@@ -7049,17 +7851,15 @@ pub fn rbi_ancestor_declares<S: std::hash::BuildHasher>(
 
 /// Instance method names, then SINGLETON method names, that a start
 /// name's RBI ancestry declares — mapped to the RAW `.returns(...)`
-/// source text of the method's `.rbi` sig (bead ita-uh1's
-/// `MethodDef::sorbet_ret`), `None` for a method with no sig. Text, not
-/// `Ty` (bead ita-tjr): the memo below is keyed on the start name alone
-/// and shared by every call site, so it cannot depend on any one call's
-/// `ProjectIndex` — resolving a PROJECT class name inside the sig
-/// (`sig { returns(::Package) }` in a DSL RBI) needs that index, so the
-/// text-to-`Ty` conversion (`sorbet_sig::resolve_ret_ty`) happens at the
-/// lookup call site instead, where the index is in hand. A hit is still
-/// a hit whether or not the text resolves to something other than
-/// `Ty::Unknown` (see `rbi_method_lookup`/`dsl_method_lookup`). The
-/// order is load-bearing: `extend` and `mixes_in_class_methods` move a
+/// source text of the method's `.rbi` sig, `None` for a method with no
+/// usable sig or a `void` one. Text, not `Ty` (bead ita-tjr): the memo
+/// below is keyed on the start name alone and shared by every call site,
+/// so it cannot depend on any one call's `ProjectIndex`; the text-to-`Ty`
+/// conversion (`sorbet_sig::resolve_ret_ty`) happens at the lookup call
+/// site instead. An RBI is never checked at runtime, so this text only
+/// ever TYPES the consumer of a method no project source defines — it is
+/// never a contract (no E0103/E0109) and never reaches a source method.
+/// The order is load-bearing: `extend` and `mixes_in_class_methods` move a
 /// module's *instance* methods into the singleton slot (that is how
 /// `Model.where` exists), so swapping the two silently turns every
 /// class-method hit into an instance-method hit. `Arc` because the memo
@@ -7301,8 +8101,8 @@ fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
     start: &str,
     rbi_map: &HashMap<String, Vec<PathBuf>, S>,
 ) -> (HashMap<String, Option<String>>, HashMap<String, Option<String>>) {
-    let mut instance: HashMap<String, Option<String>> = HashMap::new();
-    let mut singleton: HashMap<String, Option<String>> = HashMap::new();
+    let mut instance = HashMap::new();
+    let mut singleton = HashMap::new();
     let mut visited: std::collections::HashSet<(String, bool)> = std::collections::HashSet::new();
     let mut work: Vec<MethodWorkItem> = vec![MethodWorkItem {
         node: start.to_string(),
@@ -7336,10 +8136,9 @@ fn compute_rbi_method_closure<S: std::hash::BuildHasher>(
 /// while its INSTANCE methods land in whichever map the track that
 /// reached it selects. First visit wins (`or_insert_with`) because the
 /// walk already runs in MRO order — the nearest ancestor is the one that
-/// really answers at runtime. Values are the raw `.returns(...)` sig
-/// text (`MethodDef::sorbet_ret`), `None` for an unsigned method — see
-/// `RbiMethodSets`'s doc comment for why the `Ty` conversion is deferred
-/// to the lookup call site.
+/// really answers at runtime. Values are the raw `.returns(...)` sig text
+/// (`rbi_ret`) — see `RbiMethodSets`'s doc comment for why the `Ty`
+/// conversion is deferred to the lookup call site.
 fn harvest_frag_methods(
     frag: &ClassFragment,
     on_singleton_track: bool,
@@ -7347,12 +8146,17 @@ fn harvest_frag_methods(
     singleton: &mut HashMap<String, Option<String>>,
 ) {
     for m in &frag.singleton_methods {
-        singleton.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+        singleton.entry(m.name.clone()).or_insert_with(|| rbi_ret(m));
     }
     let target = if on_singleton_track { singleton } else { instance };
     for m in &frag.methods {
-        target.entry(m.name.clone()).or_insert_with(|| m.sorbet_ret.clone());
+        target.entry(m.name.clone()).or_insert_with(|| rbi_ret(m));
     }
+}
+
+/// The `.returns(...)` text of a declaration's sig; `void` has none.
+fn rbi_ret(m: &MethodDef) -> Option<String> {
+    m.sorbet_sig.as_ref().filter(|sig| !sig.void).and_then(|sig| sig.ret.clone())
 }
 
 /// Rules 1/2/3: `superclass`/`include`/`prepend` keep the current track;
@@ -7520,7 +8324,7 @@ pub fn rbi_core_methods(
     out
 }
 
-fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
+fn method_sig(md: &MethodDef, file: SourceFile, nesting: &[String]) -> MethodSig {
     MethodSig {
         required: md.required,
         optional: md.optional,
@@ -7528,7 +8332,9 @@ fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
         keywords: md.keywords.clone(),
         kwrest: md.kwrest,
         sig: md.sig.clone(),
-        sorbet_ret: md.sorbet_ret.clone(),
+        sorbet_sig: md.sorbet_sig.clone(),
+        positional_names: md.positional_names.clone(),
+        nesting: nesting.to_vec(),
         arity_unknown: md.arity_unknown,
         abstract_stub: md.abstract_stub,
         file,
@@ -7536,6 +8342,340 @@ fn method_sig(md: &MethodDef, file: SourceFile) -> MethodSig {
         name_span: md.name_span,
         schema_col_type: None,
     }
+}
+
+fn merge_source_method(
+    methods: &mut FxHashMap<String, MethodSig>,
+    definition: &MethodDef,
+    file: SourceFile,
+    nesting: &[String],
+) {
+    let mut method = method_sig(definition, file, nesting);
+    if methods.contains_key(&definition.name) {
+        // The index's historical last-body policy is not evidence of runtime
+        // load order. Preserve inference, but never pick a Sorbet contract.
+        method.sorbet_sig = None;
+    }
+    methods.insert(definition.name.clone(), method);
+}
+
+/// A redefinition the merge cannot order keeps a body for inference but
+/// never a Sorbet contract.
+fn poison_contract(method: &mut MethodSig) {
+    method.sorbet_sig = None;
+}
+
+/// Name-keyed redefinitions written from outside the class body
+/// (`X.class_eval { def m }`, `X.define_method(:m)`, `X.send(:alias_method,
+/// ...)`, `X.instance_eval`, a string eval on `X`) poison the contracts of
+/// the names they define on every track; `def X.m` only on the singleton
+/// track. A body that cannot be read, or an injected module whose methods
+/// cannot be enumerated — including one whose mixin hook runs on `X`
+/// (`X.include(M)`, `X.extend(M)` with `M.included`/`M.extended`), which
+/// can redefine or prepend over anything — poisons every contract of the
+/// class. The class's own methods are not the only ones it now answers
+/// differently, so a contract higher in its family stops treating it as a
+/// plain inheritor. A receiver no constant names stays out of reach, as it
+/// is for every other check.
+fn poison_injected_contracts(index: &mut ProjectIndex) {
+    let hits: Vec<(ClassId, Option<Vec<String>>, bool)> = index
+        .keyed_raw
+        .iter()
+        .filter_map(|(target, nesting, source)| {
+            let target = target.as_deref()?.trim_start_matches("::");
+            let id = index
+                .resolve_const(nesting, target)
+                .or_else(|| index.by_path.get(target).copied())?;
+            let (source, singleton_only) = match source {
+                PollutionSource::Singleton(inner) => (inner.as_ref(), true),
+                other => (other, false),
+            };
+            let names = match source {
+                PollutionSource::Names(n) => Some(n.clone()),
+                PollutionSource::Module(path) => known_mixin_names(index, nesting, path),
+                PollutionSource::Opaque | PollutionSource::Singleton(_) => None,
+            };
+            Some((id, names, singleton_only))
+        })
+        .collect();
+    for (id, names, singleton_only) in hits {
+        index.include_time_code.insert(id);
+        if names.as_ref().is_none_or(|n| n.iter().any(|name| name == "new")) {
+            index.outside_new.insert(id);
+        }
+        let class = &mut index.classes[id.0 as usize];
+        match names {
+            Some(names) => {
+                for name in &names {
+                    if !singleton_only {
+                        class.methods.get_mut(name).map(poison_contract);
+                    }
+                    class.singleton_methods.get_mut(name).map(poison_contract);
+                }
+            }
+            None => class
+                .methods
+                .values_mut()
+                .chain(class.singleton_methods.values_mut())
+                .for_each(poison_contract),
+        }
+    }
+}
+
+/// The methods mixing in `path` can put on its target, or `None` when that
+/// set is not fully known: the module is unresolved, open, too deep for
+/// `module_method_names`, or its chain runs a mixin hook, which can define
+/// or prepend anything on the target at the moment of the mixin.
+fn known_mixin_names(index: &ProjectIndex, nesting: &[String], path: &str) -> Option<Vec<String>> {
+    let module = index.resolve_const(nesting, path)?;
+    let hooked = index.ancestors(module).0.iter().any(|&a| {
+        let m = index.class(a);
+        runs_code_on_includer(m) || EXTEND_HOOKS.iter().any(|hook| m.singleton_methods.contains_key(*hook))
+    });
+    if hooked {
+        return None;
+    }
+    module_method_names(index, nesting, path)
+}
+
+/// Singleton methods Ruby runs on the extender when `extend` itself runs.
+const EXTEND_HOOKS: &[&str] = &["extended", "extend_object"];
+
+/// A prepend lands IN FRONT of its target, on the instance track
+/// (`prepend M`) or the singleton track (`class << self; prepend M; end`,
+/// `X.singleton_class.prepend(M)`, `class << X; prepend M; end`): every
+/// method the module answers shadows the target's own definition of that
+/// name, so the written contract no longer governs the call. A module
+/// whose method set is not fully known (`known_mixin_names`) may shadow
+/// anything on that track, so every contract there comes off and a
+/// contract higher in the family stops treating the target as a plain
+/// inheritor.
+fn poison_prepend_shadowed_contracts(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, bool, Option<Vec<String>>)> = Vec::new();
+    for (i, class) in index.classes.iter().enumerate() {
+        let Ok(raw) = u32::try_from(i) else { continue };
+        let tracks = class.prepends.iter().map(|p| (false, p));
+        for (singleton, path) in tracks.chain(class.singleton_prepends.iter().map(|p| (true, p))) {
+            hits.push((ClassId(raw), singleton, known_mixin_names(index, &class.nesting, path)));
+        }
+    }
+    for (id, singleton, names) in hits {
+        let class = &mut index.classes[id.0 as usize];
+        let track = if singleton { &mut class.singleton_methods } else { &mut class.methods };
+        if let Some(names) = names {
+            for name in &names {
+                track.get_mut(name).map(poison_contract);
+            }
+        } else {
+            track.values_mut().for_each(poison_contract);
+            index.include_time_code.insert(id);
+        }
+    }
+}
+
+/// Fail-closed half of a known ancestry bug: `include A, B` is
+/// linearized here in reverse of Ruby's order, so a name that both
+/// modules (or their ancestors) answer resolves to the wrong one. Until
+/// that is fixed, no contract written in a module named by such a call,
+/// or in any of its ancestors, is trusted.
+fn poison_ambiguous_mixin_contracts(index: &mut ProjectIndex) {
+    let mut hit: Vec<ClassId> = Vec::new();
+    for (path, nesting) in &index.ambiguous_mixins {
+        let Some(module) = index.resolve_const(nesting, path) else { continue };
+        for id in index.ancestors(module).0 {
+            if !hit.contains(&id) {
+                hit.push(id);
+            }
+        }
+    }
+    for id in hit {
+        let class = &mut index.classes[id.0 as usize];
+        class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
+    }
+}
+
+/// A `sig` block is a contract only when it is sorbet-runtime's own
+/// `T::Sig#sig` and its method-added hook really attaches it to the def.
+/// Every contract of a class fails that proof when the class's `sig` is
+/// not provably `T::Sig`'s (`sorbet_sig_reaches`). Such a sig is inert:
+/// never a contract, and never a declared type for a consumer. A project
+/// `sig` or a hook that can swallow the attachment makes EVERY sig inert
+/// (`crate::runtime_gate`), so neither is tracked per class here.
+fn poison_runtime_inert_contracts(index: &mut ProjectIndex) {
+    let t_sig = index.by_path.get("T::Sig").copied();
+    let hit: Vec<ClassId> = (0..index.classes.len())
+        .filter_map(|i| u32::try_from(i).ok().map(ClassId))
+        .filter(|&id| {
+            let class = index.class(id);
+            class.methods.values().chain(class.singleton_methods.values()).any(|m| m.sorbet_sig.is_some())
+        })
+        .filter(|&id| !sorbet_sig_reaches(index, id, t_sig))
+        .collect();
+    for id in hit {
+        let class = &mut index.classes[id.0 as usize];
+        class.methods.values_mut().chain(class.singleton_methods.values_mut()).for_each(poison_contract);
+    }
+}
+
+/// Names sorbet-runtime's type test runs on a value (`T::Types::Simple`
+/// asks `is_a?`): a project definition of one on some class decides what
+/// that class's values satisfy.
+pub const TYPE_TEST_NAMES: &[&str] = &["is_a?", "kind_of?", "instance_of?"];
+
+/// A definition or mixin aimed at a receiver no constant names
+/// (`FileScan::note_hidden_call`, `class << obj`, `def obj.m`, a
+/// refinement of an unnamed class, a bare `eval`) may land on ANY class,
+/// on either track: every contract of every name it can define comes off,
+/// everywhere. One it cannot enumerate — a dynamic name, a string body, a
+/// module whose methods are not fully known — takes every contract off,
+/// and so does one that defines a type test (`TYPE_TEST_NAMES`), which
+/// decides what a literal of whatever class it lands on satisfies.
+///
+/// That global answer is kept only where the target truly cannot be
+/// bounded: a method or block parameter (`ObjectSpace.each_object`, a
+/// patch helper's `k`), a `const_get` by a computed name, a bare string
+/// `eval`. A mixin hook's own receiver parameter is bounded by the
+/// module's includers and extenders (`poison_hook_installs`); a literal
+/// that is never a module makes no mixin; Rails' route helpers define
+/// route-helper names only (`hidden_mixin_source`).
+fn poison_hidden_redefinitions(index: &mut ProjectIndex) {
+    let mut names: FxHashSet<String> = FxHashSet::default();
+    let mut every = false;
+    for (nesting, source) in std::mem::take(&mut index.hidden_raw) {
+        match hidden_names(index, &nesting, &source) {
+            Some(defined) => names.extend(defined),
+            None => every = true,
+        }
+    }
+    every |= TYPE_TEST_NAMES.iter().any(|n| names.contains(*n));
+    if !every && names.is_empty() {
+        return;
+    }
+    for class in &mut index.classes {
+        for track in [&mut class.methods, &mut class.singleton_methods] {
+            for (name, method) in track.iter_mut() {
+                if every || defines_name(&names, name) {
+                    poison_contract(method);
+                }
+            }
+        }
+    }
+}
+
+/// What a mixin hook installs through its receiver parameter
+/// (`def self.included(base); base.prepend(M)`, `def self.extended(base);
+/// base.define_method(:m)`, `class << self; def included(base)`) lands
+/// only on the classes and modules that mix the hook's module in
+/// directly, on either track (a hook deferred through a concern reaches
+/// its final includer, whose every contract the include-time rule
+/// already takes off).
+/// Each of them loses the contract of every name the install can define,
+/// or every contract when that set is unknown, and stops counting as a
+/// plain inheritor for a contract higher in its family. An install that
+/// defines a type test, or whose module cannot be found, is judged like
+/// any hidden definition (`poison_hidden_redefinitions`).
+fn poison_hook_installs(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, Option<Vec<String>>)> = Vec::new();
+    for (nesting, source) in std::mem::take(&mut index.hook_raw) {
+        let names = hidden_names(index, &nesting, &source);
+        let module = nesting.last().and_then(|path| index.by_path.get(path).copied());
+        let type_test = names.as_ref().is_some_and(|n| n.iter().any(|name| TYPE_TEST_NAMES.contains(&name.as_str())));
+        let Some(module) = module.filter(|_| !type_test) else {
+            index.hidden_raw.push((nesting, source));
+            continue;
+        };
+        for (i, class) in index.classes.iter().enumerate() {
+            let Ok(raw) = u32::try_from(i) else { continue };
+            let mixes = class
+                .includes
+                .iter()
+                .chain(&class.prepends)
+                .chain(&class.extends)
+                .any(|path| index.resolve_const(&class.nesting, path) == Some(module));
+            if mixes {
+                hits.push((ClassId(raw), names.clone()));
+            }
+        }
+    }
+    for (id, names) in hits {
+        index.include_time_code.insert(id);
+        let names: Option<FxHashSet<String>> = names.map(|n| n.into_iter().collect());
+        let class = &mut index.classes[id.0 as usize];
+        for method in class.methods.iter_mut().chain(class.singleton_methods.iter_mut()) {
+            if names.as_ref().is_none_or(|n| defines_name(n, method.0)) {
+                poison_contract(method.1);
+            }
+        }
+    }
+}
+
+/// The names one hidden source can define, or `None` for any name.
+fn hidden_names(index: &ProjectIndex, nesting: &[String], source: &PollutionSource) -> Option<Vec<String>> {
+    match source {
+        PollutionSource::Names(n) if n.iter().any(|name| name == ROUTE_HELPERS) && project_defines(index, "url_helpers") => None,
+        PollutionSource::Names(n) => Some(n.clone()),
+        PollutionSource::Module(path) => known_mixin_names(index, nesting, path),
+        PollutionSource::Singleton(inner) => hidden_names(index, nesting, inner),
+        PollutionSource::Opaque => None,
+    }
+}
+
+/// `Alias = Foo; class Alias; def m; end; end` reopens `Foo` itself, but
+/// the index files the body under `Alias`. Each name the reopen defines
+/// is a second definition of that name on `Foo`, shadowing whatever
+/// `Foo`'s ancestors answer, so its contract comes off `Foo` and every
+/// ancestor, on the track it was written on, and off the reopen's own
+/// definition of it.
+fn poison_alias_reopen_redefinitions(index: &mut ProjectIndex) {
+    let mut hits: Vec<(ClassId, ClassId)> = Vec::new();
+    for (alias, (nesting, target)) in &index.const_aliases {
+        let Some(&reopen) = index.by_path.get(alias) else { continue };
+        match index.resolve_const_through_aliases(nesting, target) {
+            Some(real) if real != reopen => hits.push((reopen, real)),
+            _ => {}
+        }
+    }
+    for (reopen, real) in hits {
+        let instance: Vec<String> = index.class(reopen).methods.keys().cloned().collect();
+        let singleton: Vec<String> = index.class(reopen).singleton_methods.keys().cloned().collect();
+        let mut family = index.ancestors(real).0;
+        family.push(reopen);
+        for id in family {
+            let class = &mut index.classes[id.0 as usize];
+            for name in &instance {
+                class.methods.get_mut(name).map(poison_contract);
+            }
+            for name in &singleton {
+                class.singleton_methods.get_mut(name).map(poison_contract);
+            }
+        }
+    }
+}
+
+/// Is the bare `sig` in `id`'s body sorbet-runtime's? The class-object
+/// lookup chain is the class and its superclasses (a module: itself
+/// alone), and one of them must `extend` (or `class << self;
+/// include`) a module whose ancestry holds `T::Sig`, or the project puts
+/// `T::Sig` on every class. This index files a `class << self; extend
+/// T::Sig` with the class's own extends, though a `sig` inside `class <<
+/// self` needs exactly that one; a misplaced `extend` makes the `sig`
+/// raise `NoMethodError` at load, so the body never runs to be judged.
+fn sorbet_sig_reaches(index: &ProjectIndex, id: ClassId, t_sig: Option<ClassId>) -> bool {
+    let chain: Vec<ClassId> = if index.class(id).is_module {
+        vec![id]
+    } else {
+        index.ancestors(id).0.into_iter().filter(|&a| !index.class(a).is_module).collect()
+    };
+    if index.sorbet_sig_everywhere {
+        return true;
+    }
+    let Some(t_sig) = t_sig else { return false };
+    chain.iter().any(|&a| {
+        let class = index.class(a);
+        class.extends.iter().any(|path| {
+            index.resolve_const(&class.nesting, path).is_some_and(|m| index.ancestors(m).0.contains(&t_sig))
+        })
+    })
 }
 
 /// Result of a method lookup on a project class.
@@ -7585,6 +8725,7 @@ impl ProjectIndex {
             includes: Vec::new(),
             prepends: Vec::new(),
             extends: Vec::new(),
+            singleton_prepends: Vec::new(),
             methods: FxHashMap::default(),
             singleton_methods: FxHashMap::default(),
             consts: Vec::new(),
@@ -7752,6 +8893,7 @@ impl ProjectIndex {
     /// when any named superclass/mixin failed to resolve in the index —
     /// callers must then treat lookups as Inconclusive.
     pub fn ancestors(&self, id: ClassId) -> (Vec<ClassId>, bool) {
+        ANCESTOR_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut out = Vec::new();
         let mut complete = true;
         let mut visited = std::collections::HashSet::new();
@@ -7967,6 +9109,70 @@ impl ProjectIndex {
             }
         }
         false
+    }
+
+    /// Can a call typed at `owner` reach any body other than this exact
+    /// definition (`file`, `def_span`) of `name`? Walks every class a
+    /// receiver typed `owner` may really be: subclasses, and for a module
+    /// its includers and prependers, with an `extend` moving the walk to
+    /// that extender's singleton track. Each one must either leave the
+    /// name alone (no mixins, not open, no own definition) or resolve it,
+    /// through the checker's own lookup, back to this very definition.
+    /// Anything else — an override, a mixin answering first, an open
+    /// member, an inconclusive lookup — is a divergence, fail-closed.
+    pub fn contract_dispatch_diverges(
+        &self,
+        owner: ClassId,
+        name: &str,
+        singleton: bool,
+        file: SourceFile,
+        def_span: (usize, usize),
+    ) -> bool {
+        let mut stack = vec![(owner, singleton)];
+        let mut seen = FxHashSet::default();
+        while let Some((cur, on_singleton)) = stack.pop() {
+            if !seen.insert((cur, on_singleton)) {
+                continue;
+            }
+            let kids = self.subclasses.get(&cur).into_iter().flatten().map(|&k| (k, on_singleton));
+            let mixed = self.mixers.get(&cur).into_iter().flatten().filter_map(|m| match (m.extends, on_singleton) {
+                (false, track) => Some((m.class, track)),
+                (true, false) => Some((m.class, true)),
+                // Extending a module never exposes its singleton methods.
+                (true, true) => None,
+            });
+            for (kid, track) in kids.chain(mixed).collect::<Vec<_>>() {
+                crate::check::note_contract_work(|w| w.family_visits += 1);
+                if self.member_diverges(kid, name, track, file, def_span) {
+                    return true;
+                }
+                stack.push((kid, track));
+            }
+        }
+        false
+    }
+
+    fn member_diverges(
+        &self,
+        id: ClassId,
+        name: &str,
+        singleton: bool,
+        file: SourceFile,
+        def_span: (usize, usize),
+    ) -> bool {
+        let class = self.class(id);
+        if class.open || self.include_time_code.contains(&id) {
+            return true;
+        }
+        let own = if singleton { &class.singleton_methods } else { &class.methods };
+        let mixes = !class.includes.is_empty()
+            || !class.prepends.is_empty()
+            || (singleton && !class.extends.is_empty());
+        if !mixes {
+            return own.contains_key(name);
+        }
+        let found = if singleton { self.lookup_singleton(id, name) } else { self.lookup_method(id, name) };
+        !matches!(found, MethodLookup::Found(m, _) if m.file == file && m.def_span == def_span)
     }
 
     /// The refined instance-track counterpart of `descendant_defines`
@@ -8239,6 +9445,54 @@ impl ProjectIndex {
             }
         }
         None
+    }
+
+    /// Can a project singleton `new` answer `X.new` instead of
+    /// `Class#new`, so `X.new` proves no `X` instance? Asked where
+    /// `lookup_singleton_own(id, "new")` finds none: every link it cannot
+    /// close counts, except sorbet-runtime's own `T::Sig` (it defines only
+    /// `sig`) and a descendant's `self.new`, which never runs for `X.new`.
+    /// It also sees what that lookup does not: a source written outside a
+    /// class body (`outside_new`). A singleton prepend is an `extends` edge
+    /// here too (`singleton_mixin`).
+    pub fn singleton_new_hidden(&self, id: ClassId) -> bool {
+        let t_sig = self.by_path.get("T::Sig").copied();
+        let (ancestors, _complete) = self.ancestors(id);
+        for &a in &ancestors {
+            let class = self.class(a);
+            if class.open {
+                if class.open_reason == Some(OpenReason::DeclaredExternal) {
+                    continue;
+                }
+                return true;
+            }
+            if class.singleton_methods.contains_key("new") || self.outside_new.contains(&a) {
+                return true;
+            }
+            if class.extends.iter().any(|ext| self.module_hides_new(class, ext, t_sig)) {
+                return true;
+            }
+        }
+        self.ambiguous_ancestry.contains(&id)
+    }
+
+    /// Can `ext`, extended onto (or prepended to) `class`'s singleton, answer
+    /// `new`? Unless it resolves to a fully known chain with no `new` and
+    /// no mixin hook.
+    fn module_hides_new(&self, class: &ClassDef, ext: &str, t_sig: Option<ClassId>) -> bool {
+        let Some(mid) = self.resolve_const(&class.nesting, ext) else {
+            return true;
+        };
+        let (chain, complete) = self.ancestors(mid);
+        if !complete {
+            return true;
+        }
+        chain.iter().any(|&m| {
+            let module = self.class(m);
+            let answers_new = module.methods.contains_key("new") || self.outside_new.contains(&m);
+            // What a mixin hook installs on the extender is `outside_new`'s.
+            answers_new || (module.open && Some(m) != t_sig)
+        })
     }
 
     /// Bead ita-6bq: does a class's OWN singleton `new` show up somewhere
@@ -8975,6 +10229,41 @@ impl ProjectIndex {
             self.toplevel_consts.contains(name) || stdlib_declares(&self.requires, nesting, name)
         }
     }
+    /// Sorbet contract names: what the crefs' ancestors say about `first`
+    /// once the lexical walk fell through to `top`, the top-level binding
+    /// (`None`: no project class there). Ruby consults the cref's ancestors
+    /// before the top level, so a known ancestor namespace carrying `first`
+    /// as anything but `top` shadows the fallback. Ancestry that is missing,
+    /// incomplete, ambiguous or open for a reason that could hide ancestors
+    /// or constants (a gem class, a dynamic mixin) proves nothing. Every
+    /// nesting level is consulted, not only the innermost: over-silencing is
+    /// acceptable, a wrong nominal type is not (invariant #1).
+    pub fn const_fallback(&self, nesting: &[String], first: &str, top: Option<ClassId>) -> ConstFallback {
+        let mut verdict = ConstFallback::Proven;
+        for level in nesting {
+            let Some(&id) = self.by_path.get(level) else {
+                verdict = ConstFallback::Opaque;
+                continue;
+            };
+            let (chain, complete) = self.ancestors(id);
+            if !complete {
+                verdict = ConstFallback::Opaque;
+            }
+            for a in chain {
+                let c = self.class(a);
+                if c.consts.iter().any(|k| k == first)
+                    || self.by_path.get(&format!("{}::{first}", c.path)).is_some_and(|&r| Some(r) != top)
+                {
+                    return ConstFallback::Shadowed;
+                }
+                if self.ambiguous_ancestry.contains(&a) || (c.open && !constant_neutral_open(c.open_reason)) {
+                    verdict = ConstFallback::Opaque;
+                }
+            }
+        }
+        verdict
+    }
+
     /// Does `simple` exist, or might conflicting ancestry provide it?
     /// This suppression-only answer never gives a type/navigation target.
     fn const_in_ancestors(&self, id: ClassId, simple: &str) -> bool {

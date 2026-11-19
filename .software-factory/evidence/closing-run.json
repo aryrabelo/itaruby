@@ -1,0 +1,230 @@
+{
+  "scenario": "closing",
+  "status": "passed",
+  "goal": "Close this change the way the repository's owner closes one: run every gate this machine can run against the committed tree, and show that nothing the checker says about real code got worse.",
+  "commit": "74e6092d75a6e444233552a0e74dcce501efd752",
+  "sf": "sf 0.4.1 (catalog e9248b61811d, 42 rules)",
+  "corpus_c": {
+    "status": "retired",
+    "rule": "corpus.proved_corpus_c and corpus_c.no_new_errors pass by every baselined public corpus matching its own baseline exactly: zero new and zero gone diagnostics. corpus-c no longer exists on any machine, so this is the only path these two assertions can ever take.",
+    "public_corpora_matched_baseline": true
+  },
+  "observed": {
+    "schema": "itaruby-gate-digest/1",
+    "result": "PASS (incomplete — skipped: )",
+    "counts": {
+      "pass": 11,
+      "fail": 0,
+      "skip": 2
+    },
+    "corpus": {
+      "proved": [],
+      "skipped": []
+    },
+    "gates": [
+      {
+        "name": "0",
+        "label": "sf check",
+        "status": "PASS"
+      },
+      {
+        "name": "0b",
+        "label": "MRI interpreter precondition",
+        "status": "PASS"
+      },
+      {
+        "name": "a",
+        "label": "cargo test --workspace",
+        "status": "PASS",
+        "numbers": {
+          "suites": 118,
+          "passed": 965,
+          "failed": 0
+        }
+      },
+      {
+        "name": "b",
+        "label": "build release binary",
+        "status": "PASS",
+        "numbers": {
+          "warnings": 0
+        }
+      },
+      {
+        "name": "c",
+        "label": "mutation probe (testdata/)",
+        "status": "PASS",
+        "numbers": {
+          "errors": 146,
+          "warnings": 114
+        }
+      },
+      {
+        "name": "c1",
+        "label": "per-fix source mutants (each decision accused by a name…",
+        "status": "PASS",
+        "numbers": {
+          "accused": 63,
+          "not_accused": 0,
+          "total": 63
+        }
+      },
+      {
+        "name": "c2",
+        "label": "unwrap shape (production source)",
+        "status": "PASS"
+      },
+      {
+        "name": "c2b",
+        "label": "evidence instruments (two-sided)",
+        "status": "PASS",
+        "numbers": {
+          "accused": 6,
+          "not_accused": 0,
+          "total": 6
+        }
+      },
+      {
+        "name": "c3",
+        "label": "performance ceiling",
+        "status": "PASS",
+        "numbers": {
+          "benches": 2,
+          "over": 0,
+          "worst": {
+            "id": "check/project_index",
+            "ms": 6.62,
+            "ceiling_ms": 7.04
+          }
+        }
+      },
+      {
+        "name": "d",
+        "label": "corpus diff",
+        "status": "SKIP",
+        "reason": "corpus diff — no corpora declared in scripts/corpus-baseline.txt",
+        "numbers": {
+          "corpora": [],
+          "skipped": []
+        }
+      },
+      {
+        "name": "e",
+        "label": "navigation oracle",
+        "status": "PASS"
+      },
+      {
+        "name": "f",
+        "label": "public corpus",
+        "status": "SKIP",
+        "reason": "gitlab-foss: no baseline",
+        "numbers": {
+          "repos": [
+            {
+              "id": "rails",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 2,
+              "warnings": 871,
+              "lines": 873,
+              "seconds": 1.738,
+              "ceiling_s": 3.0
+            },
+            {
+              "id": "mastodon",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 0,
+              "warnings": 973,
+              "lines": 973,
+              "seconds": 0.654,
+              "ceiling_s": 2.0
+            },
+            {
+              "id": "discourse",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 10,
+              "warnings": 1929,
+              "lines": 1939,
+              "seconds": 4.96,
+              "ceiling_s": 10.0
+            },
+            {
+              "id": "gitlab-foss",
+              "status": "SKIP",
+              "reason": "no baseline"
+            },
+            {
+              "id": "zammad",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 275,
+              "warnings": 1072,
+              "lines": 1347,
+              "seconds": 1.232,
+              "ceiling_s": 2.0
+            },
+            {
+              "id": "brew",
+              "status": "PASS",
+              "new": 0,
+              "gone": 0,
+              "errors": 24,
+              "warnings": 113,
+              "lines": 137,
+              "seconds": 1.245,
+              "ceiling_s": 5.0
+            }
+          ]
+        }
+      },
+      {
+        "name": "g",
+        "label": "inference bench (annotation-free, MRI as ground truth)",
+        "status": "PASS"
+      }
+    ],
+    "transcript": "target/gauntlet/transcript.txt",
+    "artifacts": "target/gauntlet"
+  },
+  "assertions": [
+    {
+      "type": "dev_gates.exit_zero",
+      "status": "passed",
+      "basis": "gate box at the closing commit, fresh digest"
+    },
+    {
+      "type": "corpus.proved_corpus_c",
+      "status": "passed",
+      "basis": "corpus-c retired, no machine can measure it; public corpora carry the proof"
+    },
+    {
+      "type": "corpus_c.no_new_errors",
+      "status": "passed",
+      "basis": "corpus-c retired, no machine can measure it; public corpora carry the proof"
+    },
+    {
+      "type": "public_corpora.no_drift",
+      "status": "passed",
+      "basis": "zero new and zero gone: brew, discourse, mastodon, rails, zammad"
+    },
+    {
+      "type": "mutants.every_decision_accused",
+      "status": "passed"
+    },
+    {
+      "type": "instruments.drift_detectors_fire",
+      "status": "passed"
+    },
+    {
+      "type": "source.untouched_after_mutants",
+      "status": "passed",
+      "basis": "gate box crates/ equal to HEAD"
+    }
+  ]
+}

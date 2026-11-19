@@ -1,10 +1,9 @@
-//! Bead ita-uh1: sorbet sig return-type mapping. Two independent groups —
-//! `sorbet_sig::sorbet_ret_ty` (pure string -> `Ty` mapping, no AST
-//! involved) and `DefWalker`'s capture of a `sig { ... }`'s `.returns(...)`
-//! text into `MethodDef::sorbet_ret`. Inline sources, same shape as
-//! `tests/open_reason.rs`.
+//! Index-blind type-expression mapping (`sorbet_ret_ty`) and the
+//! class-openness controls around an unrecognized `sig` block. The named
+//! contracts themselves are exercised end to end, through real
+//! diagnostics, in `sorbet_contracts.rs`.
 
-use itaruby_semantic::index::{parse_defs_text, ClassFragment, MethodDef, OpenReason};
+use itaruby_semantic::index::{parse_defs_text, ClassFragment, OpenReason};
 use itaruby_semantic::sorbet_sig::sorbet_ret_ty;
 use itaruby_semantic::types::Ty;
 
@@ -122,10 +121,6 @@ fn never_produces_instance_or_class() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// DefWalker capture: sig { ... } -> MethodDef::sorbet_ret.
-// ---------------------------------------------------------------------------
-
 fn widget_fragment(text: &str) -> ClassFragment {
     parse_defs_text(text)
         .fragments
@@ -134,50 +129,6 @@ fn widget_fragment(text: &str) -> ClassFragment {
         .expect("fragment `Widget` not found")
 }
 
-fn method<'a>(frag: &'a ClassFragment, name: &str) -> &'a MethodDef {
-    frag.methods
-        .iter()
-        .find(|m| m.name == name)
-        .unwrap_or_else(|| panic!("method `{name}` not found on Widget"))
-}
-
-/// `sig { returns(String) }` immediately above a `def` populates
-/// `sorbet_ret` with the raw `returns(...)` argument text.
-#[test]
-fn sig_returns_populates_sorbet_ret() {
-    let frag = widget_fragment(
-        "class Widget\n  sig { returns(String) }\n  def name\n  end\nend\n",
-    );
-    assert_eq!(method(&frag, "name").sorbet_ret.as_deref(), Some("String"));
-}
-
-/// `sig { params(...).returns(X) }`: only the `returns(...)` argument text
-/// is captured, `params` is ignored (arity is out of scope for this bead).
-#[test]
-fn sig_params_returns_captures_only_returns_text() {
-    let frag = widget_fragment(
-        "class Widget\n  sig { params(x: Integer).returns(T::Array[String]) }\n  def names(x)\n  end\nend\n",
-    );
-    assert_eq!(
-        method(&frag, "names").sorbet_ret.as_deref(),
-        Some("T::Array[String]")
-    );
-}
-
-/// `sig { void }` — no return type — leaves `sorbet_ret` `None`.
-#[test]
-fn sig_void_leaves_sorbet_ret_none() {
-    let frag = widget_fragment("class Widget\n  sig { void }\n  def save\n  end\nend\n");
-    assert_eq!(method(&frag, "save").sorbet_ret, None);
-}
-
-/// A `def` with no preceding `sig` at all: `sorbet_ret` is `None`, same as
-/// every project this bead ships to before Tapioca RBIs exist.
-#[test]
-fn def_without_sig_is_none() {
-    let frag = widget_fragment("class Widget\n  def plain\n  end\nend\n");
-    assert_eq!(method(&frag, "plain").sorbet_ret, None);
-}
 
 /// Bead ita-4xy narrows this: a RECOGNIZED `sig { ... }` shape (bare
 /// `returns(X)`/`void`, optionally `params(...)`/`override.`/`abstract.`

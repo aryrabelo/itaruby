@@ -38,7 +38,10 @@ kept verbatim: a lesson without its measurement is folklore, not knowledge.
   empty array plus a log line, never an exception in the host.
 - **Sig fill, pull diagnostics, persistent runner** (`method_return`, wave 2):
   falls back to a method's own `sig { returns(X) }` only when the inferred body
-  type is Unknown; an inferred type never loses to a sig. The **`sig{}`
+  type is Unknown; an inferred type never loses to a sig. (Superseded
+  2026-09-22: the sig is now a contract that types the consumer, and a body
+  that disagrees is accused as E0109. See the contract in the root
+  `AGENTS.md`.) The **`sig{}`
   carve-out** — a recognized sig block (returns/void, with
   params/override/abstract) stops marking its class `open` — unmasked 63
   diagnostics on the reference corpus, all read: 3 precision fixes (a reopened

@@ -1,0 +1,112 @@
+#!/usr/bin/env python3
+"""The command L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE runs for the closing claim.
+
+Run: scripts/claim-judge-gate --expect relation=supports --min-confidence 0.8
+
+The deterministic part runs first, and fails on its own terms before anything
+is asked of a model (software-factory docs/concepts/judging-a-claim-against-
+its-evidence.md, "the deterministic part runs first"):
+
+  1. the question's `claim` is, byte for byte, the sentence under the
+     `CLOSING_GATES_GREEN` marker in AGENTS.md — so rewording the promise
+     without re-asking Jev is red;
+  2. the question's `evidence` is, byte for byte, the sealed closing report —
+     so re-running the gates without re-asking Jev is red;
+  3. the twin is the same question with `supports` and `says_nothing`
+     swapped, and nothing else.
+
+Then the judge (`scripts/claim-judge.mjs`, the reference oracle, verdicts
+cached in `.software-factory/evidence/jev/closing.cache.json`) must accept the
+real question and REFUSE the twin. An oracle only ever seen passing may be
+approving anything; the twin is its mutation fixture.
+
+In CI there is no API key: every verdict must already be in the committed
+cache, and a miss exits 2. That is the point — a closing nobody asked Jev
+about cannot be replayed into a green.
+
+Exit: 0 supported and the twin refused · 1 the finding · 2 could not run.
+"""
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+JEV = ROOT / ".software-factory/evidence/jev"
+REQUEST = JEV / "closing.json"
+TWIN = JEV / "closing.twin.json"
+CACHE = JEV / "closing.cache.json"
+REPORT = ROOT / ".software-factory/evidence/closing-run.json"
+CLAIM_DOC = ROOT / "AGENTS.md"
+CLAIM_ID = "CLOSING_GATES_GREEN"
+
+
+def fail(code, message):
+    print(f"claim-judge-gate: {message}", file=sys.stderr)
+    sys.exit(code)
+
+
+def marked_sentence():
+    lines = CLAIM_DOC.read_text().splitlines()
+    marker = re.compile(rf"<!--\s*claim:\s*{CLAIM_ID}\s+proven-by:\s*closing\s*-->")
+    hits = [i for i, line in enumerate(lines) if marker.search(line)]
+    if len(hits) != 1:
+        fail(2, f"expected one `{CLAIM_ID}` marker in AGENTS.md, found {len(hits)}")
+    sentence = []
+    for line in (line.strip() for line in lines[hits[0] + 1:]):
+        if not line:
+            if sentence:
+                break
+            continue
+        sentence.append(line)
+    return " ".join(sentence)
+
+
+def load(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError) as error:
+        fail(2, f"cannot read {path.relative_to(ROOT)}: {error} — run scripts/closing-evidence")
+
+
+def judge(request, argv):
+    return subprocess.run(
+        ["node", str(ROOT / "scripts/claim-judge.mjs"), "--request", str(request),
+         "--cache", str(CACHE), *argv],
+        cwd=ROOT, check=False,
+    ).returncode
+
+
+def main():
+    argv = sys.argv[1:]
+    if "--expect" not in argv:
+        fail(2, "usage: claim-judge-gate --expect name=label --min-confidence N")
+    real, twin = load(REQUEST), load(TWIN)
+    claim, evidence = marked_sentence(), REPORT.read_text() if REPORT.exists() else None
+    if evidence is None:
+        fail(2, "no sealed closing report — run scripts/closing-evidence")
+    if real["state"].get("claim") != claim:
+        fail(1, "the question's claim is not the sentence AGENTS.md marks — re-run scripts/closing-evidence")
+    if real["state"].get("evidence") != evidence:
+        fail(1, "the question's evidence is not the sealed closing report — re-run scripts/closing-evidence")
+    criteria = real["questions"]["relation"]["criteria"]
+    swapped = dict(criteria, supports=criteria["says_nothing"], says_nothing=criteria["supports"])
+    expected_twin = json.loads(json.dumps(real))
+    expected_twin["questions"]["relation"]["criteria"] = swapped
+    if twin != expected_twin:
+        fail(1, "the twin is not the real question with `supports` and `says_nothing` swapped")
+
+    verdict = judge(REQUEST, argv)
+    if verdict != 0:
+        sys.exit(verdict)
+    inverted = judge(TWIN, argv)
+    if inverted == 0:
+        fail(1, "the judge also accepted the negated twin — it is approving anything")
+    if inverted != 1:
+        sys.exit(inverted)
+    print("claim-judge-gate: Jev supports the closing claim and refuses its negated twin")
+
+
+if __name__ == "__main__":
+    main()

@@ -7,7 +7,6 @@
 {"code":"E0101","column":24,"line":162,"message":"undefined method `present?` for `Homebrew::BumpVersionParser`","path":"brew/Library/Homebrew/dev-cmd/bump-cask-pr.rb","severity":"error"}
 {"code":"E0104","column":23,"line":10,"message":"unresolved constant `Sorbet::Private::Static::ENVClass`","path":"brew/Library/Homebrew/extend/ENV/sensitive.rb","severity":"warning"}
 {"code":"E0104","column":23,"line":20,"message":"unresolved constant `Sorbet::Private::Static::ENVClass`","path":"brew/Library/Homebrew/extend/ENV/shared.rb","severity":"warning"}
-{"code":"E0101","column":66,"line":884,"message":"undefined method `to_a` for `Options`","path":"brew/Library/Homebrew/formula_installer.rb","severity":"error"}
 {"code":"E0104","column":47,"line":56,"message":"unresolved constant `REXML::Document`","path":"brew/Library/Homebrew/livecheck/strategy/xml.rb","severity":"warning"}
 {"code":"E0104","column":13,"line":60,"message":"unresolved constant `REXML::Document`","path":"brew/Library/Homebrew/livecheck/strategy/xml.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":61,"message":"unresolved constant `REXML::UndefinedNamespaceException`","path":"brew/Library/Homebrew/livecheck/strategy/xml.rb","severity":"warning"}
@@ -30,7 +29,6 @@
 {"code":"E0104","column":74,"line":31,"message":"unresolved constant `VariableForce::VariableTable`","path":"brew/Library/Homebrew/rubocops/ternary_to_if.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":86,"message":"unresolved constant `::Bootsnap`","path":"brew/Library/Homebrew/startup/bootsnap.rb","severity":"warning"}
 {"code":"E0104","column":7,"line":103,"message":"unresolved constant `::Bootsnap`","path":"brew/Library/Homebrew/startup/bootsnap.rb","severity":"warning"}
-{"code":"E0101","column":25,"line":500,"message":"undefined method `to_a` for `Options`","path":"brew/Library/Homebrew/tab/tab.rb","severity":"error"}
 {"code":"E0104","column":18,"line":22,"message":"unresolved constant `TestCat`","path":"brew/Library/Homebrew/test/abstract_command_spec.rb","severity":"warning"}
 {"code":"E0104","column":16,"line":26,"message":"unresolved constant `TestCat`","path":"brew/Library/Homebrew/test/abstract_command_spec.rb","severity":"warning"}
 {"code":"E0104","column":18,"line":30,"message":"unresolved constant `TestCat`","path":"brew/Library/Homebrew/test/abstract_command_spec.rb","severity":"warning"}

@@ -23,6 +23,7 @@ the harnesses mutate), and a single mismatch is named.
 Usage: scripts/mutant-anchors [--tree <dir>]   (default: this repo's root)
 """
 import argparse
+import importlib.util
 import os
 import re
 import subprocess
@@ -48,6 +49,28 @@ def unescape(needle: str) -> str:
     needle counts zero and reports two healthy anchors (M37, MUT-K) as broken.
     """
     return needle.replace('\'"\'"\'', "'").replace("'\\''", "'")
+
+
+def python_harness_needles(path: str):
+    """(label, relative source path, needle) for every mutant a Python harness declares.
+
+    A `*-mutants.py` harness that declares its mutants as a module-level
+    `MUTATIONS` table of `(label, path, needle, replacement, named test)`
+    (scripts/sorbet-contracts-mutants.py, whose own `--anchors` mode counts
+    the same table) is loaded, never run, and its needles are counted here
+    against `--tree`, so gate c1's up-front count covers it too. A Python
+    harness without that table (conflicting-superclasses) is not counted.
+    Returns None for such a harness.
+    """
+    sys.dont_write_bytecode = True  # never leave scripts/__pycache__ behind
+    spec = importlib.util.spec_from_file_location(
+        os.path.basename(path).replace('-', '_')[:-3], path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    table = getattr(module, 'MUTATIONS', None)
+    if table is None:
+        return None
+    return [(m[0], str(m[1]), m[2]) for m in table]
 
 
 def main() -> int:
@@ -100,11 +123,36 @@ def main() -> int:
                 first = unescape(needle).splitlines()[0].strip()
                 broken.append(f'{name} {label}: needle matches {n} times — {first[:70]}')
 
+    # Python harnesses mutate a temporary copy, never this tree, so they
+    # neither hold the tree nor need the refusal above.
+    py_harnesses = sorted(
+        os.path.join(ROOT, 'scripts', f)
+        for f in os.listdir(os.path.join(ROOT, 'scripts'))
+        if f.endswith('-mutants.py')
+    )
+    counted_py = 0
+    for path in py_harnesses:
+        name = os.path.basename(path)
+        needles = python_harness_needles(path)
+        if needles is None:
+            continue
+        counted_py += 1
+        for label, rel, needle in needles:
+            total += 1
+            full = os.path.join(args.tree, rel)
+            if not os.path.exists(full):
+                unknown.append(f'{name} {label} ({rel} missing)')
+                continue
+            n = open(full).read().count(needle)
+            if n != 1:
+                first = needle.splitlines()[0].strip()
+                broken.append(f'{name} {label}: needle matches {n} times — {first[:70]}')
+
     for line in unknown:
         print(f'UNKNOWN {line}')
     for line in broken:
         print(f'BROKEN {line}')
-    print(f'{total} anchors checked in {len(harnesses)} harnesses against {args.tree}')
+    print(f'{total} anchors checked in {len(harnesses) + counted_py} harnesses against {args.tree}')
     if broken or unknown:
         print(f'FAIL {len(broken)} broken, {len(unknown)} unmapped — a mutant that cannot '
               f'inject proves nothing, and the harness would report INVALIDO '

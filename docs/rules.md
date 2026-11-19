@@ -48,7 +48,7 @@ Dependency manifests are hash-locked. A changed manifest without a matching lock
 
 **Why.** Adding a dependency is a supply-chain decision wearing the costume of a one-line diff, and it is the single easiest thing for an agent to do while solving something else. Forcing the lock to move in the same commit turns the reviewer's attention on at exactly the moment it is worth spending.
 
-**Fix.** If the dependency is intended, run `sf lock --update` in the same commit and say in the message what it buys. If it is incidental, remove it.
+**Fix.** If the dependency is intended, run `sf lock` in the same commit and say in the message what it buys. If it is incidental, remove it.
 
 ### L2.FACTORY_CONFIG_IS_LOCKED
 
@@ -68,7 +68,7 @@ Every generated or vendored file is recorded in a lock with its SHA-256. Content
 
 **Why.** A generated file is a derivative of a source of truth somewhere else. Editing it by hand looks like the smallest possible fix and silently forks the derivative from its source — the next regeneration destroys the edit, usually in a different pull request, where nobody connects the two. The lock makes the fork impossible instead of merely discouraged.
 
-**Fix.** Change the source and regenerate, then run `sf lock --update` in the same commit so the lock diff is visible to the reviewer as a deliberate act.
+**Fix.** Change the source and regenerate, then run `sf lock` in the same commit so the lock diff is visible to the reviewer as a deliberate act.
 
 ### L2.NO_PERMANENT_EXCEPTION
 
@@ -84,13 +84,45 @@ Each ratchet entry and each policy exclusion declares a `review_by` date, and an
 
 **The guardrail may be strengthened, never quietly weakened**
 
-Compared with the revision under review, no rule may be disabled or removed, no exclusion added, no scope narrowed, no ceiling raised, no gate weakened, no new violation frozen, and no review date pushed out.
+Compared with the revision under review, no rule may be disabled or removed, no exclusion added, no scope narrowed, no ceiling raised, no denylist value removed, no gate weakened, no new violation frozen for a rule that was already enabled, and no review date pushed out. A newly enabled rule may seed the existing debt it exposes.
 
-**Why.** The lock makes a guardrail edit visible; this reads the edit and decides which direction it went. Weakening is the specific move an agent makes when a check stands between it and a green build, and it is the one that costs nothing to write and everything to notice six months later. Strengthening passes silently, so the rule never taxes the direction you want.
+**Why.** The lock makes a guardrail edit visible; this reads the edit and decides which direction it went. Weakening is the specific move an agent makes when a check stands between it and a green build, and it is the one that costs nothing to write and everything to notice six months later. An empty denylist is a particularly quiet loosening: the checker still runs but the values it was supposed to reject are all admitted. A new rule is a strengthening even when it first sees old debt, so its initial ratchet is allowed; once enabled, adding a key is again a weakening. Strengthening passes silently, so the rule never taxes the direction you want.
 
-**Fix.** Restore what was weakened. If the loosening is genuinely right — the rule was wrong, the exclusion is narrower than the alternative — that is a human's call to merge, with the reasoning in the pull request, not a line an agent slips into a diff about something else.
+**Fix.** Restore what was weakened. If the loosening is genuinely right — the rule was wrong, the exclusion is narrower than the alternative — that is a human's call to merge, with the reasoning in the pull request, not a line an agent slips into a diff about something else. To adopt a newly enabled rule, run `sf ratchet` once; do not add keys by hand.
+
+## L3 — Effect: a real actor achieved the outcome
+
+### L3.GATE_HAS_FRESH_EVIDENCE
+
+**A gate activated by touched paths needs digest-verified, non-stale evidence**
+
+When a change touches a gate's activation paths, that gate's evidence manifest must exist, its referenced report must match the recorded SHA-256, each run must name an actor that could have been a customer, every report must carry at least one assertion, every required assertion must be `passed` with none `unsupported`, and the digest of the implementation it certifies must still match the code on disk.
+
+**Why.** This is the whole method in one check. Activation comes from touched paths, so nobody can skip the gate by omitting a label or writing "done" in a pull request. The manifest is not trusted, it is re-verified, so a summary cannot claim a pass the raw report never contained. And the implementation digest is what makes evidence expire: change the code the evidence certified and the evidence dies with it, instead of quietly certifying something it never saw. The actor is the property the other four are in service of: the gate is not "the tests pass", it is that something shaped like the customer achieved the effect, so a run filed under `scripted` has recorded a replay of a fixed sequence and a replay proves the sequence rather than the outcome. That last one is a denylist over free text and is worth no more than it claims — a manifest set on getting past it writes "the script" and does. It is exactly as strong as the goal check beside it: it names the value somebody reaches for when they have not thought about the actor, and stops the field being decoration nothing reads. An empty assertion list is the same failure one level down: the per-assertion loops can faithfully compare nothing and still make a run that observed nothing look complete, so the report itself needs a floor.
+
+**Fix.** Re-run the proof against the real thing and regenerate the manifest with `sf seal <gate>`. If the run cannot pass, the finding is the product behaviour, not the gate. If the finding is the actor, the fix is not a better word in the manifest — it is running the scenario as the customer would meet it. Never hand-edit a digest.
 
 ## L4 — Cadence: docs, plans and rules stay attached
+
+### L4.CLAIM_CITES_ITS_EVIDENCE
+
+**Every marked promise names the gate that proves it**
+
+Every claim marker in a scoped page carries an id and a `proven-by:` naming a gate this policy declares. Markers inside fenced code are documentation showing the form and are left alone.
+
+**Why.** A landing page and a README make promises, and nothing normally joins a promise to the thing that proved it, so the two come apart the ordinary way: the sentence was true when it was written, the code moved, and the sentence stayed. A promise is rarely written false, it ages into false. Naming a gate is the join. The gate carries evidence and `L3.GATE_HAS_FRESH_EVIDENCE` already fails once the implementation digest behind it moves, so a promise goes red through the gate rather than through a second, worse copy of that freshness logic here. The id matters as much as the gate: without one, moving a promise into another paragraph reads as one claim deleted and another added, and the reviewer loses the thread of which promise was ever proven. What this cannot do is enumerate the promises on a page, so it will never notice a new unmarked one, and it does not judge whether the sentence means what the gate proved. Only a reader does that, once, when the promise is written. What CI gets for free is the join.
+
+**Fix.** Mark the promise with an HTML comment carrying `claim:` and an id, then `proven-by:` and the name of a gate in `gates:`. If no gate proves it, the finding is the missing proof, not the marker: define the gate and seal its evidence with `sf seal <gate>`, or delete a promise nothing stands behind.
+
+### L4.CLAIM_IS_SUPPORTED_BY_ITS_EVIDENCE
+
+**A marked claim is supported by the evidence it cites**
+
+A command that judges every marked claim against the evidence of the gate its marker names runs and succeeds. Configure it with `run`.
+
+**Why.** `L4.CLAIM_CITES_ITS_EVIDENCE` joins a promise to a gate and `L3.GATE_HAS_FRESH_EVIDENCE` expires that join when the implementation moves, but nothing reads the sentence against the report. A report can say "passed" without ever containing the effect the sentence promises, the same way a summary can assert a pass the report never held, and a sentence can age into stronger than its proof without any digest changing. Whether a body of evidence supports a sentence is not a question a glob or a query can ask, so the rule runs a command the repository owns. What it buys over a plain CI step is everything around it: the reason printed where it fails, a mutation proving it still fails when it should, and a policy that cannot be quietly loosened. The catalog names no judge for the same reason it names no generator: a judgment that costs money or needs a credential belongs to the repository running it, and its verdicts should be cached and committed so the check stays deterministic and reviewable.
+
+**Fix.** Fix the claim to say what the evidence shows, or produce evidence that supports it and seal the gate. If the judge itself is broken or cannot run, that is the finding — an oracle nobody can run is a promise nobody can verify. Writing the judge for the first time: `docs/concepts/judging-a-claim-against-its-evidence.md` gives the reference wiring — a TypeSafe Jev judgment over a committed request file, the deterministic part run first, a confidence floor, cached verdicts, and the negated-criterion twin that proves the oracle can still fail.
 
 ### L4.DOC_LINKS_RESOLVE
 
@@ -158,11 +190,11 @@ For each enabled rule there is a mutation fixture that violates it, and `sf veri
 
 **An enabled rule must be capable of producing a finding**
 
-A rule that is switched on must be configured to look at something: a lock rule needs a scope, a toolchain rule needs tools, a gate rule needs a gate.
+A rule that is switched on must be configured to look at something: a lock rule needs a scope, a toolchain rule needs tools, an evidence rule needs a gate a change can activate, a gate-coverage rule needs a gate that names a plan, a text-pattern or complexity rule needs a scope that actually selects a file it can evaluate, and a rule carrying a `when` needs a manifest that still satisfies it.
 
-**Why.** `sf verify` proves a rule *can* fire, by running it against a fixture built to trip it. It says nothing about whether the rule is pointed at anything in *this* repository. An enabled lock with an empty scope, or a hazard rule with no tools declared, passes every run forever and appears in every report as a rule that found nothing — indistinguishable from a rule that is protecting you. This was not hypothetical: the tool's own scaffolding wrote an empty scope over a critical lock, and nothing noticed until the lock file failed to appear.
+**Why.** `sf verify` proves a rule *can* fire, by running it against a fixture built to trip it. It says nothing about whether the rule is pointed at anything in *this* repository. An enabled lock with an empty scope, or a hazard rule with no tools declared, passes every run forever and appears in every report as a rule that found nothing — indistinguishable from a rule that is protecting you. This was not hypothetical: the tool's own scaffolding wrote an empty scope over a critical lock, and nothing noticed until the lock file failed to appear. The same blindness reaches a text-pattern or complexity rule: a scope glob that matches no file in the repository, or a declared language none of its files ever resolve to, leaves the rule enabled and silent forever. This was also not hypothetical — a repository that declared `languages: [typescript]` while containing zero `.ts` files ran its complexity ceiling and its suppression bans over 365,133 lines and reported nothing, and nothing here noticed until this rule was taught to look. A `toolchain` rule has the same hole in a quieter form: `tools:` is a map, so it can be non-empty and still miss the one language the adopting project declares — `checks::toolchain::run` skips a declared language it has no entry for with a bare `continue`, not a finding. This was also not hypothetical: a Ruby-only adoption enabled `L6.DATA_RACES_ARE_DETECTED`, `L6.DEAD_CODE_IS_DETECTED` and `L6.PERFORMANCE_REGRESSION_IS_GUARDED`, whose `tools:` maps carry python, typescript, go and rust and no `ruby:` key, and got three permanent green checkmarks that could never have said anything else — `sf verify` reported all three proven to fire and never mentioned that the project's own language was invisible to them. The last shape is the one a repository walks into without editing a line of policy: a rule written for one version of a dependency, carrying a `when` that names it, after somebody moved the pin. Its patterns then describe an API nobody calls anymore, and a text-pattern rule matching nothing reads exactly like a text-pattern rule protecting you. A condition that went false stops the rule running — it is about a version this repository does not have — and is reported here rather than quietly disabling itself, which is also what stops `when` becoming a way to switch a rule off by editing a manifest. And L3 reaches it through a third door, because gates live in their own top-level `gates:` map: `enabled: true` and `gates: {}` coexist perfectly happily, and the two rules the method calls "the whole method in one check" then sit in every report having found nothing. This one was the least hypothetical of all — it was the state of `software-factory`'s own policy, under a rule written to catch exactly this, which could not see the layer it mattered most in. Both L3 rules have the quieter form too: a gate whose `activation` is empty can never be turned on by any change, and `gate_coverage` silently skips every gate that names no `plan`.
 
-**Fix.** Give the rule something to look at, or switch it off in policy and say why in the rules document. Disabled and documented is honest; enabled and inert is a rule that lies about its own coverage.
+**Fix.** Give the rule something to look at, or switch it off in policy and say why in the rules document. Disabled and documented is honest; enabled and inert is a rule that lies about its own coverage. A rule whose `when` went false is the one case with nothing to configure: repoint it at the version this repository installs, or remove it along with the version it described.
 
 ## L6 — Hazard: the defect classes this repository hunts
 
@@ -194,7 +226,7 @@ At least one dependency vulnerability scanner for each of this repository's lang
 
 **Why.** An agent adding a dependency is making a supply-chain decision in a one-line diff, usually while solving something else entirely, and it has no way to know what that package shipped last week. This check does not audit anything itself — the ecosystem tools are far better than anything that could live here. What it guarantees is the thing that actually rots: that the audit is still wired in. A scanner someone removed to make CI faster fails exactly like one that was never added.
 
-**Fix.** Add the scanner to your CI workflow or task runner. `pip-audit` for Python, `npm audit` or `osv-scanner` for TypeScript, `govulncheck` for Go, `cargo audit` for Rust.
+**Fix.** Add the scanner to your CI workflow or task runner. `pip-audit` for Python, `npm audit` or `osv-scanner` for TypeScript, `govulncheck` for Go, `cargo audit` for Rust, `bundler-audit` for Ruby.
 
 ### L6.INSECURE_PATTERNS_ARE_SCANNED
 
@@ -204,7 +236,7 @@ A static security analyser for each of this repository's languages runs somewher
 
 **Why.** Shell interpolation, string-built SQL, disabled certificate verification, weak hashes, unsafe deserialization — these are the defects that look entirely normal in review, because the code reads exactly like the safe version. An agent reproduces them faithfully from the enormous amount of training data that contains them. A static analyser recognises the shapes a reviewer skims past.
 
-**Fix.** Wire in `bandit` or `semgrep` for Python, `semgrep` or `eslint-plugin-security` for TypeScript, `gosec` for Go, `cargo-geiger` or `clippy` for Rust.
+**Fix.** Wire in `bandit` or `semgrep` for Python, `semgrep` or `eslint-plugin-security` for TypeScript, `gosec` for Go, `cargo-geiger` or `clippy` for Rust, `brakeman` for Ruby.
 
 ### L6.NO_BLOCKING_CALL_WHILE_HOLDING_A_LOCK
 

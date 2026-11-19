@@ -52,11 +52,60 @@ every would-be accusation on the three public corpora until the residue
 was 8 records across rails/mastodon/discourse, each read and proven to
 raise under MRI.
 
-This alpha is not a replacement for Sorbet in annotated projects. Support
-for existing Sorbet `sig`s and RBI files is partial, including extraction
-of some return types. Full contract checking of parameters and returns,
-and full RBI interoperability, remain on the roadmap. Keep running `srb tc`
-alongside itaruby to preserve your existing Sorbet checks.
+This alpha is not a replacement for Sorbet in annotated projects. A
+project method's own recognized `sig { ... }` is checked as a contract.
+Its declared return types the caller only where body inference answers
+nothing (an inferred return always wins: sorbet-runtime proves only
+`is_a?`, which a decorator overriding it also passes), a collection by its
+category only (`returns(T::Array[String])` is `Array[untyped]` to the
+caller): sorbet-runtime never checks type arguments. A declared param
+never types the method body. `X.new` types nothing when a project
+singleton `new` may answer it (on `X`, a superclass or an extended or
+singleton-prepended module, `def X.new` anywhere, or an extended module
+whose methods are not fully known). The contract accuses only values
+WRITTEN as literals (strings, symbols, numbers, `nil`, `true`/`false`,
+Array/Hash literals, ranges, regexps, `__FILE__`/`__LINE__`): a literal
+the body returns contradicts the declared return (E0109) only when every
+return point (each reachable explicit `return` and each leaf of the
+reachable implicit tail) is a literal and none fits; a literal argument
+that contradicts a declared param, matched by name, is E0103. A variable, `self`, a constant or any call is never judged, so a
+contradiction carried by an inferred value is a known false negative. A
+sig accuses and types callers only where sorbet-runtime provably enforces
+it; otherwise it is inert (no E0103/E0109, no declared type for callers). Inert everywhere in a project
+whose visible `Gemfile.lock` names `sorbet-runtime-stub` or never names
+`sorbet-runtime` (no lock found: judged from source), or where any Ruby
+file under the project root (the nearest directory holding a `Gemfile`,
+`Gemfile.lock` or `.git`, so `ita check app/` still reads
+`config/initializers`, a `Rakefile`, `*.rake`, `*.gemspec`, `config.ru`
+and `bin/*`) references `T::Configuration` or `T::Private` in any
+spelling other than the literal statement
+`T::Configuration.default_checked_level = :always`, defines a method
+named `sig` on any receiver, or defines a `method_added`/
+`singleton_method_added` that never calls `super` (a `define_method` or
+`alias` spelling of either counts as one); a file outside the checked
+paths that defines `is_a?`/`kind_of?`/`instance_of?` does too. Inert per
+sig for `.checked(:never)`/`.checked(:tests)`, and per class when
+`T::Sig` is not extended by the class or a superclass (or included into
+every class via `Object`/`Module`/`Class`). An RBI is never
+checked at runtime, so it is never a contract: no RBI accuses, and no RBI
+types the callers of a method the project source defines. A method that
+exists only in an RBI (a gem, a Tapioca DSL file) still types its callers
+with its declared return, type arguments erased, and its params are never
+judged. Everything else stays silent rather than guessed:
+generics, procs, overloads, rest and block parameters, duplicate
+definitions or any other redefinition (a `class << X` patch, a hook, a
+`class_eval`, a reopen through a constant alias), and open classes. A
+method defined through a receiver no constant names (`k.class_eval { def
+m }`, `k.define_method(:m)`, `def k.m`, `k.prepend(M)`, a block parameter
+of `[A, B].each`) takes the contract of every method of that name off,
+everywhere; one whose name cannot be read (`define_method(name)`, a
+string body, a bare `eval`) takes every contract off. A literal of a core
+class whose `is_a?`, `kind_of?` or `instance_of?` the project redefines
+never accuses. Two known
+gaps follow from that: `Foo.new(...)` is not checked against
+`initialize`'s `sig`, and a method with a `*rest`, `**kwrest`, `&block` or
+post parameter loses its whole contract, the return type included. Keep running
+`srb tc` alongside itaruby to preserve your existing Sorbet checks.
 
 ## Quick start
 
@@ -84,12 +133,13 @@ fine, a wrong answer is not.
 |---|---|---|
 | E0101 | Error | `undefined method` on an instance of a project class, or on a project CLASS OBJECT (closed ancestor chain on either track) |
 | E0102 | Error | wrong arity (positional) |
-| E0103 | Error | argument type incompatible with an inline RBS sig |
+| E0103 | Error | argument type incompatible with an inline RBS sig; for a Sorbet `sig` param (never an RBI param), only a literal argument is judged, and only where sorbet-runtime provably enforces the sig (`T::Sig` on the class, no `.checked(:never/:tests)`; anywhere under the project root, not only in the checked paths: no hook swallowing `method_added`, no project method named `sig`, no `T::Configuration`/`T::Private` reference but a literal `default_checked_level = :always`, no lock without `sorbet-runtime`; no redefinition of that name through a receiver no constant names, a mixin hook on a module the class mixes in, or a constant alias, no project `is_a?`/`kind_of?`/`instance_of?` on the literal's core class, nor any in a project file outside the checked paths); the receiver must be typed (a sig's declared return types it only when the body's own return is unknown; `X.new` types nothing when a project singleton `new` may answer it), and a `for` index, a nested or splatted multi-assignment target, a pattern or named regexp capture, and every local of a scope with a string `eval`, a `binding` escape, a `local_variable_set` or a singleton method defined on a local types no receiver |
 | E0104 | Warning | unresolved constant |
 | E0105 | Warning | malformed `#:` comment (the sig is ignored; the method falls back to inference) |
 | E0106 | Warning | string literal assigned to a column whose schema type won't take it |
 | E0107 | Warning | a local's inferred usage contradicts every candidate type |
 | E0108 | Error | operator operand pairing MRI raises `TypeError` on, both operands proven from literals in one scope |
+| E0109 | Error | EVERY return point of a method (each reachable explicit `return`, a bare one being `nil`, and each leaf of its reachable implicit tail) is a literal and none fits its own Sorbet `sig` return type (never an RBI's); one non-literal point or one fitting literal keeps it silent, and code after a `return`/`raise` or an `if`/`unless`/`case … else` whose every branch leaves is no return point; same runtime-enforcement gates as E0103 |
 | E0001 | Error | syntax error (prism, error-tolerant) |
 
 itaruby reads whatever else exists for free: Tapioca RBIs (`sorbet/rbi/`,

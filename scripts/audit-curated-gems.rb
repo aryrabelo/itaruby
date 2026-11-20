@@ -12,12 +12,16 @@
 # `gem unpack <name> -v <version>` reads clean.
 #
 # Scanned: every `.rb` under `lib/` and `exe/`, plus every extensionless
-# file under `exe/` whose first line is a Ruby shebang. Any other file
-# under `exe/` is printed as `skipped_non_ruby_exe`, never silently
-# dropped. A file Prism cannot parse aborts the audit (exit 1, file named
-# on stderr): a partial parse would read clean.
+# file under `exe/` whose first line is a Ruby shebang, hidden files
+# included. Any other file under `exe/` is printed as
+# `skipped_non_ruby_exe`, never silently dropped. A file Prism cannot
+# parse, a gem dir that is missing or unreadable, or any entry the walk
+# cannot read aborts the audit (exit 1, named on stderr): a partial read
+# would read clean. `extend` is printed on the singleton surface it
+# reaches (main, a chain class body, a chain constant receiver).
 #
 #   ruby scripts/audit-curated-gems.rb <unpacked-gem-dir>...
+require "find"
 require "prism"
 CHAIN = %w[Integer Float Numeric Comparable String Symbol Array Hash Enumerable NilClass TrueClass FalseClass Object Kernel BasicObject]
 DYN = %i[include prepend class_eval module_eval class_exec module_exec instance_exec define_method send public_send __send__ instance_eval alias_method attr_accessor attr_reader attr_writer refine]
@@ -105,9 +109,22 @@ class V < Prism::Visitor
         out << [:chain_call_indirect, n.slice[0, 80], loc(n)]
       end
     end
-    out << [:singleton_body_call, "main#{SINGLETON} extend", loc(n)] if n.name == :extend && r.nil? && @stack.empty?
+    record_extend(n) if n.name == :extend
     out << [:eval, n.slice[0, 60], loc(n)] if n.name == :eval
     super
+  end
+  # `extend` adds to its receiver's SINGLETON surface (`String.extend(M)`
+  # gives the class object `String` M's methods), so it is printed as such:
+  # on main, in a chain class body, or on a chain constant receiver; any
+  # other receiver that mentions a chain name is printed indirect.
+  def record_extend(n)
+    r = n.receiver
+    if r.nil? && @stack.empty? then out << [:singleton_body_call, "main#{SINGLETON} extend", loc(n)]
+    elsif r.nil? && CHAIN.include?(@stack.last.to_s) then out << [:singleton_body_call, "#{@stack.last}#{SINGLETON} extend", loc(n)]
+    elsif r && (rn = cname(r)&.delete_prefix("::")) && CHAIN.include?(rn) then out << [:singleton_call, "#{rn}#{SINGLETON} extend", loc(n)]
+    elsif r && !(r.is_a?(Prism::ConstantReadNode) || r.is_a?(Prism::ConstantPathNode)) && r.slice =~ /\b(#{CHAIN.join('|')})\b/
+      out << [:chain_call_indirect, n.slice[0, 80], loc(n)]
+    end
   end
 end
 
@@ -117,10 +134,25 @@ def ruby_exe?(path)
   line.start_with?("#!") && line.include?("ruby")
 end
 
+# Every file under `dir/<sub>`, hidden ones included (a dotfile under
+# `lib/` is still Ruby a `require` can load). A missing `<sub>` has no
+# files; an unreadable one, or any entry the walk cannot read, aborts: a
+# partial listing would read clean.
+def tree(dir, sub)
+  root = File.join(dir, sub)
+  return [] unless File.exist?(root)
+  files = []
+  Find.find(root, ignore_error: false) { |f| files << f if File.file?(f) }
+  files
+end
+
 ARGV.each do |dir|
+  unless File.directory?(dir) && File.readable?(dir) && File.executable?(dir)
+    abort("audit-curated-gems: #{dir} is not a readable gem directory")
+  end
   out = []
-  lib = Dir.glob("#{dir}/lib/**/*.rb").select { |f| File.file?(f) }
-  exe = Dir.glob("#{dir}/exe/**/*").select { |f| File.file?(f) }
+  lib = tree(dir, "lib").select { |f| f.end_with?(".rb") }
+  exe = tree(dir, "exe")
   exe_ruby, exe_other = exe.partition { |f| ruby_exe?(f) }
   (lib + exe_ruby).sort.each do |f|
     res = Prism.parse_file(f)
@@ -135,4 +167,6 @@ ARGV.each do |dir|
   end
   puts "### #{File.basename(dir)} (#{lib.size} lib .rb, #{exe_ruby.size} exe Ruby, #{exe_other.size} exe skipped)"
   out.each { |k, v, l| puts "  #{k}\t#{v}\t#{l}" }
+rescue SystemCallError => e
+  abort("audit-curated-gems: cannot read #{dir}: #{e.message}")
 end

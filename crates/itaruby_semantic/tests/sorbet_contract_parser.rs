@@ -207,14 +207,49 @@ fn unsupported_shapes_and_procs_retain_the_known_collection_category() {
 /// `{foo}` reaches the reader from a file prism recovered after a syntax
 /// error (measured: `returns({foo})` typed its consumer `Hash` and the
 /// consumer's `.upcase` drew E0101); sorbet-runtime never built it, so it
-/// types nothing.
+/// types nothing. Ruby allows one trailing comma, and sorbet-runtime
+/// coerces `{foo: Integer, }` to the same shape as `{foo: Integer}`
+/// (measured). A member sorbet-runtime raises on when it evaluates the sig
+/// (`T.any(Integer,)` is `T.any` with one argument, measured
+/// `ArgumentError`) leaves no value to type, at any depth.
 #[test]
 fn a_brace_expression_is_a_shape_only_with_key_type_members() {
     let unknown_hash = Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown));
-    for shape in ["{}", "{foo: Integer}", "{foo: Integer, bar: T::Array[String]}"] {
+    for shape in [
+        "{}",
+        "{foo: Integer}",
+        "{foo: Integer, bar: T::Array[String]}",
+        "{foo: Integer, }",
+        "{foo: T.any(Integer, String), bar: T.nilable([Integer, {baz: T.untyped}])}",
+    ] {
         assert_eq!(sorbet_ret_ty(shape), unknown_hash, "{shape}");
     }
-    for malformed in ["{foo}", "{foo, bar: Integer}", "{foo:}", "{1: Integer}", "{A::B}", "{foo: Integer, }"] {
+    for malformed in [
+        "{foo}",
+        "{foo, bar: Integer}",
+        "{foo:}",
+        "{1: Integer}",
+        "{A::B}",
+        "{foo: Integer,,}",
+        "{foo: T.any(Integer,)}",
+        "{foo: T.any(Integer)}",
+        "{foo: T::Hash[String, T.nilable(Integer, String)]}",
+        "{foo: [T.all(Integer)]}",
+        "{foo: {bar}}",
+    ] {
+        assert_eq!(sorbet_ret_ty(malformed), Ty::Unknown, "{malformed}");
+    }
+}
+
+/// The same rule for a tuple: a trailing comma is Ruby, a member
+/// sorbet-runtime cannot build is not.
+#[test]
+fn a_tuple_is_an_array_only_with_well_formed_members() {
+    let unknown_array = Ty::Array(Box::new(Ty::Unknown));
+    for tuple in ["[]", "[Integer, String]", "[Integer, String, ]", "[{foo: Integer}, T::Set[String]]"] {
+        assert_eq!(sorbet_ret_ty(tuple), unknown_array, "{tuple}");
+    }
+    for malformed in ["[,]", "[Integer,,]", "[T.any(Integer,)]", "[T::Array[Integer, String]]", "[Integer", "[A] [B]"] {
         assert_eq!(sorbet_ret_ty(malformed), Ty::Unknown, "{malformed}");
     }
 }

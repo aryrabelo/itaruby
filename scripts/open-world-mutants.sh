@@ -25,6 +25,10 @@
 #            checked files, walk errors, the whole gem, unknown refine/eval
 #            targets in an RBI gem, chain type tests, the lock's shape, and
 #            a name only the hardened audit saw (debug's `alias bb`)
+#   O53..O57 the lock Bundler writes and the gem's Ruby files (cubic review
+#            of #19): a source `specs:` list, a non-empty option value,
+#            `specs` never an option, specs inside their list, and
+#            extensionless Ruby-shebang scripts
 #
 # Instrument rules (AGENTS.md, the evidence producer is checked like code):
 # the backup is verified before any mutation and a failed restore is
@@ -471,8 +475,8 @@ mutant O44 "$OW" \
   'a gap gem whose source cannot be listed stays a gap'
 
 mutant O45 "$OW" \
-  '        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb"))' \
-  '        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb") && p.components().any(|c| c.as_os_str() == "lib"))' \
+  '        return ext == "rb";' \
+  '        return ext == "rb" && path.components().any(|c| c.as_os_str() == "lib");' \
   gap_gem_source_outside_lib_stays_silent \
   'a gemspec'"'"'s require_paths may name a directory besides lib/'
 
@@ -492,7 +496,7 @@ mutant O47 "$OW" \
   '`class String; def is_a?` lets a String pass `returns(Integer)`'
 
 mutant O48 "$OW" \
-  '    if !(state.platforms && state.dependencies) {' \
+  '    if !(state.sourced && state.platforms && state.dependencies) {' \
   '    if false {' \
   empty_lockfile_stays_silent \
   'an empty Gemfile.lock is no lock Bundler wrote'
@@ -504,14 +508,14 @@ mutant O49 "$OW" \
   'a header Bundler never writes hides a gem nobody accounts for'
 
 mutant O50 "$OW" \
-  '            if !is_source_key(line) {' \
-  '            if false {' \
+  '                source_option(line).ok_or_else(|| format!("unreadable lock line `{line}`"))?;' \
+  '                source_option(line).unwrap_or(("", ""));' \
   misindented_lock_spec_stays_silent \
   'a source line with no Bundler shape is a spec nobody read'
 
 mutant O51 "$OW" \
-  "        .is_some_and(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))" \
-  '        .is_some_and(|_| false)' \
+  '        .then_some((key, value))' \
+  '        .then_some((key, value)).filter(|_| false)' \
   lock_with_no_gems_still_accuses \
   'positive side: a lock Bundler wrote for a Gemfile with no gems proves zero gems'
 
@@ -521,6 +525,38 @@ mutant O52 "$OW" \
   '            "debugger",' \
   curated_gem_keyword_alias_stays_silent \
   'debug 1.11.1 aliases `bb` inside `module Kernel`: an audit blind to the `alias` keyword missed it'
+
+mutant O53 "$OW" \
+  '    if !(state.sourced && state.platforms && state.dependencies) {' \
+  '    if !(state.platforms && state.dependencies) {' \
+  lock_without_a_source_section_stays_silent \
+  'Bundler writes GEM / specs: even for an empty Gemfile: a lock without one is truncated'
+
+mutant O54 "$OW" \
+  ' && !value.is_empty())' \
+  ')' \
+  path_gem_with_a_blank_remote_stays_silent \
+  'a blank PATH remote joined to the lock directory reads as the project itself'
+
+mutant O55 "$OW" \
+  ' && key != "specs" &&' \
+  ' &&' \
+  corrupt_specs_option_stays_silent \
+  '`specs: <value>` opens no spec list: a corrupt source section is not an empty one'
+
+mutant O56 "$OW" \
+  '        if !self.specs {
+            return Err(format!("lock spec line `{rest}` outside a `specs:` list"));
+        }' \
+  '' \
+  spec_outside_a_specs_list_stays_silent \
+  'a spec line before its section'"'"'s specs: list has no Bundler shape'
+
+mutant O57 "$OW" \
+  '    first.starts_with(b"#!") && first.windows(4).any(|w| w == b"ruby")' \
+  '    false' \
+  gap_gem_shebang_script_stays_silent \
+  'an extensionless Ruby-shebang script in a gem is Ruby a require path can load'
 
 echo
 if (( fail )); then echo 'open-world mutants: FAIL'; exit 1; fi

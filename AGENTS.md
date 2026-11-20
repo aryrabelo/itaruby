@@ -310,9 +310,14 @@ winning on both.
   wires `TapiocaEvidence` (and closed world) for a root with a `Gemfile`
   only when every spec in `Gemfile.lock` is accounted for
   (`open_world::lock_evidence`, and only for a lock with Bundler's shape:
-  known section headers, Bundler's line shapes in source sections, and
-  `PLATFORMS` and `DEPENDENCIES` present - an empty or garbled lock proves
-  nothing, a lock with no specs proves zero gems): a gem with an RBI for its LOCKED version
+  known section headers, Bundler's line shapes in source sections (a
+  non-empty `key: value` option, the exact `  specs:` line, specs only
+  inside that list), a source section with its `specs:` list, and
+  `PLATFORMS` and `DEPENDENCIES` present - an empty, truncated or garbled
+  lock proves nothing, a lock with no specs proves zero gems; Bundler
+  2.6-4.0 writes `GEM` / `  specs:` even for an empty Gemfile, and lists a
+  platform-excluded dependency with no spec, so `DEPENDENCIES` is never
+  matched against the specs): a gem with an RBI for its LOCKED version
   whose RBI reopens a chain namespace (`Integer`..`BasicObject`) is read
   from its installed source for that exact version
   (`installed_gem_dir`: `GEM_PATH`/`GEM_HOME`, Bundler's path, the
@@ -322,7 +327,8 @@ winning on both.
   `exclude:`d, never generated) needs a `CURATED_GEMS` audit or its
   installed Ruby source (a native extension is a gap: C is unreadable);
   a `PATH` gem must live inside the project. An installed gem is read
-  WHOLE (`gem_files`: a gemspec's `require_paths` may name any directory),
+  WHOLE (`gem_files`: a gemspec's `require_paths` may name any directory;
+  every `.rb` and every extensionless Ruby-shebang file is harvested),
   and a listing the walk could not complete is no source: a gap for a gem
   without an RBI, every chain open for an RBI gem. Sources are harvested
   NAME-KEYED (`open_world::Harvest`): readable chain reopenings, literal
@@ -373,7 +379,7 @@ winning on both.
   block, `rainbow`'s `refine String`, YARD's and RDoc's evals). Zero new
   diagnostics; public corpora byte-identical. Proof:
   `crates/itaruby/tests/open_world_cli.rs` and
-  `scripts/open-world-mutants.sh` (O1-O52, gate c1).
+  `scripts/open-world-mutants.sh` (O1-O57, gate c1).
 - Tracker: GitHub Issues on this repository. A local beads/Dolt database MAY
   exist per machine for agent-local planning memory, but `.beads/` is
   gitignored and never versioned here.

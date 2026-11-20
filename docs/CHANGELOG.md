@@ -37,9 +37,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup/restore, rejects a run whose two test binaries did not both
   finish, and requires the named test's own failure to carry the
   diagnostic; the `T.unsafe` contracts mutant fails a typing assertion
-  instead of an index panic. H6's E0109 arm is unreachable today (a
-  `sig` attaches only to a class-body def), now pinned by an expiring
-  control instead of an untested claim.
+  instead of an index panic. H6's E0109 arm is unreachable today (the
+  return-contract check never reaches a def inside a class-body branch),
+  now pinned by an expiring control instead of an untested claim.
+- W11 lock evidence, cubic review of #19: a `Gemfile.lock` proves its
+  gem list only with a source section's `  specs:` list (Bundler writes
+  `GEM` / `  specs:` even for an empty Gemfile, measured on 2.6.2, 2.6.6
+  and 4.0.20), every option a non-empty `key: value` (a blank PATH
+  `remote:` no longer resolves to the project itself), `specs:` never an
+  option, and every spec inside its section's `specs:` list. An installed
+  gem's extensionless Ruby-shebang scripts are harvested like `.rb`
+  files. New fixtures in `open_world_cli.rs`, mutants O53-O57.
+- A `sig` tuple or shape keeps its `Array`/`Hash` category only when every
+  member is a type sorbet-runtime builds: `{foo: T.any(Integer,)}` (which
+  raises `ArgumentError` when the sig is evaluated) is now `Unknown`, at
+  any depth, and Ruby's trailing comma (`{foo: Integer, }`, the same
+  `FixedHash` at runtime) is now a shape instead of `Unknown`. Three new
+  sorbet-contracts mutants.
+- Instruments: `audit-curated-gems.rb` aborts on a missing or unreadable
+  gem tree instead of reporting it clean, reads hidden files, and reports
+  `extend` on a chain receiver on its singleton surface; its selftest
+  checks the generator's exit status (guarded by a stand-in crashing
+  generator) and exits 2 without Ruby >= 3.4.2, which the gauntlet
+  reports as a SKIP (incomplete run) instead of a failure. The `clean`
+  audit fixture now loads under MRI. The H6 control states the measured
+  boundary: a branch def's `sig` types its consumers, but the
+  return-contract check never reaches the branch def's body.
+- Test helper: `tapioca_closed_world_cli.rs`'s `lock()` lists every spec
+  under `DEPENDENCIES`, as Bundler does for the fixtures' Gemfiles.
 - Restore the open-world mutant controls on the W11 branch: O8 uses an
   unloaded extensionless script so ignored-file indexing cannot mask the
   removed harvest; O23 exercises a generic annotation ending in `.checked`

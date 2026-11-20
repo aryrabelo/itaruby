@@ -899,6 +899,23 @@ fn gap_gem_source_outside_lib_stays_silent() {
     );
 }
 
+/// An extensionless Ruby-shebang script is Ruby a `require_paths` entry or
+/// a `load` can reach: it is harvested like a `.rb` file.
+#[test]
+fn gap_gem_shebang_script_stays_silent() {
+    let script = format!("#!/usr/bin/env ruby\n{INTEGER_UPCASE_PATCH}");
+    assert_silent(
+        "silent-gap-shebang",
+        &[
+            ("main.rb", SIG_INTEGER),
+            GAP_RBIS[0],
+            GAP_RBIS[1],
+            ("@gems/mygem-1.0.0/lib/mygem.rb", "class MyGem\nend\n"),
+            ("@gems/mygem-1.0.0/exe/mygem", &script),
+        ],
+    );
+}
+
 /// A refinement whose target the walker cannot read may refine Integer,
 /// and no RBI reflects a refinement: the targeted read opens every chain
 /// for it, as the untargeted one does.
@@ -973,6 +990,54 @@ fn misindented_lock_spec_stays_silent() {
                 LOCK.replace("\n\nPLATFORMS", "\n   other (2.0.0)\n\nPLATFORMS").as_str(),
             ),
         ],
+    );
+}
+
+/// A blank `remote:` is no PATH: joined to the lock's directory it would
+/// read as the project itself, and a truncated PATH section would pass.
+#[test]
+fn path_gem_with_a_blank_remote_stays_silent() {
+    let lock = format!("PATH\n  remote: \n  specs:\n    local (0.1.0)\n\n{LOCK}");
+    assert_silent(
+        "silent-path-blank-remote",
+        &[("main.rb", SIG_INTEGER), ("Gemfile.lock", &lock)],
+    );
+}
+
+/// A lock truncated to `PLATFORMS`/`DEPENDENCIES` has no source section;
+/// Bundler writes `GEM` / `  specs:` even for an empty Gemfile (measured,
+/// 2.6.2 to 4.0.20), so this is no lock Bundler wrote.
+#[test]
+fn lock_without_a_source_section_stays_silent() {
+    assert_silent(
+        "silent-lock-no-source",
+        &[
+            ("main.rb", "# typed: true\n1.upcase\n"),
+            ("Gemfile", "source \"https://rubygems.org\"\n"),
+            ("Gemfile.lock", "PLATFORMS\n  ruby\n\nDEPENDENCIES\n\nBUNDLED WITH\n   2.5.0\n"),
+        ],
+    );
+}
+
+/// `specs: <value>` is no option Bundler writes and opens no spec list:
+/// a source section carrying it is corrupt, not empty.
+#[test]
+fn corrupt_specs_option_stays_silent() {
+    let lock = format!("PATH\n  remote: vendor/local\n  specs: corrupted\n\n{LOCK}");
+    assert_silent(
+        "silent-lock-specs-option",
+        &[("main.rb", SIG_INTEGER), ("Gemfile.lock", &lock)],
+    );
+}
+
+/// A spec line in a source section that never opened its `specs:` list
+/// has no Bundler shape.
+#[test]
+fn spec_outside_a_specs_list_stays_silent() {
+    let lock = format!("GEM\n  remote: https://gems.example/\n    mygem (1.0.0)\n\n{LOCK}");
+    assert_silent(
+        "silent-lock-spec-outside-list",
+        &[("main.rb", SIG_INTEGER), ("Gemfile.lock", &lock)],
     );
 }
 

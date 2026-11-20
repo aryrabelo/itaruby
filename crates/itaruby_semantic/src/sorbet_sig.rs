@@ -398,22 +398,82 @@ fn sig_only_leaf(s: &str) -> Option<Ty> {
 /// A tuple `[A, B]` or a shape `{a: A}` (W6). sorbet-runtime checks the
 /// members too, but only the category is kept here: an `Array` / a `Hash`
 /// with unknown contents, exactly what `T::Array[X]` / `T::Hash[K, V]`
-/// already give.
+/// already give. A literal with a member sorbet-runtime cannot build
+/// (`well_formed`) types nothing.
 fn literal_shape_leaf(s: &str) -> Option<Ty> {
-    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
-        return Some(if inner.trim().is_empty() || split_top_level(inner, ',').is_some() {
-            Ty::Array(Box::new(Ty::Unknown))
-        } else {
-            Ty::Unknown
-        });
-    }
-    let inner = s.strip_prefix('{')?.strip_suffix('}')?;
-    let shape = inner.trim().is_empty()
-        || split_top_level(inner, ',').is_some_and(|parts| parts.iter().all(|part| shape_member(part)));
-    Some(if shape { Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)) } else { Ty::Unknown })
+    let category = match (s.chars().next(), s.chars().last()) {
+        (Some('['), Some(']')) => Ty::Array(Box::new(Ty::Unknown)),
+        (Some('{'), Some('}')) => Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)),
+        _ => return None,
+    };
+    Some(if well_formed(s) { category } else { Ty::Unknown })
 }
 
-/// One `key: Type` member of a shape: a label, then a non-empty type. The
+/// Does `s` spell a type sorbet-runtime builds? A tuple or shape literal is
+/// judged member by member (Ruby allows one trailing comma in both, and
+/// measured, `{foo: Integer, }` coerces to the same `FixedHash` as
+/// `{foo: Integer}`), and every compound this reader recognizes by the
+/// member count sorbet-runtime accepts (`compound_args`). A member that
+/// raises when the sig is evaluated (`T.any(Integer,)` is `T.any` with one
+/// argument, measured `ArgumentError`) leaves no value for a consumer to
+/// hold, so its literal must not keep a category. Any other spelling is a
+/// name or a form this reader does not model, judged elsewhere.
+fn well_formed(s: &str) -> bool {
+    let s = s.trim();
+    let s = s.strip_prefix("::").unwrap_or(s);
+    if let Some(inner) = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+        return literal_members(inner).is_some_and(|parts| parts.iter().all(|part| well_formed(part)));
+    }
+    if let Some(inner) = s.strip_prefix('{').and_then(|r| r.strip_suffix('}')) {
+        return literal_members(inner).is_some_and(|parts| parts.iter().all(|part| shape_member(part)));
+    }
+    if s.starts_with(['[', '{']) {
+        return false;
+    }
+    compound_args(s).is_none_or(|(inner, min, max)| {
+        split_top_level(inner, ',')
+            .is_some_and(|parts| (min..=max).contains(&parts.len()) && parts.iter().all(|part| well_formed(part)))
+    })
+}
+
+/// A literal's members: none, or a comma list ending in at most one
+/// trailing comma.
+fn literal_members(inner: &str) -> Option<Vec<&str>> {
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Some(Vec::new());
+    }
+    split_top_level(inner.strip_suffix(',').unwrap_or(inner), ',')
+}
+
+/// The recognized compound spellings with their arguments and the member
+/// counts sorbet-runtime accepts (measured on 0.6.13036: every other count
+/// raises `ArgumentError`).
+fn compound_args(s: &str) -> Option<(&str, usize, usize)> {
+    const CALLS: [(&str, usize, usize); 4] = [
+        ("T.nilable", 1, 1),
+        ("T.any", 2, usize::MAX),
+        ("T.all", 2, usize::MAX),
+        ("T.class_of", 1, 1),
+    ];
+    const INDEXES: [(&str, usize, usize); 9] = [
+        ("T::Array", 1, 1),
+        ("T::Hash", 2, 2),
+        ("T::Set", 1, 1),
+        ("T::Range", 1, 1),
+        ("T::Enumerable", 1, 1),
+        ("T::Enumerator::Lazy", 1, 1),
+        ("T::Enumerator", 1, 1),
+        ("T::Class", 1, 1),
+        ("T::Module", 1, 1),
+    ];
+    CALLS
+        .iter()
+        .find_map(|&(name, min, max)| strip_call(s, name).map(|inner| (inner, min, max)))
+        .or_else(|| INDEXES.iter().find_map(|&(name, min, max)| strip_index(s, name).map(|inner| (inner, min, max))))
+}
+
+/// One `key: Type` member of a shape: a label, then a well-formed type. The
 /// `=>` and `**` member forms never pass `split_top_level`'s character
 /// filter. Anything else (`{foo}`, recovered from a syntax error) is no
 /// shape sorbet-runtime would build, so it types nothing.
@@ -426,6 +486,7 @@ fn shape_member(part: &str) -> bool {
         && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         && !value.starts_with(':')
         && !value.trim().is_empty()
+        && well_formed(value)
 }
 
 /// The two bracketed containers. A member count the spelling does not

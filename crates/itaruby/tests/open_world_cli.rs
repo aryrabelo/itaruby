@@ -411,6 +411,24 @@ fn curated_gem_name_stays_silent() {
     );
 }
 
+/// The 2026-11-19 re-audit: debug 1.11.1's `alias bb debugger` inside
+/// `module Kernel` (the `alias` keyword the first audit could not see)
+/// gives every object `bb`.
+#[test]
+fn curated_gem_keyword_alias_stays_silent() {
+    let lock = LOCK.replace(
+        "    mygem (1.0.0)\n",
+        "    debug (1.11.1)\n    mygem (1.0.0)\n",
+    );
+    assert_silent(
+        "silent-curated-alias",
+        &[
+            ("main.rb", "# typed: true\n1.bb\n"),
+            ("Gemfile.lock", &lock),
+        ],
+    );
+}
+
 // ---- E0108 shares the chain ---------------------------------------------
 
 #[test]
@@ -751,5 +769,228 @@ fn project_refinement_of_another_name_stays_silent() {
                 "module Up\n  refine Integer do\n    def other_name = to_s\n  end\nend\n",
             ),
         ],
+    );
+}
+
+// ---- an incomplete read is no evidence (cubic review of W11) -------------
+
+/// The core reopening every fixture below hides from an incomplete read:
+/// with it read, `A.new.f.upcase` is legal.
+const INTEGER_UPCASE_PATCH: &str = "class Integer\n  def upcase = to_s\nend\n";
+/// A gem with no RBI for its locked version (`gap_gem_*` above).
+const GAP_RBIS: [(&str, &str); 2] = [
+    ("sorbet/rbi/gems/mygem@1.0.0.rbi", ""),
+    ("sorbet/rbi/gems/mygem@0.9.0.rbi", RBI),
+];
+/// A gem whose RBI reopens `Hash`, so its source is read (`Targeted`).
+const HASH_RBI: &str = "# typed: true\n\nclass Hash\n  def mygem_x; end\nend\n";
+const HASH_SRC: &str = "class Hash\n  def mygem_x; end\nend\n";
+
+/// `files` with `locked` (project-relative, or `@gems/` for the gem
+/// store) made unreadable: the run must stay silent. The skip is the
+/// precondition itself, measured after the `chmod` (as in
+/// `missing_path_cli.rs`): a process that still reads a `0o000` entry
+/// (root, a filesystem ignoring permission bits) cannot build the shape.
+#[cfg(unix)]
+fn assert_silent_unreadable(name: &str, files: &[(&str, &str)], locked: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = project(name, files);
+    let path = match locked.strip_prefix("@gems/") {
+        Some(rel) => gem_store(&dir).join("gems").join(rel),
+        None => dir.join(locked),
+    };
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let took = if path.is_dir() {
+        std::fs::read_dir(&path).is_err()
+    } else {
+        std::fs::read(&path).is_err()
+    };
+    let ran = took.then(|| check(&dir));
+    // Restore before asserting, so a failure never leaves an unremovable
+    // tree behind for the next run.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(gem_store(&dir));
+    let Some((text, code)) = ran else {
+        eprintln!("skipped {name}: this process still reads a 0o000 entry, so the fixture cannot exist here");
+        return;
+    };
+    assert!(
+        !text.contains("error[") && !text.contains("warning["),
+        "{name}: fail closed to silence, got:\n{text}"
+    );
+    assert_eq!(code, Some(0), "{name}: no errors expected, got:\n{text}");
+}
+
+/// A checked file the run could not read was never loaded: the
+/// unloaded-file harvest must try it and fail closed, not skip it.
+#[cfg(unix)]
+#[test]
+fn unreadable_checked_file_stays_silent() {
+    assert_silent_unreadable(
+        "silent-unreadable-checked",
+        &[("main.rb", SIG_INTEGER), ("patch.rb", INTEGER_UPCASE_PATCH)],
+        "patch.rb",
+    );
+}
+
+/// A directory the unloaded-file walk cannot list may hold a reopening.
+#[cfg(unix)]
+#[test]
+fn unreadable_project_directory_stays_silent() {
+    assert_silent_unreadable(
+        "silent-unreadable-dir",
+        &[
+            ("main.rb", SIG_INTEGER),
+            ("patches/core_ext.rb", INTEGER_UPCASE_PATCH),
+        ],
+        "patches",
+    );
+}
+
+/// A gap gem whose installed source cannot be listed completely is no
+/// cover.
+#[cfg(unix)]
+#[test]
+fn gap_gem_with_an_unreadable_subtree_stays_silent() {
+    assert_silent_unreadable(
+        "silent-gap-unreadable",
+        &[
+            ("main.rb", SIG_INTEGER),
+            GAP_RBIS[0],
+            GAP_RBIS[1],
+            ("@gems/mygem-1.0.0/lib/mygem.rb", "class MyGem\nend\n"),
+            ("@gems/mygem-1.0.0/lib/mygem/locked/core_ext.rb", INTEGER_UPCASE_PATCH),
+        ],
+        "@gems/mygem-1.0.0/lib/mygem/locked",
+    );
+}
+
+/// The same for a gem whose RBI sends it to the targeted source read.
+#[cfg(unix)]
+#[test]
+fn rbi_gem_with_an_unreadable_subtree_stays_silent() {
+    assert_silent_unreadable(
+        "silent-rbi-gem-unreadable",
+        &[
+            ("main.rb", SIG_INTEGER),
+            ("sorbet/rbi/gems/mygem@1.0.0.rbi", HASH_RBI),
+            ("@gems/mygem-1.0.0/lib/mygem.rb", HASH_SRC),
+            ("@gems/mygem-1.0.0/lib/mygem/locked/core_ext.rb", INTEGER_UPCASE_PATCH),
+        ],
+        "@gems/mygem-1.0.0/lib/mygem/locked",
+    );
+}
+
+/// A gemspec's `require_paths` may name a directory besides `lib/`: the
+/// whole installed gem is read.
+#[test]
+fn gap_gem_source_outside_lib_stays_silent() {
+    assert_silent(
+        "silent-gap-outside-lib",
+        &[
+            ("main.rb", SIG_INTEGER),
+            GAP_RBIS[0],
+            GAP_RBIS[1],
+            ("@gems/mygem-1.0.0/lib/mygem.rb", "class MyGem\nend\n"),
+            ("@gems/mygem-1.0.0/src/mygem/core_ext.rb", INTEGER_UPCASE_PATCH),
+        ],
+    );
+}
+
+/// A refinement whose target the walker cannot read may refine Integer,
+/// and no RBI reflects a refinement: the targeted read opens every chain
+/// for it, as the untargeted one does.
+#[test]
+fn rbi_gem_unknown_refinement_stays_silent() {
+    assert_silent(
+        "silent-rbi-gem-refine-unknown",
+        &[
+            ("main.rb", SIG_INTEGER),
+            ("sorbet/rbi/gems/mygem@1.0.0.rbi", HASH_RBI),
+            (
+                "@gems/mygem-1.0.0/lib/mygem.rb",
+                "class Hash\n  def mygem_x; end\nend\n\nmodule MyGem\n  refine(Object.const_get(:Integer)) do\n    def upcase = to_s\n  end\nend\n",
+            ),
+        ],
+    );
+}
+
+/// A gap gem reopening a CHAIN class to override `is_a?` lets a String
+/// pass `returns(Integer)`: the declared type is no longer exact.
+#[test]
+fn gap_gem_chain_type_test_override_stays_silent() {
+    assert_silent(
+        "silent-gap-chain-type-test",
+        &[
+            ("main.rb", SIG_INTEGER),
+            GAP_RBIS[0],
+            GAP_RBIS[1],
+            ("@gems/mygem-1.0.0/lib/mygem.rb", "class String\n  def is_a?(*) = true\nend\n"),
+        ],
+    );
+}
+
+/// An empty `Gemfile.lock` is no lock Bundler wrote: Bundler resolves the
+/// Gemfile again at runtime and loads whatever it names. A literal
+/// receiver: with no `sorbet-runtime` in the lock a `sig` is inert, which
+/// would be silence for another reason.
+#[test]
+fn empty_lockfile_stays_silent() {
+    assert_silent(
+        "silent-empty-lock",
+        &[("main.rb", "# typed: true\n1.upcase\n"), ("Gemfile.lock", "\n")],
+    );
+}
+
+/// A section header Bundler never writes (a tab-indented spec) hides a
+/// gem nobody accounts for.
+#[test]
+fn unread_lock_section_stays_silent() {
+    assert_silent(
+        "silent-lock-unread-section",
+        &[
+            ("main.rb", SIG_INTEGER),
+            (
+                "Gemfile.lock",
+                LOCK.replace("\n\nPLATFORMS", "\n\tother (2.0.0)\n\nPLATFORMS").as_str(),
+            ),
+        ],
+    );
+}
+
+/// A source-section line with no Bundler shape (a spec at the wrong
+/// indentation) is no spec read.
+#[test]
+fn misindented_lock_spec_stays_silent() {
+    assert_silent(
+        "silent-lock-misindented",
+        &[
+            ("main.rb", SIG_INTEGER),
+            (
+                "Gemfile.lock",
+                LOCK.replace("\n\nPLATFORMS", "\n   other (2.0.0)\n\nPLATFORMS").as_str(),
+            ),
+        ],
+    );
+}
+
+/// Positive side: a Gemfile with no gems locks to no specs, and that lock
+/// proves zero gems. A literal receiver, because without `sorbet-runtime`
+/// in the lock a `sig` is inert.
+#[test]
+fn lock_with_no_gems_still_accuses() {
+    assert_accuses(
+        "accuse-lock-no-gems",
+        &[
+            ("main.rb", "# typed: true\n1.upcase\n"),
+            ("Gemfile", "source \"https://rubygems.org\"\n"),
+            (
+                "Gemfile.lock",
+                "GEM\n  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n\nBUNDLED WITH\n   2.5.0\n",
+            ),
+        ],
+        "./main.rb:2:3: error[E0101]: undefined method `upcase` for `Integer`",
     );
 }

@@ -21,7 +21,17 @@
 #            restated core inclusions, and the limit of that allowance)
 #   O26..O39 installed gem source (Tapioca drops aliases), per-class fail
 #            closed, gap gems, top-level includes, literal core definers
+#   O40..O52 an incomplete read is no evidence (cubic review): unread
+#            checked files, walk errors, the whole gem, unknown refine/eval
+#            targets in an RBI gem, chain type tests, the lock's shape, and
+#            a name only the hardened audit saw (debug's `alias bb`)
 #
+# Instrument rules (AGENTS.md, the evidence producer is checked like code):
+# the backup is verified before any mutation and a failed restore is
+# fatal; a run counts only when BOTH test binaries printed their result
+# line (a compile, linker or cargo failure is no verdict); and a silent-side
+# mutant must re-emit the diagnostic inside the NAMED test's own failure
+# block, never anywhere in the log.
 # Builds/tests go to $ROOT/target (the 2026-09-17 stale-binary defect).
 set -uo pipefail
 
@@ -39,20 +49,46 @@ fail=0
 ok()  { printf 'PASS %s\n' "$1"; }
 bad() { printf 'FAIL %s\n' "$1"; fail=1; }
 
-mkdir -p "$BAK"
-for f in "${FILES[@]}"; do cp "$f" "$BAK/$(basename "$f")"; done
-restore() { for f in "${FILES[@]}"; do cp "$BAK/$(basename "$f")" "$f"; done; }
+mkdir -p "$BAK" || { echo "ABORT: cannot create $BAK"; exit 1; }
+for f in "${FILES[@]}"; do
+  if ! cp "$f" "$BAK/$(basename "$f")" || ! cmp -s "$f" "$BAK/$(basename "$f")"; then
+    echo "ABORT: backup of $f failed; nothing was mutated"
+    exit 1
+  fi
+done
+restore() {
+  local f
+  for f in "${FILES[@]}"; do
+    if ! cp "$BAK/$(basename "$f")" "$f" || ! cmp -s "$f" "$BAK/$(basename "$f")"; then
+      echo "FATAL: could not restore $f from $BAK — the tree may hold a mutant"
+      exit 3
+    fi
+  done
+}
 trap restore EXIT
 
 compiles=0
 failing=
 # Sets `compiles`/`failing` in the caller's shell (never in `$(...)`).
 # `--no-fail-fast`: the control may live in the second test binary.
+# `compiles` means both binaries RAN: each prints one `test result:` line,
+# and cargo's exit status must agree with the failures it reported.
 run_suite() {
   CARGO_TARGET_DIR="$ROOT/target" cargo test -p itaruby --no-fail-fast \
     --test open_world_cli --test tapioca_closed_world_cli >"$LOG" 2>&1
-  if grep -q 'could not compile' "$LOG"; then compiles=0; else compiles=1; fi
+  local status=$? results
+  results=$(grep -cE '^test result: (ok|FAILED)\.' "$LOG")
   failing=$(grep -oE '^test [a-z0-9_]+ \.\.\. FAILED' "$LOG" | awk '{print $2}' | sort -u)
+  compiles=0
+  if (( results == 2 )) && { [[ -z $failing && $status -eq 0 ]] || [[ -n $failing && $status -ne 0 ]]; }; then
+    compiles=1
+  fi
+}
+
+# The named test's own failure block (`---- <test> stdout ----` up to the
+# next block or the `failures:` list).
+failure_block() {
+  awk -v t="---- $1 stdout ----" '$0 == t { on = 1; next } on && (/^---- / || /^failures:$/) { exit } on' "$LOG"
 }
 
 inject() {
@@ -81,14 +117,14 @@ mutant() {
   fi
   run_suite
   if (( ! compiles )); then
-    bad "$label did not compile — a mutant that cannot run proves nothing"
+    bad "$label did not run both test binaries (compile, linker or cargo failure) — a mutant that cannot run proves nothing"
   elif [[ -z $failing ]]; then
     bad "$label BLIND — compiles and the suite is green: the control is missing, not the change safe"
   elif grep -qx "$expect" <<<"$failing"; then
-    # A silent-side mutant must make the checker SPEAK (the code shows in
-    # the failure text); a `positive side` mutant silences an accusing
-    # fixture instead.
-    if [[ $why == 'positive side'* ]] || grep -qE '(error|warning)\[E010[178]\]' "$LOG"; then
+    # A silent-side mutant must make the checker SPEAK in the named test
+    # (the code shows in its own failure text); a `positive side` mutant
+    # silences an accusing fixture instead.
+    if [[ $why == 'positive side'* ]] || failure_block "$expect" | grep -qE '(error|warning)\[E010[178]\]'; then
       ok "$label accused by $expect ($(tr '\n' ' ' <<<"$failing" | sed 's/ $//'))"
     else
       bad "$label $expect failed without re-emitting the diagnostic"
@@ -104,7 +140,7 @@ mutant() {
 
 echo '--- baseline (shipped source)'
 run_suite
-if (( ! compiles )); then echo 'ABORT: shipped source does not compile'; exit 1; fi
+if (( ! compiles )); then echo 'ABORT: shipped source did not run both test binaries'; exit 1; fi
 if [[ -n $failing ]]; then
   echo "ABORT: baseline is not green — failing: $(tr '\n' ' ' <<<"$failing")"
   exit 1
@@ -310,8 +346,8 @@ mutant O25 "$OW" \
 # ---- installed gem source and name-keyed core definers -----------------
 
 mutant O26 "$OW" \
-  '                Some(dir) => evidence.harvest.merge(harvest_gem(&dir, Reach::Targeted)),' \
-  '                Some(_) => {}' \
+  '                    Ok(files) => evidence.harvest.merge(harvest_gem(&files, Reach::Targeted)),' \
+  '                    Ok(_) => {}' \
   source_alias_the_rbi_omits_stays_silent \
   'Tapioca drops `alias_method` in `class Hash` (json_expressions 0.9.0): only the installed source names it'
 
@@ -328,13 +364,13 @@ mutant O28 "$OW" \
   'positive side: a gem that only reopens Hash cannot give Integer a method'
 
 mutant O29 "$OW" \
-  '        evidence.harvest.merge(harvest_gem(&dir, Reach::Everything));' \
+  '        evidence.harvest.merge(harvest_gem(&files, Reach::Everything));' \
   '' \
   gap_gem_source_defining_the_name_stays_silent \
   'a gap gem covered by its source still adds what that source defines'
 
 mutant O30 "$OW" \
-  '        if native_extension(&dir) {' \
+  '        if native_extension(&dir, &files) {' \
   '        if false {' \
   gap_gem_with_native_extension_stays_silent \
   'C code defines methods no walker reads'
@@ -388,8 +424,8 @@ mutant O37 "$CHK" \
   'the harvested names must reach the E0101 lookup'
 
 mutant O38 "$OW" \
-  '                Some(dir) => evidence.harvest.merge(harvest_gem(&dir, Reach::Targeted)),' \
-  '                Some(dir) => evidence.harvest.merge(harvest_gem(&dir, Reach::Everything)),' \
+  '                    Ok(files) => evidence.harvest.merge(harvest_gem(&files, Reach::Targeted)),' \
+  '                    Ok(files) => evidence.harvest.merge(harvest_gem(&files, Reach::Everything)),' \
   rbi_gem_untargeted_definer_is_left_to_its_rbi \
   'positive side: a load-time definer through an unnamed receiver is in the RBI if it reached the chain'
 
@@ -398,6 +434,93 @@ mutant O39 "$OW" \
   '    let untargeted = false;' \
   gap_gem_untargeted_definer_stays_silent \
   'a gap gem has no RBI: a definer through an unnamed receiver may land on Integer'
+
+# ---- an incomplete read is no evidence (cubic review) --------------------
+
+mutant O40 "$MAIN" \
+  '    let loaded: Vec<PathBuf> = sources.iter().map(|file| file.path(&db).clone()).collect();
+    wire_closed_world(&db, paths, &loaded);' \
+  '    wire_closed_world(&db, paths, &rb_files);' \
+  unreadable_checked_file_stays_silent \
+  'a checked file whose read failed was never loaded: counting it as loaded skips its reopening'
+
+mutant O41 "$OW" \
+  '        let entry = entry.map_err(|err| walk_error_path(&err, &project))?;' \
+  '        let Ok(entry) = entry else { continue };' \
+  unreadable_project_directory_stays_silent \
+  'an unloaded directory the walk cannot list may hold a core reopening'
+
+mutant O42 "$OW" \
+  '        let entry = entry.map_err(|err| walk_error_path(&err, dir))?;' \
+  '        let Ok(entry) = entry else { continue };' \
+  gap_gem_with_an_unreadable_subtree_stays_silent \
+  'an installed gem listed only in part is no clean source'
+
+mutant O43 "$OW" \
+  '                    Err(_) => evidence.harvest.open_all(),' \
+  '                    Err(_) => {}' \
+  rbi_gem_with_an_unreadable_subtree_stays_silent \
+  'an RBI gem whose source cannot be listed opens every chain'
+
+mutant O44 "$OW" \
+  '        let files = gem_files(&dir).map_err(|path| {
+            format!("gem `{name} ({version})` has no RBI and {} cannot be read", path.display())
+        })?;' \
+  '        let files = gem_files(&dir).unwrap_or_default();' \
+  gap_gem_with_an_unreadable_subtree_stays_silent \
+  'a gap gem whose source cannot be listed stays a gap'
+
+mutant O45 "$OW" \
+  '        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb"))' \
+  '        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb") && p.components().any(|c| c.as_os_str() == "lib"))' \
+  gap_gem_source_outside_lib_stays_silent \
+  'a gemspec'"'"'s require_paths may name a directory besides lib/'
+
+mutant O46 "$OW" \
+  '    if defs.refined_unknown || defs.eval_unknown {' \
+  '    if false {' \
+  rbi_gem_unknown_refinement_stays_silent \
+  'no RBI reflects a refinement: an unknown target may be Integer'
+
+mutant O47 "$OW" \
+  '    h.type_test |= untargeted
+        && frag.methods.iter().any(|m| {' \
+  '    h.type_test |= untargeted
+        && chain_target(&frag.path).is_none()
+        && frag.methods.iter().any(|m| {' \
+  gap_gem_chain_type_test_override_stays_silent \
+  '`class String; def is_a?` lets a String pass `returns(Integer)`'
+
+mutant O48 "$OW" \
+  '    if !(state.platforms && state.dependencies) {' \
+  '    if false {' \
+  empty_lockfile_stays_silent \
+  'an empty Gemfile.lock is no lock Bundler wrote'
+
+mutant O49 "$OW" \
+  '            other => return Err(format!("Gemfile.lock has an unread section `{other}`")),' \
+  '            _ => {}' \
+  unread_lock_section_stays_silent \
+  'a header Bundler never writes hides a gem nobody accounts for'
+
+mutant O50 "$OW" \
+  '            if !is_source_key(line) {' \
+  '            if false {' \
+  misindented_lock_spec_stays_silent \
+  'a source line with no Bundler shape is a spec nobody read'
+
+mutant O51 "$OW" \
+  "        .is_some_and(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))" \
+  '        .is_some_and(|_| false)' \
+  lock_with_no_gems_still_accuses \
+  'positive side: a lock Bundler wrote for a Gemfile with no gems proves zero gems'
+
+mutant O52 "$OW" \
+  '            "debugger",
+            "bb",' \
+  '            "debugger",' \
+  curated_gem_keyword_alias_stays_silent \
+  'debug 1.11.1 aliases `bb` inside `module Kernel`: an audit blind to the `alias` keyword missed it'
 
 echo
 if (( fail )); then echo 'open-world mutants: FAIL'; exit 1; fi

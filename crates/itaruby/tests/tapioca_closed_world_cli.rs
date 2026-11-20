@@ -35,11 +35,25 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// A fresh project dir; its sibling gem store is cleared too, so a gem a
+/// previous run installed never answers for this one.
 fn tmpdir(name: &str) -> PathBuf {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
-    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&dir);
     std::fs::create_dir_all(dir.join("sorbet/rbi/gems")).unwrap();
     dir
+}
+
+/// Removes a fixture project AND its gem store.
+fn cleanup(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(gem_store(dir));
+}
+
+/// A `Gemfile.lock` as Bundler writes it: `specs` lines, then the
+/// `PLATFORMS` and `DEPENDENCIES` sections every lock carries.
+fn lock(specs: &str) -> String {
+    format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n")
 }
 
 fn write(dir: &Path, name: &str, text: &str) {
@@ -64,7 +78,7 @@ fn full_coverage_closes_the_world_and_rbi_declared_methods_stay_silent() {
     write(
         &dir,
         "Gemfile.lock",
-        "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n",
+        &lock("    mygem (1.0.0)\n"),
     );
     write(
         &dir.join("sorbet/rbi/gems"),
@@ -92,7 +106,7 @@ fn full_coverage_closes_the_world_and_rbi_declared_methods_stay_silent() {
         "String#squish is declared in the gem RBI — silence, got: {text}"
     );
     assert_eq!(out.status.code(), Some(1), "one planted error => exit 1");
-    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&dir);
 }
 
 /// Narrowed typo (silent since W11), a literal typo (the positive
@@ -113,7 +127,7 @@ fn missing_gem_rbi_fails_closed_to_silence() {
     write(
         &dir,
         "Gemfile.lock",
-        "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n",
+        &lock("    mygem (1.0.0)\n"),
     );
     write(&dir, "probe.rb", PROBE);
     let out = run_check(&dir);
@@ -127,7 +141,7 @@ fn missing_gem_rbi_fails_closed_to_silence() {
         Some(0),
         "no errors expected, got: {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&dir);
 }
 
 /// Lock names two gems, only one RBI exists: incomplete coverage, mode
@@ -143,7 +157,7 @@ fn two_gems_one_rbi_is_incomplete_coverage() {
     write(
         &dir,
         "Gemfile.lock",
-        "GEM\n  remote: https://rubygems.org/\n  specs:\n    mygem (1.0.0)\n    other (2.0.0)\n",
+        &lock("    mygem (1.0.0)\n    other (2.0.0)\n"),
     );
     write(
         &dir.join("sorbet/rbi/gems"),
@@ -162,7 +176,7 @@ fn two_gems_one_rbi_is_incomplete_coverage() {
         Some(0),
         "no errors expected, got: {text}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&dir);
 }
 
 /// w12 closure, E0104 did-you-mean for VALUE constants: `Foo::Barr`
@@ -190,5 +204,5 @@ fn value_constant_typo_gets_did_you_mean_and_defined_at() {
         "defined-at must point at foo.rb line 2 (the `Bar = 1`), got:\n{text}"
     );
     assert_eq!(out.status.code(), Some(0), "warning only => exit 0");
-    let _ = std::fs::remove_dir_all(&dir);
+    cleanup(&dir);
 }

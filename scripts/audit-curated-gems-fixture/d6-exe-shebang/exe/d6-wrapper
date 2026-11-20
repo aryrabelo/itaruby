@@ -1,0 +1,3 @@
+#!/bin/sh
+# Not Ruby: parsing it as Ruby would be noise (or an abort).
+if [ -n "$1" ]; then exec d6-tool "$@"; fi

@@ -408,11 +408,24 @@ fn literal_shape_leaf(s: &str) -> Option<Ty> {
         });
     }
     let inner = s.strip_prefix('{')?.strip_suffix('}')?;
-    Some(if inner.trim().is_empty() || split_top_level(inner, ',').is_some() {
-        Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown))
-    } else {
-        Ty::Unknown
-    })
+    let shape = inner.trim().is_empty()
+        || split_top_level(inner, ',').is_some_and(|parts| parts.iter().all(|part| shape_member(part)));
+    Some(if shape { Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown)) } else { Ty::Unknown })
+}
+
+/// One `key: Type` member of a shape: a label, then a non-empty type. The
+/// `=>` and `**` member forms never pass `split_top_level`'s character
+/// filter. Anything else (`{foo}`, recovered from a syntax error) is no
+/// shape sorbet-runtime would build, so it types nothing.
+fn shape_member(part: &str) -> bool {
+    let Some((key, value)) = part.split_once(':') else {
+        return false;
+    };
+    !key.is_empty()
+        && !key.starts_with(|c: char| c.is_ascii_digit())
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !value.starts_with(':')
+        && !value.trim().is_empty()
 }
 
 /// The two bracketed containers. A member count the spelling does not

@@ -24,23 +24,32 @@ use std::sync::LazyLock;
 /// `Enumerable`/`Object`/`Kernel`/`BasicObject` ancestry). A locked
 /// version not listed here is unaudited and fails closed.
 ///
-/// Audit (2026-10-20, `scripts/audit-curated-gems.rb` over each version's
-/// unpacked `lib/` and `exe/`): every `class`/`module` reopening of a
-/// chain name, every chain-receiver `include`/`prepend`/`define_method`/
-/// `send`/`class_eval`, every top-level `def` (a private `Object` method),
-/// every `refine`, and every `is_a?`/`kind_of?`/`instance_of?`/
+/// Audit (2026-10-20, re-run 2026-11-19 after the cubic review hardened
+/// `scripts/audit-curated-gems.rb`, over each version's unpacked `lib/`
+/// and every `.rb` or Ruby-shebang file under `exe/`, aborting on a parse
+/// error): every `class`/`module` reopening of a chain name, every
+/// chain-receiver `include`/`prepend`/`define_method`/`send`/
+/// `class_eval`/`instance_exec`, every `alias` keyword, every top-level
+/// `def`/`alias`/mixin (a private or public `Object` method), every
+/// `refine`, every `eval` whatever its receiver, `class << self` bodies
+/// labeled singleton, and every `is_a?`/`kind_of?`/`instance_of?`/
 /// `method_missing` definition. Findings:
 /// - sorbet-static, sorbet-static-and-runtime: no Ruby under `lib/`.
 /// - sorbet-runtime: no chain reopening. Its one type-test override,
 ///   `T::InterfaceWrapper#is_a?` (0.5.10262 only), answers true for its
 ///   own class and an interface MODULE, never for a core class.
 /// - sorbet (the `srb` CLI, never required by an application):
-///   `DelegateClass` at top level, `Object.prepend` of `extend`, and
-///   `Kernel.send(:define_method, ...)` of `exit`/`at_exit`.
-/// - debug: `Kernel#debugger`, `Kernel` prepends of `fork`/`_fork`/
-///   `trap`/`daemon`, `BasicObject#singleton_method_added`.
-/// - irb: top-level `xmp`, and `irb_binding` defined on `Object` by a
-///   string `eval` in `IRB::WorkSpace`.
+///   `DelegateClass` at top level and its top-level `alias`
+///   `DelegateClass_without_rbi_generator`, `Object.prepend` of `extend`,
+///   and `Kernel.send(:define_method, ...)` of `exit`/`at_exit`.
+/// - debug: `Kernel#debugger` and its `alias bb` (under
+///   `RUBY_DEBUG_BB`), `Kernel` prepends of `fork`/`_fork`/`trap`/
+///   `daemon`, `BasicObject#singleton_method_added`.
+/// - irb: top-level `xmp`, `irb_binding` defined on `Object` by a
+///   string `eval` in `IRB::WorkSpace`, and the two `Object` aliases of
+///   `irb/ext/use-loader.rb` (`__original__load__IRB_use_loader__`,
+///   `__original__require__IRB_use_loader__`). Its other `eval`s run
+///   user or debugger expressions and define no name.
 pub const CURATED_GEMS: &[(&str, &[&str], &[&str])] = &[
     ("sorbet-static", SORBET_VERSIONS, &[]),
     ("sorbet-static-and-runtime", SORBET_VERSIONS, &[]),
@@ -48,13 +57,20 @@ pub const CURATED_GEMS: &[(&str, &[&str], &[&str])] = &[
     (
         "sorbet",
         SORBET_VERSIONS,
-        &["DelegateClass", "extend", "exit", "at_exit"],
+        &[
+            "DelegateClass",
+            "DelegateClass_without_rbi_generator",
+            "extend",
+            "exit",
+            "at_exit",
+        ],
     ),
     (
         "debug",
         &["1.11.1"],
         &[
             "debugger",
+            "bb",
             "fork",
             "_fork",
             "trap",
@@ -65,7 +81,12 @@ pub const CURATED_GEMS: &[(&str, &[&str], &[&str])] = &[
     (
         "irb",
         &["1.15.2", "1.16.0", "1.17.0", "1.18.0"],
-        &["xmp", "irb_binding"],
+        &[
+            "xmp",
+            "irb_binding",
+            "__original__load__IRB_use_loader__",
+            "__original__require__IRB_use_loader__",
+        ],
     ),
 ];
 
@@ -142,8 +163,15 @@ impl Harvest {
 ///   entry naming that version.
 /// - `PATH` specs must live inside the project: their source is then the
 ///   project's own, read by the checker or by `unloaded_core_hazard`.
-/// - Any other section that declares specs (`PLUGIN SOURCE`, a section
-///   this parser does not know) is unreadable.
+/// - Any other section that declares specs (`PLUGIN SOURCE`) is
+///   unreadable.
+///
+/// The text must also be a lock Bundler wrote: every section header is
+/// one Bundler writes, every line of a source section has one of its
+/// shapes, and `PLATFORMS` and `DEPENDENCIES` (written even for a Gemfile
+/// with no gems) are present. A lock with no specs then proves zero gems;
+/// an empty or garbled file proves nothing, because Bundler resolves the
+/// `Gemfile` again at runtime and loads whatever it names.
 ///
 /// # Errors
 ///
@@ -154,38 +182,103 @@ pub fn lock_evidence(
     env: &GemEnv<'_>,
 ) -> Result<LockEvidence, String> {
     let mut evidence = LockEvidence::default();
-    let mut section = "";
-    let mut remote: Option<&str> = None;
+    let mut state = LockState::default();
     for line in lock_text.lines() {
         if line.is_empty() {
             continue;
         }
         if !line.starts_with(' ') {
-            section = line.trim_end();
-            remote = None;
+            state.enter_section(line)?;
             continue;
         }
-        if let Some(r) = line.strip_prefix("  remote: ") {
-            remote = Some(r.trim());
+        if !SOURCE_SECTIONS.contains(&state.section) {
             continue;
         }
-        let Some(rest) = line.strip_prefix("    ") else {
+        let Some((name, version)) = state.source_line(line)? else {
             continue;
         };
-        if rest.starts_with(' ') {
-            continue;
-        }
-        let (name, version) =
-            parse_spec(rest).ok_or_else(|| format!("unreadable spec line `{rest}`"))?;
         let spec = Spec {
-            section,
-            remote,
+            section: state.section,
+            remote: state.remote,
             name,
             version,
         };
         account_spec(&spec, lock_dir, env, &mut evidence)?;
     }
+    if !(state.platforms && state.dependencies) {
+        return Err("Gemfile.lock lacks PLATFORMS or DEPENDENCIES: not a lock Bundler wrote".into());
+    }
     Ok(evidence)
+}
+
+/// Where `lock_evidence` is in the lock, and which of Bundler's
+/// always-written sections it has seen.
+#[derive(Default)]
+struct LockState<'a> {
+    section: &'a str,
+    remote: Option<&'a str>,
+    platforms: bool,
+    dependencies: bool,
+}
+
+impl<'a> LockState<'a> {
+    /// A non-indented line: one of Bundler's section headers, or a gap.
+    fn enter_section(&mut self, line: &'a str) -> Result<(), String> {
+        self.section = line.trim_end();
+        self.remote = None;
+        match self.section {
+            "PLATFORMS" => self.platforms = true,
+            "DEPENDENCIES" => self.dependencies = true,
+            s if LOCK_SECTIONS.contains(&s) => {}
+            other => return Err(format!("Gemfile.lock has an unread section `{other}`")),
+        }
+        Ok(())
+    }
+
+    /// One line of a source section: the spec it declares (`name`,
+    /// `version`), nothing for a `key:` or dependency-constraint line, or
+    /// a gap for a line of no Bundler shape.
+    fn source_line(&mut self, line: &'a str) -> Result<Option<(&'a str, &'a str)>, String> {
+        if let Some(r) = line.strip_prefix("  remote: ") {
+            self.remote = Some(r.trim());
+            return Ok(None);
+        }
+        let Some(rest) = line.strip_prefix("    ") else {
+            if !is_source_key(line) {
+                return Err(format!("unreadable lock line `{line}`"));
+            }
+            return Ok(None);
+        };
+        if rest.starts_with(' ') {
+            return Ok(None);
+        }
+        parse_spec(rest)
+            .map(Some)
+            .ok_or_else(|| format!("unreadable spec line `{rest}`"))
+    }
+}
+
+/// The section headers Bundler writes; specs are read only in the
+/// `SOURCE_SECTIONS`, the others carry no gem.
+const LOCK_SECTIONS: &[&str] = &[
+    "GEM",
+    "GIT",
+    "PATH",
+    "PLUGIN SOURCE",
+    "PLATFORMS",
+    "DEPENDENCIES",
+    "RUBY VERSION",
+    "BUNDLED WITH",
+    "CHECKSUMS",
+];
+const SOURCE_SECTIONS: &[&str] = &["GEM", "GIT", "PATH", "PLUGIN SOURCE"];
+
+/// A source section's two-space `key:` line (`remote:`, `revision:`,
+/// `specs:`, `glob:`, ...).
+fn is_source_key(line: &str) -> bool {
+    line.strip_prefix("  ")
+        .and_then(|rest| rest.split_once(':'))
+        .is_some_and(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
 }
 
 /// One lock spec and where it was read.
@@ -210,7 +303,10 @@ fn account_gem(
         let touched = rbi_chain_touch(env.rbi_gems_dir, name, version);
         if !touched.is_empty() {
             match installed_gem_dir(env.gem_roots, name, version) {
-                Some(dir) => evidence.harvest.merge(harvest_gem(&dir, Reach::Targeted)),
+                Some(dir) => match gem_files(&dir) {
+                    Ok(files) => evidence.harvest.merge(harvest_gem(&files, Reach::Targeted)),
+                    Err(_) => evidence.harvest.open_all(),
+                },
                 None => evidence.harvest.open.extend(touched),
             }
         }
@@ -222,12 +318,15 @@ fn account_gem(
         let dir = installed_gem_dir(env.gem_roots, name, version).ok_or_else(|| {
             format!("gem `{name} ({version})` has no RBI and no installed source for its locked version")
         })?;
-        if native_extension(&dir) {
+        let files = gem_files(&dir).map_err(|path| {
+            format!("gem `{name} ({version})` has no RBI and {} cannot be read", path.display())
+        })?;
+        if native_extension(&dir, &files) {
             return Err(format!(
                 "gem `{name} ({version})` has no RBI and a native extension"
             ));
         }
-        evidence.harvest.merge(harvest_gem(&dir, Reach::Everything));
+        evidence.harvest.merge(harvest_gem(&files, Reach::Everything));
     }
     Ok(())
 }
@@ -265,7 +364,6 @@ fn account_spec(
                 return Err(format!("PATH gem `{name}` lives outside the project"));
             }
         }
-        "PLATFORMS" | "DEPENDENCIES" | "RUBY VERSION" | "BUNDLED WITH" | "CHECKSUMS" => {}
         other => return Err(format!("spec `{name}` in unread section `{other}`")),
     }
     Ok(())
@@ -349,7 +447,8 @@ pub fn rbi_gem_versions(gems_dir: &Path) -> HashMap<String, Vec<String>> {
 ///
 /// # Errors
 ///
-/// An unreadable file (or project) is named: nothing says what it adds.
+/// An unreadable file, directory (or project) is named: nothing says what
+/// it adds, and a walk that skipped it is not a complete read.
 pub fn harvest_unloaded<S: std::hash::BuildHasher>(
     project: &Path,
     loaded: &HashSet<PathBuf, S>,
@@ -365,7 +464,8 @@ pub fn harvest_unloaded<S: std::hash::BuildHasher>(
         })
         .build();
     let mut files = Vec::new();
-    for entry in walker.filter_map(Result::ok) {
+    for entry in walker {
+        let entry = entry.map_err(|err| walk_error_path(&err, &project))?;
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
         }
@@ -394,19 +494,52 @@ pub fn installed_gem_dir(roots: &[PathBuf], name: &str, version: &str) -> Option
 }
 
 /// Does an installed gem carry compiled code (an `ext/` tree or a built
-/// `.so`/`.bundle`)? C defines methods no Ruby walker can read.
-fn native_extension(dir: &Path) -> bool {
+/// `.so`/`.bundle`)? C defines methods no Ruby walker can read. `files`
+/// is the gem's complete listing (`gem_files`).
+fn native_extension(dir: &Path, files: &[PathBuf]) -> bool {
     dir.join("ext").is_dir()
-        || ignore::WalkBuilder::new(dir)
-            .standard_filters(false)
-            .build()
-            .filter_map(Result::ok)
-            .any(|e| {
-                matches!(
-                    e.path().extension().and_then(|x| x.to_str()),
-                    Some("so" | "bundle" | "dll")
-                )
-            })
+        || files.iter().any(|p| {
+            matches!(
+                p.extension().and_then(|x| x.to_str()),
+                Some("so" | "bundle" | "dll")
+            )
+        })
+}
+
+/// Every file of an installed gem, the WHOLE gem: a gemspec's
+/// `require_paths` may name any directory besides `lib/`, and a `lib/`
+/// file may `require_relative` outside it. Symlinks are followed (a loop
+/// is an error).
+///
+/// # Errors
+///
+/// The entry the walk could not read: a partial listing is not a clean
+/// gem.
+fn gem_files(dir: &Path) -> Result<Vec<PathBuf>, PathBuf> {
+    let mut out = Vec::new();
+    for entry in ignore::WalkBuilder::new(dir)
+        .standard_filters(false)
+        .follow_links(true)
+        .build()
+    {
+        let entry = entry.map_err(|err| walk_error_path(&err, dir))?;
+        if entry.path().is_file() {
+            out.push(entry.into_path());
+        }
+    }
+    Ok(out)
+}
+
+/// The path a walk error names, else the walk's root.
+fn walk_error_path(err: &ignore::Error, root: &Path) -> PathBuf {
+    match err {
+        ignore::Error::WithPath { path, .. } => path.clone(),
+        ignore::Error::WithDepth { err, .. } | ignore::Error::WithLineNumber { err, .. } => {
+            walk_error_path(err, root)
+        }
+        ignore::Error::Loop { child, .. } => child.clone(),
+        _ => root.to_path_buf(),
+    }
 }
 
 /// Every chain namespace the gem's Tapioca RBI for the locked version
@@ -447,20 +580,15 @@ fn rbi_chain_touch(gems_dir: &Path, name: &str, version: &str) -> HashSet<String
     out
 }
 
-/// Harvest an installed gem: every `.rb` under `lib/` (its require path),
-/// or under the whole gem when it has no `lib/`. An unreadable file opens
-/// every chain.
-pub fn harvest_gem(dir: &Path, reach: Reach) -> Harvest {
-    let lib = dir.join("lib");
-    let root = if lib.is_dir() { lib } else { dir.to_path_buf() };
-    let files: Vec<PathBuf> = ignore::WalkBuilder::new(&root)
-        .standard_filters(false)
-        .build()
-        .filter_map(Result::ok)
-        .map(ignore::DirEntry::into_path)
-        .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("rb"))
+/// Harvest an installed gem from its complete listing (`gem_files`):
+/// every `.rb` file. An unreadable file opens every chain.
+pub fn harvest_gem(files: &[PathBuf], reach: Reach) -> Harvest {
+    let rb: Vec<PathBuf> = files
+        .iter()
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb"))
+        .cloned()
         .collect();
-    harvest_files(&files, reach).unwrap_or_else(|_| {
+    harvest_files(&rb, reach).unwrap_or_else(|_| {
         let mut h = Harvest::default();
         h.open_all();
         h
@@ -477,7 +605,10 @@ pub enum Reach {
     /// `rbi_type_test_hazard`). What the RBI measurably drops is what a
     /// chain REOPENING adds (`alias_method` in `class Hash`); only the
     /// chain-targeted shapes are read: reopening fragments, keyed sources
-    /// on a chain constant, and the blanket `core_mixin`.
+    /// on a chain constant, the blanket `core_mixin`, and the two shapes
+    /// whose reach nothing bounds - a refinement with an unknown target
+    /// (no RBI reflects a refinement; `using` activates it) and an eval
+    /// body with an unknown target - which open every chain.
     Targeted,
     /// A gem with no RBI, or a project file this run does not load:
     /// nothing else describes it, so every shape counts.
@@ -565,12 +696,12 @@ fn chain_target(target: &str) -> Option<String> {
 }
 
 /// One file's additions, name-keyed. The blanket `core_mixin` flag is set
-/// by the walker only for injections it cannot key (a core-receiver
-/// `class_eval`, a toplevel `method_missing`, ...); the keyed ones arrive
-/// through `keyed_pollution`.
+/// by the walker only for what it cannot key (a toplevel
+/// `method_missing`); the keyed injections arrive through
+/// `keyed_pollution`.
 fn harvest_defs(defs: &crate::FileDefs, modules: &ModuleTable, reach: Reach, h: &mut Harvest) {
     let untargeted = reach == Reach::Everything;
-    harvest_blanket(defs, untargeted, h);
+    harvest_blanket(defs, h);
     if untargeted {
         harvest_untargeted(defs, modules, h);
     }
@@ -583,13 +714,14 @@ fn harvest_defs(defs: &crate::FileDefs, modules: &ModuleTable, reach: Reach, h: 
 }
 
 /// The file-level marks that name no method: a `method_missing` the
-/// walker could not bound, unknown refinement/eval targets, and every
-/// refined or evaled chain namespace.
-fn harvest_blanket(defs: &crate::FileDefs, untargeted: bool, h: &mut Harvest) {
+/// walker could not bound, unknown refinement/eval targets (for every
+/// reach, see `Reach::Targeted`), and every refined or evaled chain
+/// namespace.
+fn harvest_blanket(defs: &crate::FileDefs, h: &mut Harvest) {
     if defs.core_mixin {
         h.open_all();
     }
-    if untargeted && (defs.refined_unknown || defs.eval_unknown) {
+    if defs.refined_unknown || defs.eval_unknown {
         h.open_all();
     }
     for (target, _) in defs.refine_targets.iter().chain(&defs.eval_targets) {
@@ -664,12 +796,15 @@ fn harvest_fragment(
     untargeted: bool,
     h: &mut Harvest,
 ) {
+    // A type-test override on ANY class, a chain class included (`class
+    // String; def is_a?`), lets a value pass sorbet-runtime's `is_a?`
+    // check for a type it is not.
+    h.type_test |= untargeted
+        && frag.methods.iter().any(|m| {
+            crate::index::TYPE_TEST_NAMES.contains(&m.name.as_str())
+                || matches!(m.name.as_str(), "method_missing" | "respond_to_missing?")
+        });
     let Some(ns) = chain_target(&frag.path) else {
-        h.type_test |= untargeted
-            && frag.methods.iter().any(|m| {
-                crate::index::TYPE_TEST_NAMES.contains(&m.name.as_str())
-                    || matches!(m.name.as_str(), "method_missing" | "respond_to_missing?")
-            });
         return;
     };
     if !fragment_readable(frag) {
@@ -826,18 +961,41 @@ mod tests {
         assert!(err.unwrap_err().contains("sorbet-runtime"));
     }
 
+    /// What Bundler writes after the source sections of every lock.
+    const TAIL: &str = "\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem!\n";
+
     #[test]
     fn plugin_source_specs_are_unreadable() {
-        let lock = "PLUGIN SOURCE\n  remote: https://x\n  specs:\n    mygem (1.0)\n";
-        assert!(ev(lock, &HashMap::new()).is_err());
+        let lock = format!("PLUGIN SOURCE\n  remote: https://x\n  specs:\n    mygem (1.0)\n{TAIL}");
+        assert!(ev(&lock, &HashMap::new()).unwrap_err().contains("PLUGIN SOURCE"));
     }
 
     #[test]
     fn git_rbi_with_sha_suffix_covers() {
-        let lock =
-            "GIT\n  remote: https://x\n  revision: abc\n  specs:\n    json_api_client (1.23.0)\n";
-        assert!(ev(lock, &rbis(&[("json_api_client", "1.23.0-606196")])).is_ok());
-        assert!(ev(lock, &rbis(&[("json_api_client", "1.23.01")])).is_err());
+        let lock = format!(
+            "GIT\n  remote: https://x\n  revision: abc\n  specs:\n    json_api_client (1.23.0)\n{TAIL}"
+        );
+        assert!(ev(&lock, &rbis(&[("json_api_client", "1.23.0-606196")])).is_ok());
+        assert!(ev(&lock, &rbis(&[("json_api_client", "1.23.01")])).is_err());
+    }
+
+    /// A Gemfile with no gems locks to sources with no specs: zero gems,
+    /// complete. An empty or structureless file is not a lock Bundler
+    /// wrote, so it proves nothing.
+    #[test]
+    fn only_a_lock_bundler_wrote_proves_zero_gems() {
+        let empty_gems = "GEM\n  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n\nBUNDLED WITH\n   2.5.0\n";
+        assert!(ev(empty_gems, &HashMap::new()).is_ok());
+        for garbled in [
+            "",
+            "\n\n",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n\tmygem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n",
+            "GEM\n  remote: https://rubygems.org/\n  specs:\n   mygem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n",
+            "<<<<<<< HEAD\nGEM\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n",
+        ] {
+            assert!(ev(garbled, &HashMap::new()).is_err(), "must not prove zero gems: {garbled:?}");
+        }
     }
 
     #[test]

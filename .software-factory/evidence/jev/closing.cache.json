@@ -78,5 +78,25 @@
       "contradicts": 0.09,
       "says_nothing": 0.76
     }
+  },
+  "8896afe3ce799272bf92d5293d7bc9bc90457805b4a869a521f910ce3880dcd5": {
+    "type": "choice",
+    "choice": "supports",
+    "confidence": 0.91,
+    "probabilities": {
+      "supports": 0.94,
+      "contradicts": 0.04,
+      "says_nothing": 0.02
+    }
+  },
+  "5cd29f7f691b6a4b5d14f657b702c07110c4742548f5d8cde7d397c183782fdd": {
+    "type": "choice",
+    "choice": "says_nothing",
+    "confidence": 0.58,
+    "probabilities": {
+      "supports": 0.19,
+      "contradicts": 0.09,
+      "says_nothing": 0.72
+    }
   }
 }

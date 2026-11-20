@@ -203,6 +203,22 @@ fn unsupported_shapes_and_procs_retain_the_known_collection_category() {
     );
 }
 
+/// A brace expression is a shape only when every member is `key: Type`.
+/// `{foo}` reaches the reader from a file prism recovered after a syntax
+/// error (measured: `returns({foo})` typed its consumer `Hash` and the
+/// consumer's `.upcase` drew E0101); sorbet-runtime never built it, so it
+/// types nothing.
+#[test]
+fn a_brace_expression_is_a_shape_only_with_key_type_members() {
+    let unknown_hash = Ty::Hash(Box::new(Ty::Unknown), Box::new(Ty::Unknown));
+    for shape in ["{}", "{foo: Integer}", "{foo: Integer, bar: T::Array[String]}"] {
+        assert_eq!(sorbet_ret_ty(shape), unknown_hash, "{shape}");
+    }
+    for malformed in ["{foo}", "{foo, bar: Integer}", "{foo:}", "{1: Integer}", "{A::B}", "{foo: Integer, }"] {
+        assert_eq!(sorbet_ret_ty(malformed), Ty::Unknown, "{malformed}");
+    }
+}
+
 #[test]
 fn malformed_type_boundaries_never_drop_an_empty_or_unknown_member() {
     for expression in [

@@ -1,0 +1,3 @@
+#!/usr/bin/env ruby
+require "clean"
+Clean::Thing.build.each { |x| p x }

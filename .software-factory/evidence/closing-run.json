@@ -2,7 +2,7 @@
   "scenario": "closing",
   "status": "passed",
   "goal": "Close this change the way the repository's owner closes one: run every gate this machine can run against the committed tree, and show that nothing the checker says about real code got worse.",
-  "commit": "86f83618d2267766f9e6a35369125f4921b9d121",
+  "commit": "fdb17f0b4142e5f5b515f4525b94ee68b8144822",
   "sf": "sf 0.4.1 (catalog e9248b61811d, 42 rules)",
   "corpus_c": {
     "status": "retired",
@@ -38,7 +38,7 @@
         "status": "PASS",
         "numbers": {
           "suites": 119,
-          "passed": 1038,
+          "passed": 1045,
           "failed": 0
         }
       },
@@ -93,7 +93,7 @@
           "over": 0,
           "worst": {
             "id": "check/project_index",
-            "ms": 6.56,
+            "ms": 6.11,
             "ceiling_ms": 7.04
           }
         }
@@ -128,7 +128,7 @@
               "errors": 2,
               "warnings": 871,
               "lines": 873,
-              "seconds": 2.186,
+              "seconds": 1.834,
               "ceiling_s": 3.0
             },
             {
@@ -139,7 +139,7 @@
               "errors": 0,
               "warnings": 973,
               "lines": 973,
-              "seconds": 1.238,
+              "seconds": 0.738,
               "ceiling_s": 2.0
             },
             {
@@ -150,7 +150,7 @@
               "errors": 10,
               "warnings": 1929,
               "lines": 1939,
-              "seconds": 6.019,
+              "seconds": 5.25,
               "ceiling_s": 10.0
             },
             {
@@ -166,7 +166,7 @@
               "errors": 275,
               "warnings": 1072,
               "lines": 1347,
-              "seconds": 1.394,
+              "seconds": 1.356,
               "ceiling_s": 2.0
             },
             {
@@ -177,7 +177,7 @@
               "errors": 24,
               "warnings": 113,
               "lines": 137,
-              "seconds": 1.363,
+              "seconds": 1.293,
               "ceiling_s": 5.0
             }
           ]

@@ -1,14 +1,14 @@
 {
   "schema_version": 1,
   "gate": "closing",
-  "implementation_sha256": "1e22ef8e531e1ce922942700b442b5cf37b53e211633ad496efbbdda2d6e3588",
+  "implementation_sha256": "901fc1de652e910b296b648384d6c9b2af6a2fa14403afadd40f00975dab0332",
   "runs": [
     {
       "scenario": "closing",
       "status": "passed",
-      "actor": "scripts/closing-evidence, gauntlet run in the gate box at 86f83618d2",
+      "actor": "scripts/closing-evidence, gauntlet run in the gate box at fdb17f0b41",
       "report": ".software-factory/evidence/closing-run.json",
-      "report_sha256": "4c81b79fb8575e9b594367815f750bb8c5d3c9dad8881cc99cd57d4d25e6163b",
+      "report_sha256": "93421ad5d024775ce0a11dcf2b7006219ee08e9f32f24b9a632b44c3d7e16ef7",
       "required_assertions": [
         "dev_gates.exit_zero",
         "corpus.proved_corpus_c",

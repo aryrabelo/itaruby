@@ -4689,8 +4689,9 @@ ContractRbsInferred.take(count.succ)
 /// `x if false`, `x if nil`, `x unless true`, the then-branch of `false ? x
 /// : y` and of `if false`, and the else-branch of `if true` never run, so
 /// no contract (Sorbet `sig` or `#:` RBS) is accused inside them. The
-/// `dead_return` def is written for the day a branch def carries a return
-/// contract (see `a_sig_inside_a_branch_carries_no_return_contract_yet`).
+/// `dead_return` def is written for the day the return-contract check
+/// reaches a branch def (see
+/// `a_sig_inside_a_branch_types_consumers_but_its_body_is_never_checked`).
 #[test]
 fn contracts_stay_silent_in_a_statically_dead_branch() {
     let source = r#"
@@ -4762,15 +4763,18 @@ ContractLiveBranch.new.f(:live_guard) if ENV.key?("NOPE_Q")
     assert_eq!(contract_codes(&diags), ["E0103"; 5], "{diags:?}");
 }
 
-/// H6's forget list names E0109 too, but no E0109 can be emitted inside a
-/// branch today: a `sig` attaches only to a def written directly in a
-/// class body, so a def inside ANY `if` (live or dead) carries no return
-/// contract (measured 2026-11-19 with `ita check`, the cubic review of the
-/// H6 control). This control expires on purpose: the day a branch def
-/// gains a contract, it fails, and the dead-branch E0109 arm needs its own
-/// accused mutant before the change ships.
+/// H6's forget list names E0109 too, but no E0109 is emitted inside a
+/// branch today, and the boundary is the checker's traversal, not the
+/// index (measured 2026-11-20 with `ita check`, the cubic review of #19):
+/// a `sig` above a def inside a class-body `if` is still indexed, and its
+/// declared return types the def's consumer (`sig_fill`: the `.upcase`
+/// below draws E0101 for `Integer`), but the return-contract check runs
+/// only from the class body's own defs, so the branch def's body is never
+/// held to its sig. This control expires on purpose: the day the traversal
+/// reaches a branch def, it fails, and the dead-branch E0109 arm needs its
+/// own accused mutant before the change ships.
 #[test]
-fn a_sig_inside_a_branch_carries_no_return_contract_yet() {
+fn a_sig_inside_a_branch_types_consumers_but_its_body_is_never_checked() {
     let source = r#"
 class ContractBranchDef
   extend T::Sig
@@ -4779,12 +4783,21 @@ class ContractBranchDef
   if true
     sig { returns(Integer) }
     def live_branch_return = "live branch"
+    sig { returns(Integer) }
+    def live_branch_unknown = Kernel.unknown_thing
   end
 end
+ContractBranchDef.new.live_branch_unknown.upcase
 "#;
     let diags = check("branch-def", source, None);
     assert_eq!(contract_names(source, &diags), ["body_return"], "{diags:?}");
     assert_eq!(contract_codes(&diags), ["E0109"], "{diags:?}");
+    let consumer: Vec<_> = diags
+        .iter()
+        .filter(|d| d.code == "E0101")
+        .map(|d| (&source[d.start..d.end], d.message.as_str()))
+        .collect();
+    assert_eq!(consumer, [("upcase", "undefined method `upcase` for `Integer`")], "{diags:?}");
 }
 
 

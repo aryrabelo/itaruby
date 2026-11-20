@@ -318,11 +318,18 @@ fi
 # The two producers of the evidence that SILENCES E0101 under Tapioca
 # evidence (`CURATED_GEMS` from the curated-gem audit, the stdlib core-ext
 # inventory from its generator): a name either misses is a false positive
-# waiting in the checker, so each once-missed shape is a fixture.
+# waiting in the checker, so each once-missed shape is a fixture. Both run
+# only under the Ruby the inventory was generated with (>= 3.4.2, the
+# generator's own guard); gate 0b's any-3.x bar is the operand fixtures'.
+# Without that Ruby the selftest exits 2: a SKIP, so the run is incomplete
+# (exit 2), never green - the same rule as a missing corpus.
 if "$ROOT/scripts/audit-curated-gems-selftest.sh" >"$ART/audit-curated-gems-selftest.txt" 2>&1; then
   ok 'open-world evidence producers (curated-gem audit + stdlib core-ext generator, each defect fixture accused)'
 else
-  bad 'open-world evidence producers (see target/gauntlet/audit-curated-gems-selftest.txt)'
+  case $? in
+    2) skip 'open-world evidence producers' "no Ruby >= 3.4.2 on this machine ($(tail -n 1 "$ART/audit-curated-gems-selftest.txt"))" ;;
+    *) bad 'open-world evidence producers (see target/gauntlet/audit-curated-gems-selftest.txt)' ;;
+  esac
 fi
 
 # --- gate c3: performance ceiling. The launch bar for this project is speed

@@ -51,9 +51,19 @@ fn cleanup(dir: &Path) {
 }
 
 /// A `Gemfile.lock` as Bundler writes it: `specs` lines, then the
-/// `PLATFORMS` and `DEPENDENCIES` sections every lock carries.
+/// `PLATFORMS` section and a `DEPENDENCIES` section naming every spec as
+/// a direct dependency (each fixture's `Gemfile` lists exactly those gems).
 fn lock(specs: &str) -> String {
-    format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n")
+    let dependencies = specs
+        .lines()
+        .filter_map(|line| line.strip_prefix("    ")?.split(" (").next().filter(|name| !name.starts_with(' ')))
+        .fold(String::new(), |mut out, name| {
+            out.push_str("  ");
+            out.push_str(name);
+            out.push('\n');
+            out
+        });
+    format!("GEM\n  remote: https://rubygems.org/\n  specs:\n{specs}\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n{dependencies}")
 }
 
 fn write(dir: &Path, name: &str, text: &str) {

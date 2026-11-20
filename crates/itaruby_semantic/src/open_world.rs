@@ -168,10 +168,16 @@ impl Harvest {
 ///
 /// The text must also be a lock Bundler wrote: every section header is
 /// one Bundler writes, every line of a source section has one of its
-/// shapes, and `PLATFORMS` and `DEPENDENCIES` (written even for a Gemfile
-/// with no gems) are present. A lock with no specs then proves zero gems;
-/// an empty or garbled file proves nothing, because Bundler resolves the
-/// `Gemfile` again at runtime and loads whatever it names.
+/// shapes (a non-empty `key: value` option, the exact `  specs:` line, then
+/// specs), and a source section with its `specs:` list, `PLATFORMS` and
+/// `DEPENDENCIES` are present (measured: Bundler 2.6.2, 2.6.6 and 4.0.20
+/// write `GEM` / `  specs:` even for an empty Gemfile). A lock with no
+/// specs then proves zero gems; an empty, truncated or garbled file proves
+/// nothing, because Bundler resolves the `Gemfile` again at runtime and
+/// loads whatever it names. `DEPENDENCIES` is not matched against the
+/// specs: Bundler lists a dependency excluded for every locked platform
+/// (`gem "tzinfo-data", platforms: %i[windows jruby]`) with no spec, and
+/// what loads is the specs.
 ///
 /// # Errors
 ///
@@ -205,18 +211,25 @@ pub fn lock_evidence(
         };
         account_spec(&spec, lock_dir, env, &mut evidence)?;
     }
-    if !(state.platforms && state.dependencies) {
-        return Err("Gemfile.lock lacks PLATFORMS or DEPENDENCIES: not a lock Bundler wrote".into());
+    if !(state.sourced && state.platforms && state.dependencies) {
+        return Err(
+            "Gemfile.lock lacks a source `specs:` list, PLATFORMS or DEPENDENCIES: not a lock Bundler wrote"
+                .into(),
+        );
     }
     Ok(evidence)
 }
 
 /// Where `lock_evidence` is in the lock, and which of Bundler's
-/// always-written sections it has seen.
+/// always-written parts it has seen.
 #[derive(Default)]
 struct LockState<'a> {
     section: &'a str,
     remote: Option<&'a str>,
+    /// The current source section opened its `  specs:` list.
+    specs: bool,
+    /// Some source section opened its `  specs:` list.
+    sourced: bool,
     platforms: bool,
     dependencies: bool,
 }
@@ -226,6 +239,7 @@ impl<'a> LockState<'a> {
     fn enter_section(&mut self, line: &'a str) -> Result<(), String> {
         self.section = line.trim_end();
         self.remote = None;
+        self.specs = false;
         match self.section {
             "PLATFORMS" => self.platforms = true,
             "DEPENDENCIES" => self.dependencies = true,
@@ -236,19 +250,25 @@ impl<'a> LockState<'a> {
     }
 
     /// One line of a source section: the spec it declares (`name`,
-    /// `version`), nothing for a `key:` or dependency-constraint line, or
-    /// a gap for a line of no Bundler shape.
+    /// `version`), nothing for an option, the `specs:` line or a
+    /// dependency-constraint line, or a gap for a line of no Bundler shape.
     fn source_line(&mut self, line: &'a str) -> Result<Option<(&'a str, &'a str)>, String> {
-        if let Some(r) = line.strip_prefix("  remote: ") {
-            self.remote = Some(r.trim());
+        if line == "  specs:" {
+            self.specs = true;
+            self.sourced = true;
             return Ok(None);
         }
         let Some(rest) = line.strip_prefix("    ") else {
-            if !is_source_key(line) {
-                return Err(format!("unreadable lock line `{line}`"));
+            let (key, value) =
+                source_option(line).ok_or_else(|| format!("unreadable lock line `{line}`"))?;
+            if key == "remote" {
+                self.remote = Some(value);
             }
             return Ok(None);
         };
+        if !self.specs {
+            return Err(format!("lock spec line `{rest}` outside a `specs:` list"));
+        }
         if rest.starts_with(' ') {
             return Ok(None);
         }
@@ -258,8 +278,9 @@ impl<'a> LockState<'a> {
     }
 }
 
-/// The section headers Bundler writes; specs are read only in the
-/// `SOURCE_SECTIONS`, the others carry no gem.
+/// The section headers Bundler writes (`Bundler::LockfileParser::
+/// KNOWN_SECTIONS`, 4.0.20); specs are read only in the `SOURCE_SECTIONS`,
+/// the others carry no gem.
 const LOCK_SECTIONS: &[&str] = &[
     "GEM",
     "GIT",
@@ -273,12 +294,16 @@ const LOCK_SECTIONS: &[&str] = &[
 ];
 const SOURCE_SECTIONS: &[&str] = &["GEM", "GIT", "PATH", "PLUGIN SOURCE"];
 
-/// A source section's two-space `key:` line (`remote:`, `revision:`,
-/// `specs:`, `glob:`, ...).
-fn is_source_key(line: &str) -> bool {
-    line.strip_prefix("  ")
-        .and_then(|rest| rest.split_once(':'))
-        .is_some_and(|(key, _)| !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+/// A source section's option line, `  key: value` (Bundler's
+/// `LockfileParser::OPTIONS`, `^  ([a-z]+): (.*)$`, and Bundler never
+/// writes an option with an empty value): `remote`, `revision`, `glob`,
+/// `branch`, ... `specs` is never an option - its line is exactly
+/// `  specs:`, and `specs: <anything>` would open no spec list in Bundler.
+fn source_option(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.strip_prefix("  ")?.split_once(": ")?;
+    let value = value.trim();
+    (!key.is_empty() && key != "specs" && key.chars().all(|c| c.is_ascii_alphabetic()) && !value.is_empty())
+        .then_some((key, value))
 }
 
 /// One lock spec and where it was read.
@@ -581,18 +606,34 @@ fn rbi_chain_touch(gems_dir: &Path, name: &str, version: &str) -> HashSet<String
 }
 
 /// Harvest an installed gem from its complete listing (`gem_files`):
-/// every `.rb` file. An unreadable file opens every chain.
+/// every Ruby file (`gem_ruby_file`). An unreadable file opens every chain.
 pub fn harvest_gem(files: &[PathBuf], reach: Reach) -> Harvest {
-    let rb: Vec<PathBuf> = files
-        .iter()
-        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("rb"))
-        .cloned()
-        .collect();
+    let rb: Vec<PathBuf> = files.iter().filter(|p| gem_ruby_file(p)).cloned().collect();
     harvest_files(&rb, reach).unwrap_or_else(|_| {
         let mut h = Harvest::default();
         h.open_all();
         h
     })
+}
+
+/// A gem file Ruby may load: `.rb`, or an extensionless file whose first
+/// line is a Ruby shebang (an `exe/` script, which a `require_paths` entry
+/// or a `load` can reach). An extensionless file whose head cannot be read
+/// counts, so `harvest_files` fails on it and the gem opens every chain.
+fn gem_ruby_file(path: &Path) -> bool {
+    use std::io::Read;
+    if let Some(ext) = path.extension() {
+        return ext == "rb";
+    }
+    let mut head = Vec::with_capacity(128);
+    let Ok(file) = std::fs::File::open(path) else {
+        return true;
+    };
+    if file.take(128).read_to_end(&mut head).is_err() {
+        return true;
+    }
+    let first = head.split(|&b| b == b'\n').next().unwrap_or_default();
+    first.starts_with(b"#!") && first.windows(4).any(|w| w == b"ruby")
 }
 
 /// How far a harvest must reach.
@@ -979,13 +1020,17 @@ mod tests {
         assert!(ev(&lock, &rbis(&[("json_api_client", "1.23.01")])).is_err());
     }
 
-    /// A Gemfile with no gems locks to sources with no specs: zero gems,
-    /// complete. An empty or structureless file is not a lock Bundler
-    /// wrote, so it proves nothing.
+    /// A Gemfile with no gems locks to a source with an empty `specs:`
+    /// list: zero gems, complete. A file Bundler could not have written
+    /// (empty, truncated to `PLATFORMS`/`DEPENDENCIES`, a spec outside a
+    /// `specs:` list, an option of no Bundler shape) proves nothing.
     #[test]
     fn only_a_lock_bundler_wrote_proves_zero_gems() {
         let empty_gems = "GEM\n  remote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n\nBUNDLED WITH\n   2.5.0\n";
         assert!(ev(empty_gems, &HashMap::new()).is_ok());
+        // What Bundler 4.0.20 writes for an empty Gemfile: no `remote:`.
+        let no_remote = "GEM\n  specs:\n\nPLATFORMS\n  arm64-darwin-25\n  ruby\n\nDEPENDENCIES\n\nCHECKSUMS\n  bundler (4.0.20) sha256=7978\n\nBUNDLED WITH\n  4.0.20\n";
+        assert!(ev(no_remote, &HashMap::new()).is_ok());
         for garbled in [
             "",
             "\n\n",
@@ -993,9 +1038,25 @@ mod tests {
             "GEM\n  remote: https://rubygems.org/\n  specs:\n\tmygem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n",
             "GEM\n  remote: https://rubygems.org/\n  specs:\n   mygem (1.0.0)\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n",
             "<<<<<<< HEAD\nGEM\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n",
+            "PLATFORMS\n  ruby\n\nDEPENDENCIES\n",
+            "GEM\n  remote: https://rubygems.org/\n  specs: corrupted\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n",
+            "GEM\n  remote: https://rubygems.org/\n    mygem (1.0.0)\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n  mygem\n",
+            "GEM\n  re_mote: https://rubygems.org/\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n",
+            "GEM\n  remote:\n  specs:\n\nPLATFORMS\n  ruby\n\nDEPENDENCIES\n",
         ] {
             assert!(ev(garbled, &HashMap::new()).is_err(), "must not prove zero gems: {garbled:?}");
         }
+    }
+
+    /// A blank `remote:` is no PATH: joined to the lock's directory it
+    /// would read as the project itself.
+    #[test]
+    fn path_gem_with_a_blank_remote_is_a_gap() {
+        let lock = format!("PATH\n  remote: \n  specs:\n    local (0.1.0)\n\n{LOCK}");
+        let all = rbis(&[("nokogiri", "1.19.3"), ("racc", "1.8.1")]);
+        assert!(ev(&lock, &all).is_err());
+        let inside = format!("PATH\n  remote: .\n  specs:\n    local (0.1.0)\n\n{LOCK}");
+        assert!(ev(&inside, &all).is_ok());
     }
 
     #[test]
